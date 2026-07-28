@@ -22,6 +22,76 @@ func snapWithRollup(rollup string) *Snapshot {
 	}
 }
 
+func TestComputeChangeset_ReviewRequired_NeedsReviewNotPolish(t *testing.T) {
+	t.Parallel()
+	// All-green but unapproved. This must NOT be mergeable, must NOT trigger a
+	// polish round (no agent can produce a human approval), and must surface as
+	// a distinct NeedsReview reason so the caller notifies and stops.
+	prev := &State{
+		LastCheckAt:     time.Now(),
+		LastSeenHeadSHA: "head1",
+		LastSeenBaseSHA: "base1",
+	}
+	snap := snapWithRollup("SUCCESS")
+	cs := ComputeChangeset(prev, snap)
+	assert.False(t, cs.Mergeable, "REVIEW_REQUIRED must suppress Mergeable")
+	assert.True(t, cs.NeedsReview, "missing approval must surface as NeedsReview")
+	assert.False(t, cs.NeedsPolish(), "a missing approval is not agent-fixable")
+}
+
+func TestComputeChangeset_Conflicting_PolishesAndSuppressesMergeable(t *testing.T) {
+	t.Parallel()
+	// A CONFLICTING (mergeable_state: dirty) PR schedules ZERO CI runs, so its
+	// empty status rollup must not read as "CI hasn't started". It needs a
+	// rebase, which is exactly the polish agent's job.
+	prev := &State{
+		LastCheckAt:     time.Now(),
+		LastSeenHeadSHA: "head1",
+		LastSeenBaseSHA: "base1",
+	}
+	snap := snapWithRollup("")
+	snap.PR.ReviewDecision = "APPROVED"
+	snap.PR.Mergeable = "CONFLICTING"
+
+	cs := ComputeChangeset(prev, snap)
+	assert.True(t, cs.Conflicting, "CONFLICTING must be surfaced")
+	assert.False(t, cs.Mergeable, "a conflicting PR is never mergeable")
+	assert.False(t, cs.Empty(), "a conflicting PR is actionable even with no other signal")
+	assert.True(t, cs.NeedsPolish(), "conflict resolution routes to polish")
+	assert.False(t, cs.NeedsReview, "an approved-but-dirty PR is not awaiting review")
+}
+
+func TestComputeChangeset_ApprovedGreen_IsMergeableNotNeedsReview(t *testing.T) {
+	t.Parallel()
+	prev := &State{
+		LastCheckAt:     time.Now(),
+		LastSeenHeadSHA: "head1",
+		LastSeenBaseSHA: "base1",
+	}
+	snap := snapWithRollup("SUCCESS")
+	snap.PR.ReviewDecision = "APPROVED"
+
+	cs := ComputeChangeset(prev, snap)
+	assert.True(t, cs.Mergeable)
+	assert.False(t, cs.NeedsReview, "an approved PR is not awaiting review")
+	assert.False(t, cs.NeedsPolish())
+}
+
+func TestComputeChangeset_ReviewRequiredButRed_IsNotNeedsReview(t *testing.T) {
+	t.Parallel()
+	// Unapproved AND red: the agent still has work to do, so this is a polish
+	// round, not a "waiting on a human" stop.
+	prev := &State{
+		LastCheckAt:     time.Now(),
+		LastSeenHeadSHA: "head1",
+		LastSeenBaseSHA: "base1",
+	}
+	snap := snapWithRollup("FAILURE")
+	cs := ComputeChangeset(prev, snap)
+	assert.False(t, cs.NeedsReview, "a red PR is blocked on CI, not on review")
+	assert.True(t, cs.NeedsPolish())
+}
+
 func TestComputeChangeset_FirstRun_Idle(t *testing.T) {
 	t.Parallel()
 	prev := &State{}

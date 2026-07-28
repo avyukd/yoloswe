@@ -186,6 +186,160 @@ func TestWatcher_Tick_PolishFailure_TripsCooldown(t *testing.T) {
 	assert.Len(t, polish.calls, 2, "third tick should be skipped by cooldown")
 }
 
+// approvedGreenGH builds a fake gh serving an APPROVED + SUCCESS PR (i.e.
+// cs.Mergeable) plus a `.merged` verification response.
+func approvedGreenGH(mergedVerdict string) *fakeGH {
+	approved := strings.Replace(okPRJSON, `"reviewDecision": "REVIEW_REQUIRED"`, `"reviewDecision": "APPROVED"`, 1)
+	gh := setupGH(buildPRJSON(approved, "SUCCESS"), "[]", "base1")
+	gh.addPrefix("api repos/o/r/pulls/42 --jq .merged", mergedVerdict)
+	return gh
+}
+
+// findCall returns the first recorded call whose joined args start with prefix.
+func (f *fakeGH) findCall(prefix string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.calls {
+		if strings.HasPrefix(strings.Join(c, " "), prefix) {
+			return c
+		}
+	}
+	return nil
+}
+
+func TestWatcher_MergePolicy_EmitsCorrectArgv(t *testing.T) {
+	// The two rules that broke kernel merges are argv-level, so assert on argv:
+	// never --delete-branch under ANY policy (it closed PRs #6283/#3179
+	// unmerged), and never a strategy flag under "queue" (the merge queue
+	// rejects it outright).
+	cases := []struct {
+		policy     MergePolicy
+		merged     string
+		wantAction LastAction
+		wantArgs   []string
+	}{
+		{
+			policy:     MergePolicyQueue,
+			merged:     "false",
+			wantArgs:   []string{"pr", "merge", "42", "--auto"},
+			wantAction: LastActionArmed,
+		},
+		{
+			policy:     MergePolicySquash,
+			merged:     "true",
+			wantArgs:   []string{"pr", "merge", "42", "--squash"},
+			wantAction: LastActionMerged,
+		},
+		{
+			policy:     MergePolicyRebase,
+			merged:     "true",
+			wantArgs:   []string{"pr", "merge", "42", "--rebase"},
+			wantAction: LastActionMerged,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.policy), func(t *testing.T) {
+			gh := approvedGreenGH(tc.merged)
+			w := newWatcherForTest(t, gh, &stubPolish{})
+			w.cfg.Polish.AutoMerge = true
+			w.cfg.Polish.MergePolicy = tc.policy
+
+			res, err := w.Tick(context.Background())
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantAction, res.Action)
+
+			got := gh.findCall("pr merge")
+			require.NotNil(t, got, "a merge call must have been issued")
+			assert.Equal(t, tc.wantArgs, got)
+			joined := strings.Join(got, " ")
+			assert.NotContains(t, joined, "--delete-branch",
+				"--delete-branch closed PRs unmerged; it must never be passed")
+			if tc.policy == MergePolicyQueue {
+				for _, flag := range []string{"--squash", "--rebase", "--merge"} {
+					assert.NotContains(t, joined, flag,
+						"a merge-queue repo rejects an explicit strategy flag")
+				}
+			}
+		})
+	}
+}
+
+func TestWatcher_MergePolicyNotify_NeverMerges(t *testing.T) {
+	gh := approvedGreenGH("false")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicyNotify
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionNeedsHuman, res.Action)
+	assert.Nil(t, gh.findCall("pr merge"),
+		"merge_policy notify must not issue any merge command")
+}
+
+func TestWatcher_Merge_VerifyFalse_IsFailureNotMerged(t *testing.T) {
+	// `gh pr merge` exiting 0 does NOT mean the PR merged. Under a direct
+	// policy, a `.merged == false` verdict must be reported as a failure —
+	// declaring victory here is how a "merged" PR silently stays open.
+	gh := approvedGreenGH("false")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicySquash
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionFailed, res.Action,
+		"unverified merge must not be reported as merged")
+}
+
+func TestWatcher_Merge_VerifiesViaMergedField(t *testing.T) {
+	// The ONLY trustworthy merge signal is `.merged` on the pulls endpoint:
+	// state:closed is ambiguous and merge_commit_sha can be populated for a
+	// merge the queue only speculatively built.
+	gh := approvedGreenGH("true")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicySquash
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionMerged, res.Action)
+
+	verify := gh.findCall("api repos/o/r/pulls/42 --jq .merged")
+	require.NotNil(t, verify, "merge must be verified against the API")
+}
+
+func TestWatcher_NeedsReview_StopsInsteadOfPolishing(t *testing.T) {
+	// An all-green unapproved PR must notify, not burn polish rounds.
+	gh := setupGH(buildPRJSON(okPRJSON, "SUCCESS"), "[]", "base1")
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	// Pre-seed so this is not a first run.
+	require.NoError(t, (&State{
+		PRNumber:        42,
+		Repo:            "r",
+		LastCheckAt:     time.Now(),
+		LastSeenHeadSHA: "head1",
+		LastSeenBaseSHA: "base1",
+	}).Save(StatePath("r", 42)))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionNeedsHuman, res.Action)
+	assert.Empty(t, polish.calls, "a missing approval must not trigger polish")
+}
+
+func TestMergePolicy_MergeArgs(t *testing.T) {
+	t.Parallel()
+	for _, p := range []MergePolicy{MergePolicyQueue, MergePolicySquash, MergePolicyRebase} {
+		args, ok := p.MergeArgs(7)
+		require.True(t, ok, "policy %q should merge", p)
+		assert.NotContains(t, strings.Join(args, " "), "--delete-branch")
+	}
+	_, ok := MergePolicyNotify.MergeArgs(7)
+	assert.False(t, ok, "notify policy must not produce merge args")
+}
+
 func TestWatcher_StateFileLocation(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

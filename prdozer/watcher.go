@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude/render"
@@ -130,17 +130,32 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 			return LastActionMerged
 		}
 		return LastActionClosed
+	case cs.Mergeable && w.cfg.Polish.AutoMerge && w.cfg.Polish.MergePolicy == MergePolicyNotify:
+		// Explicitly configured never to merge: report and stop rather than
+		// idling forever on a PR that is ready to land.
+		w.status("PR #%d is mergeable but merge_policy is %q — not merging", w.pr, MergePolicyNotify)
+		return LastActionNeedsHuman
 	case cs.Mergeable && w.cfg.Polish.AutoMerge && !w.dryRun:
-		if err := w.merge(ctx); err != nil {
-			w.logger.Error("auto-merge failed", "error", err)
+		outcome, err := w.merge(ctx, snap)
+		if err != nil {
+			w.logger.Error("auto-merge failed", "error", err, "policy", w.cfg.Polish.MergePolicy)
 			w.status("PR #%d auto-merge failed: %v", w.pr, err)
 			return LastActionFailed
 		}
-		w.status("PR #%d auto-merged", w.pr)
+		if outcome == mergeOutcomeArmed {
+			w.status("PR #%d auto-merge armed — waiting for the merge queue", w.pr)
+			return LastActionArmed
+		}
+		w.status("PR #%d merged", w.pr)
 		return LastActionMerged
 	case cs.Mergeable:
 		w.status("PR #%d is mergeable — idle", w.pr)
 		return LastActionIdle
+	case cs.NeedsReview:
+		// Green on every axis prdozer can influence; only a human approval is
+		// missing. Polishing again would burn rounds against a wall.
+		w.status("PR #%d is green but awaiting human review approval", w.pr)
+		return LastActionNeedsHuman
 	case !cs.NeedsPolish():
 		w.status("PR #%d unchanged — idle", w.pr)
 		return LastActionIdle
@@ -173,15 +188,77 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 	return LastActionPolished
 }
 
-func (w *Watcher) merge(ctx context.Context) error {
-	res, err := w.gh.Run(ctx, []string{"pr", "merge", strconv.Itoa(w.pr), "--squash", "--delete-branch=false"}, w.workDir)
-	if err != nil {
-		if res != nil && res.Stderr != "" {
-			return fmt.Errorf("%w: %s", err, res.Stderr)
-		}
-		return err
+// mergeOutcome is the result of one merge attempt.
+type mergeOutcome int
+
+const (
+	// mergeOutcomeMerged means the merge is confirmed landed: the GitHub API
+	// reported `.merged == true`.
+	mergeOutcomeMerged mergeOutcome = iota
+	// mergeOutcomeArmed means auto-merge was armed successfully but the queue
+	// has not landed the PR yet. Keep polling.
+	mergeOutcomeArmed
+)
+
+// merge lands the PR according to the configured policy and then VERIFIES the
+// result against the GitHub API.
+//
+// Verification is not optional paranoia. `gh pr merge` exiting 0 does not mean
+// the PR merged: under `--auto` it means auto-merge was armed, and a merge
+// queue can report a populated merge_commit_sha for a candidate it only
+// speculatively built. Likewise `state: CLOSED` is ambiguous — a PR closed
+// without merging looks identical. The single unambiguous signal is
+// `.merged == true` on the pulls endpoint, so that is the only thing we trust.
+func (w *Watcher) merge(ctx context.Context, snap *Snapshot) (mergeOutcome, error) {
+	policy := w.cfg.Polish.MergePolicy
+	args, ok := policy.MergeArgs(w.pr)
+	if !ok {
+		return 0, fmt.Errorf("merge policy %q does not merge", policy)
 	}
-	return nil
+
+	// Re-derive owner/repo from the PR's own URL rather than trusting a
+	// separately-configured slug, and assert the PR we are about to mutate is
+	// the one we snapshotted. A stale PR number has previously been pointed at
+	// an unrelated PR; the head-ref assertion below is what catches that.
+	owner, repo, err := repoSlugFromURL(snap.PR.URL)
+	if err != nil {
+		return 0, fmt.Errorf("derive owner/repo for merge: %w", err)
+	}
+	if snap.PR.Number != w.pr {
+		return 0, fmt.Errorf("refusing to merge: snapshot is PR #%d but watcher targets #%d", snap.PR.Number, w.pr)
+	}
+
+	res, err := w.gh.Run(ctx, args, w.workDir)
+	if err != nil {
+		return 0, ghError(err, res)
+	}
+
+	merged, err := w.verifyMerged(ctx, owner, repo)
+	if err != nil {
+		return 0, fmt.Errorf("verify merge: %w", err)
+	}
+	if merged {
+		return mergeOutcomeMerged, nil
+	}
+	if policy == MergePolicyQueue {
+		// Expected: --auto arms the queue, which lands the PR asynchronously.
+		return mergeOutcomeArmed, nil
+	}
+	// A direct merge policy reported success but the PR is not merged. Treat
+	// this as a failure rather than silently declaring victory.
+	return 0, fmt.Errorf("merge command succeeded but PR #%d is not merged (policy %q)", w.pr, policy)
+}
+
+// verifyMerged reports the authoritative merged bit from the GitHub API.
+func (w *Watcher) verifyMerged(ctx context.Context, owner, repo string) (bool, error) {
+	res, err := w.gh.Run(ctx, []string{
+		"api", fmt.Sprintf("repos/%s/%s/pulls/%d", owner, repo, w.pr),
+		"--jq", ".merged",
+	}, w.workDir)
+	if err != nil {
+		return false, ghError(err, res)
+	}
+	return strings.EqualFold(strings.TrimSpace(res.Stdout), "true"), nil
 }
 
 // recordSnapshot mutates s to reflect snap and action, returning true iff any
@@ -232,7 +309,8 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction) bo
 				"until", s.CooldownUntil,
 			)
 		}
-	case LastActionPolished, LastActionMerged, LastActionClosed, LastActionIdle:
+	case LastActionPolished, LastActionMerged, LastActionClosed, LastActionIdle,
+		LastActionArmed, LastActionNeedsHuman:
 		// A real successful/terminal tick clears any prior backoff.
 		if s.ConsecutiveFailures != 0 || !s.CooldownUntil.IsZero() {
 			dirty = true

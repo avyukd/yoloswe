@@ -29,6 +29,14 @@ const (
 	LastActionClosed   LastAction = "closed"
 	LastActionFailed   LastAction = "failed"
 	LastActionDryRun   LastAction = "dry_run"
+	// LastActionArmed means auto-merge was armed on a merge-queue repo. The
+	// PR has NOT landed yet — the queue lands it asynchronously — so this is a
+	// non-terminal state that keeps the watcher polling until `.merged` is true.
+	LastActionArmed LastAction = "armed"
+	// LastActionNeedsHuman is terminal: something only a person can resolve
+	// (a missing review approval, a fork PR, merge_policy "notify"). Polishing
+	// again cannot help, so the run stops and notifies.
+	LastActionNeedsHuman LastAction = "needs_human"
 )
 
 // State is the per-PR persisted state, used to detect change between ticks
