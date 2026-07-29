@@ -490,11 +490,20 @@ func TestNew_DefaultApprovalPolicyCodex(t *testing.T) {
 	}
 }
 
+// The read-only default must be an interactive policy that every codex-cli we
+// run accepts. It was "on-failure" until codex-cli 0.145.0 removed that
+// variant, which crashed codex reviewers at startup on upgraded hosts;
+// "on-request" is accepted by both 0.141 and 0.145.
 func TestNew_ReadOnlyApprovalPolicyCodex(t *testing.T) {
 	r := New(Config{BackendType: BackendCodex, ReadOnly: true})
-	if r.config.ApprovalPolicy != codex.ApprovalPolicyOnFailure {
+	if r.config.ApprovalPolicy != codex.ApprovalPolicyOnRequest {
 		t.Errorf("expected codex read-only approval policy %q, got %q",
-			codex.ApprovalPolicyOnFailure, r.config.ApprovalPolicy)
+			codex.ApprovalPolicyOnRequest, r.config.ApprovalPolicy)
+	}
+	// A non-interactive policy would leave ReadOnlyHandler unreachable and
+	// silently permit writes — the failure mode the guard exists to prevent.
+	if r.config.ApprovalPolicy == codex.ApprovalPolicyNever {
+		t.Error("read-only must not use a policy that auto-approves writes")
 	}
 }
 

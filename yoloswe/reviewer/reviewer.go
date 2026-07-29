@@ -95,7 +95,7 @@ const (
 // # Codex approval policy and --read-only mitigation
 //
 // To mitigate the lack of bwrap, the --read-only flag provides a
-// software-level guard: it sets the approval policy to "on-failure" and
+// software-level guard: it sets the approval policy to "on-request" and
 // wires a ReadOnlyHandler that auto-approves Bash tool calls but denies
 // Write tool calls. This prevents file writes through the Codex Write
 // tool but cannot block destructive shell commands (rm, git reset, etc.)—
@@ -989,9 +989,13 @@ func New(config Config) *Reviewer {
 		}
 		if config.ApprovalPolicy == "" {
 			if config.ReadOnly {
-				// on-failure triggers the approval handler so
-				// ReadOnlyHandler can deny Write tool calls.
-				config.ApprovalPolicy = codex.ApprovalPolicyOnFailure
+				// on-request triggers the approval handler so
+				// ReadOnlyHandler can deny Write tool calls. It is
+				// accepted by every codex-cli we run (0.141 and 0.145+);
+				// on-failure was removed in 0.145. If a future version
+				// drops it too, the client renegotiates from the
+				// server's own list of supported policies.
+				config.ApprovalPolicy = codex.ApprovalPolicyOnRequest
 			} else {
 				// never = auto-approve; avoids hanging without a handler.
 				config.ApprovalPolicy = codex.ApprovalPolicyNever
