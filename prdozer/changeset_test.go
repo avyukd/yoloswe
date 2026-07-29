@@ -382,3 +382,20 @@ func TestBotReviewers(t *testing.T) {
 	assert.True(t, got["sycamore-groot"], "keyed by the stripped login, matching ChangesRequestedBy")
 	assert.False(t, got["a-human"], "humans are re-requestable and must not be skipped")
 }
+
+func TestPRHealth_BetterThan(t *testing.T) {
+	t.Parallel()
+	green2 := PRHealth{UnresolvedThreads: 2}
+	green5 := PRHealth{UnresolvedThreads: 5}
+	red1 := PRHealth{UnresolvedThreads: 1, CIFailing: true}
+
+	assert.True(t, green2.BetterThan(green5), "fewer unresolved threads is better")
+	assert.False(t, green5.BetterThan(green2))
+	assert.False(t, green2.BetterThan(green2), "equal is NOT an improvement — a round that changed nothing must count")
+
+	// Green CI dominates: a red PR cannot merge at all, so going red is a
+	// regression even while resolving threads. This is exactly the kernel#8227
+	// shape — threads fell while the polish commits turned CI red.
+	assert.True(t, green5.BetterThan(red1), "green with more threads beats red with fewer")
+	assert.False(t, red1.BetterThan(green5))
+}

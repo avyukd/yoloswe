@@ -131,6 +131,16 @@ type PolishConfig struct {
 type BackoffConfig struct {
 	MaxConsecutiveFailures int           `yaml:"max_consecutive_failures"`
 	Cooldown               time.Duration `yaml:"cooldown"`
+	// MaxRoundsWithoutImprovement stops polishing when this many consecutive
+	// rounds fail to improve on the best PR health seen so far.
+	//
+	// The existing brake counts only hard failures, so a run whose rounds all
+	// "succeed" while the PR gets worse never trips it. kernel#8227 ran
+	// seventeen such rounds: unresolved threads went 6 -> 2 -> 11 and CI went
+	// red on errors the polish commits introduced.
+	//
+	// Zero disables the guard. Default 3, matching the failure brake.
+	MaxRoundsWithoutImprovement int `yaml:"max_rounds_without_improvement"`
 }
 
 // DefaultConfig returns the built-in defaults with validate() applied so the
@@ -167,8 +177,9 @@ func defaultConfig() Config {
 			// MaxBudgetUSD left at zero so validate() inherits the top-level value.
 		},
 		Backoff: BackoffConfig{
-			MaxConsecutiveFailures: 3,
-			Cooldown:               2 * time.Hour,
+			MaxConsecutiveFailures:      3,
+			MaxRoundsWithoutImprovement: 3,
+			Cooldown:                    2 * time.Hour,
 		},
 	}
 }

@@ -35,6 +35,23 @@ type Snapshot struct {
 	// on push.
 	IsBotReviewer map[string]bool
 	PR            PRDetails
+	// UnresolvedThreads counts review threads still awaiting work, or -1 when
+	// it could not be read. -1 disables the divergence guard for this tick
+	// rather than being mistaken for a healthy zero. Last so the int packs into
+	// the tail (govet fieldalignment).
+	UnresolvedThreads int
+}
+
+// Health summarizes the snapshot for divergence tracking. ok is false when the
+// thread count is unknown, in which case the caller must not compare.
+func (s *Snapshot) Health() (PRHealth, bool) {
+	if s.UnresolvedThreads < 0 {
+		return PRHealth{}, false
+	}
+	return PRHealth{
+		UnresolvedThreads: s.UnresolvedThreads,
+		CIFailing:         s.StatusRollup == StatusFailure,
+	}, true
 }
 
 // PRDetails is the fields prdozer cares about from `gh pr view`.
@@ -104,9 +121,21 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 		failed                 []int64
 		comments               []CommentRef
 		baseSHA                string
+		unresolved             int
 		failedErr, commentsErr error
 	)
-	wg.Add(3)
+	wg.Add(4)
+	go func() {
+		defer wg.Done()
+		// Best-effort, like base detection: an unreadable thread count only
+		// disables the divergence guard for this tick rather than failing the
+		// whole snapshot. -1 marks "unknown" so the guard can tell it apart
+		// from a genuine zero.
+		unresolved = -1
+		if n, err := fetchUnresolvedThreads(ctx, gh, dir, owner, repo, prNumber); err == nil {
+			unresolved = n
+		}
+	}()
 	go func() {
 		defer wg.Done()
 		failed, failedErr = fetchFailedRunIDs(ctx, gh, dir, pr.HeadRefName)
@@ -137,7 +166,41 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 		StatusRollup:       summarizeRollup(pr.StatusCheckRollup),
 		ChangesRequestedBy: changesRequestedBy(pr.LatestReviews),
 		IsBotReviewer:      botReviewers(pr.LatestReviews),
+		UnresolvedThreads:  unresolved,
 	}, nil
+}
+
+// fetchUnresolvedThreads counts review threads that are neither resolved nor
+// outdated — the work reviewers are still asking for, and the primary signal
+// for whether a PR is getting better or worse across polish rounds.
+//
+// Outdated threads are excluded deliberately: they attach to lines a later
+// commit already replaced, so counting them would make any rebase look like a
+// regression.
+func fetchUnresolvedThreads(ctx context.Context, gh wt.GHRunner, dir, owner, repo string, prNumber int) (int, error) {
+	const query = `query($owner:String!,$repo:String!,$pr:Int!){
+  repository(owner:$owner,name:$repo){
+    pullRequest(number:$pr){
+      reviewThreads(last:100){ nodes { isResolved isOutdated } }
+    }
+  }
+}`
+	res, err := gh.Run(ctx, []string{
+		"api", "graphql",
+		"-f", "query=" + query,
+		"-F", "owner=" + owner,
+		"-F", "repo=" + repo,
+		"-F", fmt.Sprintf("pr=%d", prNumber),
+		"--jq", `[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved==false and .isOutdated==false)] | length`,
+	}, dir)
+	if err != nil {
+		return 0, ghError(err, res)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(res.Stdout))
+	if err != nil {
+		return 0, fmt.Errorf("parse unresolved thread count %q: %w", strings.TrimSpace(res.Stdout), err)
+	}
+	return n, nil
 }
 
 // botReviewers maps the stripped login of each app reviewer to true, keyed the

@@ -25,6 +25,9 @@ type Watcher struct {
 	reworkSpec StepSpec
 	pr         int
 	dryRun     bool
+	// diverged is set by the divergence guard within a tick so Tick can
+	// report WHY it stopped. Reset at the top of every tick.
+	diverged bool
 }
 
 // WithRework attaches the merge-rework runner and the rounds it should run,
@@ -81,6 +84,12 @@ type TickResult struct {
 	Snapshot  *Snapshot
 	Action    LastAction
 	Changeset Changeset
+	// Diverged reports that NeedsHuman was reached because the PR stopped
+	// improving, rather than because it is waiting on an approval. The two need
+	// opposite responses, so the notification must tell them apart.
+	Diverged bool
+	// PolishRounds is the run's polish count, reported alongside Diverged.
+	PolishRounds int
 }
 
 func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
@@ -119,12 +128,24 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 		"pr_closed", cs.PRClosed,
 	)
 
+	w.diverged = false
 	priorAttempts, priorMergeErr := state.MergeAttempts, state.LastMergeError
 	action := w.decideAndAct(ctx, snap, cs, state)
 	mergeStateDirty := state.MergeAttempts != priorAttempts || state.LastMergeError != priorMergeErr
 
-	res := TickResult{Snapshot: snap, Changeset: cs, Action: action}
-	if w.recordSnapshot(state, snap, action, mergeStateDirty) {
+	// Fold this tick's observed health into the run's best-so-far.
+	//
+	// The snapshot was taken BEFORE this tick's action, so it measures the
+	// result of the PREVIOUS round, not the one just run. That lag is
+	// deliberate: CI needs time to run after a push, so judging a round
+	// immediately would read a stale-green rollup and call a regression an
+	// improvement. The cost is that the guard trips one tick later than the
+	// round that actually caused the divergence.
+	healthDirty := w.recordHealth(state, snap)
+
+	res := TickResult{Snapshot: snap, Changeset: cs, Action: action,
+		Diverged: w.diverged, PolishRounds: state.PolishRounds}
+	if w.recordSnapshot(state, snap, action, mergeStateDirty || healthDirty) {
 		if err := state.Save(statePath); err != nil {
 			// State save failure is serious: the action already ran (maybe merged
 			// or polished) and the next tick will reload stale state and could
@@ -180,6 +201,19 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 	case !cs.NeedsPolish():
 		w.status("PR #%d unchanged — idle", w.pr)
 		return LastActionIdle
+	case w.diverging(snap, state):
+		// More polish rounds are not producing a better PR. Stop and hand it
+		// to a human rather than burning rounds — and money — making it worse.
+		w.diverged = true
+		best := state.BestHealth
+		w.status("PR #%d is not improving after %d rounds (best: %d unresolved, ci_failing=%t) — needs a human",
+			w.pr, state.RoundsSinceImprovement, best.UnresolvedThreads, best.CIFailing)
+		w.logger.Warn("divergence guard tripped",
+			"rounds_since_improvement", state.RoundsSinceImprovement,
+			"polish_rounds", state.PolishRounds,
+			"best_unresolved", best.UnresolvedThreads,
+			"best_ci_failing", best.CIFailing)
+		return LastActionNeedsHuman
 	}
 
 	if w.dryRun {
@@ -341,6 +375,58 @@ const (
 // speculatively built. Likewise `state: CLOSED` is ambiguous — a PR closed
 // without merging looks identical. The single unambiguous signal is
 // `.merged == true` on the pulls endpoint, so that is the only thing we trust.
+// diverging reports whether polishing has stopped making the PR better.
+//
+// It is deliberately evaluated BEFORE the polish call and AFTER the health
+// bookkeeping from the previous round, so the decision uses the outcome of work
+// already done rather than predicting the next round.
+func (w *Watcher) diverging(snap *Snapshot, state *State) bool {
+	limit := w.cfg.Backoff.MaxRoundsWithoutImprovement
+	if limit <= 0 || state.BestHealth == nil {
+		return false
+	}
+	// An unreadable thread count means we cannot judge improvement; never stop
+	// a run on missing data.
+	if _, ok := snap.Health(); !ok {
+		return false
+	}
+	return state.RoundsSinceImprovement >= limit
+}
+
+// recordHealth folds this tick's observed health into the run's best-so-far,
+// which is what the divergence guard measures against.
+//
+// Called on every tick rather than only after polishing, so a PR that improves
+// on its own — a reviewer resolving threads, a flaky job going green on rerun —
+// still resets the counter. Only polish rounds increment it.
+func (w *Watcher) recordHealth(state *State, snap *Snapshot) bool {
+	h, ok := snap.Health()
+	if !ok {
+		return false
+	}
+	if state.BestHealth == nil {
+		state.BestHealth = &h
+		state.RoundsSinceImprovement = 0
+		return true
+	}
+	if h.BetterThan(*state.BestHealth) {
+		state.BestHealth = &h
+		state.RoundsSinceImprovement = 0
+		return true
+	}
+	// No improvement. Charge it only when a polish round is actually
+	// outstanding — i.e. the PREVIOUS tick polished and this snapshot is the
+	// first look at its result. Charging on the current action instead would
+	// mis-attribute by one tick; charging on every tick would trip the guard on
+	// a PR that is merely waiting for CI, having done no work at all.
+	if state.LastAction == LastActionPolished {
+		state.PolishRounds++
+		state.RoundsSinceImprovement++
+		return true
+	}
+	return false
+}
+
 func (w *Watcher) merge(ctx context.Context, snap *Snapshot) (mergeOutcome, error) {
 	policy := w.cfg.Polish.MergePolicy
 	args, ok := policy.MergeArgs(w.pr)

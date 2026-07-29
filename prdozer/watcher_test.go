@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -575,4 +576,85 @@ func TestBuildPolishPrompt(t *testing.T) {
 func TestFakeGHIsolated(t *testing.T) {
 	t.Parallel()
 	require.NotEmpty(t, os.TempDir())
+}
+
+// setThreads makes the fake gh return n unresolved review threads.
+func (f *fakeGH) setThreads(n int) {
+	f.addPrefix("api graphql", strconv.Itoa(n))
+}
+
+// A PR that keeps needing polish while never getting better must stop and go
+// to a human. This is the kernel#8227 failure: seventeen polish rounds each
+// reported success while unresolved threads went 6 -> 2 -> 11 and CI went red
+// on errors the polish commits introduced. The existing backoff only counts
+// hard failures, so nothing ever fired and it burned rounds making the PR
+// worse.
+func TestWatcher_DivergenceGuard_StopsWhenNotImproving(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(6)
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 3
+
+	ctx := context.Background()
+	// First tick records the baseline without reacting.
+	_, err := w.Tick(ctx)
+	require.NoError(t, err)
+
+	// Now hold health flat at its worst: every tick needs polish, none improves.
+	gh.setThreads(11)
+	var lastAction LastAction
+	for range 6 {
+		res, err := w.Tick(ctx)
+		require.NoError(t, err)
+		lastAction = res.Action
+		if lastAction == LastActionNeedsHuman {
+			break
+		}
+	}
+	assert.Equal(t, LastActionNeedsHuman, lastAction,
+		"a PR that stops improving must escalate rather than polish forever")
+	assert.Less(t, len(polish.calls), 6,
+		"the guard must cut polishing short, not run every round first")
+}
+
+// Improvement must reset the budget, or a long but healthy run would trip the
+// guard purely for taking many rounds.
+func TestWatcher_DivergenceGuard_ImprovementResetsCounter(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(10)
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 3
+
+	ctx := context.Background()
+	_, err := w.Tick(ctx)
+	require.NoError(t, err)
+
+	// Two flat rounds, then a real improvement, then two more flat ones. The
+	// improvement in the middle must clear the counter so the guard does not
+	// trip on a total that spans it.
+	for _, threads := range []int{10, 10, 4, 4, 4} {
+		gh.setThreads(threads)
+		res, err := w.Tick(ctx)
+		require.NoError(t, err)
+		require.NotEqual(t, LastActionNeedsHuman, res.Action,
+			"must not trip while the PR is still improving (threads=%d)", threads)
+	}
+}
+
+// Missing data must never stop a run: an unreadable thread count disables the
+// guard rather than being treated as a healthy zero or a regression.
+func TestWatcher_DivergenceGuard_UnknownThreadCountDisablesGuard(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.failPrefix("api graphql", "GraphQL: something broke")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 1
+
+	ctx := context.Background()
+	for range 4 {
+		res, err := w.Tick(ctx)
+		require.NoError(t, err)
+		assert.NotEqual(t, LastActionNeedsHuman, res.Action,
+			"an unreadable thread count must not be mistaken for divergence")
+	}
 }

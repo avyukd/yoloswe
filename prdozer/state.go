@@ -57,11 +57,21 @@ type State struct {
 	Repo            string     `json:"repo,omitempty"`
 	// LastMergeError is the verbatim gh stderr from the most recent failed
 	// merge, carried across ticks so the rework agent sees the real message.
-	LastMergeError      string   `json:"last_merge_error,omitempty"`
-	LastSeenCommentIDs  []string `json:"last_seen_comment_ids,omitempty"`
-	LastSeenCIRunIDs    []int64  `json:"last_seen_ci_run_ids,omitempty"`
-	ConsecutiveFailures int      `json:"consecutive_failures,omitempty"`
-	PRNumber            int      `json:"pr_number"`
+	LastMergeError string `json:"last_merge_error,omitempty"`
+	// BestHealth is the healthiest PR state observed so far; PolishRounds counts
+	// rounds run since it was set.
+	//
+	// Together these detect DIVERGENCE: a PR getting worse round over round
+	// rather than better. Observed on kernel#8227, where seventeen polish rounds
+	// each fixed things while new findings arrived faster — unresolved threads
+	// went 6 -> 2 -> 11 and CI went red on errors the polish commits themselves
+	// introduced. Every round reported success, so nothing in the existing
+	// backoff (which only counts hard failures) ever fired.
+	BestHealth          *PRHealth `json:"best_health,omitempty"`
+	LastSeenCommentIDs  []string  `json:"last_seen_comment_ids,omitempty"`
+	LastSeenCIRunIDs    []int64   `json:"last_seen_ci_run_ids,omitempty"`
+	ConsecutiveFailures int       `json:"consecutive_failures,omitempty"`
+	PRNumber            int       `json:"pr_number"`
 	// MergeAttempts counts merge attempts across the whole run, surviving
 	// cooldowns so a resumed run keeps climbing (and the Slack message can
 	// honestly say "attempt 9") rather than restarting its numbering.
@@ -70,6 +80,36 @@ type State struct {
 	// cooldown, so the brake measures attempts SINCE that point. Without it a
 	// run that resumes past its cooldown would re-trip on every later tick.
 	CooldownFromAttempt int `json:"cooldown_from_attempt,omitempty"`
+	// PolishRounds counts polish rounds run since BestHealth was set.
+	PolishRounds int `json:"polish_rounds,omitempty"`
+	// RoundsSinceImprovement counts consecutive polish rounds that failed to
+	// beat BestHealth. Reset to zero whenever a new best is reached.
+	RoundsSinceImprovement int `json:"rounds_since_improvement,omitempty"`
+}
+
+// PRHealth is the cheap, externally-observable measure of whether a PR is
+// getting better. Both fields come from data the snapshot already fetches, so
+// tracking them costs no extra API calls.
+type PRHealth struct {
+	// UnresolvedThreads counts review threads that are neither resolved nor
+	// outdated — the work a reviewer is still asking for.
+	UnresolvedThreads int `json:"unresolved_threads"`
+	// CIFailing reports whether the status rollup is FAILURE. A round that
+	// turns CI red has made the PR strictly worse even if it resolved threads.
+	CIFailing bool `json:"ci_failing"`
+}
+
+// BetterThan reports whether h is a strict improvement over other.
+//
+// Green CI dominates: going from red to green is an improvement even if the
+// thread count rose, because a red PR cannot merge at all. Otherwise fewer
+// unresolved threads wins. Equal state is NOT an improvement — a round that
+// changed nothing is exactly what the divergence guard must count.
+func (h PRHealth) BetterThan(other PRHealth) bool {
+	if h.CIFailing != other.CIFailing {
+		return !h.CIFailing
+	}
+	return h.UnresolvedThreads < other.UnresolvedThreads
 }
 
 // LoadState reads the state file at path. Returns a zero State (no error) when
