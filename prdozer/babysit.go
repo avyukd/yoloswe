@@ -244,6 +244,7 @@ func (b *Babysitter) watcherConfig(rc *RunContext) *Config {
 		cfg.Polish.MaxBudgetUSD = b.opts.Entry.MaxBudgetUSD
 	}
 	cfg.Polish.MergePolicy = b.opts.Entry.MergePolicy
+	cfg.Polish.SelfReview = b.opts.Entry.SelfReview
 	// AutoMerge is on so the loop can reach a merge; the POLICY decides
 	// whether anything actually lands. merge_policy "notify" reports and stops.
 	cfg.Polish.AutoMerge = true

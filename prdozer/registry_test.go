@@ -391,3 +391,29 @@ func TestRepoEntry_CheckUsable_AcceptsWTLayoutWithBaseCheckout(t *testing.T) {
 	e := RepoEntry{WorktreeRoot: root, Layout: LayoutWT, BaseBranch: "main", Flow: "pr-polish"}
 	assert.NoError(t, e.CheckUsable("bazelment/yoloswe"))
 }
+
+// Every other RepoEntry field inherits from defaults; this one must too, or a
+// fleet-wide self_review would be silently ignored.
+func TestRegistry_SelfReviewInheritsFromDefaults(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "main", ".git"), 0o755))
+
+	r, err := LoadRegistry(writeRegistry(t, `
+defaults:
+  self_review: true
+repos:
+  o/inherits:
+    worktree_root: `+root+`
+  o/explicit:
+    worktree_root: `+root+`
+    self_review: true
+`))
+	require.NoError(t, err)
+
+	for _, name := range []string{"o/inherits", "o/explicit"} {
+		e, rerr := r.Resolve(name)
+		require.NoError(t, rerr)
+		assert.True(t, e.SelfReview, "%s must have self_review enabled", name)
+	}
+}

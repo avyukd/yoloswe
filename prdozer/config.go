@@ -131,6 +131,11 @@ type PolishConfig struct {
 	RoundsPerTick int  `yaml:"rounds_per_tick"`
 	Local         bool `yaml:"local"`      // pass --local to /pr-polish
 	AutoMerge     bool `yaml:"auto_merge"` // run gh pr merge when PR is mergeable
+	// SelfReview mirrors RepoEntry.SelfReview: on a repo with no automated
+	// review bots, /pr-polish must ORIGINATE the review rather than react to
+	// one. Every other trigger is reactive, so without this a healthy PR on a
+	// bot-less repo is declared done having never been reviewed.
+	SelfReview bool `yaml:"self_review"`
 }
 
 // BackoffConfig caps how aggressively prdozer keeps retrying after failures.

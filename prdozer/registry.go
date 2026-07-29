@@ -68,6 +68,20 @@ type RepoEntry struct {
 	MergeRework  StepSpec      `yaml:"merge_rework"`
 	PollInterval time.Duration `yaml:"poll_interval"`
 	MaxBudgetUSD float64       `yaml:"max_budget_usd"`
+	// SelfReview marks a repo with no automated PR review bots, where
+	// /pr-polish IS the reviewer rather than a reactor to one.
+	//
+	// Every other polish trigger is reactive: new comments, CI failure, a moved
+	// base, a conflict. On a repo with review bots (kernel: sycamore-groot,
+	// coderabbitai) that suffices — the bots post and prdozer responds. On a
+	// repo without them (yoloswe) a healthy PR fires no trigger at all, so
+	// prdozer declares it done having never reviewed it: yoloswe#287 closed out
+	// in ~1 second three times that way.
+	//
+	// When set, an unreviewed commit is polished once so the local reviewers
+	// (codex/cursor) can produce findings, which then feed the normal loop.
+	// Last so the bool packs into the tail (govet fieldalignment).
+	SelfReview bool `yaml:"self_review"`
 }
 
 // StepSpec is a sequence of rounds run as one logical step. It mirrors
@@ -252,6 +266,12 @@ func (r *Registry) merged(e RepoEntry) RepoEntry {
 	}
 	if e.SlackTarget == "" {
 		e.SlackTarget = d.SlackTarget
+	}
+	// A bool cannot distinguish "unset" from "false", so defaults can only turn
+	// this ON. That is the right asymmetry: a repo can never accidentally lose
+	// origination it needs, and a repo that wants it explicitly sets it.
+	if d.SelfReview {
+		e.SelfReview = true
 	}
 	if e.Model == "" {
 		e.Model = d.Model

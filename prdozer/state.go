@@ -49,9 +49,13 @@ const (
 // State is the per-PR persisted state, used to detect change between ticks
 // and to back off after repeated failures.
 type State struct {
-	LastCheckAt     time.Time  `json:"last_check_at,omitempty"`
-	CooldownUntil   time.Time  `json:"cooldown_until,omitempty"`
-	LastSeenHeadSHA string     `json:"last_seen_head_sha,omitempty"`
+	LastCheckAt     time.Time `json:"last_check_at,omitempty"`
+	CooldownUntil   time.Time `json:"cooldown_until,omitempty"`
+	LastSeenHeadSHA string    `json:"last_seen_head_sha,omitempty"`
+	// SelfReviewedSHA is the head SHA prdozer last originated a review for on a
+	// self_review repo. Keyed by SHA so the review happens once per commit: an
+	// unconditional trigger would re-review an idle PR on every tick forever.
+	SelfReviewedSHA string     `json:"self_reviewed_sha,omitempty"`
 	LastSeenBaseSHA string     `json:"last_seen_base_sha,omitempty"`
 	LastAction      LastAction `json:"last_action,omitempty"`
 	Repo            string     `json:"repo,omitempty"`

@@ -2,6 +2,7 @@ package prdozer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -704,4 +705,89 @@ func TestWatcher_MergeableWithNewComments_StillPolishes(t *testing.T) {
 	assert.Len(t, polish.calls, 1, "pr-polish must actually be invoked")
 	assert.Nil(t, gh.findCall("pr merge"),
 		"never merge while reviewer feedback is outstanding")
+}
+
+// On a repo with no review bots, /pr-polish IS the reviewer — it runs
+// codex/cursor locally to PRODUCE findings. Every other trigger is reactive, so
+// a healthy new PR fires none of them and prdozer declares it done having never
+// reviewed it. yoloswe#287 was closed out in ~1s three separate times that way,
+// with zero pr-polish invocations.
+func TestWatcher_SelfReview_PolishesAnUnreviewedPR(t *testing.T) {
+	prJSON := strings.Replace(okPRJSON, `"reviewDecision": "REVIEW_REQUIRED"`, `"reviewDecision": ""`, 1)
+	gh := setupGH(buildPRJSON(prJSON, "SUCCESS"), "[]", "base1")
+	gh.setThreads(0)
+	gh.addPrefix("api repos/o/r/pulls/42 --jq .merged", "false")
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicyNotify
+	w.cfg.Polish.SelfReview = true
+
+	ctx := context.Background()
+	res, err := w.Tick(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, LastActionPolished, res.Action,
+		"a bot-less repo must have its review ORIGINATED, not skipped as 'nothing changed'")
+	assert.Len(t, polish.calls, 1, "pr-polish must actually run")
+	assert.Nil(t, gh.findCall("pr merge"), "never merge a PR that was just reviewed for the first time")
+}
+
+// Keyed by SHA so a commit is reviewed exactly once. "No bot reviewed this"
+// never stops being true on its own, so an unconditional trigger would
+// re-review an idle PR on every tick forever.
+func TestWatcher_SelfReview_OncePerCommit(t *testing.T) {
+	prJSON := strings.Replace(okPRJSON, `"reviewDecision": "REVIEW_REQUIRED"`, `"reviewDecision": ""`, 1)
+	gh := setupGH(buildPRJSON(prJSON, "SUCCESS"), "[]", "base1")
+	gh.setThreads(0)
+	gh.addPrefix("api repos/o/r/pulls/42 --jq .merged", "false")
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicyNotify
+	w.cfg.Polish.SelfReview = true
+
+	ctx := context.Background()
+	for range 3 {
+		_, err := w.Tick(ctx)
+		require.NoError(t, err)
+	}
+	assert.Len(t, polish.calls, 1,
+		"the same commit must be self-reviewed once, not on every tick")
+}
+
+// A failed round produced no review, so the commit must stay eligible.
+func TestWatcher_SelfReview_FailedRoundStaysEligible(t *testing.T) {
+	prJSON := strings.Replace(okPRJSON, `"reviewDecision": "REVIEW_REQUIRED"`, `"reviewDecision": ""`, 1)
+	gh := setupGH(buildPRJSON(prJSON, "SUCCESS"), "[]", "base1")
+	gh.setThreads(0)
+	gh.addPrefix("api repos/o/r/pulls/42 --jq .merged", "false")
+	polish := &stubPolish{err: errors.New("boom")}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicyNotify
+	w.cfg.Polish.SelfReview = true
+	w.cfg.Backoff.MaxConsecutiveFailures = 0 // isolate from the cooldown brake
+
+	ctx := context.Background()
+	for range 2 {
+		_, err := w.Tick(ctx)
+		require.NoError(t, err)
+	}
+	assert.Len(t, polish.calls, 2, "a failed review must be retried, not marked done")
+}
+
+// Without the flag, behavior is unchanged: a clean mergeable PR terminates.
+func TestWatcher_SelfReviewOff_CleanPRStillTerminates(t *testing.T) {
+	prJSON := strings.Replace(okPRJSON, `"reviewDecision": "REVIEW_REQUIRED"`, `"reviewDecision": ""`, 1)
+	gh := setupGH(buildPRJSON(prJSON, "SUCCESS"), "[]", "base1")
+	gh.setThreads(0)
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicyNotify
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionNeedsHuman, res.Action)
+	assert.Empty(t, polish.calls, "no self-review means no origination")
 }

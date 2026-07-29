@@ -134,8 +134,11 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 
 	w.diverged = false
 	priorAttempts, priorMergeErr := state.MergeAttempts, state.LastMergeError
+	priorSelfReviewed := state.SelfReviewedSHA
 	action := w.decideAndAct(ctx, snap, cs, state)
-	mergeStateDirty := state.MergeAttempts != priorAttempts || state.LastMergeError != priorMergeErr
+	mergeStateDirty := state.MergeAttempts != priorAttempts ||
+		state.LastMergeError != priorMergeErr ||
+		state.SelfReviewedSHA != priorSelfReviewed
 
 	// Fold this tick's observed health into the run's best-so-far.
 	//
@@ -175,12 +178,12 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 	// with unhandled comments short-circuits to a terminal state and pr-polish
 	// never runs (yoloswe#287 finished in 1.5s that way), and worse, a repo on
 	// a real merge policy would land the PR with the feedback outstanding.
-	case cs.Mergeable && !cs.NeedsPolish() && w.cfg.Polish.AutoMerge && w.cfg.Polish.MergePolicy == MergePolicyNotify:
+	case cs.Mergeable && !cs.NeedsPolish() && !w.needsSelfReview(snap, state) && w.cfg.Polish.AutoMerge && w.cfg.Polish.MergePolicy == MergePolicyNotify:
 		// Explicitly configured never to merge: report and stop rather than
 		// idling forever on a PR that is ready to land.
 		w.status("PR #%d is mergeable but merge_policy is %q — not merging", w.pr, MergePolicyNotify)
 		return LastActionNeedsHuman
-	case cs.Mergeable && !cs.NeedsPolish() && w.cfg.Polish.AutoMerge && !w.dryRun:
+	case cs.Mergeable && !cs.NeedsPolish() && !w.needsSelfReview(snap, state) && w.cfg.Polish.AutoMerge && !w.dryRun:
 		state.MergeAttempts++
 		outcome, err := w.merge(ctx, snap)
 		if err != nil {
@@ -200,7 +203,7 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		}
 		w.status("PR #%d merged", w.pr)
 		return LastActionMerged
-	case cs.Mergeable && !cs.NeedsPolish():
+	case cs.Mergeable && !cs.NeedsPolish() && !w.needsSelfReview(snap, state):
 		w.status("PR #%d is mergeable — idle", w.pr)
 		return LastActionIdle
 	case cs.NeedsReview:
@@ -208,7 +211,7 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		// missing. Polishing again would burn rounds against a wall.
 		w.status("PR #%d is green but awaiting human review approval", w.pr)
 		return LastActionNeedsHuman
-	case !cs.NeedsPolish():
+	case !cs.NeedsPolish() && !w.needsSelfReview(snap, state):
 		w.status("PR #%d unchanged — idle", w.pr)
 		return LastActionIdle
 	case w.diverging(snap, state):
@@ -254,6 +257,14 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		return LastActionFailed
 	}
 	w.status("PR #%d polish completed", w.pr)
+
+	// Mark this commit as self-reviewed. Recorded on SUCCESS only: a failed
+	// round has produced no review, so retrying it is correct. Note the SHA is
+	// the one we reviewed, not whatever the round just pushed — a new commit
+	// legitimately warrants a fresh review on the next tick.
+	if w.cfg.Polish.SelfReview && snap.PR.HeadRefOid != "" {
+		state.SelfReviewedSHA = snap.PR.HeadRefOid
+	}
 
 	// A CHANGES_REQUESTED verdict is sticky: it stays set until the reviewer
 	// looks again. Without an explicit re-request the fixes just sit there and
@@ -385,6 +396,28 @@ const (
 // speculatively built. Likewise `state: CLOSED` is ambiguous — a PR closed
 // without merging looks identical. The single unambiguous signal is
 // `.merged == true` on the pulls endpoint, so that is the only thing we trust.
+// needsSelfReview reports whether prdozer must ORIGINATE a review for this
+// commit, on a repo that has no automated review bots.
+//
+// Every other polish trigger is reactive — new comments, CI failure, a moved
+// base, a conflict. On a bot-less repo a healthy new PR fires none of them, so
+// prdozer would declare it done without ever reviewing it: yoloswe#287 was
+// closed out in ~1 second, three separate times, having never invoked
+// /pr-polish. On kernel the bots (sycamore-groot, coderabbitai) supply the
+// findings and the reactive model is enough; on yoloswe /pr-polish IS the
+// reviewer, running codex/cursor locally to produce them.
+//
+// Keyed by head SHA so a commit is reviewed exactly once. An unconditional
+// trigger would re-review an idle PR on every tick forever — the reactive
+// triggers are self-limiting because comments get marked seen, but "no bot
+// reviewed this" never stops being true on its own.
+func (w *Watcher) needsSelfReview(snap *Snapshot, state *State) bool {
+	if !w.cfg.Polish.SelfReview || snap.PR.HeadRefOid == "" {
+		return false
+	}
+	return state.SelfReviewedSHA != snap.PR.HeadRefOid
+}
+
 // diverging reports whether polishing has stopped making the PR better.
 //
 // It is deliberately evaluated BEFORE the polish call and AFTER the health
