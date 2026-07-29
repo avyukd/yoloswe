@@ -6,9 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bazelment/yoloswe/notify"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/bazelment/yoloswe/notify"
 )
 
 func sampleMeta() RunMeta {

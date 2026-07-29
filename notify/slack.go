@@ -28,13 +28,14 @@ var SlackAPIURL = "https://slack.com/api"
 // Target may be a channel ID, "#channel", or "@user"; "@user" is resolved to a
 // DM channel, which costs two extra API calls the first time and is then
 // cached for the process lifetime.
+// Field order groups the pointer-bearing fields first to satisfy govet's
+// fieldalignment check.
 type SlackAPINotifier struct {
-	Client *http.Client
-	Token  string
-	Target string
-
-	mu       sync.Mutex
+	Client   *http.Client
 	resolved map[string]string
+	Token    string
+	Target   string
+	mu       sync.Mutex
 }
 
 // Notify delivers the rendered message. An empty Token or Target disables the
@@ -114,7 +115,6 @@ func (n *SlackAPINotifier) resolveChannel(ctx context.Context, target string) (s
 // ({"channel":"D123"}). Decoding both into one struct field fails on the
 // string form, so the shape is resolved per call site instead.
 type slackResponse struct {
-	OK      bool            `json:"ok"`
 	Error   string          `json:"error"`
 	Channel json.RawMessage `json:"channel"`
 	Members []struct {
@@ -125,6 +125,9 @@ type slackResponse struct {
 			RealName    string `json:"real_name"`
 		} `json:"profile"`
 	} `json:"members"`
+	// Last so the bool packs into the tail rather than splitting the
+	// pointer-bearing fields (govet fieldalignment).
+	OK bool `json:"ok"`
 }
 
 // channelID extracts the channel id from either shape Slack returns.

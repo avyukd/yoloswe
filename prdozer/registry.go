@@ -35,11 +35,11 @@ func (l Layout) Valid() bool {
 // them: where their checkouts live, which flow to run, and how (or whether) to
 // merge. It is loaded from ~/magent/prdozer/registry.yaml.
 type Registry struct {
-	Repos    map[string]RepoEntry `yaml:"repos"`
-	Defaults RepoEntry            `yaml:"defaults"`
+	Repos map[string]RepoEntry `yaml:"repos"`
 	// Notify is fleet-wide: the destination is a property of the operator, not
 	// of the repository. Per-repo slack_target selects the recipient within it.
-	Notify NotifyConfig `yaml:"notify"`
+	Notify   NotifyConfig `yaml:"notify"`
+	Defaults RepoEntry    `yaml:"defaults"`
 }
 
 // RepoEntry is the per-repository configuration. Zero-valued fields inherit
