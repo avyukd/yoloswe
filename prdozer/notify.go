@@ -19,10 +19,13 @@ type NotifyConfig struct {
 	// Target names the DM recipient (e.g. "@ming") for message context, and is
 	// substituted for "{{recipient}}" in DMCommandArgs.
 	Target string `yaml:"target"`
-	// DMCommand is a program that delivers a direct message, used when no
-	// webhook is configured. A webhook must be created by hand in the Slack UI,
-	// whereas a DM helper backed by an existing user token needs no setup — so
-	// this is what makes notification work out of the box.
+	// SlackToken is the Web API token, either a literal or a "$ENV_VAR"
+	// reference. When empty, the token is discovered from $SLACK_BOT_TOKEN or
+	// ~/.env, which is what makes DM notification work with no setup at all.
+	SlackToken string `yaml:"slack_token"`
+	// DMCommand is an optional external program that delivers a message. The
+	// native API sink covers this case without an interpreter or an absolute
+	// path, so this exists only as an escape hatch for a bespoke transport.
 	DMCommand string `yaml:"dm_command"`
 	// DMCommandArgs are the arguments to DMCommand. "{{recipient}}" and
 	// "{{message}}" are substituted per notify.CommandNotifier.
@@ -56,6 +59,14 @@ func (c NotifyConfig) Notifier() notify.Notifier {
 	}
 	if url := notify.ResolveWebhookURL(raw); url != "" {
 		return notify.SlackWebhookNotifier{WebhookURL: url}
+	}
+	// Native API next: it needs no interpreter, no absolute script path that
+	// differs per box, and no webhook created by hand in the Slack UI.
+	if token := notify.ResolveEnvRef(c.SlackToken); token != "" {
+		return &notify.SlackAPINotifier{Token: token, Target: c.Target}
+	}
+	if token := notify.ResolveSlackToken(); token != "" && strings.TrimSpace(c.Target) != "" {
+		return &notify.SlackAPINotifier{Token: token, Target: c.Target}
 	}
 	if cmd := strings.TrimSpace(c.DMCommand); cmd != "" {
 		// Expand "~" in args too, not just the program path: the registry is

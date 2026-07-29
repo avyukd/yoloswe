@@ -204,6 +204,13 @@ func truncateOutput(s string) string {
 // plain URL is returned unchanged; an unset variable yields "", which disables
 // the sink.
 func ResolveWebhookURL(raw string) string {
+	return ResolveEnvRef(raw)
+}
+
+// ResolveEnvRef expands a "$ENV_VAR" reference to its value and returns any
+// other string unchanged. An unset variable yields "", which callers treat as
+// "not configured" rather than passing a literal "$VAR" downstream.
+func ResolveEnvRef(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if after, ok := strings.CutPrefix(raw, "$"); ok {
 		return strings.TrimSpace(os.Getenv(after))
