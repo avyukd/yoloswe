@@ -36,6 +36,9 @@ func (l Layout) Valid() bool {
 type Registry struct {
 	Repos    map[string]RepoEntry `yaml:"repos"`
 	Defaults RepoEntry            `yaml:"defaults"`
+	// Notify is fleet-wide: the destination is a property of the operator, not
+	// of the repository. Per-repo slack_target selects the recipient within it.
+	Notify NotifyConfig `yaml:"notify"`
 }
 
 // RepoEntry is the per-repository configuration. Zero-valued fields inherit

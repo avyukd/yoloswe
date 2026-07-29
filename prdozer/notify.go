@@ -13,29 +13,58 @@ import (
 // NotifyConfig configures where babysit outcomes are reported.
 type NotifyConfig struct {
 	// SlackWebhook is either a URL or a "$ENV_VAR" reference. A webhook is the
-	// better default for an unattended process: no token handling. Empty
-	// disables notification entirely.
+	// better default for an unattended process: no token handling. Empty falls
+	// back to DMCommand.
 	SlackWebhook string `yaml:"slack_webhook"`
-	// Target names the DM recipient (e.g. "@ming") for message context.
+	// Target names the DM recipient (e.g. "@ming") for message context, and is
+	// substituted for "{{recipient}}" in DMCommandArgs.
 	Target string `yaml:"target"`
+	// DMCommand is a program that delivers a direct message, used when no
+	// webhook is configured. A webhook must be created by hand in the Slack UI,
+	// whereas a DM helper backed by an existing user token needs no setup — so
+	// this is what makes notification work out of the box.
+	DMCommand string `yaml:"dm_command"`
+	// DMCommandArgs are the arguments to DMCommand. "{{recipient}}" and
+	// "{{message}}" are substituted per notify.CommandNotifier.
+	DMCommandArgs []string `yaml:"dm_command_args"`
 }
 
 // DefaultSlackWebhookEnv is the env var consulted when no webhook is
 // configured explicitly.
 const DefaultSlackWebhookEnv = "$PRDOZER_SLACK_WEBHOOK"
 
+// WithTarget returns a copy addressed to recipient. An empty recipient leaves
+// the configured target alone, so a repo that names no target inherits the
+// fleet-wide one rather than losing its destination.
+func (c NotifyConfig) WithTarget(recipient string) NotifyConfig {
+	if strings.TrimSpace(recipient) != "" {
+		c.Target = recipient
+	}
+	return c
+}
+
 // Notifier builds the sinks for a babysit run. A nil result means notification
 // is disabled, which is a normal unconfigured state and not an error.
+//
+// A configured webhook wins: it has no interpreter or token-file dependency and
+// so is the more robust sink for unattended runs. The DM command is the
+// fallback that makes an unconfigured deployment still notify.
 func (c NotifyConfig) Notifier() notify.Notifier {
 	raw := c.SlackWebhook
 	if strings.TrimSpace(raw) == "" {
 		raw = DefaultSlackWebhookEnv
 	}
-	url := notify.ResolveWebhookURL(raw)
-	if url == "" {
-		return nil
+	if url := notify.ResolveWebhookURL(raw); url != "" {
+		return notify.SlackWebhookNotifier{WebhookURL: url}
 	}
-	return notify.SlackWebhookNotifier{WebhookURL: url}
+	if cmd := strings.TrimSpace(c.DMCommand); cmd != "" {
+		return notify.CommandNotifier{
+			Path:      ExpandHome(cmd),
+			Recipient: c.Target,
+			Args:      c.DMCommandArgs,
+		}
+	}
+	return nil
 }
 
 // RunReport is everything a human needs to act on a finished (or stalled)
