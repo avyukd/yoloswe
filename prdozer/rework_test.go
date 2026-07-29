@@ -428,3 +428,69 @@ func TestAgentRework_BadTemplateFails(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "Nope")
 }
+
+func TestRedactSecrets(t *testing.T) {
+	t.Parallel()
+	// Provider errors can embed the endpoint config that produced them, and
+	// these strings reach disk (run logs) and Slack. CodeQL flags the flow as
+	// go/clear-text-logging; scrub rather than trust the error's shape.
+	cases := []struct {
+		name        string
+		in          string
+		mustNotHave string
+		mustHave    string
+	}{
+		{
+			name:        "api key assignment",
+			in:          "dial failed: api_key=sk-abcdefghijklmnop endpoint=https://x",
+			mustNotHave: "sk-abcdefghijklmnop",
+			mustHave:    "[REDACTED]",
+		},
+		{
+			name:        "colon form with spaces",
+			in:          "config: {token: ghp_ABCDEFGHIJKLMNOPQRST}",
+			mustNotHave: "ghp_ABCDEFGHIJKLMNOPQRST",
+			mustHave:    "[REDACTED]",
+		},
+		{
+			name:        "bare key prefix",
+			in:          "auth rejected for sk-livekey1234567890abc",
+			mustNotHave: "sk-livekey1234567890abc",
+			mustHave:    "auth rejected",
+		},
+		{
+			name:        "authorization header",
+			in:          "Authorization: Bearer-xyz123456789",
+			mustNotHave: "Bearer-xyz123456789",
+			mustHave:    "[REDACTED]",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := redactSecrets(tc.in)
+			assert.NotContains(t, got, tc.mustNotHave, "the secret must not survive redaction")
+			assert.Contains(t, got, tc.mustHave)
+		})
+	}
+}
+
+func TestRedactSecrets_KeepsOrdinaryDiagnostics(t *testing.T) {
+	t.Parallel()
+	// Over-redaction would destroy the diagnostic value the rework agent needs.
+	in := "Pull request is in an unmergeable state; base moved to abc1234"
+	assert.Equal(t, in, redactSecrets(in))
+}
+
+func TestSafeErr_PreservesErrorIdentity(t *testing.T) {
+	t.Parallel()
+	// Scrubbing must not break errors.Is/As, or control flow that inspects
+	// error identity would silently change behaviour.
+	sentinel := fmt.Errorf("boom token=sk-secret123456789")
+	wrapped := fmt.Errorf("merge failed: %w", sentinel)
+	safe := safeErr(wrapped)
+
+	assert.NotContains(t, safe.Error(), "sk-secret123456789")
+	assert.ErrorIs(t, safe, sentinel, "errors.Is must still match through the wrapper")
+	assert.Nil(t, safeErr(nil), "a nil error stays nil")
+}

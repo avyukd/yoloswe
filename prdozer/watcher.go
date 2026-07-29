@@ -156,7 +156,9 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 			w.logger.Error("auto-merge failed",
 				"error", err, "policy", w.cfg.Polish.MergePolicy, "attempt", state.MergeAttempts)
 			w.status("PR #%d merge attempt %d failed: %v", w.pr, state.MergeAttempts, err)
-			state.LastMergeError = err.Error()
+			// Persisted to the state file and fed verbatim into the rework
+			// prompt, so scrub it at the source.
+			state.LastMergeError = safeErr(err).Error()
 			return w.reworkAfterFailedMerge(ctx, snap, state)
 		}
 		state.LastMergeError = ""
@@ -198,8 +200,9 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		Model:    w.cfg.Agent.Model,
 	}
 	if _, err := w.polish.Run(ctx, req); err != nil {
-		w.logger.Error("polish failed", "error", err)
-		w.status("PR #%d polish failed: %v", w.pr, err)
+		safe := safeErr(err)
+		w.logger.Error("polish failed", "error", safe)
+		w.status("PR #%d polish failed: %v", w.pr, safe)
 		return LastActionFailed
 	}
 	w.status("PR #%d polish completed", w.pr)
@@ -246,8 +249,11 @@ func (w *Watcher) reworkAfterFailedMerge(ctx context.Context, snap *Snapshot, st
 	}
 	w.status("PR #%d running merge rework (attempt %d)", w.pr, state.MergeAttempts)
 	if _, err := w.rework.Run(ctx, req); err != nil {
-		w.logger.Error("merge rework failed", "error", err, "attempt", state.MergeAttempts)
-		w.status("PR #%d merge rework failed: %v", w.pr, err)
+		// Scrub before logging: a provider error can embed the endpoint
+		// config that produced it, and these logs are persisted and Slacked.
+		safe := safeErr(err)
+		w.logger.Error("merge rework failed", "error", safe, "attempt", state.MergeAttempts)
+		w.status("PR #%d merge rework failed: %v", w.pr, safe)
 		return LastActionFailed
 	}
 	w.status("PR #%d merge rework completed — will retry merge next tick", w.pr)

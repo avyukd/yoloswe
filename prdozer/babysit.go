@@ -95,8 +95,11 @@ func (b *Babysitter) Run(ctx context.Context) (state TerminalState, err error) {
 
 	rc, err := PrepareWorktree(ctx, b.git, o.Entry, pr, runID, b.logger)
 	if err != nil {
-		_ = runLog.Finish(TerminalFailed, err.Error())
-		b.report(ctx, notifier, runLog, TerminalFailed, err.Error(), "", time.Since(started))
+		// Scrub before persisting or Slacking: run logs live on disk and the
+		// report is published.
+		detail := safeErr(err).Error()
+		_ = runLog.Finish(TerminalFailed, detail)
+		b.report(ctx, notifier, runLog, TerminalFailed, detail, "", time.Since(started))
 		return TerminalFailed, err
 	}
 	if uerr := runLog.UpdateMeta(func(m *RunMeta) { m.WorktreePath = rc.WorktreePath }); uerr != nil {
@@ -155,8 +158,9 @@ func (b *Babysitter) loop(ctx context.Context, rc *RunContext, runLog *RunLog, p
 	for {
 		res, err := w.Tick(ctx)
 		if err != nil {
-			b.event(runLog, "tick_error", err.Error(), nil)
-			b.logger.Error("tick failed", "error", err)
+			safe := safeErr(err)
+			b.event(runLog, "tick_error", safe.Error(), nil)
+			b.logger.Error("tick failed", "error", safe)
 			// A tick error is transient (a gh hiccup, a state write); keep
 			// polling rather than abandoning a PR mid-flight.
 		} else {
