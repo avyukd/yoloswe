@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func snapWithRollup(rollup string) *Snapshot {
@@ -398,4 +399,48 @@ func TestPRHealth_BetterThan(t *testing.T) {
 	// shape — threads fell while the polish commits turned CI red.
 	assert.True(t, green5.BetterThan(red1), "green with more threads beats red with fewer")
 	assert.False(t, red1.BetterThan(green5))
+}
+
+// GitHub calls a PR mergeable when it has no conflicts and required checks
+// pass — that says nothing about whether reviewer feedback was addressed.
+// Treating mergeable as "done" let yoloswe#287 finish in 1.5 seconds with
+// new_comments=1 and pr-polish never invoked.
+func TestComputeChangeset_MergeablePRWithNewCommentsStillNeedsPolish(t *testing.T) {
+	t.Parallel()
+	prev := &State{
+		LastCheckAt:     time.Now(),
+		LastSeenHeadSHA: "head1",
+		LastSeenBaseSHA: "base1",
+	}
+	snap := snapWithRollup(StatusSuccess)
+	snap.PR.ReviewDecision = "APPROVED"
+	snap.PR.Mergeable = "MERGEABLE"
+	snap.Comments = []CommentRef{{ID: "issue:1", Author: "someone"}}
+
+	cs := ComputeChangeset(prev, snap)
+	require.True(t, cs.Mergeable, "precondition: the PR is mergeable")
+	assert.True(t, cs.NewComments, "precondition: there is unhandled feedback")
+	assert.True(t, cs.NeedsPolish(),
+		"unaddressed comments must be polished even on a mergeable PR")
+}
+
+// The converse: a genuinely clean mergeable PR has nothing to do. Without this
+// the loop would never reach a terminal state.
+func TestComputeChangeset_CleanMergeablePRNeedsNoPolish(t *testing.T) {
+	t.Parallel()
+	prev := &State{
+		LastCheckAt:        time.Now(),
+		LastSeenHeadSHA:    "head1",
+		LastSeenBaseSHA:    "base1",
+		LastSeenCommentIDs: []string{"issue:1"},
+	}
+	snap := snapWithRollup(StatusSuccess)
+	snap.PR.ReviewDecision = "APPROVED"
+	snap.PR.Mergeable = "MERGEABLE"
+	snap.Comments = []CommentRef{{ID: "issue:1", Author: "someone"}}
+
+	cs := ComputeChangeset(prev, snap)
+	require.True(t, cs.Mergeable)
+	assert.False(t, cs.NewComments, "the comment was already seen")
+	assert.False(t, cs.NeedsPolish(), "a clean mergeable PR is done")
 }

@@ -169,12 +169,18 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 			return LastActionMerged
 		}
 		return LastActionClosed
-	case cs.Mergeable && w.cfg.Polish.AutoMerge && w.cfg.Polish.MergePolicy == MergePolicyNotify:
+	// NOTE: every cs.Mergeable branch below is guarded by !cs.NeedsPolish().
+	// Mergeable means "no conflicts, required checks pass" — it says nothing
+	// about whether reviewer feedback was addressed. Without the guard, a PR
+	// with unhandled comments short-circuits to a terminal state and pr-polish
+	// never runs (yoloswe#287 finished in 1.5s that way), and worse, a repo on
+	// a real merge policy would land the PR with the feedback outstanding.
+	case cs.Mergeable && !cs.NeedsPolish() && w.cfg.Polish.AutoMerge && w.cfg.Polish.MergePolicy == MergePolicyNotify:
 		// Explicitly configured never to merge: report and stop rather than
 		// idling forever on a PR that is ready to land.
 		w.status("PR #%d is mergeable but merge_policy is %q — not merging", w.pr, MergePolicyNotify)
 		return LastActionNeedsHuman
-	case cs.Mergeable && w.cfg.Polish.AutoMerge && !w.dryRun:
+	case cs.Mergeable && !cs.NeedsPolish() && w.cfg.Polish.AutoMerge && !w.dryRun:
 		state.MergeAttempts++
 		outcome, err := w.merge(ctx, snap)
 		if err != nil {
@@ -194,7 +200,7 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		}
 		w.status("PR #%d merged", w.pr)
 		return LastActionMerged
-	case cs.Mergeable:
+	case cs.Mergeable && !cs.NeedsPolish():
 		w.status("PR #%d is mergeable — idle", w.pr)
 		return LastActionIdle
 	case cs.NeedsReview:

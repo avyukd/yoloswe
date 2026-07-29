@@ -658,3 +658,38 @@ func TestWatcher_DivergenceGuard_UnknownThreadCountDisablesGuard(t *testing.T) {
 			"an unreadable thread count must not be mistaken for divergence")
 	}
 }
+
+// The end-to-end shape of the yoloswe#287 bug: a mergeable PR carrying an
+// unhandled comment reached a terminal state in 1.5 seconds without ever
+// invoking pr-polish. The mergeable branches preempted the polish branch, and
+// NeedsPolish itself returned false whenever Mergeable was true.
+func TestWatcher_MergeableWithNewComments_StillPolishes(t *testing.T) {
+	prJSON := strings.Replace(okPRJSON, `"reviewDecision": "REVIEW_REQUIRED"`, `"reviewDecision": "APPROVED"`, 1)
+	gh := setupGH(buildPRJSON(prJSON, "SUCCESS"), "[]", "base1")
+	gh.setThreads(0)
+	// A comment that has never been seen before.
+	gh.addPrefix("api --paginate repos/o/r/issues/42/comments",
+		`[{"id":991,"user":{"login":"reviewer","type":"User"},"created_at":"2026-07-29T12:00:00Z","body":"please fix"}]`)
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicyNotify
+
+	ctx := context.Background()
+	// First tick establishes the baseline without reacting.
+	_, err := w.Tick(ctx)
+	require.NoError(t, err)
+
+	// Second tick: still mergeable, but the comment is now a NEW comment.
+	gh.addPrefix("api --paginate repos/o/r/issues/42/comments",
+		`[{"id":991,"user":{"login":"reviewer","type":"User"},"created_at":"2026-07-29T12:00:00Z","body":"please fix"},
+		  {"id":992,"user":{"login":"reviewer","type":"User"},"created_at":"2026-07-29T13:00:00Z","body":"and this"}]`)
+	res, err := w.Tick(ctx)
+	require.NoError(t, err)
+
+	assert.Equal(t, LastActionPolished, res.Action,
+		"unhandled feedback must be polished, not short-circuited to a terminal state")
+	assert.Len(t, polish.calls, 1, "pr-polish must actually be invoked")
+	assert.Nil(t, gh.findCall("pr merge"),
+		"never merge while reviewer feedback is outstanding")
+}
