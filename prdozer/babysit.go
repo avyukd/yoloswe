@@ -210,9 +210,13 @@ func terminalFor(res TickResult, pr DiscoveredPR) (TerminalState, string, bool) 
 		// PR waiting on an approval from one the babysitter was actively making
 		// worse — and those call for opposite responses.
 		if res.Diverged {
+			// Report the streak the guard tripped on, NOT the run's cumulative
+			// PolishRounds: a run that improved several times before stalling
+			// would otherwise claim "17 rounds produced no better result" when
+			// only the last 3 were flat.
 			return TerminalNeedsHuman, fmt.Sprintf(
-				"PR #%d stopped improving: %d polish rounds produced no better result, so the run was halted before it degraded the PR further. Review the pushed commits before resuming.",
-				pr.Number, res.PolishRounds), true
+				"PR #%d stopped improving: %d polish rounds produced no better result (%d rounds total), so the run was halted before it degraded the PR further. Review the pushed commits before resuming.",
+				pr.Number, res.RoundsSinceImprovement, res.PolishRounds), true
 		}
 		return TerminalNeedsHuman, "This PR needs a human: it is blocked on something no agent round can resolve (a review approval, or a merge policy that never merges).", true
 	}

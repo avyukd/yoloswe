@@ -62,8 +62,8 @@ type State struct {
 	// LastMergeError is the verbatim gh stderr from the most recent failed
 	// merge, carried across ticks so the rework agent sees the real message.
 	LastMergeError string `json:"last_merge_error,omitempty"`
-	// BestHealth is the healthiest PR state observed so far; PolishRounds counts
-	// rounds run since it was set.
+	// BestHealth is the healthiest PR state observed so far;
+	// RoundsSinceImprovement counts the rounds run since it was last beaten.
 	//
 	// Together these detect DIVERGENCE: a PR getting worse round over round
 	// rather than better. Observed on kernel#8227, where seventeen polish rounds
@@ -84,7 +84,9 @@ type State struct {
 	// cooldown, so the brake measures attempts SINCE that point. Without it a
 	// run that resumes past its cooldown would re-trip on every later tick.
 	CooldownFromAttempt int `json:"cooldown_from_attempt,omitempty"`
-	// PolishRounds counts polish rounds run since BestHealth was set.
+	// PolishRounds counts every polish round this run has seen the result of,
+	// cumulative and never reset. It is the "how much work did this run do"
+	// figure; the divergence guard measures RoundsSinceImprovement instead.
 	PolishRounds int `json:"polish_rounds,omitempty"`
 	// RoundsSinceImprovement counts consecutive polish rounds that failed to
 	// beat BestHealth. Reset to zero whenever a new best is reached.

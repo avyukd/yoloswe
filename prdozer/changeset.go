@@ -49,8 +49,11 @@ func (c Changeset) Empty() bool {
 }
 
 // NeedsPolish reports whether prdozer should invoke the polish agent.
-// Mergeable PRs do NOT need polish even if other flags are true (e.g. a fresh
-// commit moved HEAD but checks are green).
+//
+// Unaddressed feedback (NewComments, ChangesRequested) is checked FIRST and
+// polishes even a mergeable PR. Past that point mergeable does mean done: a
+// green mergeable PR with only BaseMoved/CIFailed/Conflicting left to consider
+// has nothing for the agent to do.
 //
 // NeedsReview is deliberately NOT a polish trigger: a missing human approval is
 // not something the agent can fix, so it must route to a notification instead.

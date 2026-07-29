@@ -88,8 +88,15 @@ type TickResult struct {
 	// improving, rather than because it is waiting on an approval. The two need
 	// opposite responses, so the notification must tell them apart.
 	Diverged bool
-	// PolishRounds is the run's polish count, reported alongside Diverged.
+	// PolishRounds is the run's cumulative polish count, reported alongside
+	// Diverged.
 	PolishRounds int
+	// RoundsSinceImprovement is the streak the divergence guard actually trips
+	// on. Reported separately from PolishRounds because the two diverge the
+	// moment a run improves at all: a run can be 17 rounds deep and only 3
+	// rounds flat, and saying "17 rounds produced no better result" would be a
+	// lie.
+	RoundsSinceImprovement int
 }
 
 func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
@@ -151,7 +158,8 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 	healthDirty := w.recordHealth(state, snap)
 
 	res := TickResult{Snapshot: snap, Changeset: cs, Action: action,
-		Diverged: w.diverged, PolishRounds: state.PolishRounds}
+		Diverged: w.diverged, PolishRounds: state.PolishRounds,
+		RoundsSinceImprovement: state.RoundsSinceImprovement}
 	if w.recordSnapshot(state, snap, action, mergeStateDirty || healthDirty) {
 		if err := state.Save(statePath); err != nil {
 			// State save failure is serious: the action already ran (maybe merged
@@ -217,6 +225,16 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 	case w.diverging(snap, state):
 		// More polish rounds are not producing a better PR. Stop and hand it
 		// to a human rather than burning rounds — and money — making it worse.
+		//
+		// Ordered ahead of the self-review path on purpose, even though that
+		// means a bot-less repo can stop with an unreviewed head commit. Every
+		// polish round pushes a commit, which moves the head SHA, which makes
+		// needsSelfReview true again — so a self_review repo re-arms its own
+		// trigger forever and this guard is the ONLY thing that can end the
+		// loop. Exempting self-review here would restore the unbounded run the
+		// guard exists to prevent. The first review is never at risk: the guard
+		// needs a non-zero RoundsSinceImprovement, which only prior polish
+		// rounds can produce.
 		w.diverged = true
 		best := state.BestHealth
 		w.status("PR #%d is not improving after %d rounds (best: %d unresolved, ci_failing=%t) — needs a human",
@@ -447,27 +465,27 @@ func (w *Watcher) recordHealth(state *State, snap *Snapshot) bool {
 	if !ok {
 		return false
 	}
-	if state.BestHealth == nil {
-		state.BestHealth = &h
-		state.RoundsSinceImprovement = 0
-		return true
-	}
-	if h.BetterThan(*state.BestHealth) {
-		state.BestHealth = &h
-		state.RoundsSinceImprovement = 0
-		return true
-	}
-	// No improvement. Charge it only when a polish round is actually
-	// outstanding — i.e. the PREVIOUS tick polished and this snapshot is the
-	// first look at its result. Charging on the current action instead would
-	// mis-attribute by one tick; charging on every tick would trip the guard on
-	// a PR that is merely waiting for CI, having done no work at all.
-	if state.LastAction == LastActionPolished {
+	// A round counts only when one is actually outstanding — i.e. the PREVIOUS
+	// tick polished and this snapshot is the first look at its result. Charging
+	// on the current action instead would mis-attribute by one tick; charging on
+	// every tick would count a PR that is merely waiting for CI, having done no
+	// work at all.
+	polished := state.LastAction == LastActionPolished
+	if polished {
+		// Cumulative: counted whether or not the round helped, so the terminal
+		// report can say how much work the run did as well as how long it has
+		// been stuck.
 		state.PolishRounds++
-		state.RoundsSinceImprovement++
+	}
+	if state.BestHealth == nil || h.BetterThan(*state.BestHealth) {
+		state.BestHealth = &h
+		state.RoundsSinceImprovement = 0
 		return true
 	}
-	return false
+	if polished {
+		state.RoundsSinceImprovement++
+	}
+	return polished
 }
 
 func (w *Watcher) merge(ctx context.Context, snap *Snapshot) (mergeOutcome, error) {

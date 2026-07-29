@@ -596,6 +596,39 @@ func (f *fakeGH) setThreads(n int) {
 	f.addPrefix("api graphql", strconv.Itoa(n))
 }
 
+// `gh api graphql --paginate` emits one --jq result per page, so a PR with more
+// than 100 review threads reports several counts that must be summed. Taking
+// only the first would undercount the outstanding work and read as a healthier
+// PR than it is — the one direction the divergence guard must not be wrong in.
+func TestFetchUnresolvedThreads_SumsPages(t *testing.T) {
+	t.Parallel()
+	gh := newFakeGH()
+	gh.addPrefix("api graphql", "100\n40\n7\n")
+
+	n, err := fetchUnresolvedThreads(context.Background(), gh, ".", "o", "r", 42)
+	require.NoError(t, err)
+	assert.Equal(t, 147, n)
+
+	call := gh.findCall("api graphql")
+	require.NotNil(t, call)
+	assert.Contains(t, call, "--paginate",
+		"without --paginate gh never walks past the first page")
+	assert.Contains(t, strings.Join(call, " "), "$endCursor",
+		"gh only paginates a query that declares the cursor variable")
+}
+
+// An empty count is unknown, not zero: returning 0 would look like a perfectly
+// healthy PR and hand the guard a baseline no later round can beat. The caller
+// turns the error into -1, which disables the guard for the tick.
+func TestFetchUnresolvedThreads_EmptyIsAnError(t *testing.T) {
+	t.Parallel()
+	gh := newFakeGH()
+	gh.addPrefix("api graphql", "  \n")
+
+	_, err := fetchUnresolvedThreads(context.Background(), gh, ".", "o", "r", 42)
+	require.Error(t, err)
+}
+
 // A PR that keeps needing polish while never getting better must stop and go
 // to a human. This is the kernel#8227 failure: seventeen polish rounds each
 // reported success while unresolved threads went 6 -> 2 -> 11 and CI went red
@@ -616,19 +649,26 @@ func TestWatcher_DivergenceGuard_StopsWhenNotImproving(t *testing.T) {
 
 	// Now hold health flat at its worst: every tick needs polish, none improves.
 	gh.setThreads(11)
-	var lastAction LastAction
+	var last TickResult
 	for range 6 {
 		res, err := w.Tick(ctx)
 		require.NoError(t, err)
-		lastAction = res.Action
-		if lastAction == LastActionNeedsHuman {
+		last = res
+		if res.Action == LastActionNeedsHuman {
 			break
 		}
 	}
-	assert.Equal(t, LastActionNeedsHuman, lastAction,
+	assert.Equal(t, LastActionNeedsHuman, last.Action,
 		"a PR that stops improving must escalate rather than polish forever")
 	assert.Less(t, len(polish.calls), 6,
 		"the guard must cut polishing short, not run every round first")
+	// Without Diverged the notification falls back to the generic "needs a
+	// human" text, which reads like a PR waiting on an approval — the opposite
+	// response to one the babysitter was actively making worse.
+	assert.True(t, last.Diverged,
+		"stopping for divergence must be reported as divergence, not as a plain block")
+	assert.GreaterOrEqual(t, last.RoundsSinceImprovement, 3,
+		"the reported streak must be the one the guard tripped on")
 }
 
 // Improvement must reset the budget, or a long but healthy run would trip the
