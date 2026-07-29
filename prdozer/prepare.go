@@ -37,6 +37,14 @@ type RunContext struct {
 	LogDir string
 	Branch string
 	Layout Layout
+	// BaseRemoteSHA is origin/<branch> as it stood when this worktree was
+	// created. It is the --force-with-lease baseline, captured HERE rather
+	// than read at push time: the polish agent's job includes rebasing onto a
+	// moved base, so it routinely runs `git fetch`, which advances the
+	// remote-tracking ref. A lease read after that equals whatever the remote
+	// now holds, making the guard a silent no-op that force-pushes over
+	// concurrent work.
+	BaseRemoteSHA string
 	// KeptReason explains why Cleanup declined to remove the worktree, for the
 	// notification.
 	KeptReason string
@@ -107,10 +115,24 @@ func PrepareWorktree(ctx context.Context, git wt.GitRunner, e RepoEntry, pr Disc
 
 	switch e.Layout {
 	case LayoutPlain:
-		// A plain clone has no worktree support. Clone with --reference so the
-		// object store is shared and the copy stays cheap.
+		// A plain clone has no worktree support, so clone instead — but clone
+		// from the REMOTE URL, using the local repo only as an object cache
+		// via --reference.
+		//
+		// Cloning from the local directory (`clone <root> <path>`) would set
+		// origin to that directory, so the cleanup push would land in the
+		// local clone instead of GitHub: it would SUCCEED, the unpushed-work
+		// check would then report clean, and the worktree holding the only
+		// copy destined for GitHub would be removed. It also would not work
+		// in the first place — `--branch` against a non-bare source resolves
+		// only that source's local branches, so any PR branch not checked out
+		// locally fails outright.
+		originURL, oerr := remoteURL(ctx, git, root)
+		if oerr != nil {
+			return nil, fmt.Errorf("resolve origin URL for %s: %w", root, oerr)
+		}
 		if res, err := git.Run(ctx, []string{
-			"clone", "--reference", root, "--branch", pr.HeadRefName, root, path,
+			"clone", "--reference-if-able", root, "--branch", pr.HeadRefName, originURL, path,
 		}, ""); err != nil {
 			return nil, fmt.Errorf("clone %s: %w", path, gitErr(err, res))
 		}
@@ -127,8 +149,17 @@ func PrepareWorktree(ctx context.Context, git wt.GitRunner, e RepoEntry, pr Disc
 			return nil, fmt.Errorf("worktree add %s: %w", path, gitErr(err, res))
 		}
 	}
+	// Pin the push lease NOW, before any agent has a chance to fetch.
+	if res, err := git.Run(ctx, []string{"rev-parse", "refs/remotes/origin/" + pr.HeadRefName}, path); err == nil {
+		rc.BaseRemoteSHA = strings.TrimSpace(res.Stdout)
+	} else {
+		logger.Warn("could not pin push lease baseline; cleanup will refuse to force-push",
+			"branch", pr.HeadRefName, "error", gitErr(err, res))
+	}
+
 	logger.Info("prepared ephemeral worktree",
-		"path", path, "branch", pr.HeadRefName, "layout", e.Layout, "run_id", runID)
+		"path", path, "branch", pr.HeadRefName, "layout", e.Layout, "run_id", runID,
+		"base_remote_sha", rc.BaseRemoteSHA)
 	return rc, nil
 }
 
@@ -162,7 +193,7 @@ func (rc *RunContext) Cleanup(ctx context.Context, git wt.GitRunner, force bool,
 		if unclean {
 			logger.Info("worktree has unpushed work; pushing before cleanup",
 				"path", rc.WorktreePath, "reason", reason)
-			if perr := pushBranch(ctx, git, rc.WorktreePath, rc.Branch); perr != nil {
+			if perr := pushBranch(ctx, git, rc.WorktreePath, rc.Branch, rc.BaseRemoteSHA); perr != nil {
 				rc.Kept, rc.KeptReason = true, fmt.Sprintf("unpushed work and push failed: %v", perr)
 				logger.Warn("keeping worktree: push failed", "path", rc.WorktreePath, "error", perr)
 				return nil
@@ -228,12 +259,18 @@ func (rc *RunContext) parentRepoDir(ctx context.Context, git wt.GitRunner) strin
 // WorktreeHasUnpushedWork reports whether path holds state that exists nowhere
 // else: uncommitted changes, or commits not present on origin/<branch>.
 func WorktreeHasUnpushedWork(ctx context.Context, git wt.GitRunner, path, branch string) (bool, string, error) {
-	res, err := git.Run(ctx, []string{"status", "--porcelain"}, path)
+	// --untracked-files=no deliberately. Untracked files in a build tree are
+	// artifacts (bazel-*, node_modules, target/), not work: counting them
+	// would mark every post-build worktree permanently unclean, so neither
+	// Cleanup nor the sweeper could ever reclaim one — the sweeper would free
+	// nothing at all on a Bazel repo. Tracked modifications still count,
+	// because those are edits the agent made and has not committed.
+	res, err := git.Run(ctx, []string{"status", "--porcelain", "--untracked-files=no"}, path)
 	if err != nil {
 		return false, "", fmt.Errorf("git status: %w", gitErr(err, res))
 	}
 	if strings.TrimSpace(res.Stdout) != "" {
-		return true, "uncommitted changes in the working tree", nil
+		return true, "uncommitted changes to tracked files", nil
 	}
 
 	// Commits present locally but not on the remote branch.
@@ -267,31 +304,42 @@ func WorktreeHasUnpushedWork(ctx context.Context, git wt.GitRunner, path, branch
 // every push with "remote ref updated since checkout" — which would mean the
 // worktree is always kept and the commit never actually published.
 //
-// The lease is pinned to an EXPLICIT expected SHA: the remote-tracking ref as
-// this worktree currently sees it. Never refresh that ref (`git fetch`) before
-// pushing — a refresh moves the lease to whatever the remote now holds, so the
-// comparison trivially succeeds and force-with-lease silently overwrites the
-// very concurrent commit it exists to protect.
-func pushBranch(ctx context.Context, git wt.GitRunner, path, branch string) error {
-	remoteRef := "refs/remotes/origin/" + branch
-	res, err := git.Run(ctx, []string{"rev-parse", remoteRef}, path)
-	if err != nil {
-		return fmt.Errorf("resolve %s for push lease: %w", remoteRef, gitErr(err, res))
+// The lease is pinned to expectedSHA — origin/<branch> as of WORKTREE CREATION
+// (RunContext.BaseRemoteSHA), not as of push time. Reading the remote-tracking
+// ref here instead would be a no-op guard: the polish agent rebases onto a
+// moved base as part of its job, so it runs `git fetch`, which advances that
+// ref to whatever the remote now holds — and the lease would then always
+// match, force-pushing over the concurrent commit it exists to protect.
+//
+// An empty expectedSHA fails closed. Without a trustworthy baseline the only
+// safe options are "don't push" or "force blindly", and blind force is exactly
+// the data loss this guards.
+func pushBranch(ctx context.Context, git wt.GitRunner, path, branch, expectedSHA string) error {
+	if expectedSHA == "" {
+		return fmt.Errorf("no pinned lease baseline for origin/%s; refusing to force-push", branch)
 	}
-	expected := strings.TrimSpace(res.Stdout)
-	if expected == "" {
-		return fmt.Errorf("could not resolve %s for push lease", remoteRef)
-	}
-
-	res, err = git.Run(ctx, []string{
+	res, err := git.Run(ctx, []string{
 		"push",
-		fmt.Sprintf("--force-with-lease=%s:%s", branch, expected),
+		fmt.Sprintf("--force-with-lease=%s:%s", branch, expectedSHA),
 		"origin", "HEAD:refs/heads/" + branch,
 	}, path)
 	if err != nil {
 		return gitErr(err, res)
 	}
 	return nil
+}
+
+// remoteURL reads origin's URL from a repository.
+func remoteURL(ctx context.Context, git wt.GitRunner, dir string) (string, error) {
+	res, err := git.Run(ctx, []string{"remote", "get-url", "origin"}, dir)
+	if err != nil {
+		return "", gitErr(err, res)
+	}
+	url := strings.TrimSpace(res.Stdout)
+	if url == "" {
+		return "", fmt.Errorf("origin has no URL")
+	}
+	return url, nil
 }
 
 // stderrOf safely reads a possibly-nil result's stderr, for error messages.

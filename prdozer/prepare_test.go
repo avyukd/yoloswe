@@ -143,11 +143,14 @@ func TestCleanup_RemovesWorktreeButNotLogDir(t *testing.T) {
 func TestCleanup_KeepsWorktreeWithUncommittedChanges(t *testing.T) {
 	t.Parallel()
 	// A dirty working tree cannot be pushed, so it must be kept and reported.
+	// The edit is to a TRACKED file: untracked files are build artifacts and
+	// deliberately do not count (see
+	// TestWorktreeHasUnpushedWork_IgnoresUntrackedBuildArtifacts).
 	f := newGitRepoFixture(t)
 	ctx := context.Background()
 	rc, err := PrepareWorktree(ctx, f.git, f.entry(), f.pr(42), "ddd444", nil)
 	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(filepath.Join(rc.WorktreePath, "scratch.txt"), []byte("wip\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(rc.WorktreePath, "feature.txt"), []byte("edited\n"), 0o600))
 
 	require.NoError(t, rc.Cleanup(ctx, f.git, false, nil))
 	assert.DirExists(t, rc.WorktreePath, "a dirty worktree must never be silently discarded")
@@ -223,13 +226,93 @@ func TestCleanup_PushRefusesToClobberDivergedRemote(t *testing.T) {
 	assert.NotContains(t, res.Stdout, "our work", "the lease must have refused the push")
 }
 
+func TestCleanup_PushLeaseIsPinnedAtCheckoutNotPushTime(t *testing.T) {
+	t.Parallel()
+	// REGRESSION: the lease baseline must be captured when the worktree is
+	// created, not read at push time. The polish agent's job includes rebasing
+	// onto a moved base, so it runs `git fetch` — which advances
+	// refs/remotes/origin/<branch>. A lease read after that always matches the
+	// current remote, turning --force-with-lease into a silent no-op that
+	// destroys concurrent work.
+	f := newGitRepoFixture(t)
+	ctx := context.Background()
+	rc, err := PrepareWorktree(ctx, f.git, f.entry(), f.pr(42), "pin111", nil)
+	require.NoError(t, err)
+	require.NotEmpty(t, rc.BaseRemoteSHA, "the lease baseline must be pinned at checkout")
+
+	// Our run commits.
+	f.mustRun(rc.WorktreePath, "config", "user.email", "test@example.com")
+	f.mustRun(rc.WorktreePath, "config", "user.name", "Test")
+	require.NoError(t, os.WriteFile(filepath.Join(rc.WorktreePath, "ours.txt"), []byte("ours\n"), 0o600))
+	f.mustRun(rc.WorktreePath, "add", ".")
+	f.mustRun(rc.WorktreePath, "commit", "-m", "our work")
+
+	// Someone else pushes to the same branch.
+	other := t.TempDir()
+	f.mustRun("", "clone", f.origin, other)
+	f.mustRun(other, "config", "user.email", "other@example.com")
+	f.mustRun(other, "config", "user.name", "Other")
+	f.mustRun(other, "checkout", "feature/x")
+	require.NoError(t, os.WriteFile(filepath.Join(other, "theirs.txt"), []byte("theirs\n"), 0o600))
+	f.mustRun(other, "add", ".")
+	f.mustRun(other, "commit", "-m", "their work")
+	f.mustRun(other, "push", "origin", "feature/x")
+
+	// The agent fetches, as it does when rebasing. This advances the local
+	// remote-tracking ref — the exact condition that defeated the old code.
+	f.mustRun(rc.WorktreePath, "fetch", "origin")
+
+	require.NoError(t, rc.Cleanup(ctx, f.git, false, nil))
+	assert.True(t, rc.Kept, "the pinned lease must still refuse the push after a fetch")
+
+	res, err := f.git.Run(ctx, []string{"log", "--oneline", "feature/x"}, f.origin)
+	require.NoError(t, err)
+	assert.Contains(t, res.Stdout, "their work", "concurrent work must survive an intervening fetch")
+	assert.NotContains(t, res.Stdout, "our work", "the lease must have refused the force-push")
+}
+
+func TestPushBranch_RefusesWithoutPinnedBaseline(t *testing.T) {
+	t.Parallel()
+	// Fail closed: with no trustworthy baseline the only options are "don't
+	// push" and "force blindly", and blind force is the data loss this guards.
+	f := newGitRepoFixture(t)
+	err := pushBranch(context.Background(), f.git, f.root, "feature/x", "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "refusing to force-push")
+}
+
+func TestWorktreeHasUnpushedWork_IgnoresUntrackedBuildArtifacts(t *testing.T) {
+	t.Parallel()
+	// Untracked files in a build tree are artifacts (bazel-*, node_modules),
+	// not work. Counting them would mark every post-build worktree permanently
+	// unclean, so neither Cleanup nor the sweeper could ever reclaim one and
+	// the GC would free nothing at all on a Bazel repo.
+	f := newGitRepoFixture(t)
+	ctx := context.Background()
+	rc, err := PrepareWorktree(ctx, f.git, f.entry(), f.pr(42), "arti11", nil)
+	require.NoError(t, err)
+
+	require.NoError(t, os.MkdirAll(filepath.Join(rc.WorktreePath, "node_modules"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(rc.WorktreePath, "node_modules", "x.js"), []byte("//\n"), 0o600))
+
+	unclean, reason, err := WorktreeHasUnpushedWork(ctx, f.git, rc.WorktreePath, rc.Branch)
+	require.NoError(t, err)
+	assert.False(t, unclean, "build artifacts must not block reclamation, got: %s", reason)
+
+	// But a modification to a TRACKED file is real work and still counts.
+	require.NoError(t, os.WriteFile(filepath.Join(rc.WorktreePath, "feature.txt"), []byte("edited\n"), 0o600))
+	unclean, _, err = WorktreeHasUnpushedWork(ctx, f.git, rc.WorktreePath, rc.Branch)
+	require.NoError(t, err)
+	assert.True(t, unclean, "an uncommitted edit to a tracked file is work")
+}
+
 func TestCleanup_ForceSkipsSafetyCheck(t *testing.T) {
 	t.Parallel()
 	f := newGitRepoFixture(t)
 	ctx := context.Background()
 	rc, err := PrepareWorktree(ctx, f.git, f.entry(), f.pr(42), "fff666", nil)
 	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(filepath.Join(rc.WorktreePath, "scratch.txt"), []byte("wip\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(rc.WorktreePath, "feature.txt"), []byte("edited\n"), 0o600))
 
 	require.NoError(t, rc.Cleanup(ctx, f.git, true, nil))
 	assert.NoDirExists(t, rc.WorktreePath, "force must remove even a dirty worktree")
@@ -314,7 +397,8 @@ func TestGC_DryRunRemovesNothing(t *testing.T) {
 		DryRun:        true,
 	}, nil)
 	require.NoError(t, err)
-	assert.Equal(t, 1, res.Removed, "dry run still reports what it would remove")
+	assert.Equal(t, 1, res.Eligible, "dry run reports what it WOULD remove")
+	assert.Zero(t, res.Removed, "Removed counts only actual removals, so a dry run never inflates it")
 	assert.DirExists(t, rc.WorktreePath, "dry run must not remove anything")
 	require.NotEmpty(t, res.Candidates)
 	assert.False(t, res.Candidates[0].Removed)
@@ -330,10 +414,11 @@ func TestGC_SkipsYoungAndUnpushedWorktrees(t *testing.T) {
 	young, err := PrepareWorktree(ctx, f.git, f.entry(), f.pr(42), "young1", nil)
 	require.NoError(t, err)
 
-	// Old but holding uncommitted work: must be kept despite disk pressure.
+	// Old but holding uncommitted work on a TRACKED file: must be kept despite
+	// disk pressure. (Untracked files are build artifacts and don't count.)
 	dirty, err := PrepareWorktree(ctx, f.git, f.entry(), f.pr(43), "dirty1", nil)
 	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(filepath.Join(dirty.WorktreePath, "wip.txt"), []byte("x\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dirty.WorktreePath, "feature.txt"), []byte("edited\n"), 0o600))
 	old := time.Now().Add(-10 * 24 * time.Hour)
 	require.NoError(t, os.Chtimes(dirty.WorktreePath, old, old))
 

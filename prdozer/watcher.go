@@ -370,13 +370,8 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 		dirty = true
 	}
 	switch action {
-	// LastActionReworked shares the failure arm deliberately. Merge attempts
-	// are UNBOUNDED by design, and the only brake is
-	// backoff.max_consecutive_failures -> cooldown. If rework landed in the
-	// success arm below it would clear ConsecutiveFailures on every pass, the
-	// cooldown could never trip, and a PR that cannot merge would churn
-	// /pr-polish and rework rounds forever. Rework is not a terminal failure,
-	// but it must count as one for backoff.
+	// LastActionReworked shares the failure arm so a straight run of reworks
+	// still trips the ordinary backoff.
 	case LastActionFailed, LastActionReworked:
 		s.ConsecutiveFailures++
 		dirty = true
@@ -396,10 +391,51 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 		s.ConsecutiveFailures = 0
 		s.CooldownUntil = time.Time{}
 	}
+
+	// The merge-attempt brake. ConsecutiveFailures alone CANNOT bound merge
+	// retries, because the real retry loop alternates rather than repeating:
+	// rework rebases and pushes, which moves HEAD and re-triggers CI, so the
+	// next tick polishes, polish succeeds, and the counter resets to zero.
+	// Empirically the counter never exceeds 1, so the cooldown never trips and
+	// an unmergeable PR burns agent budget forever with no Slack visibility.
+	// (Same shape under MergePolicyQueue: a repeatedly-dequeued PR re-arms
+	// cleanly each tick, which is also a "success".)
+	//
+	// MergeAttempts is the signal that actually tracks merge progress, and
+	// nothing resets it — so brake on that instead. Merge attempts remain
+	// unbounded in the sense that the run resumes after each cooldown and
+	// keeps climbing; the cooldown just rate-limits it and makes it visible.
+	if w.mergeBrakeTripped(s) {
+		s.CooldownUntil = time.Now().Add(w.cfg.Backoff.Cooldown)
+		s.CooldownFromAttempt = s.MergeAttempts
+		dirty = true
+		w.logger.Warn("entering cooldown after repeated merge attempts",
+			"merge_attempts", s.MergeAttempts,
+			"until", s.CooldownUntil,
+		)
+	}
 	if dirty {
 		s.LastCheckAt = snap.TakenAt
 	}
 	return dirty
+}
+
+// mergeBrakeTripped reports whether enough merge attempts have accumulated
+// since the last cooldown to warrant another one.
+//
+// It measures attempts SINCE the previous cooldown (CooldownFromAttempt) so a
+// run that resumes after backing off gets a fresh allowance rather than
+// re-tripping on every subsequent tick forever.
+func (w *Watcher) mergeBrakeTripped(s *State) bool {
+	maxAttempts := w.cfg.Backoff.MaxConsecutiveFailures
+	if maxAttempts <= 0 || w.cfg.Backoff.Cooldown <= 0 {
+		return false
+	}
+	// Already cooling down; don't extend the window on every tick.
+	if !s.CooldownUntil.IsZero() && time.Now().Before(s.CooldownUntil) {
+		return false
+	}
+	return s.MergeAttempts-s.CooldownFromAttempt >= maxAttempts
 }
 
 func (w *Watcher) status(format string, args ...interface{}) {

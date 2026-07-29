@@ -228,6 +228,125 @@ func TestWatcher_RepeatedRework_TripsCooldown(t *testing.T) {
 		"a tripped cooldown must stop further rework rounds")
 }
 
+// TestWatcher_AlternatingReworkAndPolish_StillTripsCooldown is the real-world
+// version of the brake test, and the one that matters.
+//
+// REGRESSION: the merge-retry loop does not repeat reworks back-to-back — it
+// ALTERNATES. Rework rebases and pushes, which moves HEAD and re-triggers CI,
+// so the next tick polishes instead. Polish succeeds, which reset
+// ConsecutiveFailures to zero, so the counter never passed 1, the cooldown
+// never tripped, no Slack warning ever fired, and an unmergeable PR burned
+// agent budget forever. Backoff must therefore key off MergeAttempts, which
+// nothing resets.
+func TestWatcher_AlternatingReworkAndPolish_StillTripsCooldown(t *testing.T) {
+	gh := failingMergeGH(t)
+	rework := &stubRework{}
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish, WithRework(rework, oneRoundSpec()))
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicySquash
+	// Threshold of 2 merge attempts (newWatcherForTest sets Cooldown=1h).
+	w.cfg.Backoff.MaxConsecutiveFailures = 2
+	statePath := StatePath("r", 42)
+
+	// Simulate the alternation directly: a successful polish tick between two
+	// merge attempts. Seed a state that looks like "one merge attempt already
+	// happened, then a polish succeeded and cleared ConsecutiveFailures".
+	require.NoError(t, (&State{
+		LastCheckAt:         time.Now(),
+		LastSeenHeadSHA:     "head1",
+		LastSeenBaseSHA:     "base1",
+		MergeAttempts:       1,
+		ConsecutiveFailures: 0, // <- what a successful polish leaves behind
+		LastAction:          LastActionPolished,
+	}).Save(statePath))
+
+	// Next tick attempts the merge again (attempt 2) and reworks.
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, LastActionReworked, res.Action)
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 2, s.MergeAttempts)
+	assert.False(t, s.CooldownUntil.IsZero(),
+		"the brake must trip on accumulated MERGE ATTEMPTS; a successful polish in "+
+			"between must not launder the failure count away")
+}
+
+func TestWatcher_MergeBrake_ResumesAfterCooldown(t *testing.T) {
+	// Post-cooldown the run must get a fresh allowance rather than re-tripping
+	// on every subsequent tick, and MergeAttempts must keep climbing so the
+	// notification can honestly say "attempt N".
+	gh := failingMergeGH(t)
+	w := newWatcherForTest(t, gh, &stubPolish{}, WithRework(&stubRework{}, oneRoundSpec()))
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicySquash
+	w.cfg.Backoff.MaxConsecutiveFailures = 2
+	statePath := StatePath("r", 42)
+
+	// A run that already cooled down once, at attempt 2, now expired.
+	require.NoError(t, (&State{
+		LastCheckAt:         time.Now().Add(-2 * time.Hour),
+		LastSeenHeadSHA:     "head1",
+		LastSeenBaseSHA:     "base1",
+		MergeAttempts:       2,
+		CooldownFromAttempt: 2,
+		CooldownUntil:       time.Now().Add(-time.Hour),
+	}).Save(statePath))
+
+	// Attempt 3: within the fresh allowance, so no immediate re-trip.
+	_, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 3, s.MergeAttempts, "attempt numbering keeps climbing across cooldowns")
+	assert.True(t, s.CooldownUntil.IsZero() || s.CooldownUntil.Before(time.Now()),
+		"one attempt past a cooldown must not immediately re-trip")
+
+	// Attempt 4 reaches the threshold again (2 attempts since the last
+	// cooldown), so the run backs off rather than retrying without limit.
+	_, err = w.Tick(context.Background())
+	require.NoError(t, err)
+	s, err = LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 4, s.MergeAttempts)
+	assert.False(t, s.CooldownUntil.IsZero(), "the brake re-engages on the next batch of attempts")
+
+	// And the cooldown actually stops further work.
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionIdle, res.Action, "a tripped cooldown skips the tick")
+	s, err = LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 4, s.MergeAttempts, "no further merge attempts while cooling down")
+}
+
+func TestWatcher_QueuePolicy_RepeatedDequeueStillBrakes(t *testing.T) {
+	// Under "queue", a repeatedly-dequeued PR re-arms cleanly every tick.
+	// LastActionArmed is a success, so ConsecutiveFailures alone would never
+	// bound it — MergeAttempts must.
+	gh := approvedGreenGH("false") // arms fine, never actually merges
+	w := newWatcherForTest(t, gh, &stubPolish{}, WithRework(&stubRework{}, oneRoundSpec()))
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicyQueue
+	w.cfg.Backoff.MaxConsecutiveFailures = 2
+	statePath := StatePath("r", 42)
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, LastActionArmed, res.Action)
+	res, err = w.Tick(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, LastActionArmed, res.Action)
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 2, s.MergeAttempts)
+	assert.False(t, s.CooldownUntil.IsZero(),
+		"a PR the queue keeps dequeuing must eventually back off, not re-arm forever")
+}
+
 func TestWatcher_SuccessfulMergeClearsMergeError(t *testing.T) {
 	gh := approvedGreenGH("true")
 	w := newWatcherForTest(t, gh, &stubPolish{}, WithRework(&stubRework{}, oneRoundSpec()))

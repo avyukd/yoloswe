@@ -306,7 +306,12 @@ func newGCCmd() *cobra.Command {
 			if err := tw.Flush(); err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "\n%d removed, %d skipped\n", res.Removed, res.Skipped)
+			if dryRun {
+				fmt.Fprintf(cmd.OutOrStdout(), "\n%d would be removed, %d skipped (dry run: nothing was removed)\n",
+					res.Eligible, res.Skipped)
+			} else {
+				fmt.Fprintf(cmd.OutOrStdout(), "\n%d removed, %d skipped\n", res.Removed, res.Skipped)
+			}
 			return nil
 		},
 	}

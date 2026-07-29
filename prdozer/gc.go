@@ -51,8 +51,13 @@ type GCCandidate struct {
 // GCResult summarizes a sweep.
 type GCResult struct {
 	Candidates []GCCandidate
-	Removed    int
-	Skipped    int
+	// Removed counts what was ACTUALLY removed; it stays zero under DryRun so
+	// the summary line never claims removals that did not happen.
+	Removed int
+	// Eligible counts what met every removal condition, whether or not it was
+	// removed. This is the number a dry run reports.
+	Eligible int
+	Skipped  int
 }
 
 // RunGC reaps orphaned ephemeral worktrees and expired run logs. Orphans arise
@@ -142,8 +147,9 @@ func RunGC(ctx context.Context, git wt.GitRunner, opts GCOptions, logger *slog.L
 					continue
 				}
 				cand.Removed = true
+				res.Removed++
 			}
-			res.Removed++
+			res.Eligible++
 			res.Candidates = append(res.Candidates, cand)
 		}
 	}
@@ -172,7 +178,18 @@ func RunGC(ctx context.Context, git wt.GitRunner, opts GCOptions, logger *slog.L
 			res.Skipped++
 			continue
 		}
-		if m, err := LoadRunMeta(path); err == nil && m.State == TerminalRunning {
+		// Keep anything we cannot positively confirm is finished. An
+		// unreadable or half-written meta.json means the run may still be
+		// alive — "cannot verify" must fail closed, the same way the worktree
+		// loop above treats an unverifiable working tree.
+		m, merr := LoadRunMeta(path)
+		switch {
+		case merr != nil:
+			cand.Reason = fmt.Sprintf("cannot verify run state: %v", merr)
+			res.Skipped++
+			res.Candidates = append(res.Candidates, cand)
+			continue
+		case m.State == TerminalRunning:
 			cand.Reason = "run still marked running"
 			res.Skipped++
 			res.Candidates = append(res.Candidates, cand)
@@ -187,8 +204,9 @@ func RunGC(ctx context.Context, git wt.GitRunner, opts GCOptions, logger *slog.L
 				continue
 			}
 			cand.Removed = true
+			res.Removed++
 		}
-		res.Removed++
+		res.Eligible++
 		res.Candidates = append(res.Candidates, cand)
 	}
 	return res, nil

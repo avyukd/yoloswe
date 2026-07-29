@@ -66,6 +66,10 @@ type State struct {
 	// cooldowns so a resumed run keeps climbing (and the Slack message can
 	// honestly say "attempt 9") rather than restarting its numbering.
 	MergeAttempts int `json:"merge_attempts,omitempty"`
+	// CooldownFromAttempt records MergeAttempts as of the last merge-brake
+	// cooldown, so the brake measures attempts SINCE that point. Without it a
+	// run that resumes past its cooldown would re-trip on every later tick.
+	CooldownFromAttempt int `json:"cooldown_from_attempt,omitempty"`
 }
 
 // LoadState reads the state file at path. Returns a zero State (no error) when
