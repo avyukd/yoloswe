@@ -126,6 +126,10 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 		"ci_failed", cs.CIFailed,
 		"mergeable", cs.Mergeable,
 		"pr_closed", cs.PRClosed,
+		// The divergence guard's input. Logged on every tick so a run that
+		// stops (or fails to stop) can be explained from the log alone.
+		"unresolved_threads", snap.UnresolvedThreads,
+		"rounds_since_improvement", state.RoundsSinceImprovement,
 	)
 
 	w.diverged = false
