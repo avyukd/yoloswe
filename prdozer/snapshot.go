@@ -35,6 +35,33 @@ type Snapshot struct {
 	// on push.
 	IsBotReviewer map[string]bool
 	PR            PRDetails
+	// UnresolvedThreads counts review threads still awaiting work, or -1 when
+	// it could not be read. -1 disables the divergence guard for this tick
+	// rather than being mistaken for a healthy zero. Last so the int packs into
+	// the tail (govet fieldalignment).
+	UnresolvedThreads int
+}
+
+// Health summarizes the snapshot for divergence tracking. ok is false when the
+// thread count is unknown, in which case the caller must not compare.
+//
+// CIFailing reads the head commit's rollup ONLY, deliberately not the
+// FailedRunIDs that ComputeChangeset also folds into cs.CIFailed. The two serve
+// different purposes: cs.CIFailed is an event ("a run failed since last tick"),
+// while this is a point-in-time measurement that has to be able to improve.
+// FailedRunIDs is branch-scoped and historical — a run that failed five commits
+// ago still appears — so folding it in would pin CIFailing true for the rest of
+// the run and trip the guard on a PR that had already gone green. Nothing is
+// lost by omitting it: summarizeRollup scores failure above pending, so any
+// failed check on the head commit shows up as StatusFailure immediately.
+func (s *Snapshot) Health() (PRHealth, bool) {
+	if s.UnresolvedThreads < 0 {
+		return PRHealth{}, false
+	}
+	return PRHealth{
+		UnresolvedThreads: s.UnresolvedThreads,
+		CIFailing:         s.StatusRollup == StatusFailure,
+	}, true
 }
 
 // PRDetails is the fields prdozer cares about from `gh pr view`.
@@ -104,9 +131,21 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 		failed                 []int64
 		comments               []CommentRef
 		baseSHA                string
+		unresolved             int
 		failedErr, commentsErr error
 	)
-	wg.Add(3)
+	wg.Add(4)
+	go func() {
+		defer wg.Done()
+		// Best-effort, like base detection: an unreadable thread count only
+		// disables the divergence guard for this tick rather than failing the
+		// whole snapshot. -1 marks "unknown" so the guard can tell it apart
+		// from a genuine zero.
+		unresolved = -1
+		if n, err := fetchUnresolvedThreads(ctx, gh, dir, owner, repo, prNumber); err == nil {
+			unresolved = n
+		}
+	}()
 	go func() {
 		defer wg.Done()
 		failed, failedErr = fetchFailedRunIDs(ctx, gh, dir, pr.HeadRefName)
@@ -137,7 +176,60 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 		StatusRollup:       summarizeRollup(pr.StatusCheckRollup),
 		ChangesRequestedBy: changesRequestedBy(pr.LatestReviews),
 		IsBotReviewer:      botReviewers(pr.LatestReviews),
+		UnresolvedThreads:  unresolved,
 	}, nil
+}
+
+// fetchUnresolvedThreads counts review threads that are neither resolved nor
+// outdated — the work reviewers are still asking for, and the primary signal
+// for whether a PR is getting better or worse across polish rounds.
+//
+// Outdated threads are excluded deliberately: they attach to lines a later
+// commit already replaced, so counting them would make any rebase look like a
+// regression.
+//
+// Paginated rather than capped at one page: a truncated count reads as a
+// healthier PR than it is, which is the one direction the divergence guard must
+// not be wrong in — it would let a regression past. `gh api graphql --paginate`
+// walks pageInfo for us and emits one --jq result per page, so the counts are
+// summed here.
+func fetchUnresolvedThreads(ctx context.Context, gh wt.GHRunner, dir, owner, repo string, prNumber int) (int, error) {
+	const query = `query($owner:String!,$repo:String!,$pr:Int!,$endCursor:String){
+  repository(owner:$owner,name:$repo){
+    pullRequest(number:$pr){
+      reviewThreads(first:100,after:$endCursor){
+        pageInfo{ hasNextPage endCursor }
+        nodes { isResolved isOutdated }
+      }
+    }
+  }
+}`
+	res, err := gh.Run(ctx, []string{
+		"api", "graphql", "--paginate",
+		"-f", "query=" + query,
+		"-F", "owner=" + owner,
+		"-F", "repo=" + repo,
+		"-F", fmt.Sprintf("pr=%d", prNumber),
+		"--jq", `[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved==false and .isOutdated==false)] | length`,
+	}, dir)
+	if err != nil {
+		return 0, ghError(err, res)
+	}
+	pages := strings.Fields(res.Stdout)
+	if len(pages) == 0 {
+		// No count at all is unknown, not zero. Returning 0 here would read as a
+		// perfectly healthy PR and hand the guard a baseline nothing can beat.
+		return 0, fmt.Errorf("empty unresolved thread count")
+	}
+	total := 0
+	for _, page := range pages {
+		n, err := strconv.Atoi(page)
+		if err != nil {
+			return 0, fmt.Errorf("parse unresolved thread count %q: %w", strings.TrimSpace(res.Stdout), err)
+		}
+		total += n
+	}
+	return total, nil
 }
 
 // botReviewers maps the stripped login of each app reviewer to true, keyed the

@@ -250,6 +250,30 @@ func TestTerminalFor(t *testing.T) {
 	}
 }
 
+// A divergence stop and an approval block are both LastActionNeedsHuman but
+// call for opposite responses, so the message must tell them apart — and must
+// quote the streak the guard tripped on, not the run's cumulative round count.
+func TestTerminalFor_DivergedSaysWhy(t *testing.T) {
+	t.Parallel()
+	pr := DiscoveredPR{Number: 42}
+
+	state, msg, done := terminalFor(TickResult{
+		Action: LastActionNeedsHuman, Diverged: true,
+		RoundsSinceImprovement: 3, PolishRounds: 17,
+	}, pr)
+	require.True(t, done)
+	assert.Equal(t, TerminalNeedsHuman, state)
+	assert.Contains(t, msg, "stopped improving")
+	assert.Contains(t, msg, "3 polish rounds produced no better result",
+		"must report the flat streak, not the 17 rounds the run did in total")
+	assert.Contains(t, msg, "17 rounds total")
+
+	_, plain, done := terminalFor(TickResult{Action: LastActionNeedsHuman}, pr)
+	require.True(t, done)
+	assert.NotContains(t, plain, "stopped improving",
+		"a PR blocked on an approval must not be reported as diverging")
+}
+
 func TestTerminalFor_ArmedIsNotTerminal(t *testing.T) {
 	t.Parallel()
 	// --auto only ARMS the merge queue; the PR has not landed. Treating this

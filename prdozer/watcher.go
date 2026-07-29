@@ -25,6 +25,9 @@ type Watcher struct {
 	reworkSpec StepSpec
 	pr         int
 	dryRun     bool
+	// diverged is set by the divergence guard within a tick so Tick can
+	// report WHY it stopped. Reset at the top of every tick.
+	diverged bool
 }
 
 // WithRework attaches the merge-rework runner and the rounds it should run,
@@ -81,6 +84,19 @@ type TickResult struct {
 	Snapshot  *Snapshot
 	Action    LastAction
 	Changeset Changeset
+	// Diverged reports that NeedsHuman was reached because the PR stopped
+	// improving, rather than because it is waiting on an approval. The two need
+	// opposite responses, so the notification must tell them apart.
+	Diverged bool
+	// PolishRounds is the run's cumulative polish count, reported alongside
+	// Diverged.
+	PolishRounds int
+	// RoundsSinceImprovement is the streak the divergence guard actually trips
+	// on. Reported separately from PolishRounds because the two diverge the
+	// moment a run improves at all: a run can be 17 rounds deep and only 3
+	// rounds flat, and saying "17 rounds produced no better result" would be a
+	// lie.
+	RoundsSinceImprovement int
 }
 
 func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
@@ -104,6 +120,21 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 		return TickResult{}, fmt.Errorf("snapshot: %w", err)
 	}
 	cs := ComputeChangeset(state, snap)
+
+	// Fold this tick's observed health into the run's best-so-far BEFORE
+	// deciding what to do. The divergence guard runs inside decideAndAct, so
+	// scoring afterward would hand it the PREVIOUS tick's streak: a snapshot
+	// that is strictly better still trips the guard, because the reset lands
+	// only after the stop has already been decided. (Flat rounds charged on
+	// ticks 2-4 leave the streak at the limit; if the polish from tick 4 finally
+	// improves the PR, tick 5 must not halt it.) It also keeps the streak in the
+	// log line, the w.status message, and TickResult all reading the same value.
+	//
+	// recordHealth reads state.LastAction, which recordSnapshot does not update
+	// until the end of the tick, so it still charges against the PREVIOUS tick's
+	// action from here.
+	healthDirty := w.recordHealth(state, snap)
+
 	w.logger.Info("snapshot",
 		"head", snap.PR.HeadRefOid,
 		"base_sha", snap.BaseSHA,
@@ -117,14 +148,24 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 		"ci_failed", cs.CIFailed,
 		"mergeable", cs.Mergeable,
 		"pr_closed", cs.PRClosed,
+		// The divergence guard's input. Logged on every tick so a run that
+		// stops (or fails to stop) can be explained from the log alone.
+		"unresolved_threads", snap.UnresolvedThreads,
+		"rounds_since_improvement", state.RoundsSinceImprovement,
 	)
 
+	w.diverged = false
 	priorAttempts, priorMergeErr := state.MergeAttempts, state.LastMergeError
+	priorSelfReviewed := state.SelfReviewedSHA
 	action := w.decideAndAct(ctx, snap, cs, state)
-	mergeStateDirty := state.MergeAttempts != priorAttempts || state.LastMergeError != priorMergeErr
+	mergeStateDirty := state.MergeAttempts != priorAttempts ||
+		state.LastMergeError != priorMergeErr ||
+		state.SelfReviewedSHA != priorSelfReviewed
 
-	res := TickResult{Snapshot: snap, Changeset: cs, Action: action}
-	if w.recordSnapshot(state, snap, action, mergeStateDirty) {
+	res := TickResult{Snapshot: snap, Changeset: cs, Action: action,
+		Diverged: w.diverged, PolishRounds: state.PolishRounds,
+		RoundsSinceImprovement: state.RoundsSinceImprovement}
+	if w.recordSnapshot(state, snap, action, mergeStateDirty || healthDirty) {
 		if err := state.Save(statePath); err != nil {
 			// State save failure is serious: the action already ran (maybe merged
 			// or polished) and the next tick will reload stale state and could
@@ -144,12 +185,18 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 			return LastActionMerged
 		}
 		return LastActionClosed
-	case cs.Mergeable && w.cfg.Polish.AutoMerge && w.cfg.Polish.MergePolicy == MergePolicyNotify:
+	// NOTE: every cs.Mergeable branch below is guarded by !cs.NeedsPolish().
+	// Mergeable means "no conflicts, required checks pass" — it says nothing
+	// about whether reviewer feedback was addressed. Without the guard, a PR
+	// with unhandled comments short-circuits to a terminal state and pr-polish
+	// never runs (yoloswe#287 finished in 1.5s that way), and worse, a repo on
+	// a real merge policy would land the PR with the feedback outstanding.
+	case cs.Mergeable && !cs.NeedsPolish() && !w.needsSelfReview(snap, state) && w.cfg.Polish.AutoMerge && w.cfg.Polish.MergePolicy == MergePolicyNotify:
 		// Explicitly configured never to merge: report and stop rather than
 		// idling forever on a PR that is ready to land.
 		w.status("PR #%d is mergeable but merge_policy is %q — not merging", w.pr, MergePolicyNotify)
 		return LastActionNeedsHuman
-	case cs.Mergeable && w.cfg.Polish.AutoMerge && !w.dryRun:
+	case cs.Mergeable && !cs.NeedsPolish() && !w.needsSelfReview(snap, state) && w.cfg.Polish.AutoMerge && !w.dryRun:
 		state.MergeAttempts++
 		outcome, err := w.merge(ctx, snap)
 		if err != nil {
@@ -169,7 +216,7 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		}
 		w.status("PR #%d merged", w.pr)
 		return LastActionMerged
-	case cs.Mergeable:
+	case cs.Mergeable && !cs.NeedsPolish() && !w.needsSelfReview(snap, state):
 		w.status("PR #%d is mergeable — idle", w.pr)
 		return LastActionIdle
 	case cs.NeedsReview:
@@ -177,9 +224,39 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		// missing. Polishing again would burn rounds against a wall.
 		w.status("PR #%d is green but awaiting human review approval", w.pr)
 		return LastActionNeedsHuman
-	case !cs.NeedsPolish():
+	case !cs.NeedsPolish() && !w.needsSelfReview(snap, state):
 		w.status("PR #%d unchanged — idle", w.pr)
 		return LastActionIdle
+	case w.diverging(snap, state):
+		// More polish rounds are not producing a better PR. Stop and hand it
+		// to a human rather than burning rounds — and money — making it worse.
+		//
+		// Ordered ahead of the self-review path on purpose, even though that
+		// means a bot-less repo can stop with an unreviewed head commit. Every
+		// polish round pushes a commit, which moves the head SHA, which makes
+		// needsSelfReview true again — so a self_review repo re-arms its own
+		// trigger forever and this guard is the ONLY thing that can end the
+		// loop. Exempting self-review here would restore the unbounded run the
+		// guard exists to prevent. The first review is never at risk: the guard
+		// needs a non-zero RoundsSinceImprovement, which only prior polish
+		// rounds can produce.
+		//
+		// What the stop DOES owe the human is a note when it lands on an
+		// unreviewed head: on a self_review repo prdozer is the only reviewer,
+		// so "not improving" and "nobody has looked at the last commit" are
+		// different things to walk into.
+		w.diverged = true
+		best := state.BestHealth
+		unreviewed := w.needsSelfReview(snap, state)
+		w.status("PR #%d is not improving after %d rounds (best: %d unresolved, ci_failing=%t, head_reviewed=%t) — needs a human",
+			w.pr, state.RoundsSinceImprovement, best.UnresolvedThreads, best.CIFailing, !unreviewed)
+		w.logger.Warn("divergence guard tripped",
+			"rounds_since_improvement", state.RoundsSinceImprovement,
+			"polish_rounds", state.PolishRounds,
+			"best_unresolved", best.UnresolvedThreads,
+			"best_ci_failing", best.CIFailing,
+			"head_unreviewed", unreviewed)
+		return LastActionNeedsHuman
 	}
 
 	if w.dryRun {
@@ -210,6 +287,14 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		return LastActionFailed
 	}
 	w.status("PR #%d polish completed", w.pr)
+
+	// Mark this commit as self-reviewed. Recorded on SUCCESS only: a failed
+	// round has produced no review, so retrying it is correct. Note the SHA is
+	// the one we reviewed, not whatever the round just pushed — a new commit
+	// legitimately warrants a fresh review on the next tick.
+	if w.cfg.Polish.SelfReview && snap.PR.HeadRefOid != "" {
+		state.SelfReviewedSHA = snap.PR.HeadRefOid
+	}
 
 	// A CHANGES_REQUESTED verdict is sticky: it stays set until the reviewer
 	// looks again. Without an explicit re-request the fixes just sit there and
@@ -341,6 +426,88 @@ const (
 // speculatively built. Likewise `state: CLOSED` is ambiguous — a PR closed
 // without merging looks identical. The single unambiguous signal is
 // `.merged == true` on the pulls endpoint, so that is the only thing we trust.
+// needsSelfReview reports whether prdozer must ORIGINATE a review for this
+// commit, on a repo that has no automated review bots.
+//
+// Every other polish trigger is reactive — new comments, CI failure, a moved
+// base, a conflict. On a bot-less repo a healthy new PR fires none of them, so
+// prdozer would declare it done without ever reviewing it: yoloswe#287 was
+// closed out in ~1 second, three separate times, having never invoked
+// /pr-polish. On kernel the bots (sycamore-groot, coderabbitai) supply the
+// findings and the reactive model is enough; on yoloswe /pr-polish IS the
+// reviewer, running codex/cursor locally to produce them.
+//
+// Keyed by head SHA so a commit is reviewed exactly once. An unconditional
+// trigger would re-review an idle PR on every tick forever — the reactive
+// triggers are self-limiting because comments get marked seen, but "no bot
+// reviewed this" never stops being true on its own.
+func (w *Watcher) needsSelfReview(snap *Snapshot, state *State) bool {
+	if !w.cfg.Polish.SelfReview || snap.PR.HeadRefOid == "" {
+		return false
+	}
+	return state.SelfReviewedSHA != snap.PR.HeadRefOid
+}
+
+// diverging reports whether polishing has stopped making the PR better.
+//
+// It is deliberately evaluated BEFORE the polish call and AFTER this tick's
+// recordHealth, so the decision uses the outcome of work already done rather
+// than predicting the next round — and so a snapshot that finally improves is
+// scored before it can be used to stop the run.
+func (w *Watcher) diverging(snap *Snapshot, state *State) bool {
+	limit := w.cfg.Backoff.MaxRoundsWithoutImprovement
+	if limit <= 0 || state.BestHealth == nil {
+		return false
+	}
+	// An unreadable thread count means we cannot judge improvement; never stop
+	// a run on missing data.
+	if _, ok := snap.Health(); !ok {
+		return false
+	}
+	return state.RoundsSinceImprovement >= limit
+}
+
+// recordHealth folds this tick's observed health into the run's best-so-far,
+// which is what the divergence guard measures against.
+//
+// Called on every tick rather than only after polishing, so a PR that improves
+// on its own — a reviewer resolving threads, a flaky job going green on rerun —
+// still resets the counter. Only polish rounds increment it.
+//
+// The snapshot was taken BEFORE this tick's action, so it measures the result
+// of the PREVIOUS round, not the one about to run. That lag is deliberate: CI
+// needs time to run after a push, so judging a round immediately would read a
+// stale-green rollup and call a regression an improvement. The cost is that the
+// guard trips one tick later than the round that actually caused the
+// divergence.
+func (w *Watcher) recordHealth(state *State, snap *Snapshot) bool {
+	h, ok := snap.Health()
+	if !ok {
+		return false
+	}
+	// A round counts only when one is actually outstanding — i.e. the PREVIOUS
+	// tick polished and this snapshot is the first look at its result. Charging
+	// on the current action instead would mis-attribute by one tick; charging on
+	// every tick would count a PR that is merely waiting for CI, having done no
+	// work at all.
+	polished := state.LastAction == LastActionPolished
+	if polished {
+		// Cumulative: counted whether or not the round helped, so the terminal
+		// report can say how much work the run did as well as how long it has
+		// been stuck.
+		state.PolishRounds++
+	}
+	if state.BestHealth == nil || h.BetterThan(*state.BestHealth) {
+		state.BestHealth = &h
+		state.RoundsSinceImprovement = 0
+		return true
+	}
+	if polished {
+		state.RoundsSinceImprovement++
+	}
+	return polished
+}
+
 func (w *Watcher) merge(ctx context.Context, snap *Snapshot) (mergeOutcome, error) {
 	policy := w.cfg.Polish.MergePolicy
 	args, ok := policy.MergeArgs(w.pr)

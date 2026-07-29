@@ -49,8 +49,11 @@ func (c Changeset) Empty() bool {
 }
 
 // NeedsPolish reports whether prdozer should invoke the polish agent.
-// Mergeable PRs do NOT need polish even if other flags are true (e.g. a fresh
-// commit moved HEAD but checks are green).
+//
+// Unaddressed feedback (NewComments, ChangesRequested) is checked FIRST and
+// polishes even a mergeable PR. Past that point mergeable does mean done: a
+// green mergeable PR with only BaseMoved/CIFailed/Conflicting left to consider
+// has nothing for the agent to do.
 //
 // NeedsReview is deliberately NOT a polish trigger: a missing human approval is
 // not something the agent can fix, so it must route to a notification instead.
@@ -58,10 +61,24 @@ func (c Changeset) Empty() bool {
 // fires even when no other signal changed, because a dirty PR produces no new
 // CI runs to notice.
 func (c Changeset) NeedsPolish() bool {
-	if c.PRClosed || c.Mergeable {
+	if c.PRClosed {
 		return false
 	}
-	return c.BaseMoved || c.CIFailed || c.NewComments || c.Conflicting || c.ChangesRequested
+	// Unaddressed review feedback is polish-worthy even on a MERGEABLE PR.
+	// GitHub calls a PR mergeable when it has no conflicts and passes required
+	// checks — that says nothing about whether a reviewer's comments were
+	// handled. Treating mergeable as "done" let yoloswe#287 finish in 1.5s with
+	// new_comments=1 and pr-polish never invoked at all.
+	if c.NewComments || c.ChangesRequested {
+		return true
+	}
+	// For the remaining signals, mergeable really does mean nothing to do: a
+	// green mergeable PR has no failing CI and no conflict to resolve, and a
+	// moved base that still merges cleanly needs no rebase.
+	if c.Mergeable {
+		return false
+	}
+	return c.BaseMoved || c.CIFailed || c.Conflicting
 }
 
 // ComputeChangeset diffs the snapshot against the previously persisted State.

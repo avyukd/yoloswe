@@ -2,9 +2,11 @@ package prdozer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -566,13 +568,325 @@ func TestFetchBaseSHA_EscapesSlashInBranch(t *testing.T) {
 
 func TestBuildPolishPrompt(t *testing.T) {
 	t.Parallel()
-	assert.Equal(t, "/pr-polish 42", buildPolishPrompt(42, false))
-	assert.Equal(t, "/pr-polish --local 42", buildPolishPrompt(42, true))
-	assert.Equal(t, "/pr-polish", buildPolishPrompt(0, false))
+	assert.Equal(t, "/pr-polish 42", buildPolishPrompt(42, false, 0))
+	assert.Equal(t, "/pr-polish --local 42", buildPolishPrompt(42, true, 0))
+	assert.Equal(t, "/pr-polish", buildPolishPrompt(0, false, 0))
+}
+
+// /pr-polish loops internally inside ONE polish.Run() call. Uncapped, a single
+// tick absorbed 22 rounds over 64 minutes on kernel#8227 — and the divergence
+// guard compares health BETWEEN ticks, so a tick that never ends is never
+// guarded. The cap is what makes the tick boundary mean anything.
+func TestBuildPolishPrompt_CapsInternalRounds(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, "/pr-polish --rounds 3 42", buildPolishPrompt(42, false, 3))
+	assert.Equal(t, "/pr-polish --local --rounds 3 42", buildPolishPrompt(42, true, 3))
+	assert.Equal(t, "/pr-polish 42", buildPolishPrompt(42, false, 0),
+		"zero omits the flag so the skill uses its own default")
 }
 
 // Sanity check that fakeGH wraps OS env without leaking real paths.
 func TestFakeGHIsolated(t *testing.T) {
 	t.Parallel()
 	require.NotEmpty(t, os.TempDir())
+}
+
+// setThreads makes the fake gh return n unresolved review threads.
+func (f *fakeGH) setThreads(n int) {
+	f.addPrefix("api graphql", strconv.Itoa(n))
+}
+
+// `gh api graphql --paginate` emits one --jq result per page, so a PR with more
+// than 100 review threads reports several counts that must be summed. Taking
+// only the first would undercount the outstanding work and read as a healthier
+// PR than it is — the one direction the divergence guard must not be wrong in.
+func TestFetchUnresolvedThreads_SumsPages(t *testing.T) {
+	t.Parallel()
+	gh := newFakeGH()
+	gh.addPrefix("api graphql", "100\n40\n7\n")
+
+	n, err := fetchUnresolvedThreads(context.Background(), gh, ".", "o", "r", 42)
+	require.NoError(t, err)
+	assert.Equal(t, 147, n)
+
+	call := gh.findCall("api graphql")
+	require.NotNil(t, call)
+	assert.Contains(t, call, "--paginate",
+		"without --paginate gh never walks past the first page")
+	assert.Contains(t, strings.Join(call, " "), "$endCursor",
+		"gh only paginates a query that declares the cursor variable")
+}
+
+// An empty count is unknown, not zero: returning 0 would look like a perfectly
+// healthy PR and hand the guard a baseline no later round can beat. The caller
+// turns the error into -1, which disables the guard for the tick.
+func TestFetchUnresolvedThreads_EmptyIsAnError(t *testing.T) {
+	t.Parallel()
+	gh := newFakeGH()
+	gh.addPrefix("api graphql", "  \n")
+
+	_, err := fetchUnresolvedThreads(context.Background(), gh, ".", "o", "r", 42)
+	require.Error(t, err)
+}
+
+// A PR that keeps needing polish while never getting better must stop and go
+// to a human. This is the kernel#8227 failure: seventeen polish rounds each
+// reported success while unresolved threads went 6 -> 2 -> 11 and CI went red
+// on errors the polish commits introduced. The existing backoff only counts
+// hard failures, so nothing ever fired and it burned rounds making the PR
+// worse.
+func TestWatcher_DivergenceGuard_StopsWhenNotImproving(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(6)
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 3
+
+	ctx := context.Background()
+	// First tick records the baseline without reacting.
+	_, err := w.Tick(ctx)
+	require.NoError(t, err)
+
+	// Now hold health flat at its worst: every tick needs polish, none improves.
+	gh.setThreads(11)
+	var last TickResult
+	for range 6 {
+		res, err := w.Tick(ctx)
+		require.NoError(t, err)
+		last = res
+		if res.Action == LastActionNeedsHuman {
+			break
+		}
+	}
+	assert.Equal(t, LastActionNeedsHuman, last.Action,
+		"a PR that stops improving must escalate rather than polish forever")
+	assert.Less(t, len(polish.calls), 6,
+		"the guard must cut polishing short, not run every round first")
+	// Without Diverged the notification falls back to the generic "needs a
+	// human" text, which reads like a PR waiting on an approval — the opposite
+	// response to one the babysitter was actively making worse.
+	assert.True(t, last.Diverged,
+		"stopping for divergence must be reported as divergence, not as a plain block")
+	assert.GreaterOrEqual(t, last.RoundsSinceImprovement, 3,
+		"the reported streak must be the one the guard tripped on")
+}
+
+// Improvement must reset the budget, or a long but healthy run would trip the
+// guard purely for taking many rounds.
+func TestWatcher_DivergenceGuard_ImprovementResetsCounter(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(10)
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 3
+
+	ctx := context.Background()
+	_, err := w.Tick(ctx)
+	require.NoError(t, err)
+
+	// Two flat rounds, then a real improvement, then two more flat ones. The
+	// improvement in the middle must clear the counter so the guard does not
+	// trip on a total that spans it.
+	for _, threads := range []int{10, 10, 4, 4, 4} {
+		gh.setThreads(threads)
+		res, err := w.Tick(ctx)
+		require.NoError(t, err)
+		require.NotEqual(t, LastActionNeedsHuman, res.Action,
+			"must not trip while the PR is still improving (threads=%d)", threads)
+	}
+
+	// Assert the bookkeeping directly, not just that nothing tripped: a run that
+	// merely stopped short of the limit would satisfy the loop above even with
+	// the reset deleted.
+	state, err := LoadState(StatePath("r", 42))
+	require.NoError(t, err)
+	require.NotNil(t, state.BestHealth)
+	assert.Equal(t, 4, state.BestHealth.UnresolvedThreads,
+		"the improvement must be adopted as the new best")
+	assert.Equal(t, 2, state.RoundsSinceImprovement,
+		"the streak must count only the two flat rounds AFTER the improvement")
+}
+
+// The guard is consulted inside decideAndAct, so this tick's health has to be
+// scored FIRST. Scored afterward, the guard reads a streak that predates the
+// snapshot in front of it and keeps halting a PR that has already recovered —
+// the improvement resets the counter only after the stop is decided.
+//
+// The observable case is a tripped run that gets better: a human resolves the
+// threads and the babysitter is pointed at the PR again. It must resume, not
+// re-halt on a streak the current snapshot has already disproved.
+func TestWatcher_DivergenceGuard_RecoveryAfterTripResumes(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(10)
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 3
+
+	ctx := context.Background()
+	_, err := w.Tick(ctx)
+	require.NoError(t, err)
+
+	// Flat rounds until the guard stops the run.
+	var tripped bool
+	for range 6 {
+		res, err := w.Tick(ctx)
+		require.NoError(t, err)
+		if res.Action == LastActionNeedsHuman {
+			tripped = true
+			break
+		}
+	}
+	require.True(t, tripped, "the guard must trip on a run that never improves")
+	state, err := LoadState(StatePath("r", 42))
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, state.RoundsSinceImprovement, 3,
+		"the streak is persisted at (or past) the limit")
+	callsAtTrip := len(polish.calls)
+
+	// Someone resolved the threads. The very next snapshot is strictly better.
+	gh.setThreads(1)
+	res, err := w.Tick(ctx)
+	require.NoError(t, err)
+	assert.NotEqual(t, LastActionNeedsHuman, res.Action,
+		"an improving snapshot must be scored before the guard reads the streak")
+	assert.Zero(t, res.RoundsSinceImprovement,
+		"the reported streak must be the post-scoring value the guard actually used")
+	assert.Greater(t, len(polish.calls), callsAtTrip,
+		"a recovered PR must resume polishing, not stay stuck at the old streak")
+}
+
+// Missing data must never stop a run: an unreadable thread count disables the
+// guard rather than being treated as a healthy zero or a regression.
+func TestWatcher_DivergenceGuard_UnknownThreadCountDisablesGuard(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.failPrefix("api graphql", "GraphQL: something broke")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 1
+
+	ctx := context.Background()
+	for range 4 {
+		res, err := w.Tick(ctx)
+		require.NoError(t, err)
+		assert.NotEqual(t, LastActionNeedsHuman, res.Action,
+			"an unreadable thread count must not be mistaken for divergence")
+	}
+}
+
+// The end-to-end shape of the yoloswe#287 bug: a mergeable PR carrying an
+// unhandled comment reached a terminal state in 1.5 seconds without ever
+// invoking pr-polish. The mergeable branches preempted the polish branch, and
+// NeedsPolish itself returned false whenever Mergeable was true.
+func TestWatcher_MergeableWithNewComments_StillPolishes(t *testing.T) {
+	prJSON := strings.Replace(okPRJSON, `"reviewDecision": "REVIEW_REQUIRED"`, `"reviewDecision": "APPROVED"`, 1)
+	gh := setupGH(buildPRJSON(prJSON, "SUCCESS"), "[]", "base1")
+	gh.setThreads(0)
+	// A comment that has never been seen before.
+	gh.addPrefix("api --paginate repos/o/r/issues/42/comments",
+		`[{"id":991,"user":{"login":"reviewer","type":"User"},"created_at":"2026-07-29T12:00:00Z","body":"please fix"}]`)
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicyNotify
+
+	ctx := context.Background()
+	// First tick establishes the baseline without reacting.
+	_, err := w.Tick(ctx)
+	require.NoError(t, err)
+
+	// Second tick: still mergeable, but the comment is now a NEW comment.
+	gh.addPrefix("api --paginate repos/o/r/issues/42/comments",
+		`[{"id":991,"user":{"login":"reviewer","type":"User"},"created_at":"2026-07-29T12:00:00Z","body":"please fix"},
+		  {"id":992,"user":{"login":"reviewer","type":"User"},"created_at":"2026-07-29T13:00:00Z","body":"and this"}]`)
+	res, err := w.Tick(ctx)
+	require.NoError(t, err)
+
+	assert.Equal(t, LastActionPolished, res.Action,
+		"unhandled feedback must be polished, not short-circuited to a terminal state")
+	assert.Len(t, polish.calls, 1, "pr-polish must actually be invoked")
+	assert.Nil(t, gh.findCall("pr merge"),
+		"never merge while reviewer feedback is outstanding")
+}
+
+// On a repo with no review bots, /pr-polish IS the reviewer — it runs
+// codex/cursor locally to PRODUCE findings. Every other trigger is reactive, so
+// a healthy new PR fires none of them and prdozer declares it done having never
+// reviewed it. yoloswe#287 was closed out in ~1s three separate times that way,
+// with zero pr-polish invocations.
+func TestWatcher_SelfReview_PolishesAnUnreviewedPR(t *testing.T) {
+	prJSON := strings.Replace(okPRJSON, `"reviewDecision": "REVIEW_REQUIRED"`, `"reviewDecision": ""`, 1)
+	gh := setupGH(buildPRJSON(prJSON, "SUCCESS"), "[]", "base1")
+	gh.setThreads(0)
+	gh.addPrefix("api repos/o/r/pulls/42 --jq .merged", "false")
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicyNotify
+	w.cfg.Polish.SelfReview = true
+
+	ctx := context.Background()
+	res, err := w.Tick(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, LastActionPolished, res.Action,
+		"a bot-less repo must have its review ORIGINATED, not skipped as 'nothing changed'")
+	assert.Len(t, polish.calls, 1, "pr-polish must actually run")
+	assert.Nil(t, gh.findCall("pr merge"), "never merge a PR that was just reviewed for the first time")
+}
+
+// Keyed by SHA so a commit is reviewed exactly once. "No bot reviewed this"
+// never stops being true on its own, so an unconditional trigger would
+// re-review an idle PR on every tick forever.
+func TestWatcher_SelfReview_OncePerCommit(t *testing.T) {
+	prJSON := strings.Replace(okPRJSON, `"reviewDecision": "REVIEW_REQUIRED"`, `"reviewDecision": ""`, 1)
+	gh := setupGH(buildPRJSON(prJSON, "SUCCESS"), "[]", "base1")
+	gh.setThreads(0)
+	gh.addPrefix("api repos/o/r/pulls/42 --jq .merged", "false")
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicyNotify
+	w.cfg.Polish.SelfReview = true
+
+	ctx := context.Background()
+	for range 3 {
+		_, err := w.Tick(ctx)
+		require.NoError(t, err)
+	}
+	assert.Len(t, polish.calls, 1,
+		"the same commit must be self-reviewed once, not on every tick")
+}
+
+// A failed round produced no review, so the commit must stay eligible.
+func TestWatcher_SelfReview_FailedRoundStaysEligible(t *testing.T) {
+	prJSON := strings.Replace(okPRJSON, `"reviewDecision": "REVIEW_REQUIRED"`, `"reviewDecision": ""`, 1)
+	gh := setupGH(buildPRJSON(prJSON, "SUCCESS"), "[]", "base1")
+	gh.setThreads(0)
+	gh.addPrefix("api repos/o/r/pulls/42 --jq .merged", "false")
+	polish := &stubPolish{err: errors.New("boom")}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicyNotify
+	w.cfg.Polish.SelfReview = true
+	w.cfg.Backoff.MaxConsecutiveFailures = 0 // isolate from the cooldown brake
+
+	ctx := context.Background()
+	for range 2 {
+		_, err := w.Tick(ctx)
+		require.NoError(t, err)
+	}
+	assert.Len(t, polish.calls, 2, "a failed review must be retried, not marked done")
+}
+
+// Without the flag, behavior is unchanged: a clean mergeable PR terminates.
+func TestWatcher_SelfReviewOff_CleanPRStillTerminates(t *testing.T) {
+	prJSON := strings.Replace(okPRJSON, `"reviewDecision": "REVIEW_REQUIRED"`, `"reviewDecision": ""`, 1)
+	gh := setupGH(buildPRJSON(prJSON, "SUCCESS"), "[]", "base1")
+	gh.setThreads(0)
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicyNotify
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionNeedsHuman, res.Action)
+	assert.Empty(t, polish.calls, "no self-review means no origination")
 }

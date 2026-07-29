@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func snapWithRollup(rollup string) *Snapshot {
@@ -381,4 +382,65 @@ func TestBotReviewers(t *testing.T) {
 	})
 	assert.True(t, got["sycamore-groot"], "keyed by the stripped login, matching ChangesRequestedBy")
 	assert.False(t, got["a-human"], "humans are re-requestable and must not be skipped")
+}
+
+func TestPRHealth_BetterThan(t *testing.T) {
+	t.Parallel()
+	green2 := PRHealth{UnresolvedThreads: 2}
+	green5 := PRHealth{UnresolvedThreads: 5}
+	red1 := PRHealth{UnresolvedThreads: 1, CIFailing: true}
+
+	assert.True(t, green2.BetterThan(green5), "fewer unresolved threads is better")
+	assert.False(t, green5.BetterThan(green2))
+	assert.False(t, green2.BetterThan(green2), "equal is NOT an improvement — a round that changed nothing must count")
+
+	// Green CI dominates: a red PR cannot merge at all, so going red is a
+	// regression even while resolving threads. This is exactly the kernel#8227
+	// shape — threads fell while the polish commits turned CI red.
+	assert.True(t, green5.BetterThan(red1), "green with more threads beats red with fewer")
+	assert.False(t, red1.BetterThan(green5))
+}
+
+// GitHub calls a PR mergeable when it has no conflicts and required checks
+// pass — that says nothing about whether reviewer feedback was addressed.
+// Treating mergeable as "done" let yoloswe#287 finish in 1.5 seconds with
+// new_comments=1 and pr-polish never invoked.
+func TestComputeChangeset_MergeablePRWithNewCommentsStillNeedsPolish(t *testing.T) {
+	t.Parallel()
+	prev := &State{
+		LastCheckAt:     time.Now(),
+		LastSeenHeadSHA: "head1",
+		LastSeenBaseSHA: "base1",
+	}
+	snap := snapWithRollup(StatusSuccess)
+	snap.PR.ReviewDecision = "APPROVED"
+	snap.PR.Mergeable = "MERGEABLE"
+	snap.Comments = []CommentRef{{ID: "issue:1", Author: "someone"}}
+
+	cs := ComputeChangeset(prev, snap)
+	require.True(t, cs.Mergeable, "precondition: the PR is mergeable")
+	assert.True(t, cs.NewComments, "precondition: there is unhandled feedback")
+	assert.True(t, cs.NeedsPolish(),
+		"unaddressed comments must be polished even on a mergeable PR")
+}
+
+// The converse: a genuinely clean mergeable PR has nothing to do. Without this
+// the loop would never reach a terminal state.
+func TestComputeChangeset_CleanMergeablePRNeedsNoPolish(t *testing.T) {
+	t.Parallel()
+	prev := &State{
+		LastCheckAt:        time.Now(),
+		LastSeenHeadSHA:    "head1",
+		LastSeenBaseSHA:    "base1",
+		LastSeenCommentIDs: []string{"issue:1"},
+	}
+	snap := snapWithRollup(StatusSuccess)
+	snap.PR.ReviewDecision = "APPROVED"
+	snap.PR.Mergeable = "MERGEABLE"
+	snap.Comments = []CommentRef{{ID: "issue:1", Author: "someone"}}
+
+	cs := ComputeChangeset(prev, snap)
+	require.True(t, cs.Mergeable)
+	assert.False(t, cs.NewComments, "the comment was already seen")
+	assert.False(t, cs.NeedsPolish(), "a clean mergeable PR is done")
 }

@@ -123,14 +123,35 @@ type PolishConfig struct {
 	MergePolicy  MergePolicy `yaml:"merge_policy"`
 	MaxBudgetUSD float64     `yaml:"max_budget_usd"` // overrides top-level budget; 0 inherits
 	MaxTurns     int         `yaml:"max_turns"`      // cap turns for /pr-polish session
-	Local        bool        `yaml:"local"`          // pass --local to /pr-polish
-	AutoMerge    bool        `yaml:"auto_merge"`     // run gh pr merge when PR is mergeable
+	// RoundsPerTick caps /pr-polish's INTERNAL round loop, which runs inside a
+	// single polish.Run() call. Without a cap one tick absorbs unbounded work —
+	// kernel#8227 ran 22 rounds over 64 minutes in ONE tick — and since the
+	// divergence guard compares health BETWEEN ticks, a tick that never ends is
+	// never guarded. Zero omits the flag and uses the skill's own default.
+	RoundsPerTick int  `yaml:"rounds_per_tick"`
+	Local         bool `yaml:"local"`      // pass --local to /pr-polish
+	AutoMerge     bool `yaml:"auto_merge"` // run gh pr merge when PR is mergeable
+	// SelfReview mirrors RepoEntry.SelfReview: on a repo with no automated
+	// review bots, /pr-polish must ORIGINATE the review rather than react to
+	// one. Every other trigger is reactive, so without this a healthy PR on a
+	// bot-less repo is declared done having never been reviewed.
+	SelfReview bool `yaml:"self_review"`
 }
 
 // BackoffConfig caps how aggressively prdozer keeps retrying after failures.
 type BackoffConfig struct {
 	MaxConsecutiveFailures int           `yaml:"max_consecutive_failures"`
 	Cooldown               time.Duration `yaml:"cooldown"`
+	// MaxRoundsWithoutImprovement stops polishing when this many consecutive
+	// rounds fail to improve on the best PR health seen so far.
+	//
+	// The existing brake counts only hard failures, so a run whose rounds all
+	// "succeed" while the PR gets worse never trips it. kernel#8227 ran
+	// seventeen such rounds: unresolved threads went 6 -> 2 -> 11 and CI went
+	// red on errors the polish commits introduced.
+	//
+	// Zero disables the guard. Default 3, matching the failure brake.
+	MaxRoundsWithoutImprovement int `yaml:"max_rounds_without_improvement"`
 }
 
 // DefaultConfig returns the built-in defaults with validate() applied so the
@@ -162,13 +183,15 @@ func defaultConfig() Config {
 			Local:          false,
 			AutoMerge:      false,
 			MaxTurns:       100,
+			RoundsPerTick:  3,
 			PermissionMode: "bypass",
 			MergePolicy:    MergePolicyNotify,
 			// MaxBudgetUSD left at zero so validate() inherits the top-level value.
 		},
 		Backoff: BackoffConfig{
-			MaxConsecutiveFailures: 3,
-			Cooldown:               2 * time.Hour,
+			MaxConsecutiveFailures:      3,
+			MaxRoundsWithoutImprovement: 3,
+			Cooldown:                    2 * time.Hour,
 		},
 	}
 }

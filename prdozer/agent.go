@@ -59,7 +59,7 @@ func (p *AgentPolisher) Run(ctx context.Context, req PolishRequest) (PolishResul
 	}
 	defer provider.Close()
 
-	prompt := buildPolishPrompt(req.PRNumber, req.Local)
+	prompt := buildPolishPrompt(req.PRNumber, req.Local, req.Cfg.RoundsPerTick)
 
 	logger := p.logger
 	logger.Info("invoking pr-polish",
@@ -120,11 +120,27 @@ func (p *AgentPolisher) Run(ctx context.Context, req PolishRequest) (PolishResul
 	}, nil
 }
 
-func buildPolishPrompt(prNumber int, local bool) string {
+func buildPolishPrompt(prNumber int, local bool, rounds int) string {
 	var sb strings.Builder
 	sb.WriteString("/pr-polish")
 	if local {
 		sb.WriteString(" --local")
+	}
+	// Bound the skill's INTERNAL round loop.
+	//
+	// /pr-polish runs its own loop inside a single polish.Run() call, so without
+	// a cap one prdozer tick can absorb an unbounded amount of work: kernel#8227
+	// ran 22 internal rounds across 64 minutes in ONE tick. The divergence guard
+	// compares health BETWEEN ticks, so a tick that never ends is a tick the
+	// guard is never consulted on — the runaway it exists to stop becomes
+	// invisible to it.
+	//
+	// Capping rounds per tick makes the tick boundary meaningful: prdozer
+	// re-snapshots, re-evaluates health, and can stop. Work is not lost — the
+	// skill's budget resets on re-invoke and its state file persists, so the
+	// next tick resumes where this one left off.
+	if rounds > 0 {
+		sb.WriteString(fmt.Sprintf(" --rounds %d", rounds))
 	}
 	if prNumber > 0 {
 		sb.WriteString(fmt.Sprintf(" %d", prNumber))
