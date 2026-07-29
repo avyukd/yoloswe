@@ -693,6 +693,65 @@ func TestWatcher_DivergenceGuard_ImprovementResetsCounter(t *testing.T) {
 		require.NotEqual(t, LastActionNeedsHuman, res.Action,
 			"must not trip while the PR is still improving (threads=%d)", threads)
 	}
+
+	// Assert the bookkeeping directly, not just that nothing tripped: a run that
+	// merely stopped short of the limit would satisfy the loop above even with
+	// the reset deleted.
+	state, err := LoadState(StatePath("r", 42))
+	require.NoError(t, err)
+	require.NotNil(t, state.BestHealth)
+	assert.Equal(t, 4, state.BestHealth.UnresolvedThreads,
+		"the improvement must be adopted as the new best")
+	assert.Equal(t, 2, state.RoundsSinceImprovement,
+		"the streak must count only the two flat rounds AFTER the improvement")
+}
+
+// The guard is consulted inside decideAndAct, so this tick's health has to be
+// scored FIRST. Scored afterward, the guard reads a streak that predates the
+// snapshot in front of it and keeps halting a PR that has already recovered —
+// the improvement resets the counter only after the stop is decided.
+//
+// The observable case is a tripped run that gets better: a human resolves the
+// threads and the babysitter is pointed at the PR again. It must resume, not
+// re-halt on a streak the current snapshot has already disproved.
+func TestWatcher_DivergenceGuard_RecoveryAfterTripResumes(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(10)
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 3
+
+	ctx := context.Background()
+	_, err := w.Tick(ctx)
+	require.NoError(t, err)
+
+	// Flat rounds until the guard stops the run.
+	var tripped bool
+	for range 6 {
+		res, err := w.Tick(ctx)
+		require.NoError(t, err)
+		if res.Action == LastActionNeedsHuman {
+			tripped = true
+			break
+		}
+	}
+	require.True(t, tripped, "the guard must trip on a run that never improves")
+	state, err := LoadState(StatePath("r", 42))
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, state.RoundsSinceImprovement, 3,
+		"the streak is persisted at (or past) the limit")
+	callsAtTrip := len(polish.calls)
+
+	// Someone resolved the threads. The very next snapshot is strictly better.
+	gh.setThreads(1)
+	res, err := w.Tick(ctx)
+	require.NoError(t, err)
+	assert.NotEqual(t, LastActionNeedsHuman, res.Action,
+		"an improving snapshot must be scored before the guard reads the streak")
+	assert.Zero(t, res.RoundsSinceImprovement,
+		"the reported streak must be the post-scoring value the guard actually used")
+	assert.Greater(t, len(polish.calls), callsAtTrip,
+		"a recovered PR must resume polishing, not stay stuck at the old streak")
 }
 
 // Missing data must never stop a run: an unreadable thread count disables the

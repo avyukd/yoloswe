@@ -120,6 +120,21 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 		return TickResult{}, fmt.Errorf("snapshot: %w", err)
 	}
 	cs := ComputeChangeset(state, snap)
+
+	// Fold this tick's observed health into the run's best-so-far BEFORE
+	// deciding what to do. The divergence guard runs inside decideAndAct, so
+	// scoring afterward would hand it the PREVIOUS tick's streak: a snapshot
+	// that is strictly better still trips the guard, because the reset lands
+	// only after the stop has already been decided. (Flat rounds charged on
+	// ticks 2-4 leave the streak at the limit; if the polish from tick 4 finally
+	// improves the PR, tick 5 must not halt it.) It also keeps the streak in the
+	// log line, the w.status message, and TickResult all reading the same value.
+	//
+	// recordHealth reads state.LastAction, which recordSnapshot does not update
+	// until the end of the tick, so it still charges against the PREVIOUS tick's
+	// action from here.
+	healthDirty := w.recordHealth(state, snap)
+
 	w.logger.Info("snapshot",
 		"head", snap.PR.HeadRefOid,
 		"base_sha", snap.BaseSHA,
@@ -146,16 +161,6 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 	mergeStateDirty := state.MergeAttempts != priorAttempts ||
 		state.LastMergeError != priorMergeErr ||
 		state.SelfReviewedSHA != priorSelfReviewed
-
-	// Fold this tick's observed health into the run's best-so-far.
-	//
-	// The snapshot was taken BEFORE this tick's action, so it measures the
-	// result of the PREVIOUS round, not the one just run. That lag is
-	// deliberate: CI needs time to run after a push, so judging a round
-	// immediately would read a stale-green rollup and call a regression an
-	// improvement. The cost is that the guard trips one tick later than the
-	// round that actually caused the divergence.
-	healthDirty := w.recordHealth(state, snap)
 
 	res := TickResult{Snapshot: snap, Changeset: cs, Action: action,
 		Diverged: w.diverged, PolishRounds: state.PolishRounds,
@@ -438,9 +443,10 @@ func (w *Watcher) needsSelfReview(snap *Snapshot, state *State) bool {
 
 // diverging reports whether polishing has stopped making the PR better.
 //
-// It is deliberately evaluated BEFORE the polish call and AFTER the health
-// bookkeeping from the previous round, so the decision uses the outcome of work
-// already done rather than predicting the next round.
+// It is deliberately evaluated BEFORE the polish call and AFTER this tick's
+// recordHealth, so the decision uses the outcome of work already done rather
+// than predicting the next round — and so a snapshot that finally improves is
+// scored before it can be used to stop the run.
 func (w *Watcher) diverging(snap *Snapshot, state *State) bool {
 	limit := w.cfg.Backoff.MaxRoundsWithoutImprovement
 	if limit <= 0 || state.BestHealth == nil {
@@ -460,6 +466,13 @@ func (w *Watcher) diverging(snap *Snapshot, state *State) bool {
 // Called on every tick rather than only after polishing, so a PR that improves
 // on its own — a reviewer resolving threads, a flaky job going green on rerun —
 // still resets the counter. Only polish rounds increment it.
+//
+// The snapshot was taken BEFORE this tick's action, so it measures the result
+// of the PREVIOUS round, not the one about to run. That lag is deliberate: CI
+// needs time to run after a push, so judging a round immediately would read a
+// stale-green rollup and call a regression an improvement. The cost is that the
+// guard trips one tick later than the round that actually caused the
+// divergence.
 func (w *Watcher) recordHealth(state *State, snap *Snapshot) bool {
 	h, ok := snap.Health()
 	if !ok {
