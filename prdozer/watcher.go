@@ -153,12 +153,13 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		state.MergeAttempts++
 		outcome, err := w.merge(ctx, snap)
 		if err != nil {
+			// Scrub once, at the source: this message is logged, persisted to
+			// the state file, and fed verbatim into the rework prompt.
+			safe := safeErrString(err)
 			w.logger.Error("auto-merge failed",
-				"error", err, "policy", w.cfg.Polish.MergePolicy, "attempt", state.MergeAttempts)
-			w.status("PR #%d merge attempt %d failed: %v", w.pr, state.MergeAttempts, err)
-			// Persisted to the state file and fed verbatim into the rework
-			// prompt, so scrub it at the source.
-			state.LastMergeError = safeErr(err).Error()
+				"error", safe, "policy", w.cfg.Polish.MergePolicy, "attempt", state.MergeAttempts)
+			w.status("PR #%d merge attempt %d failed: %s", w.pr, state.MergeAttempts, safe)
+			state.LastMergeError = safe
 			return w.reworkAfterFailedMerge(ctx, snap, state)
 		}
 		state.LastMergeError = ""
@@ -200,9 +201,12 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		Model:    w.cfg.Agent.Model,
 	}
 	if _, err := w.polish.Run(ctx, req); err != nil {
-		safe := safeErr(err)
+		// Log the scrubbed STRING, not a wrapped error: a provider error can
+		// embed the endpoint config (API key / key-bearing env var), and these
+		// messages are persisted and Slacked.
+		safe := safeErrString(err)
 		w.logger.Error("polish failed", "error", safe)
-		w.status("PR #%d polish failed: %v", w.pr, safe)
+		w.status("PR #%d polish failed: %s", w.pr, safe)
 		return LastActionFailed
 	}
 	w.status("PR #%d polish completed", w.pr)
@@ -251,9 +255,9 @@ func (w *Watcher) reworkAfterFailedMerge(ctx context.Context, snap *Snapshot, st
 	if _, err := w.rework.Run(ctx, req); err != nil {
 		// Scrub before logging: a provider error can embed the endpoint
 		// config that produced it, and these logs are persisted and Slacked.
-		safe := safeErr(err)
+		safe := safeErrString(err)
 		w.logger.Error("merge rework failed", "error", safe, "attempt", state.MergeAttempts)
-		w.status("PR #%d merge rework failed: %v", w.pr, safe)
+		w.status("PR #%d merge rework failed: %s", w.pr, safe)
 		return LastActionFailed
 	}
 	w.status("PR #%d merge rework completed — will retry merge next tick", w.pr)

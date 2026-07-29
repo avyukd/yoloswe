@@ -319,21 +319,19 @@ func redactSecrets(s string) string {
 	return secretPattern.ReplaceAllString(s, "${1}[REDACTED]")
 }
 
-// redactedError wraps an error so its message is scrubbed when logged or
-// formatted. It keeps the original for errors.Is/As so control flow that
-// inspects error identity is unaffected.
-type redactedError struct{ err error }
-
-func (r redactedError) Error() string { return redactSecrets(r.err.Error()) }
-func (r redactedError) Unwrap() error { return r.err }
-
-// safeErr returns err with credential-looking content scrubbed from its
-// message. Use it at every site that logs or reports a provider error.
-func safeErr(err error) error {
+// safeErrString renders err as a scrubbed string. This is the form to hand to
+// a logger, a run-log entry, or a notification.
+//
+// It deliberately returns a STRING rather than a wrapped error. A wrapper that
+// redacts in Error() still carries the unredacted original underneath, so
+// go/clear-text-logging follows the taint straight through it, and any
+// downstream code that unwraps would see the raw message. Converting at the
+// boundary severs the flow outright.
+func safeErrString(err error) string {
 	if err == nil {
-		return nil
+		return ""
 	}
-	return redactedError{err: err}
+	return redactSecrets(err.Error())
 }
 
 func truncate(s string, maxLen int) string {

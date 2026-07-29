@@ -482,15 +482,16 @@ func TestRedactSecrets_KeepsOrdinaryDiagnostics(t *testing.T) {
 	assert.Equal(t, in, redactSecrets(in))
 }
 
-func TestSafeErr_PreservesErrorIdentity(t *testing.T) {
+func TestSafeErrString_ScrubsThroughWrapping(t *testing.T) {
 	t.Parallel()
-	// Scrubbing must not break errors.Is/As, or control flow that inspects
-	// error identity would silently change behaviour.
-	sentinel := fmt.Errorf("boom token=sk-secret123456789")
-	wrapped := fmt.Errorf("merge failed: %w", sentinel)
-	safe := safeErr(wrapped)
+	// A secret buried in a wrapped error must not survive, and the
+	// surrounding diagnostic context must.
+	sentinel := fmt.Errorf("auth rejected: token=sk-secret123456789")
+	wrapped := fmt.Errorf("merge rework round 1/2: %w", sentinel)
 
-	assert.NotContains(t, safe.Error(), "sk-secret123456789")
-	assert.ErrorIs(t, safe, sentinel, "errors.Is must still match through the wrapper")
-	assert.Nil(t, safeErr(nil), "a nil error stays nil")
+	got := safeErrString(wrapped)
+	assert.NotContains(t, got, "sk-secret123456789", "the secret must not survive")
+	assert.Contains(t, got, "merge rework round 1/2", "the context must survive")
+	assert.Contains(t, got, "auth rejected")
+	assert.Empty(t, safeErrString(nil), "a nil error renders as empty")
 }

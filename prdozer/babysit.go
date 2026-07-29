@@ -97,7 +97,7 @@ func (b *Babysitter) Run(ctx context.Context) (state TerminalState, err error) {
 	if err != nil {
 		// Scrub before persisting or Slacking: run logs live on disk and the
 		// report is published.
-		detail := safeErr(err).Error()
+		detail := safeErrString(err)
 		_ = runLog.Finish(TerminalFailed, detail)
 		b.report(ctx, notifier, runLog, TerminalFailed, detail, "", time.Since(started))
 		return TerminalFailed, err
@@ -158,8 +158,8 @@ func (b *Babysitter) loop(ctx context.Context, rc *RunContext, runLog *RunLog, p
 	for {
 		res, err := w.Tick(ctx)
 		if err != nil {
-			safe := safeErr(err)
-			b.event(runLog, "tick_error", safe.Error(), nil)
+			safe := safeErrString(err)
+			b.event(runLog, "tick_error", safe, nil)
 			b.logger.Error("tick failed", "error", safe)
 			// A tick error is transient (a gh hiccup, a state write); keep
 			// polling rather than abandoning a PR mid-flight.
