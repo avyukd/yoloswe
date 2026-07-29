@@ -159,6 +159,24 @@ func TestNotifyConfig_DMCommandExpandsHome(t *testing.T) {
 		"a config path must be expanded to something exec can run")
 }
 
+// The registry is shared across the fleet, where the home directory differs
+// per box (the Azure devbox runs as "ming", the AWS boxes as "ubuntu"). A
+// hardcoded /home/<user> path in an arg silently breaks on the other boxes —
+// which is exactly how the first dispatched run failed to notify.
+func TestNotifyConfig_DMCommandArgsExpandHome(t *testing.T) {
+	t.Setenv("PRDOZER_SLACK_WEBHOOK", "")
+	t.Setenv("HOME", "/home/testuser")
+	n := NotifyConfig{
+		DMCommand:     "/usr/bin/python3",
+		DMCommandArgs: []string{"~/.claude/skills/slack-message/slack_send.py", "--to", "{{recipient}}"},
+	}.Notifier()
+	require.NotNil(t, n)
+	cmd, ok := n.(notify.CommandNotifier)
+	require.True(t, ok)
+	assert.Equal(t, "/home/testuser/.claude/skills/slack-message/slack_send.py", cmd.Args[0])
+	assert.Equal(t, "{{recipient}}", cmd.Args[2], "placeholders must survive expansion")
+}
+
 func TestReport_NilNotifierIsSafe(t *testing.T) {
 	t.Parallel()
 	// Report must be callable unconditionally at every terminal state.

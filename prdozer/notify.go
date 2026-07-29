@@ -58,10 +58,18 @@ func (c NotifyConfig) Notifier() notify.Notifier {
 		return notify.SlackWebhookNotifier{WebhookURL: url}
 	}
 	if cmd := strings.TrimSpace(c.DMCommand); cmd != "" {
+		// Expand "~" in args too, not just the program path: the registry is
+		// shared across the fleet, where the home directory differs per box
+		// (the Azure devbox runs as "ming", the AWS boxes as "ubuntu"). A
+		// hardcoded /home/<user> path silently breaks on the other boxes.
+		args := make([]string, 0, len(c.DMCommandArgs))
+		for _, a := range c.DMCommandArgs {
+			args = append(args, ExpandHome(a))
+		}
 		return notify.CommandNotifier{
 			Path:      ExpandHome(cmd),
 			Recipient: c.Target,
-			Args:      c.DMCommandArgs,
+			Args:      args,
 		}
 	}
 	return nil
