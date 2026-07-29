@@ -30,7 +30,11 @@ type Snapshot struct {
 	// ChangesRequestedBy lists the reviewers whose latest review requested
 	// changes, so they can be asked to look again once the work is pushed.
 	ChangesRequestedBy []string
-	PR                 PRDetails
+	// IsBotReviewer marks which of those are apps. Bots cannot be re-requested
+	// (GitHub 422: not a collaborator) and do not need to be — they re-review
+	// on push.
+	IsBotReviewer map[string]bool
+	PR            PRDetails
 }
 
 // PRDetails is the fields prdozer cares about from `gh pr view`.
@@ -132,7 +136,20 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 		BaseSHA:            baseSHA,
 		StatusRollup:       summarizeRollup(pr.StatusCheckRollup),
 		ChangesRequestedBy: changesRequestedBy(pr.LatestReviews),
+		IsBotReviewer:      botReviewers(pr.LatestReviews),
 	}, nil
+}
+
+// botReviewers maps the stripped login of each app reviewer to true, keyed the
+// same way as ChangesRequestedBy so the two line up.
+func botReviewers(reviews []reviewRow) map[string]bool {
+	out := make(map[string]bool)
+	for _, r := range reviews {
+		if login, ok := strings.CutSuffix(r.Author.Login, "[bot]"); ok {
+			out[login] = true
+		}
+	}
+	return out
 }
 
 // changesRequestedBy returns the logins whose most recent review requested

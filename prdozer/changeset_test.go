@@ -364,3 +364,21 @@ func TestChangesRequestedBy(t *testing.T) {
 	// The [bot] suffix is a display form the reviewer API does not accept.
 	assert.Equal(t, []string{"sycamore-groot", "coderabbitai"}, got)
 }
+
+// Bots cannot be re-requested: GitHub answers 422 "Reviews may only be
+// requested from collaborators" because an app is not a collaborator. They also
+// do not need it — measured on kernel#8227, coderabbitai re-reviewed 75 seconds
+// after the polish push with no request at all.
+func TestBotReviewers(t *testing.T) {
+	t.Parallel()
+	got := botReviewers([]reviewRow{
+		{State: "CHANGES_REQUESTED", Author: struct {
+			Login string `json:"login"`
+		}{Login: "sycamore-groot[bot]"}},
+		{State: "CHANGES_REQUESTED", Author: struct {
+			Login string `json:"login"`
+		}{Login: "a-human"}},
+	})
+	assert.True(t, got["sycamore-groot"], "keyed by the stripped login, matching ChangesRequestedBy")
+	assert.False(t, got["a-human"], "humans are re-requestable and must not be skipped")
+}

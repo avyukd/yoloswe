@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strconv"
 	"strings"
 	"time"
 
@@ -224,21 +223,44 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 
 // rerequestReviews asks every reviewer who requested changes to look again.
 //
-// Best-effort by design: the polish work is already pushed, so failing to
+// Only HUMAN reviewers are re-requested. GitHub rejects a bot with HTTP 422
+// ("Reviews may only be requested from collaborators") because an app is not a
+// collaborator — and they do not need it: measured on kernel#8227, coderabbitai
+// re-reviewed 75 seconds after the polish push with no request at all. Asking
+// anyway would produce a guaranteed error on every round.
+//
+// Uses the REST endpoint rather than `gh pr edit --add-reviewer`. On kernel,
+// gh's GraphQL path touches repository.pullRequest.projectCards, which is
+// deprecated and errors the whole mutation — the command fails while looking
+// like a harmless deprecation warning.
+//
+// Best-effort by design: the polish work is already pushed, so a failure to
 // re-request is worth a warning but must not turn a successful round into a
-// failed one (which would count toward the backoff that trips cooldown).
+// failed one, which would count toward the backoff that trips cooldown.
 func (w *Watcher) rerequestReviews(ctx context.Context, snap *Snapshot) {
-	reviewers := snap.ChangesRequestedBy
-	if len(reviewers) == 0 {
-		w.logger.Warn("changes requested but no reviewer identified; skipping re-request")
+	var humans []string
+	for _, r := range snap.ChangesRequestedBy {
+		if snap.IsBotReviewer[r] {
+			w.logger.Debug("skipping bot re-request; bots re-review on push", "reviewer", r)
+			continue
+		}
+		humans = append(humans, r)
+	}
+	if len(humans) == 0 {
 		return
 	}
-	for _, r := range reviewers {
-		args := []string{"pr", "edit", strconv.Itoa(w.pr), "--add-reviewer", r}
+	owner, repo, err := repoSlugFromURL(snap.PR.URL)
+	if err != nil {
+		w.logger.Warn("cannot re-request review: unparseable PR URL", "error", err)
+		return
+	}
+	for _, r := range humans {
+		args := []string{
+			"api", "--method", "POST",
+			fmt.Sprintf("repos/%s/%s/pulls/%d/requested_reviewers", owner, repo, w.pr),
+			"-f", "reviewers[]=" + r,
+		}
 		if res, err := w.gh.Run(ctx, args, w.workDir); err != nil {
-			// Bot reviewers frequently cannot be re-requested through this API
-			// (an app is not a requestable reviewer). That is expected, not a
-			// run failure: those bots re-review on push anyway.
 			w.logger.Warn("could not re-request review",
 				"reviewer", r, "error", safeErrString(ghError(err, res)))
 			continue
