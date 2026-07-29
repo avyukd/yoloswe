@@ -300,11 +300,14 @@ func newGCCmd() *cobra.Command {
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 			fmt.Fprintln(tw, "ACTION\tKIND\tPATH\tREASON")
 			for _, c := range res.Candidates {
+				// Key off Eligible, not dryRun: a dry run removes nothing, so
+				// every row would otherwise read as a pending deletion — including
+				// the ones being deliberately kept.
 				action := "skip"
 				switch {
 				case c.Removed:
 					action = "removed"
-				case dryRun:
+				case c.Eligible:
 					action = "would-remove"
 				}
 				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", action, c.Kind, c.Path, c.Reason)

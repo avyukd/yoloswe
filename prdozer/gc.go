@@ -43,9 +43,14 @@ type GCCandidate struct {
 	// Kind is "worktree" or "runlog".
 	Kind string
 	// Reason explains a skip, or the removal justification.
-	Reason  string
-	Age     time.Duration
-	Removed bool
+	Reason string
+	Age    time.Duration
+	// Eligible reports whether this candidate qualifies for removal. It is
+	// distinct from Removed because a dry run never removes anything: without
+	// it, a preview cannot tell "would delete this" from "kept this", and every
+	// row reads as a pending deletion.
+	Eligible bool
+	Removed  bool
 }
 
 // GCResult summarizes a sweep.
@@ -149,6 +154,7 @@ func RunGC(ctx context.Context, git wt.GitRunner, opts GCOptions, logger *slog.L
 				cand.Removed = true
 				res.Removed++
 			}
+			cand.Eligible = true
 			res.Eligible++
 			res.Candidates = append(res.Candidates, cand)
 		}
@@ -176,6 +182,7 @@ func RunGC(ctx context.Context, git wt.GitRunner, opts GCOptions, logger *slog.L
 		if cand.Age < opts.RunLogTTL {
 			cand.Reason = "younger than run-log TTL"
 			res.Skipped++
+			res.Candidates = append(res.Candidates, cand)
 			continue
 		}
 		// Keep anything we cannot positively confirm is finished. An
@@ -206,6 +213,7 @@ func RunGC(ctx context.Context, git wt.GitRunner, opts GCOptions, logger *slog.L
 			cand.Removed = true
 			res.Removed++
 		}
+		cand.Eligible = true
 		res.Eligible++
 		res.Candidates = append(res.Candidates, cand)
 	}
