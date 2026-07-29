@@ -5,14 +5,24 @@ import "context"
 // ApprovalPolicy controls tool execution approval.
 type ApprovalPolicy string
 
+// Not every constant below is accepted by every codex-cli: the app-server's
+// approval enum drifts across versions (0.145.0 removed "on-failure", which
+// 0.141.0 accepts). Prefer ApprovalPolicyOnRequest, which both accept. When the
+// server rejects a policy it enumerates the ones it supports, and the client
+// renegotiates from that list — see approval_negotiate.go.
 const (
 	// ApprovalPolicyUntrusted requires approval for everything.
 	ApprovalPolicyUntrusted ApprovalPolicy = "untrusted"
 
 	// ApprovalPolicyOnFailure approves unless command fails.
+	//
+	// Removed in codex-cli 0.145.0; sending it to a newer server fails with
+	// an "unknown variant" error. Kept for older installs and for the
+	// renegotiation preference list.
 	ApprovalPolicyOnFailure ApprovalPolicy = "on-failure"
 
-	// ApprovalPolicyOnRequest approves on explicit request.
+	// ApprovalPolicyOnRequest approves on explicit request. Accepted by every
+	// codex-cli version we run; the default for the read-only guard.
 	ApprovalPolicyOnRequest ApprovalPolicy = "on-request"
 
 	// ApprovalPolicyNever auto-approves everything (use with caution).
@@ -81,7 +91,7 @@ func DenyAllHandler() ApprovalHandler {
 // reliably filtered here. The review prompt's instructions are the
 // remaining constraint for shell behavior.
 //
-// Requires a non-"never" approval policy (e.g. "on-failure") on the thread
+// Requires a non-"never" approval policy (e.g. "on-request") on the thread
 // so that Codex actually sends approval requests to the handler.
 func ReadOnlyHandler() ApprovalHandler {
 	return ApprovalHandlerFunc(func(ctx context.Context, req *ApprovalRequest) (*ApprovalResponse, error) {

@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "accumulator.go",
         "approval.go",
+        "approval_negotiate.go",
         "client.go",
         "client_options.go",
         "doc.go",
@@ -31,6 +32,7 @@ go_test(
     name = "codex_test",
     srcs = [
         "accumulator_test.go",
+        "approval_negotiate_test.go",
         "approval_test.go",
         "client_options_test.go",
         "client_test.go",
