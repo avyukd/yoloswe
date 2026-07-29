@@ -19,23 +19,34 @@ const discoverAllLimit = 200
 
 // DiscoveredPR is the minimal info needed to route a PR to a watcher.
 type DiscoveredPR struct {
-	HeadRefName string   `json:"headRefName"`
-	BaseRefName string   `json:"baseRefName"`
-	URL         string   `json:"url"`
-	Labels      []string `json:"-"`
-	Number      int      `json:"number"`
-	IsDraft     bool     `json:"isDraft"`
-}
-
-type discoverPRRaw struct {
 	HeadRefName string `json:"headRefName"`
 	BaseRefName string `json:"baseRefName"`
 	URL         string `json:"url"`
-	Labels      []struct {
+	// HeadRepoOwner is the owner of the head branch's repository. It differs
+	// from the base repo's owner exactly when the PR comes from a fork.
+	HeadRepoOwner string   `json:"-"`
+	Labels        []string `json:"-"`
+	Number        int      `json:"number"`
+	IsDraft       bool     `json:"isDraft"`
+	// IsCrossRepository marks a fork PR. Preparing a worktree for one needs
+	// remote wiring prdozer deliberately does not guess at, so it fails
+	// clearly instead.
+	IsCrossRepository bool `json:"isCrossRepository"`
+}
+
+type discoverPRRaw struct {
+	HeadRefName         string `json:"headRefName"`
+	BaseRefName         string `json:"baseRefName"`
+	URL                 string `json:"url"`
+	HeadRepositoryOwner struct {
+		Login string `json:"login"`
+	} `json:"headRepositoryOwner"`
+	Labels []struct {
 		Name string `json:"name"`
 	} `json:"labels"`
-	Number  int  `json:"number"`
-	IsDraft bool `json:"isDraft"`
+	Number            int  `json:"number"`
+	IsDraft           bool `json:"isDraft"`
+	IsCrossRepository bool `json:"isCrossRepository"`
 }
 
 // DiscoverPRs queries gh for open PRs matching the source filter.
@@ -62,7 +73,7 @@ func fetchByNumbers(ctx context.Context, gh wt.GHRunner, dir string, numbers []i
 			defer wg.Done()
 			args := []string{
 				"pr", "view", fmt.Sprintf("%d", n),
-				"--json", "number,headRefName,baseRefName,url,isDraft,labels",
+				"--json", "number,headRefName,baseRefName,url,isDraft,labels,isCrossRepository,headRepositoryOwner",
 			}
 			res, err := gh.Run(ctx, args, dir)
 			if err != nil {
@@ -90,7 +101,7 @@ func discoverAll(ctx context.Context, gh wt.GHRunner, dir string, f SourceFilter
 	args := []string{
 		"pr", "list",
 		"--state", "open",
-		"--json", "number,headRefName,baseRefName,url,isDraft,labels",
+		"--json", "number,headRefName,baseRefName,url,isDraft,labels,isCrossRepository,headRepositoryOwner",
 		"--limit", fmt.Sprintf("%d", discoverAllLimit),
 	}
 	if author := strings.TrimSpace(f.Author); author != "" {
@@ -152,11 +163,13 @@ func toDiscovered(r discoverPRRaw) DiscoveredPR {
 		labels = append(labels, l.Name)
 	}
 	return DiscoveredPR{
-		Number:      r.Number,
-		HeadRefName: r.HeadRefName,
-		BaseRefName: r.BaseRefName,
-		URL:         r.URL,
-		IsDraft:     r.IsDraft,
-		Labels:      labels,
+		Number:            r.Number,
+		HeadRefName:       r.HeadRefName,
+		BaseRefName:       r.BaseRefName,
+		URL:               r.URL,
+		IsDraft:           r.IsDraft,
+		Labels:            labels,
+		IsCrossRepository: r.IsCrossRepository,
+		HeadRepoOwner:     r.HeadRepositoryOwner.Login,
 	}
 }

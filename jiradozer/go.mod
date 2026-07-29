@@ -33,5 +33,6 @@ replace (
 	github.com/bazelment/yoloswe/cliapp => ../cliapp
 	github.com/bazelment/yoloswe/logging => ../logging
 	github.com/bazelment/yoloswe/multiagent => ../multiagent
+	github.com/bazelment/yoloswe/notify => ../notify
 	github.com/bazelment/yoloswe/wt => ../wt
 )

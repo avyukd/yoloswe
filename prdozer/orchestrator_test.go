@@ -41,7 +41,7 @@ func setupGHForOrch(t *testing.T) *fakeGH {
 	t.Helper()
 	gh := newFakeGH()
 	// Discovery: pr list returns 3 PRs.
-	gh.addPrefix("pr list --state open --json number,headRefName,baseRefName,url,isDraft,labels --limit 200 --author @me", `[
+	gh.addPrefix("pr list --state open --json number,headRefName,baseRefName,url,isDraft,labels,isCrossRepository,headRepositoryOwner --limit 200 --author @me", `[
         {"number":10,"headRefName":"feat-a","baseRefName":"main","url":"https://github.com/o/r/pull/10","isDraft":false,"labels":[]},
         {"number":20,"headRefName":"feat-b","baseRefName":"main","url":"https://github.com/o/r/pull/20","isDraft":false,"labels":[]},
         {"number":30,"headRefName":"feat-c","baseRefName":"main","url":"https://github.com/o/r/pull/30","isDraft":false,"labels":[{"name":"wip"}]}
@@ -56,7 +56,7 @@ func setupGHForOrch(t *testing.T) *fakeGH {
             "state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","mergeable":"MERGEABLE",
             "statusCheckRollup":[{"conclusion":"FAILURE","status":"COMPLETED"}]
         }`)
-		gh.addPrefix("pr view "+nStr+" --json number,headRefName,baseRefName,url,isDraft,labels", `{
+		gh.addPrefix("pr view "+nStr+" --json number,headRefName,baseRefName,url,isDraft,labels,isCrossRepository,headRepositoryOwner", `{
             "number":`+nStr+`,"headRefName":"feat","baseRefName":"main","url":"https://github.com/o/r/pull/`+nStr+`","isDraft":false,"labels":[]
         }`)
 	}
@@ -118,7 +118,7 @@ func TestOrchestrator_RunOnce_ConcurrencyLimited(t *testing.T) {
 func TestDiscoverPRs_List(t *testing.T) {
 	t.Parallel()
 	gh := newFakeGH()
-	gh.addPrefix("pr view 5 --json number,headRefName,baseRefName,url,isDraft,labels", `{
+	gh.addPrefix("pr view 5 --json number,headRefName,baseRefName,url,isDraft,labels,isCrossRepository,headRepositoryOwner", `{
         "number":5,"headRefName":"x","baseRefName":"main","url":"u","isDraft":false,"labels":[{"name":"a"}]
     }`)
 	prs, err := DiscoverPRs(context.Background(), gh, ".", SourceConfig{
@@ -134,7 +134,7 @@ func TestDiscoverPRs_List(t *testing.T) {
 func TestDiscoverPRs_AllPassesAuthorFilter(t *testing.T) {
 	t.Parallel()
 	gh := newFakeGH()
-	gh.addPrefix("pr list --state open --json number,headRefName,baseRefName,url,isDraft,labels --limit 200 --author someone", "[]")
+	gh.addPrefix("pr list --state open --json number,headRefName,baseRefName,url,isDraft,labels,isCrossRepository,headRepositoryOwner --limit 200 --author someone", "[]")
 	prs, err := DiscoverPRs(context.Background(), gh, ".", SourceConfig{
 		Mode:   SourceModeAll,
 		Filter: SourceFilter{Author: "someone"},

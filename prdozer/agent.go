@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 
@@ -297,6 +298,40 @@ func (c *compositeHandler) OnRetryAbort(reason, tool, excerpt string) {
 			rh.OnRetryAbort(reason, tool, excerpt)
 		}
 	}
+}
+
+// secretPattern matches the shapes a leaked credential takes in an error
+// string: an api-key/token/secret assignment, or a recognizable key prefix.
+// Matching is case-insensitive and covers `k=v`, `k: v`, and `k=` forms.
+var secretPattern = regexp.MustCompile(
+	`(?i)((?:api[_-]?key|apikey|token|secret|password|authorization)\s*[:=]\s*)\S+` +
+		`|\b(?:sk|pk|ghp|gho|ghs|ghu|github_pat)[-_][A-Za-z0-9_\-]{8,}`)
+
+// redactSecrets scrubs credential-looking substrings from text before it is
+// logged.
+//
+// Agent-provider errors can embed the endpoint configuration that produced
+// them, which carries an API key or the name/value of the env var holding one
+// (CodeQL go/clear-text-logging flags exactly this flow). Run logs are written
+// to disk under ~/.prdozer/runs and fanned out to Slack, so anything reaching
+// them is effectively published — scrub rather than trust the error's shape.
+func redactSecrets(s string) string {
+	return secretPattern.ReplaceAllString(s, "${1}[REDACTED]")
+}
+
+// safeErrString renders err as a scrubbed string. This is the form to hand to
+// a logger, a run-log entry, or a notification.
+//
+// It deliberately returns a STRING rather than a wrapped error. A wrapper that
+// redacts in Error() still carries the unredacted original underneath, so
+// go/clear-text-logging follows the taint straight through it, and any
+// downstream code that unwraps would see the raw message. Converting at the
+// boundary severs the flow outright.
+func safeErrString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return redactSecrets(err.Error())
 }
 
 func truncate(s string, maxLen int) string {

@@ -1,0 +1,16 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+# Marker BUILD file for the notify module root.
+
+go_library(
+    name = "notify",
+    srcs = ["notify.go"],
+    importpath = "github.com/bazelment/yoloswe/notify",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "notify_test",
+    srcs = ["notify_test.go"],
+    embed = [":notify"],
+)

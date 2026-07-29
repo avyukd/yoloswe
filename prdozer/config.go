@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,6 +52,62 @@ type SourceFilter struct {
 	ExcludeLabels []string `yaml:"exclude_labels"` // skip PRs carrying ANY of these labels
 }
 
+// MergePolicy selects how a mergeable PR is landed. The distinction matters
+// because merge-queue repositories reject an explicit strategy flag — the queue
+// itself owns the strategy — so passing --squash there fails the merge outright.
+type MergePolicy string
+
+const (
+	// MergePolicyQueue arms auto-merge and lets the repository's merge queue
+	// pick the strategy. `gh pr merge <N> --auto` with NO strategy flag.
+	MergePolicyQueue MergePolicy = "queue"
+	// MergePolicySquash squashes on merge. Only valid on repos without a
+	// merge queue.
+	MergePolicySquash MergePolicy = "squash"
+	// MergePolicyRebase rebases on merge, for repos requiring linear history.
+	MergePolicyRebase MergePolicy = "rebase"
+	// MergePolicyNotify never merges — it reports and stops. This is the safe
+	// default: opting a repo into real merging is a deliberate, watched step.
+	MergePolicyNotify MergePolicy = "notify"
+)
+
+// Valid reports whether p is a known policy.
+func (p MergePolicy) Valid() bool {
+	switch p {
+	case MergePolicyQueue, MergePolicySquash, MergePolicyRebase, MergePolicyNotify:
+		return true
+	}
+	return false
+}
+
+// MergeArgs returns the `gh` argv for merging prNumber under this policy, or
+// ok=false when the policy never merges.
+//
+// Two rules are encoded here and must not be relaxed:
+//
+//  1. **Never pass --delete-branch.** Two recorded incidents (PRs #6283, #3179)
+//     had --delete-branch close a PR *unmerged*, because the flag still
+//     executes as a side effect when the merge command itself fails. Repos that
+//     want branch cleanup set deleteBranchOnMerge server-side.
+//  2. **Never pass a strategy flag under MergePolicyQueue.** A merge-queue repo
+//     rejects it with "The merge strategy for main is set by the merge queue".
+func (p MergePolicy) MergeArgs(prNumber int) ([]string, bool) {
+	n := strconv.Itoa(prNumber)
+	switch p {
+	case MergePolicyQueue:
+		// --auto ARMS auto-merge; the queue lands it later. The caller must
+		// keep polling until `.merged` is true rather than treating the
+		// successful arm as a completed merge.
+		return []string{"pr", "merge", n, "--auto"}, true
+	case MergePolicySquash:
+		return []string{"pr", "merge", n, "--squash"}, true
+	case MergePolicyRebase:
+		return []string{"pr", "merge", n, "--rebase"}, true
+	default:
+		return nil, false
+	}
+}
+
 // PolishConfig controls the agent invocation per tick.
 type PolishConfig struct {
 	// PermissionMode is passed to the agent provider. Prdozer is designed for
@@ -58,11 +115,16 @@ type PolishConfig struct {
 	// interactive prompts). This is a trust-boundary setting — the agent can
 	// invoke any tool available on the host. Set to "default" to force
 	// per-tool approval, or to any other value accepted by the provider.
-	PermissionMode string  `yaml:"permission_mode"`
-	MaxBudgetUSD   float64 `yaml:"max_budget_usd"` // overrides top-level budget; 0 inherits
-	MaxTurns       int     `yaml:"max_turns"`      // cap turns for /pr-polish session
-	Local          bool    `yaml:"local"`          // pass --local to /pr-polish
-	AutoMerge      bool    `yaml:"auto_merge"`     // run gh pr merge when PR is mergeable
+	PermissionMode string `yaml:"permission_mode"`
+	// MergePolicy selects how AutoMerge lands the PR. Defaults to
+	// MergePolicyNotify so a config that enables auto_merge without naming a
+	// policy reports instead of guessing a strategy — guessing wrong is what
+	// broke kernel merges.
+	MergePolicy  MergePolicy `yaml:"merge_policy"`
+	MaxBudgetUSD float64     `yaml:"max_budget_usd"` // overrides top-level budget; 0 inherits
+	MaxTurns     int         `yaml:"max_turns"`      // cap turns for /pr-polish session
+	Local        bool        `yaml:"local"`          // pass --local to /pr-polish
+	AutoMerge    bool        `yaml:"auto_merge"`     // run gh pr merge when PR is mergeable
 }
 
 // BackoffConfig caps how aggressively prdozer keeps retrying after failures.
@@ -101,6 +163,7 @@ func defaultConfig() Config {
 			AutoMerge:      false,
 			MaxTurns:       100,
 			PermissionMode: "bypass",
+			MergePolicy:    MergePolicyNotify,
 			// MaxBudgetUSD left at zero so validate() inherits the top-level value.
 		},
 		Backoff: BackoffConfig{
@@ -165,6 +228,12 @@ func (c *Config) validate() error {
 	}
 	if c.Polish.PermissionMode == "" {
 		c.Polish.PermissionMode = "bypass"
+	}
+	if c.Polish.MergePolicy == "" {
+		c.Polish.MergePolicy = MergePolicyNotify
+	}
+	if !c.Polish.MergePolicy.Valid() {
+		return fmt.Errorf("polish.merge_policy %q is invalid (want queue, squash, rebase, or notify)", c.Polish.MergePolicy)
 	}
 	if envMode := strings.TrimSpace(os.Getenv("PRDOZER_PERMISSION_MODE")); envMode != "" {
 		c.Polish.PermissionMode = envMode

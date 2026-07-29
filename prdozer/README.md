@@ -153,14 +153,67 @@ Unit tests use a `fakeGH` (prefix-matched stdout map) and a `stubPolish`
 recorder — no real `gh` or Claude CLI invocations. See
 [`docs/design.md`](docs/design.md#testing-strategy) for the testing strategy.
 
+## Babysitting a PR to merge
+
+`prdozer babysit` drives a single PR all the way to merge on whichever
+devbox is healthiest, rather than requiring you to already be sitting in
+the right worktree.
+
+```
+prdozer babysit --pr sycamore-labs/kernel#8123      # pick a box and dispatch
+prdozer babysit --pr <ref> --dry-run                # score table + exact ssh command
+prdozer babysit --pr <ref> --here                   # run in-process, no dispatch
+prdozer fleet status                                # probe table for every box
+prdozer runs                                        # runs recorded on this box
+prdozer gc --dry-run                                # preview what GC would reap
+```
+
+What a run does: pick a host → prepare a private worktree at
+`<worktree_root>/.babysit/<pr>-<runid>` → loop polish / CI-green / merge,
+routing failed merges through the repo's `merge_rework` rounds → notify on
+terminal state → GC the worktree. Logs land in
+`~/.prdozer/runs/<repo>-<pr>-<runid>/` and **outlive** the worktree.
+
+Per-repo behaviour comes from `~/magent/prdozer/registry.yaml`: worktree
+root, layout, flow, merge policy, and the rework rounds.
+
+### Merge policy
+
+`merge_policy` decides how (and whether) a PR lands. It defaults to
+`notify` everywhere — opting a repo into real merging is a deliberate,
+watched step.
+
+| Policy | Behaviour |
+|---|---|
+| `notify` | Never merges. Reports and stops. **Default.** |
+| `queue` | `gh pr merge --auto`, no strategy flag — the merge queue owns the strategy. |
+| `squash` | `gh pr merge --squash`. Only for repos without a merge queue. |
+| `rebase` | `gh pr merge --rebase`, for repos requiring linear history. |
+
+Two rules are enforced in code and must not be relaxed: **never pass
+`--delete-branch`** (it has closed PRs *unmerged* when the merge command
+failed), and **never pass a strategy flag on a queue repo** (it is
+rejected outright). Every merge is verified with
+`gh api repos/<o>/<r>/pulls/<N> --jq .merged` — the only unambiguous
+signal, since `gh pr merge` exiting 0 does not mean the PR merged.
+
+### Safety properties
+
+- **One babysitter per PR**, enforced by an flock held inside the worker
+  process for its whole lifetime.
+- **GC never discards unpushed work.** It pushes first, re-checks, and
+  keeps the worktree (saying so in the notification) if still unclean.
+- **Unbounded merge retries stay visible.** Rework counts as a failure for
+  backoff, so repeated failure trips the 2h cooldown and Slacks a warning.
+
 ## Limitations
 
-- **One process per repo.** prdozer doesn't lock state files across
-  processes. If two instances watch the same PR, the last writer wins.
-- **Worktree assumption.** prdozer assumes the cwd is the PR's worktree
-  (or `--all` mode finds PRs whose head branches are checked out somewhere
-  reachable). Auto-creating worktrees per PR is future work.
+- **Fork PRs are unsupported.** Cross-repository PRs fail with a clear
+  message rather than guessing at remote setup.
 - **gh auth.** Requires `gh auth login` to be set up; checked at startup.
+- **Post-merge delivery is out of scope.** Terminal state is "merged";
+  docker-publish → Deploy to Dev → prod stays with the kernel-local
+  `sy:post-approve-babysit` skill.
 
 ## See also
 
