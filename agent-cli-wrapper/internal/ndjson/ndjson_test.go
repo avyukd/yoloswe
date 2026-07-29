@@ -1,6 +1,7 @@
 package ndjson
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"io"
@@ -136,6 +137,62 @@ func TestWriterErrors(t *testing.T) {
 			t.Fatalf("WriteRaw() error = %v, want %v", err, wantErr)
 		}
 	})
+}
+
+// TestReaderOversizedLineSurfacesError is the regression test for the fault
+// that killed Cursor reviews mid-stream: a line over the scan limit must be
+// reported as an error, never swallowed into a clean io.EOF that reads as
+// "the reviewer finished with no findings".
+func TestReaderOversizedLineSurfacesError(t *testing.T) {
+	t.Parallel()
+
+	oversized := `{"data":"` + strings.Repeat("x", maxTokenSize) + `"}`
+	reader := NewReader(strings.NewReader(oversized + "\n" + `{"ok":1}` + "\n"))
+
+	_, err := reader.ReadLine()
+	if err == nil {
+		t.Fatal("ReadLine() over-limit line error = nil, want error")
+	}
+	if !errors.Is(err, ErrLineTooLong) {
+		t.Fatalf("ReadLine() error = %v, want errors.Is(err, ErrLineTooLong)", err)
+	}
+	if errors.Is(err, io.EOF) {
+		t.Fatalf("ReadLine() error = %v, must not be reported as io.EOF", err)
+	}
+	if !errors.Is(err, bufio.ErrTooLong) {
+		t.Fatalf("ReadLine() error = %v, want the bufio cause preserved", err)
+	}
+
+	// The failure latches: a caller that keeps reading must not see the
+	// truncated stream turn into a normal end-of-stream on the next call.
+	_, err = reader.ReadLine()
+	if !errors.Is(err, ErrLineTooLong) {
+		t.Fatalf("ReadLine() after overflow = %v, want ErrLineTooLong again", err)
+	}
+	if errors.Is(err, io.EOF) {
+		t.Fatalf("ReadLine() after overflow = %v, must not degrade to io.EOF", err)
+	}
+}
+
+// TestReaderLargeLineWithinLimit pins the headroom the raised cap buys: a
+// payload far past the old 1MB limit still reads cleanly.
+func TestReaderLargeLineWithinLimit(t *testing.T) {
+	t.Parallel()
+
+	payload := strings.Repeat("y", 4*1024*1024)
+	reader := NewReader(strings.NewReader(`{"data":"` + payload + `"}` + "\n"))
+
+	line, err := reader.ReadLine()
+	if err != nil {
+		t.Fatalf("ReadLine() 4MB line error = %v, want nil", err)
+	}
+	if want := len(payload) + len(`{"data":""}`); len(line) != want {
+		t.Fatalf("ReadLine() length = %d, want %d", len(line), want)
+	}
+
+	if _, err := reader.ReadLine(); !errors.Is(err, io.EOF) {
+		t.Fatalf("ReadLine() final error = %v, want io.EOF", err)
+	}
 }
 
 type errorWriter struct {
