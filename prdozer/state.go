@@ -37,21 +37,35 @@ const (
 	// (a missing review approval, a fork PR, merge_policy "notify"). Polishing
 	// again cannot help, so the run stops and notifies.
 	LastActionNeedsHuman LastAction = "needs_human"
+	// LastActionReworked means a failed merge was routed through the
+	// merge_rework rounds. It is NOT terminal — the next tick re-snapshots and
+	// re-evaluates from scratch — but it deliberately counts as a failure for
+	// backoff purposes. See recordSnapshot: merge attempts are unbounded, and
+	// the cooldown is the only brake, so rework must never reset the failure
+	// counter or the loop churns forever.
+	LastActionReworked LastAction = "reworked"
 )
 
 // State is the per-PR persisted state, used to detect change between ticks
 // and to back off after repeated failures.
 type State struct {
-	LastCheckAt         time.Time  `json:"last_check_at,omitempty"`
-	CooldownUntil       time.Time  `json:"cooldown_until,omitempty"`
-	LastSeenHeadSHA     string     `json:"last_seen_head_sha,omitempty"`
-	LastSeenBaseSHA     string     `json:"last_seen_base_sha,omitempty"`
-	LastAction          LastAction `json:"last_action,omitempty"`
-	Repo                string     `json:"repo,omitempty"`
-	LastSeenCommentIDs  []string   `json:"last_seen_comment_ids,omitempty"`
-	LastSeenCIRunIDs    []int64    `json:"last_seen_ci_run_ids,omitempty"`
-	ConsecutiveFailures int        `json:"consecutive_failures,omitempty"`
-	PRNumber            int        `json:"pr_number"`
+	LastCheckAt     time.Time  `json:"last_check_at,omitempty"`
+	CooldownUntil   time.Time  `json:"cooldown_until,omitempty"`
+	LastSeenHeadSHA string     `json:"last_seen_head_sha,omitempty"`
+	LastSeenBaseSHA string     `json:"last_seen_base_sha,omitempty"`
+	LastAction      LastAction `json:"last_action,omitempty"`
+	Repo            string     `json:"repo,omitempty"`
+	// LastMergeError is the verbatim gh stderr from the most recent failed
+	// merge, carried across ticks so the rework agent sees the real message.
+	LastMergeError      string   `json:"last_merge_error,omitempty"`
+	LastSeenCommentIDs  []string `json:"last_seen_comment_ids,omitempty"`
+	LastSeenCIRunIDs    []int64  `json:"last_seen_ci_run_ids,omitempty"`
+	ConsecutiveFailures int      `json:"consecutive_failures,omitempty"`
+	PRNumber            int      `json:"pr_number"`
+	// MergeAttempts counts merge attempts across the whole run, surviving
+	// cooldowns so a resumed run keeps climbing (and the Slack message can
+	// honestly say "attempt 9") rather than restarting its numbering.
+	MergeAttempts int `json:"merge_attempts,omitempty"`
 }
 
 // LoadState reads the state file at path. Returns a zero State (no error) when

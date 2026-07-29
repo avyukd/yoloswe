@@ -13,16 +13,27 @@ import (
 
 // Watcher polls a single PR and reacts to changes by invoking the polish agent.
 type Watcher struct {
-	gh       wt.GHRunner
-	polish   PolishRunner
-	cfg      *Config
-	renderer *render.Renderer
-	logger   *slog.Logger
-	repo     string
-	workDir  string
-	self     string
-	pr       int
-	dryRun   bool
+	gh         wt.GHRunner
+	polish     PolishRunner
+	rework     ReworkRunner
+	cfg        *Config
+	renderer   *render.Renderer
+	logger     *slog.Logger
+	repo       string
+	workDir    string
+	self       string
+	reworkSpec StepSpec
+	pr         int
+	dryRun     bool
+}
+
+// WithRework attaches the merge-rework runner and the rounds it should run,
+// normally taken from the registry entry's merge_rework.
+func WithRework(r ReworkRunner, spec StepSpec) WatcherOption {
+	return func(w *Watcher) {
+		w.rework = r
+		w.reworkSpec = spec
+	}
 }
 
 // WatcherOption configures a new Watcher.
@@ -108,9 +119,12 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 		"pr_closed", cs.PRClosed,
 	)
 
-	action := w.decideAndAct(ctx, snap, cs)
+	priorAttempts, priorMergeErr := state.MergeAttempts, state.LastMergeError
+	action := w.decideAndAct(ctx, snap, cs, state)
+	mergeStateDirty := state.MergeAttempts != priorAttempts || state.LastMergeError != priorMergeErr
+
 	res := TickResult{Snapshot: snap, Changeset: cs, Action: action}
-	if w.recordSnapshot(state, snap, action) {
+	if w.recordSnapshot(state, snap, action, mergeStateDirty) {
 		if err := state.Save(statePath); err != nil {
 			// State save failure is serious: the action already ran (maybe merged
 			// or polished) and the next tick will reload stale state and could
@@ -122,7 +136,7 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 	return res, nil
 }
 
-func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset) LastAction {
+func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset, state *State) LastAction {
 	switch {
 	case cs.PRClosed:
 		w.status("PR #%d is %s — nothing to do", w.pr, snap.PR.State)
@@ -136,12 +150,16 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		w.status("PR #%d is mergeable but merge_policy is %q — not merging", w.pr, MergePolicyNotify)
 		return LastActionNeedsHuman
 	case cs.Mergeable && w.cfg.Polish.AutoMerge && !w.dryRun:
+		state.MergeAttempts++
 		outcome, err := w.merge(ctx, snap)
 		if err != nil {
-			w.logger.Error("auto-merge failed", "error", err, "policy", w.cfg.Polish.MergePolicy)
-			w.status("PR #%d auto-merge failed: %v", w.pr, err)
-			return LastActionFailed
+			w.logger.Error("auto-merge failed",
+				"error", err, "policy", w.cfg.Polish.MergePolicy, "attempt", state.MergeAttempts)
+			w.status("PR #%d merge attempt %d failed: %v", w.pr, state.MergeAttempts, err)
+			state.LastMergeError = err.Error()
+			return w.reworkAfterFailedMerge(ctx, snap, state)
 		}
+		state.LastMergeError = ""
 		if outcome == mergeOutcomeArmed {
 			w.status("PR #%d auto-merge armed — waiting for the merge queue", w.pr)
 			return LastActionArmed
@@ -186,6 +204,54 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 	}
 	w.status("PR #%d polish completed", w.pr)
 	return LastActionPolished
+}
+
+// reworkAfterFailedMerge decides what happens after a merge attempt fails.
+//
+// A merge can fail in ways /pr-polish will never fix, because they are about
+// LANDING rather than code quality: the queue dequeued the PR, a speculative
+// batch build went red, the base moved, a required check flipped after
+// approval. Those get the repo's merge_rework rounds; the next tick then
+// re-snapshots and re-evaluates from scratch.
+//
+// Two cases are terminal instead, because no agent round can resolve them:
+// a merge policy that never merges, and a missing human approval.
+func (w *Watcher) reworkAfterFailedMerge(ctx context.Context, snap *Snapshot, state *State) LastAction {
+	switch {
+	case w.cfg.Polish.MergePolicy == MergePolicyNotify:
+		w.status("PR #%d merge failed and merge_policy is %q — stopping", w.pr, MergePolicyNotify)
+		return LastActionNeedsHuman
+	case snap.PR.ReviewDecision == "REVIEW_REQUIRED":
+		w.status("PR #%d merge failed and needs a human approval — stopping", w.pr)
+		return LastActionNeedsHuman
+	case w.rework == nil || w.reworkSpec.Empty():
+		// Nothing configured to try. Report a plain failure so backoff still
+		// applies, rather than silently idling.
+		w.logger.Warn("merge failed and no merge_rework configured", "pr", w.pr)
+		return LastActionFailed
+	}
+
+	req := ReworkRequest{
+		WorkDir:     w.workDir,
+		Repo:        w.repo,
+		Branch:      snap.PR.HeadRefName,
+		PRURL:       snap.PR.URL,
+		MergeError:  state.LastMergeError,
+		MergePolicy: w.cfg.Polish.MergePolicy,
+		Spec:        w.reworkSpec,
+		Model:       w.cfg.Agent.Model,
+		Cfg:         w.cfg.Polish,
+		PRNumber:    w.pr,
+		Attempt:     state.MergeAttempts,
+	}
+	w.status("PR #%d running merge rework (attempt %d)", w.pr, state.MergeAttempts)
+	if _, err := w.rework.Run(ctx, req); err != nil {
+		w.logger.Error("merge rework failed", "error", err, "attempt", state.MergeAttempts)
+		w.status("PR #%d merge rework failed: %v", w.pr, err)
+		return LastActionFailed
+	}
+	w.status("PR #%d merge rework completed — will retry merge next tick", w.pr)
+	return LastActionReworked
 }
 
 // mergeOutcome is the result of one merge attempt.
@@ -266,13 +332,18 @@ func (w *Watcher) verifyMerged(ctx context.Context, owner, repo string) (bool, e
 // Dry-run is fully observe-only: it skips every persisted-state mutation so a
 // later live tick still sees the same triggers (new HEAD, new comments, new
 // failed CI runs) and can react to them.
-func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction) bool {
+//
+// mergeStateDirty tells it that decideAndAct already mutated MergeAttempts or
+// LastMergeError on s. Without that signal a tick whose only change was a
+// merge attempt would look unchanged and skip the disk write, losing the
+// attempt count the unbounded-retry design depends on.
+func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, mergeStateDirty bool) bool {
 	if action == LastActionDryRun {
 		return false
 	}
 
 	firstRun := s.LastCheckAt.IsZero()
-	dirty := firstRun
+	dirty := firstRun || mergeStateDirty
 
 	if s.LastSeenHeadSHA != snap.PR.HeadRefOid {
 		s.LastSeenHeadSHA = snap.PR.HeadRefOid
@@ -299,7 +370,14 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction) bo
 		dirty = true
 	}
 	switch action {
-	case LastActionFailed:
+	// LastActionReworked shares the failure arm deliberately. Merge attempts
+	// are UNBOUNDED by design, and the only brake is
+	// backoff.max_consecutive_failures -> cooldown. If rework landed in the
+	// success arm below it would clear ConsecutiveFailures on every pass, the
+	// cooldown could never trip, and a PR that cannot merge would churn
+	// /pr-polish and rework rounds forever. Rework is not a terminal failure,
+	// but it must count as one for backoff.
+	case LastActionFailed, LastActionReworked:
 		s.ConsecutiveFailures++
 		dirty = true
 		if w.cfg.Backoff.MaxConsecutiveFailures > 0 && s.ConsecutiveFailures >= w.cfg.Backoff.MaxConsecutiveFailures && w.cfg.Backoff.Cooldown > 0 {

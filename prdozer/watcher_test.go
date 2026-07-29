@@ -18,13 +18,17 @@ import (
 
 // fakeGH is a minimal GHRunner that matches by joined-args prefix.
 type fakeGH struct {
-	results map[string]*wt.CmdResult
-	calls   [][]string
-	mu      sync.Mutex
+	results  map[string]*wt.CmdResult
+	failures map[string]*wt.CmdResult
+	calls    [][]string
+	mu       sync.Mutex
 }
 
 func newFakeGH() *fakeGH {
-	return &fakeGH{results: make(map[string]*wt.CmdResult)}
+	return &fakeGH{
+		results:  make(map[string]*wt.CmdResult),
+		failures: make(map[string]*wt.CmdResult),
+	}
 }
 
 // addPrefix registers a stdout response for any call whose joined-args starts with prefix.
@@ -32,11 +36,25 @@ func (f *fakeGH) addPrefix(prefix, stdout string) {
 	f.results[prefix] = &wt.CmdResult{Stdout: stdout}
 }
 
+// failPrefix registers a FAILING response (non-zero exit plus stderr) for any
+// call whose joined-args starts with prefix, so tests can exercise the paths
+// that only run when a gh command actually errors.
+func (f *fakeGH) failPrefix(prefix, stderr string) {
+	f.failures[prefix] = &wt.CmdResult{Stderr: stderr, ExitCode: 1}
+}
+
 func (f *fakeGH) Run(_ context.Context, args []string, _ string) (*wt.CmdResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, args)
 	joined := strings.Join(args, " ")
+	// Failures are checked first so a failPrefix can override a broader
+	// success prefix registered by setupGH.
+	for prefix, res := range f.failures {
+		if strings.HasPrefix(joined, prefix) {
+			return res, fmt.Errorf("exit status %d", res.ExitCode)
+		}
+	}
 	for prefix, res := range f.results {
 		if strings.HasPrefix(joined, prefix) {
 			return res, nil
