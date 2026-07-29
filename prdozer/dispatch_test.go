@@ -99,6 +99,32 @@ func TestDispatchRequest_SSHCommandIsPrintableForDryRun(t *testing.T) {
 	assert.Contains(t, got, "babysit-local")
 }
 
+func TestDispatchRequest_UsesResolvedBinaryPath(t *testing.T) {
+	t.Parallel()
+	// A non-interactive SSH shell's PATH omits ~/bin (verified against the
+	// real fleet), so a bare "prdozer" produces a tmux session that dies with
+	// "command not found" — indistinguishable from a silent no-op.
+	req := DispatchRequest{
+		Host: HostHealth{
+			PublicDNS:   "b.example",
+			HasPrdozer:  true,
+			PrdozerPath: "/home/ming/bin/prdozer",
+		},
+		OwnerRepo: "o/r",
+		PRNumber:  1,
+	}
+	assert.Contains(t, req.RemoteCommand(), "/home/ming/bin/prdozer babysit-local")
+
+	// With no resolved path, fall back to the bare name rather than emitting
+	// an empty command.
+	bare := DispatchRequest{
+		Host:      HostHealth{PublicDNS: "b.example", HasPrdozer: true},
+		OwnerRepo: "o/r",
+		PRNumber:  1,
+	}
+	assert.Contains(t, bare.RemoteCommand(), "prdozer babysit-local")
+}
+
 func TestDispatchRequest_KeepWorktreeFlagPropagates(t *testing.T) {
 	t.Parallel()
 	req := DispatchRequest{

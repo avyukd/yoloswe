@@ -22,30 +22,25 @@ echo "__LOAD__"; cat /proc/loadavg
 echo "__DF__"; df -P "$HOME"; df -P /mnt/nvme 2>/dev/null
 echo "__TMUX__"; tmux list-windows -a 2>/dev/null | wc -l
 echo "__LEASES__"; ls ~/.prdozer/leases/ 2>/dev/null | wc -l
-echo "__PRDOZER__"; command -v prdozer || echo MISSING
+echo "__PRDOZER__"; command -v prdozer || ([ -x "$HOME/bin/prdozer" ] && echo "$HOME/bin/prdozer") || echo MISSING
 echo "__END__"`
 
 // HostHealth is one probed box.
 type HostHealth struct {
-	Err        error
-	Host       string
-	SSHUser    string
-	PublicDNS  string
-	Cores      int
-	Load1      float64
-	DiskFreeGB int
-	// NVMeFreeGB is the free space on /mnt/nvme, which exists only on the
-	// Azure box. Zero when absent.
+	Err         error
+	Host        string
+	SSHUser     string
+	PublicDNS   string
+	PrdozerPath string
+	DiskFreeGB  int
+	Load1       float64
 	NVMeFreeGB  int
 	TmuxWindows int
-	// Leases counts babysit leases already held on that box.
-	Leases int
-	// HasPrdozer reports whether the prdozer binary is on the target's PATH.
-	// Dispatching to a box without it produces a tmux session that dies
-	// instantly and looks like a silent no-op.
-	HasPrdozer bool
-	Reachable  bool
-	IsSelf     bool
+	Leases      int
+	Cores       int
+	HasPrdozer  bool
+	Reachable   bool
+	IsSelf      bool
 }
 
 // Target returns the ssh destination for this host.
@@ -235,6 +230,7 @@ func parseProbe(raw string, hh *HostHealth) error {
 	}
 	if v := firstLine(sections["PRDOZER"]); v != "" && v != "MISSING" {
 		hh.HasPrdozer = true
+		hh.PrdozerPath = v
 	}
 	return nil
 }
@@ -342,12 +338,12 @@ func ScoreHosts(hosts []HostHealth) {
 func PickHost(hosts []HostHealth, opts ProbeOptions) (HostHealth, error) {
 	ScoreHosts(hosts)
 	var reasons []string
-	for _, h := range hosts {
-		if ok, _ := h.Eligible(opts); ok {
-			return h, nil
+	for i := range hosts {
+		ok, why := hosts[i].Eligible(opts)
+		if ok {
+			return hosts[i], nil
 		}
-		_, why := h.Eligible(opts)
-		reasons = append(reasons, fmt.Sprintf("%s: %s", h.Host, why))
+		reasons = append(reasons, fmt.Sprintf("%s: %s", hosts[i].Host, why))
 	}
 	return HostHealth{}, fmt.Errorf("no eligible host (%s)", strings.Join(reasons, "; "))
 }

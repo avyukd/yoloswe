@@ -4,6 +4,7 @@ go_library(
     name = "prdozer",
     srcs = [
         "agent.go",
+        "babysit.go",
         "changeset.go",
         "config.go",
         "discovery.go",

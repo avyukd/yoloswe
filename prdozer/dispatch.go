@@ -119,8 +119,16 @@ type DispatchRequest struct {
 // worker instead takes the lease itself at startup via AcquireLease, holding it
 // for its real lifetime.
 func (r DispatchRequest) RemoteCommand() string {
+	// Use the path the probe actually resolved. A non-interactive SSH shell
+	// does not include ~/bin on PATH (verified), so a bare "prdozer" here
+	// would produce a tmux session that dies instantly with "command not
+	// found" — indistinguishable from a silent no-op.
+	bin := r.Host.PrdozerPath
+	if bin == "" {
+		bin = "prdozer"
+	}
 	inner := []string{
-		"prdozer", "babysit-local",
+		bin, "babysit-local",
 		"--repo", shellQuote(r.OwnerRepo),
 		"--pr", fmt.Sprintf("%d", r.PRNumber),
 	}

@@ -77,6 +77,8 @@ func main() {
 	rootCmd.Flags().BoolVar(&autoMerge, "auto-merge", false, "Merge PRs that become mergeable")
 	rootCmd.Flags().StringVar(&repoOverride, "repo", "", "Short repo name for state-file path (default: derive from cwd)")
 
+	addBabysitCommands(rootCmd)
+
 	os.Exit(cliapp.Run(&opts, func(ctx context.Context, app *cliapp.App) error {
 		return rootCmd.ExecuteContext(cliapp.WithApp(ctx, app))
 	}))
