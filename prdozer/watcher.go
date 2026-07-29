@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -191,8 +192,8 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		w.logger.Warn("no polish runner configured; skipping action")
 		return LastActionIdle
 	}
-	w.status("PR #%d polishing (base_moved=%t ci_failed=%t new_comments=%d)",
-		w.pr, cs.BaseMoved, cs.CIFailed, len(cs.NewCommentIDs))
+	w.status("PR #%d polishing (base_moved=%t ci_failed=%t new_comments=%d changes_requested=%t)",
+		w.pr, cs.BaseMoved, cs.CIFailed, len(cs.NewCommentIDs), cs.ChangesRequested)
 	req := PolishRequest{
 		PRNumber: w.pr,
 		WorkDir:  w.workDir,
@@ -210,7 +211,40 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		return LastActionFailed
 	}
 	w.status("PR #%d polish completed", w.pr)
+
+	// A CHANGES_REQUESTED verdict is sticky: it stays set until the reviewer
+	// looks again. Without an explicit re-request the fixes just sit there and
+	// the flag never clears, so the loop would keep re-polishing the same
+	// already-addressed comments forever.
+	if cs.ChangesRequested {
+		w.rerequestReviews(ctx, snap)
+	}
 	return LastActionPolished
+}
+
+// rerequestReviews asks every reviewer who requested changes to look again.
+//
+// Best-effort by design: the polish work is already pushed, so failing to
+// re-request is worth a warning but must not turn a successful round into a
+// failed one (which would count toward the backoff that trips cooldown).
+func (w *Watcher) rerequestReviews(ctx context.Context, snap *Snapshot) {
+	reviewers := snap.ChangesRequestedBy
+	if len(reviewers) == 0 {
+		w.logger.Warn("changes requested but no reviewer identified; skipping re-request")
+		return
+	}
+	for _, r := range reviewers {
+		args := []string{"pr", "edit", strconv.Itoa(w.pr), "--add-reviewer", r}
+		if res, err := w.gh.Run(ctx, args, w.workDir); err != nil {
+			// Bot reviewers frequently cannot be re-requested through this API
+			// (an app is not a requestable reviewer). That is expected, not a
+			// run failure: those bots re-review on push anyway.
+			w.logger.Warn("could not re-request review",
+				"reviewer", r, "error", safeErrString(ghError(err, res)))
+			continue
+		}
+		w.status("PR #%d re-requested review from %s", w.pr, r)
+	}
 }
 
 // reworkAfterFailedMerge decides what happens after a merge attempt fails.

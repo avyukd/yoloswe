@@ -306,3 +306,61 @@ func TestReviewSatisfied(t *testing.T) {
 		})
 	}
 }
+
+// A CHANGES_REQUESTED verdict is work, not a wall: the reviewer asked for
+// specific changes and addressing them is exactly what the polish loop does.
+// It must be its OWN trigger — the review comments get consumed as "seen" on
+// an early tick, after which nothing would drive the loop and the flag would
+// sit set forever.
+func TestComputeChangeset_ChangesRequestedDrivesPolish(t *testing.T) {
+	t.Parallel()
+	prev := &State{
+		LastCheckAt:     time.Now(),
+		LastSeenHeadSHA: "head1",
+		LastSeenBaseSHA: "base1",
+	}
+	snap := snapWithRollup(StatusSuccess)
+	snap.PR.ReviewDecision = "CHANGES_REQUESTED"
+	snap.PR.Mergeable = "MERGEABLE"
+
+	cs := ComputeChangeset(prev, snap)
+	assert.True(t, cs.ChangesRequested, "a changes-requested verdict must be surfaced")
+	assert.True(t, cs.NeedsPolish(), "requested changes route to polish")
+	assert.False(t, cs.Mergeable, "never merge past a changes-requested verdict")
+	assert.False(t, cs.NeedsReview, "this is agent-fixable, not a needs-human stop")
+	assert.False(t, cs.Empty(), "a changes-requested PR is actionable")
+}
+
+// Unlike the event-shaped triggers, this one is standing state: suppressing it
+// on the first tick would mean pointing prdozer at a changes-requested PR does
+// nothing on the tick that matters.
+func TestComputeChangeset_ChangesRequestedFiresOnFirstRun(t *testing.T) {
+	t.Parallel()
+	snap := snapWithRollup(StatusSuccess)
+	snap.PR.ReviewDecision = "CHANGES_REQUESTED"
+	snap.PR.Mergeable = "MERGEABLE"
+
+	cs := ComputeChangeset(&State{}, snap) // zero state == first run
+	assert.True(t, cs.ChangesRequested, "standing state must fire even on first run")
+	assert.True(t, cs.NeedsPolish())
+}
+
+func TestChangesRequestedBy(t *testing.T) {
+	t.Parallel()
+	got := changesRequestedBy([]reviewRow{
+		{State: "CHANGES_REQUESTED", Author: struct {
+			Login string `json:"login"`
+		}{Login: "sycamore-groot[bot]"}},
+		{State: "APPROVED", Author: struct {
+			Login string `json:"login"`
+		}{Login: "someone"}},
+		{State: "CHANGES_REQUESTED", Author: struct {
+			Login string `json:"login"`
+		}{Login: "coderabbitai[bot]"}},
+		{State: "CHANGES_REQUESTED", Author: struct {
+			Login string `json:"login"`
+		}{Login: "sycamore-groot[bot]"}}, // duplicate
+	})
+	// The [bot] suffix is a display form the reviewer API does not accept.
+	assert.Equal(t, []string{"sycamore-groot", "coderabbitai"}, got)
+}
