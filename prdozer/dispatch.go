@@ -138,10 +138,7 @@ func (r DispatchRequest) RemoteCommand() string {
 	if r.KeepWorktree {
 		inner = append(inner, "--keep-worktree")
 	}
-	// Put the user bin dirs on PATH via tmux -e rather than wrapping the
-	// command in `sh -c "export PATH=...; exec ..."`. Both work, but the
-	// wrapper needs three levels of nested shell quoting, and --dry-run is
-	// meant to print something a human can paste and run.
+	// Set PATH by wrapping the command in a shell.
 	//
 	// This matters because an absolute path fixes prdozer itself but not the
 	// agent: prdozer SPAWNS the CLI as a child and resolves it from PATH, and
@@ -149,15 +146,21 @@ func (r DispatchRequest) RemoteCommand() string {
 	// Without it the worker starts, detects work correctly, then every polish
 	// round dies with `exec: "claude": executable file not found in $PATH` —
 	// a failure with nothing to do with the PR.
-	parts := []string{"tmux", "new-session", "-d"}
+	//
+	// `tmux -e PATH=...` does NOT work here and was tried first: tmux treats
+	// PATH specially and silently ignores the override, so the session still
+	// runs with the tmux server's PATH. (`-e FOO=bar` DOES work, which makes
+	// the failure easy to misdiagnose — verify with PATH itself, not a proxy
+	// variable.) The shell wrapper costs an extra quoting level but actually
+	// takes effect.
+	cmd := strings.Join(inner, " ")
 	if pathEnv := r.remotePathEnv(); pathEnv != "" {
-		parts = append(parts, "-e", shellQuote("PATH="+pathEnv))
+		cmd = "export PATH=" + shellQuote(pathEnv) + "; exec " + cmd
 	}
-	parts = append(parts, "-s",
+	return fmt.Sprintf("tmux new-session -d -s %s %s",
 		shellQuote(TmuxSessionName(r.OwnerRepo, r.PRNumber)),
-		shellQuote(strings.Join(inner, " ")),
+		shellQuote("sh -c "+shellQuote(cmd)),
 	)
-	return strings.Join(parts, " ")
 }
 
 // remotePathEnv builds the PATH the worker needs on the target box.

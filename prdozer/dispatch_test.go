@@ -214,8 +214,13 @@ func TestDispatchRequest_RemoteCommandPutsUserBinOnPath(t *testing.T) {
 	}
 	req.Host.PrdozerPath = "/home/ming/bin/prdozer"
 	cmd := req.RemoteCommand()
-	assert.Contains(t, cmd, "tmux new-session -d -e",
-		"PATH goes through tmux -e, not a nested sh -c wrapper that needs three levels of quoting")
+	// NOT tmux -e: tmux treats PATH specially and silently ignores an -e
+	// override, so the session keeps the tmux server's PATH. (-e FOO=bar does
+	// work, which makes this easy to misdiagnose.) Only a shell wrapper takes
+	// effect.
+	assert.NotContains(t, cmd, "-e 'PATH=",
+		"tmux -e cannot override PATH; it is silently ignored")
+	assert.Contains(t, cmd, "export PATH=")
 	assert.Contains(t, cmd, "/home/ming/.local/bin",
 		"the agent CLI lives in ~/.local/bin and is resolved from PATH")
 	assert.Contains(t, cmd, "/home/ming/bin")
@@ -236,5 +241,6 @@ func TestDispatchRequest_RemotePathEnvUnresolvableIsOmitted(t *testing.T) {
 		PRNumber:  1,
 	}
 	assert.Empty(t, req.remotePathEnv())
-	assert.NotContains(t, req.RemoteCommand(), "-e ", "no -e flag when PATH cannot be derived")
+	assert.NotContains(t, req.RemoteCommand(), "export PATH=",
+		"no PATH export when it cannot be derived")
 }
