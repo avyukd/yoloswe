@@ -123,8 +123,14 @@ type PolishConfig struct {
 	MergePolicy  MergePolicy `yaml:"merge_policy"`
 	MaxBudgetUSD float64     `yaml:"max_budget_usd"` // overrides top-level budget; 0 inherits
 	MaxTurns     int         `yaml:"max_turns"`      // cap turns for /pr-polish session
-	Local        bool        `yaml:"local"`          // pass --local to /pr-polish
-	AutoMerge    bool        `yaml:"auto_merge"`     // run gh pr merge when PR is mergeable
+	// RoundsPerTick caps /pr-polish's INTERNAL round loop, which runs inside a
+	// single polish.Run() call. Without a cap one tick absorbs unbounded work —
+	// kernel#8227 ran 22 rounds over 64 minutes in ONE tick — and since the
+	// divergence guard compares health BETWEEN ticks, a tick that never ends is
+	// never guarded. Zero omits the flag and uses the skill's own default.
+	RoundsPerTick int  `yaml:"rounds_per_tick"`
+	Local         bool `yaml:"local"`      // pass --local to /pr-polish
+	AutoMerge     bool `yaml:"auto_merge"` // run gh pr merge when PR is mergeable
 }
 
 // BackoffConfig caps how aggressively prdozer keeps retrying after failures.
@@ -172,6 +178,7 @@ func defaultConfig() Config {
 			Local:          false,
 			AutoMerge:      false,
 			MaxTurns:       100,
+			RoundsPerTick:  3,
 			PermissionMode: "bypass",
 			MergePolicy:    MergePolicyNotify,
 			// MaxBudgetUSD left at zero so validate() inherits the top-level value.

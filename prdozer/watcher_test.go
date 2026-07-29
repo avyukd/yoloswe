@@ -567,9 +567,21 @@ func TestFetchBaseSHA_EscapesSlashInBranch(t *testing.T) {
 
 func TestBuildPolishPrompt(t *testing.T) {
 	t.Parallel()
-	assert.Equal(t, "/pr-polish 42", buildPolishPrompt(42, false))
-	assert.Equal(t, "/pr-polish --local 42", buildPolishPrompt(42, true))
-	assert.Equal(t, "/pr-polish", buildPolishPrompt(0, false))
+	assert.Equal(t, "/pr-polish 42", buildPolishPrompt(42, false, 0))
+	assert.Equal(t, "/pr-polish --local 42", buildPolishPrompt(42, true, 0))
+	assert.Equal(t, "/pr-polish", buildPolishPrompt(0, false, 0))
+}
+
+// /pr-polish loops internally inside ONE polish.Run() call. Uncapped, a single
+// tick absorbed 22 rounds over 64 minutes on kernel#8227 — and the divergence
+// guard compares health BETWEEN ticks, so a tick that never ends is never
+// guarded. The cap is what makes the tick boundary mean anything.
+func TestBuildPolishPrompt_CapsInternalRounds(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, "/pr-polish --rounds 3 42", buildPolishPrompt(42, false, 3))
+	assert.Equal(t, "/pr-polish --local --rounds 3 42", buildPolishPrompt(42, true, 3))
+	assert.Equal(t, "/pr-polish 42", buildPolishPrompt(42, false, 0),
+		"zero omits the flag so the skill uses its own default")
 }
 
 // Sanity check that fakeGH wraps OS env without leaking real paths.
