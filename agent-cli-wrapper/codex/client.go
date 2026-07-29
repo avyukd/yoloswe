@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
+	"strings"
 	"sync"
 	"time"
 )
@@ -206,11 +208,17 @@ func (c *Client) CreateThread(ctx context.Context, opts ...ThreadOption) (*Threa
 		opt(&cfg)
 	}
 
-	params := threadStartParamsFromConfig(cfg)
-
-	resp, err := c.sendRequestAndWait(ctx, "thread/start", params)
+	resp, negotiated, err := c.sendNegotiatingApprovalPolicy(ctx, "thread/start", cfg.ApprovalPolicy,
+		func(policy ApprovalPolicy) interface{} {
+			retry := cfg
+			retry.ApprovalPolicy = policy
+			return threadStartParamsFromConfig(retry)
+		})
 	if err != nil {
 		return nil, err
+	}
+	if negotiated != "" {
+		cfg.ApprovalPolicy = negotiated
 	}
 
 	var threadResp ThreadStartResponse
@@ -232,14 +240,20 @@ func (c *Client) ResumeThread(ctx context.Context, threadID string, opts ...Thre
 		opt(&cfg)
 	}
 
-	params := ThreadResumeParams{
-		ThreadStartParams: threadStartParamsFromConfig(cfg),
-		ThreadID:          threadID,
-	}
-
-	resp, err := c.sendRequestAndWait(ctx, "thread/resume", params)
+	resp, negotiated, err := c.sendNegotiatingApprovalPolicy(ctx, "thread/resume", cfg.ApprovalPolicy,
+		func(policy ApprovalPolicy) interface{} {
+			retry := cfg
+			retry.ApprovalPolicy = policy
+			return ThreadResumeParams{
+				ThreadStartParams: threadStartParamsFromConfig(retry),
+				ThreadID:          threadID,
+			}
+		})
 	if err != nil {
 		return nil, err
+	}
+	if negotiated != "" {
+		cfg.ApprovalPolicy = negotiated
 	}
 
 	var threadResp ThreadResumeResponse
@@ -285,6 +299,80 @@ func threadStartParamsFromConfig(cfg ThreadConfig) ThreadStartParams {
 		params.ApprovalPolicy = string(cfg.ApprovalPolicy)
 	}
 	return params
+}
+
+// sendNegotiatingApprovalPolicy sends a thread request and, if the app-server
+// rejects the approval policy as an unknown variant, retries once with the best
+// policy the server said it supports.
+//
+// The set of accepted policies is codex-version-dependent (0.145.0 dropped
+// "on-failure", which 0.141.0 accepts) and the fleet is not uniformly upgraded,
+// so a hardcoded literal is wrong on some host either way. buildParams
+// re-renders the request for a candidate policy.
+//
+// The returned policy is the one the server actually accepted, or "" when no
+// renegotiation was needed. Renegotiation never falls back to a non-interactive
+// policy: doing so would disable the read-only guard without telling anyone,
+// which is worse than the startup failure it would paper over.
+func (c *Client) sendNegotiatingApprovalPolicy(
+	ctx context.Context,
+	method string,
+	requested ApprovalPolicy,
+	buildParams func(ApprovalPolicy) interface{},
+) (*JSONRPCResponse, ApprovalPolicy, error) {
+	return negotiateApprovalPolicySend(ctx, method, requested, buildParams, c.sendRequestAndWait)
+}
+
+// negotiateApprovalPolicySend holds the negotiation logic independent of the
+// client's transport, so the retry behavior can be tested without a subprocess.
+func negotiateApprovalPolicySend(
+	ctx context.Context,
+	method string,
+	requested ApprovalPolicy,
+	buildParams func(ApprovalPolicy) interface{},
+	send func(context.Context, string, interface{}) (*JSONRPCResponse, error),
+) (*JSONRPCResponse, ApprovalPolicy, error) {
+	resp, err := send(ctx, method, buildParams(requested))
+	if err == nil {
+		return resp, "", nil
+	}
+
+	rejection, ok := parseApprovalPolicyRejection(err)
+	if !ok {
+		return nil, "", err
+	}
+
+	// "never" needs no handler and is not an interactive policy, so a caller
+	// that asked for it is not relying on the approval guard. Renegotiating it
+	// would silently upgrade to a policy that blocks without a wired handler.
+	if requested == ApprovalPolicyNever {
+		return nil, "", err
+	}
+
+	fallback, ok := negotiateInteractiveApprovalPolicy(rejection.Supported)
+	if !ok {
+		return nil, "", &approvalPolicyNegotiationError{
+			Rejected:  rejection.Rejected,
+			Supported: rejection.Supported,
+		}
+	}
+	if fallback == requested {
+		// The server rejected exactly what we would retry with; retrying is
+		// guaranteed to fail again, so surface the original error.
+		return nil, "", err
+	}
+
+	slog.Warn("codex rejected approval policy; retrying with a supported one",
+		"method", method,
+		"requested", string(requested),
+		"negotiated", string(fallback),
+		"server_supports", strings.Join(rejection.Supported, ","))
+
+	resp, err = send(ctx, method, buildParams(fallback))
+	if err != nil {
+		return nil, "", err
+	}
+	return resp, fallback, nil
 }
 
 func (c *Client) registerThreadResponse(threadResp ThreadStartResponse, cfg ThreadConfig) *Thread {
