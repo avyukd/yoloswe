@@ -26,6 +26,7 @@ go_library(
         "//agent-cli-wrapper/llmendpoint",
         "//jiradozer/tracker",
         "//multiagent/agent",
+        "//notify",
         "//wt",
         "@in_gopkg_yaml_v3//:yaml_v3",
     ],

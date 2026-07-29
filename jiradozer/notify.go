@@ -1,14 +1,13 @@
 package jiradozer
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
-	"time"
+
+	"github.com/bazelment/yoloswe/notify"
 )
 
 // FailureReport is the human-facing summary of a run that aborted. It is built
@@ -97,14 +96,17 @@ func (r FailureReport) renderFailureText() string {
 // Notifier delivers a failure report to an external destination. Implementations
 // must be safe to call with a context deadline and must not panic on partial
 // configuration.
+//
+// This stays a jiradozer-shaped interface (it takes a FailureReport, not a
+// generic message) because callers and tests are written against it. Delivery
+// is delegated to the shared notify module.
 type Notifier interface {
 	Notify(ctx context.Context, report FailureReport) error
 }
 
-// SlackWebhookNotifier posts failure reports to a Slack incoming webhook. It is
-// the first (and currently only) external sink; the Notifier interface keeps the
-// reporting call site provider-agnostic so a different backend can be added
-// without touching the workflow.
+// SlackWebhookNotifier posts failure reports to a Slack incoming webhook,
+// delegating transport to notify.SlackWebhookNotifier so jiradozer and prdozer
+// share one implementation.
 type SlackWebhookNotifier struct {
 	Client     *http.Client
 	WebhookURL string
@@ -112,31 +114,10 @@ type SlackWebhookNotifier struct {
 
 // Notify posts the report's text to the Slack webhook as a simple message.
 func (n SlackWebhookNotifier) Notify(ctx context.Context, report FailureReport) error {
-	if n.WebhookURL == "" {
-		return nil
-	}
-	client := n.Client
-	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
-	}
-	payload, err := json.Marshal(map[string]string{"text": report.renderFailureText()})
-	if err != nil {
-		return fmt.Errorf("marshal slack payload: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.WebhookURL, bytes.NewReader(payload))
-	if err != nil {
-		return fmt.Errorf("build slack request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("post to slack: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("slack webhook returned status %d", resp.StatusCode)
-	}
-	return nil
+	return notify.SlackWebhookNotifier{
+		Client:     n.Client,
+		WebhookURL: n.WebhookURL,
+	}.Notify(ctx, notify.Message{Body: report.renderFailureText()})
 }
 
 // ReportFailure fans a failure report out to all configured sinks. It is
@@ -176,6 +157,7 @@ func ReportFailure(ctx context.Context, logger *slog.Logger, poster CommentPoste
 	}
 }
 
-// sinkTimeout bounds each failure-report sink independently. It is a var (not a
+// sinkTimeout bounds each failure-report sink independently. It seeds from the
+// shared module so both tools use the same default, and stays a var (not a
 // const) so tests can shrink it.
-var sinkTimeout = 15 * time.Second
+var sinkTimeout = notify.SinkTimeout
