@@ -64,7 +64,9 @@ func (b *Babysitter) Run(ctx context.Context) (state TerminalState, err error) {
 	}
 	defer func() { _ = lease.Release() }()
 
-	prs, err := fetchByNumbers(ctx, b.gh, o.Entry.WorktreeRoot, []int{o.PRNumber})
+	// GitDir, not WorktreeRoot: under the "wt" layout the root is the bare-repo
+	// parent, and gh cannot resolve a PR from outside a work tree.
+	prs, err := fetchByNumbers(ctx, b.gh, o.Entry.GitDir(), []int{o.PRNumber})
 	if err != nil {
 		return TerminalFailed, fmt.Errorf("look up PR #%d: %w", o.PRNumber, err)
 	}
