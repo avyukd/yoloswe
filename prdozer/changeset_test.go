@@ -266,3 +266,43 @@ func TestComputeChangeset_BaseMovedSuppressesMergeable(t *testing.T) {
 	assert.False(t, cs.Mergeable, "moving base requires a rebase first")
 	assert.True(t, cs.NeedsPolish())
 }
+
+// GitHub returns an EMPTY reviewDecision when a repo requires no approving
+// review — not only when one is pending. Treating "" as unapproved stranded a
+// genuinely ready PR: not mergeable (wanted "APPROVED"), not needs-review
+// (wanted "REVIEW_REQUIRED"), so it ticked idle forever with no terminal state.
+// Observed live on bazelment/yoloswe#284.
+func TestComputeChangeset_EmptyReviewDecisionIsMergeable(t *testing.T) {
+	t.Parallel()
+	prev := &State{
+		LastCheckAt:     time.Now(),
+		LastSeenHeadSHA: "head1",
+		LastSeenBaseSHA: "base1",
+	}
+	snap := snapWithRollup(StatusSuccess)
+	snap.PR.ReviewDecision = "" // repo requires no review
+	snap.PR.Mergeable = "MERGEABLE"
+
+	cs := ComputeChangeset(prev, snap)
+	assert.True(t, cs.Mergeable,
+		"a green PR on a repo with no review requirement must be mergeable")
+	assert.False(t, cs.NeedsReview,
+		"no review is required, so this is not a needs-human state")
+}
+
+func TestReviewSatisfied(t *testing.T) {
+	t.Parallel()
+	cases := map[string]bool{
+		"APPROVED":          true,
+		"":                  true, // repo requires no review
+		"REVIEW_REQUIRED":   false,
+		"CHANGES_REQUESTED": false,
+		"SOMETHING_NEW":     false, // unknown gates fail closed
+	}
+	for decision, want := range cases {
+		t.Run(decision, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, want, reviewSatisfied(decision))
+		})
+	}
+}

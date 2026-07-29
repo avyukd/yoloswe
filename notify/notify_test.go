@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -99,6 +100,92 @@ func TestSlackWebhookNotifier_NonOKStatusIsAnError(t *testing.T) {
 	if err := n.Notify(context.Background(), Message{Title: "x"}); err == nil {
 		t.Error("a 500 from the webhook must surface as an error")
 	}
+}
+
+func TestCommandNotifier_EmptyPathIsDisabled(t *testing.T) {
+	t.Parallel()
+	if err := (CommandNotifier{}).Notify(context.Background(), Message{Title: "x"}); err != nil {
+		t.Fatalf("empty path should disable the sink silently, got %v", err)
+	}
+}
+
+func TestCommandNotifier_SubstitutesRecipientAndMessage(t *testing.T) {
+	t.Parallel()
+	out := t.TempDir() + "/args.txt"
+	n := CommandNotifier{
+		Path:      "/bin/sh",
+		Recipient: "@ming",
+		Args:      []string{"-c", `printf '%s\n' "$1" "$2" > ` + out, "sh", "{{recipient}}", "{{message}}"},
+	}
+	if err := n.Notify(context.Background(), Message{Title: "babysit merged"}); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	got := readFile(t, out)
+	if !strings.Contains(got, "@ming") {
+		t.Errorf("recipient not substituted; got %q", got)
+	}
+	if !strings.Contains(got, "babysit merged") {
+		t.Errorf("message not substituted; got %q", got)
+	}
+}
+
+func TestCommandNotifier_AlsoWritesMessageToStdin(t *testing.T) {
+	t.Parallel()
+	out := t.TempDir() + "/stdin.txt"
+	n := CommandNotifier{Path: "/bin/sh", Args: []string{"-c", "cat > " + out}}
+	if err := n.Notify(context.Background(), Message{Title: "from stdin"}); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	if got := readFile(t, out); !strings.Contains(got, "from stdin") {
+		t.Errorf("stdin did not carry the rendered message; got %q", got)
+	}
+}
+
+func TestCommandNotifier_NonZeroExitIsAnError(t *testing.T) {
+	t.Parallel()
+	n := CommandNotifier{Path: "/bin/sh", Args: []string{"-c", "echo boom >&2; exit 3"}}
+	err := n.Notify(context.Background(), Message{Title: "x"})
+	if err == nil {
+		t.Fatal("expected an error on non-zero exit")
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Errorf("error should carry command output, got %v", err)
+	}
+}
+
+// The delivery helper reports some failures as an "ERROR:" line while still
+// exiting 0, so the exit code alone would report a false success.
+func TestCommandNotifier_ErrorPrefixOnStdoutIsAnError(t *testing.T) {
+	t.Parallel()
+	n := CommandNotifier{Path: "/bin/sh", Args: []string{"-c", "echo 'ERROR: channel_not_found'; exit 0"}}
+	err := n.Notify(context.Background(), Message{Title: "x"})
+	if err == nil {
+		t.Fatal("expected an error when the helper reports ERROR: on stdout")
+	}
+	if !strings.Contains(err.Error(), "channel_not_found") {
+		t.Errorf("error should carry the reported reason, got %v", err)
+	}
+}
+
+func TestCommandNotifier_TimeoutIsEnforced(t *testing.T) {
+	t.Parallel()
+	n := CommandNotifier{Path: "/bin/sh", Args: []string{"-c", "sleep 30"}, Timeout: 100 * time.Millisecond}
+	start := time.Now()
+	if err := n.Notify(context.Background(), Message{Title: "x"}); err == nil {
+		t.Fatal("expected a timeout error")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("timeout not enforced; took %s", elapsed)
+	}
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
 }
 
 func TestResolveWebhookURL(t *testing.T) {

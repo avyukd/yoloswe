@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"text/template"
@@ -34,8 +35,11 @@ func (l Layout) Valid() bool {
 // them: where their checkouts live, which flow to run, and how (or whether) to
 // merge. It is loaded from ~/magent/prdozer/registry.yaml.
 type Registry struct {
-	Repos    map[string]RepoEntry `yaml:"repos"`
-	Defaults RepoEntry            `yaml:"defaults"`
+	Repos map[string]RepoEntry `yaml:"repos"`
+	// Notify is fleet-wide: the destination is a property of the operator, not
+	// of the repository. Per-repo slack_target selects the recipient within it.
+	Notify   NotifyConfig `yaml:"notify"`
+	Defaults RepoEntry    `yaml:"defaults"`
 }
 
 // RepoEntry is the per-repository configuration. Zero-valued fields inherit
@@ -307,7 +311,45 @@ func (e RepoEntry) CheckUsable(ownerRepo string) error {
 	if e.Flow != "pr-polish" {
 		return fmt.Errorf("repo %q flow %q is not implemented (want pr-polish)", ownerRepo, e.Flow)
 	}
+	// A directory that exists but is not a git work tree fails much later, in
+	// the middle of a dispatched run, as an opaque "not a git repository" from
+	// a gh subprocess. Catch it here where the message can name the cause.
+	if dir := e.GitDir(); !isGitDir(dir) {
+		return fmt.Errorf("repo %q: %q is not a git work tree (wt layout expects a %q checkout under worktree_root %q)",
+			ownerRepo, dir, e.BaseBranch, e.WorktreeRoot)
+	}
 	return nil
+}
+
+// GitDir returns a directory that git and gh can actually run in.
+//
+// For the "wt" layout, WorktreeRoot is the bare-repo PARENT (it holds .bare
+// and one directory per branch) and is itself outside any work tree — running
+// git there fails with "not a git repository". The shared base worktree is the
+// stable checkout to use for repo-scoped queries like resolving a PR.
+//
+// For the "plain" layout, WorktreeRoot is the clone itself.
+func (e RepoEntry) GitDir() string {
+	if e.Layout == LayoutWT {
+		base := e.BaseBranch
+		if base == "" {
+			base = "main"
+		}
+		if p := filepath.Join(e.WorktreeRoot, base); isGitDir(p) {
+			return p
+		}
+	}
+	return e.WorktreeRoot
+}
+
+// isGitDir reports whether path is inside a git work tree. It checks for the
+// .git entry directly rather than shelling out, so it stays cheap enough to
+// call on every lookup.
+func isGitDir(path string) bool {
+	if _, err := os.Stat(filepath.Join(path, ".git")); err == nil {
+		return true
+	}
+	return false
 }
 
 // RenderRound renders a round's template with the supplied data.

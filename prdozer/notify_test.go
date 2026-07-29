@@ -8,6 +8,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/bazelment/yoloswe/notify"
 )
 
 func sampleMeta() RunMeta {
@@ -121,6 +123,59 @@ func TestNotifyConfig_ExpandsExplicitEnvReference(t *testing.T) {
 	require.NotNil(t, NotifyConfig{SlackWebhook: "$MY_CUSTOM_HOOK"}.Notifier())
 	// An unset variable disables rather than posting to a literal "$VAR".
 	assert.Nil(t, NotifyConfig{SlackWebhook: "$DEFINITELY_UNSET_VAR_XYZ"}.Notifier())
+}
+
+func TestNotifyConfig_FallsBackToDMCommandWhenNoWebhook(t *testing.T) {
+	t.Setenv("PRDOZER_SLACK_WEBHOOK", "")
+	n := NotifyConfig{
+		Target:        "@ming",
+		DMCommand:     "/bin/echo",
+		DMCommandArgs: []string{"--to", "{{recipient}}"},
+	}.Notifier()
+	require.NotNil(t, n, "a DM command is the zero-setup notification path")
+	cmd, ok := n.(notify.CommandNotifier)
+	require.True(t, ok, "expected a CommandNotifier, got %T", n)
+	assert.Equal(t, "@ming", cmd.Recipient)
+}
+
+func TestNotifyConfig_WebhookWinsOverDMCommand(t *testing.T) {
+	t.Setenv("PRDOZER_SLACK_WEBHOOK", "https://hooks.example/from-env")
+	n := NotifyConfig{DMCommand: "/bin/echo"}.Notifier()
+	require.NotNil(t, n)
+	// The webhook has no interpreter or token-file dependency, so it is the
+	// more robust sink for unattended runs and must take precedence.
+	assert.IsType(t, notify.SlackWebhookNotifier{}, n)
+}
+
+func TestNotifyConfig_DMCommandExpandsHome(t *testing.T) {
+	t.Setenv("PRDOZER_SLACK_WEBHOOK", "")
+	// The test sandbox may not set HOME, and os.UserHomeDir then fails; pin it
+	// so this asserts the expansion behaviour rather than the environment.
+	t.Setenv("HOME", "/home/testuser")
+	n := NotifyConfig{DMCommand: "~/bin/send"}.Notifier()
+	require.NotNil(t, n)
+	cmd, ok := n.(notify.CommandNotifier)
+	require.True(t, ok)
+	assert.Equal(t, "/home/testuser/bin/send", cmd.Path,
+		"a config path must be expanded to something exec can run")
+}
+
+// The registry is shared across the fleet, where the home directory differs
+// per box (the Azure devbox runs as "ming", the AWS boxes as "ubuntu"). A
+// hardcoded /home/<user> path in an arg silently breaks on the other boxes —
+// which is exactly how the first dispatched run failed to notify.
+func TestNotifyConfig_DMCommandArgsExpandHome(t *testing.T) {
+	t.Setenv("PRDOZER_SLACK_WEBHOOK", "")
+	t.Setenv("HOME", "/home/testuser")
+	n := NotifyConfig{
+		DMCommand:     "/usr/bin/python3",
+		DMCommandArgs: []string{"~/.claude/skills/slack-message/slack_send.py", "--to", "{{recipient}}"},
+	}.Notifier()
+	require.NotNil(t, n)
+	cmd, ok := n.(notify.CommandNotifier)
+	require.True(t, ok)
+	assert.Equal(t, "/home/testuser/.claude/skills/slack-message/slack_send.py", cmd.Args[0])
+	assert.Equal(t, "{{recipient}}", cmd.Args[2], "placeholders must survive expansion")
 }
 
 func TestReport_NilNotifierIsSafe(t *testing.T) {

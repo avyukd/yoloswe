@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 )
@@ -119,11 +120,97 @@ func (n SlackWebhookNotifier) Notify(ctx context.Context, msg Message) error {
 	return nil
 }
 
+// CommandNotifier delivers a message by executing an external program, with the
+// rendered text passed on stdin and the recipient as an argument.
+//
+// It exists because a Slack incoming webhook has to be created by hand in the
+// Slack UI, whereas a DM helper backed by an already-provisioned user token
+// works with no setup at all. The trade-off versus SlackWebhookNotifier is that
+// this sink depends on an interpreter and a token file being present, so it is
+// the fallback rather than the default.
+//
+// Path is the program and Args are its arguments. Two placeholders are
+// substituted in each arg: "{{recipient}}" becomes Recipient and "{{message}}"
+// becomes the rendered message text. The rendered text is also always written
+// to stdin, so a helper can consume it either way.
+type CommandNotifier struct {
+	Path      string
+	Recipient string
+	Args      []string
+	Timeout   time.Duration
+}
+
+// Notify runs the command. An empty Path disables the sink silently, matching
+// SlackWebhookNotifier's behaviour so an unconfigured deployment is not a run
+// failure.
+func (n CommandNotifier) Notify(ctx context.Context, msg Message) error {
+	if strings.TrimSpace(n.Path) == "" {
+		return nil
+	}
+	timeout := n.Timeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	rendered := msg.Render()
+	args := make([]string, 0, len(n.Args))
+	for _, a := range n.Args {
+		a = strings.ReplaceAll(a, "{{recipient}}", n.Recipient)
+		a = strings.ReplaceAll(a, "{{message}}", rendered)
+		args = append(args, a)
+	}
+
+	cmd := exec.CommandContext(ctx, n.Path, args...)
+	cmd.Stdin = strings.NewReader(rendered)
+	// Capture combined output into our own buffer rather than via
+	// CombinedOutput: that helper waits for the output pipes to close, and a
+	// killed process that spawned children holding those pipes keeps them open
+	// well past the deadline. Writing into a shared buffer lets Wait return as
+	// soon as the process itself is reaped.
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	// WaitDelay bounds how long Wait blocks on inherited pipes after the
+	// context is cancelled, so an enforced timeout is actually enforced.
+	cmd.WaitDelay = time.Second
+	err := cmd.Run()
+	trimmed := strings.TrimSpace(buf.String())
+	if err != nil {
+		if trimmed != "" {
+			return fmt.Errorf("notify command %s: %w: %s", n.Path, err, truncateOutput(trimmed))
+		}
+		return fmt.Errorf("notify command %s: %w", n.Path, err)
+	}
+	if strings.HasPrefix(trimmed, "ERROR:") {
+		return fmt.Errorf("notify command %s reported: %s", n.Path, truncateOutput(trimmed))
+	}
+	return nil
+}
+
+// truncateOutput bounds command output folded into an error, so a helper that
+// dumps a stack trace cannot swamp the log line that reports it.
+func truncateOutput(s string) string {
+	const maxLen = 400
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "…"
+}
+
 // ResolveWebhookURL expands a "$ENV_VAR" reference to its value, so a config
 // file can name the variable holding the secret instead of embedding it. A
 // plain URL is returned unchanged; an unset variable yields "", which disables
 // the sink.
 func ResolveWebhookURL(raw string) string {
+	return ResolveEnvRef(raw)
+}
+
+// ResolveEnvRef expands a "$ENV_VAR" reference to its value and returns any
+// other string unchanged. An unset variable yields "", which callers treat as
+// "not configured" rather than passing a literal "$VAR" downstream.
+func ResolveEnvRef(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if after, ok := strings.CutPrefix(raw, "$"); ok {
 		return strings.TrimSpace(os.Getenv(after))

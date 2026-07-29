@@ -4,13 +4,19 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "notify",
-    srcs = ["notify.go"],
+    srcs = [
+        "notify.go",
+        "slack.go",
+    ],
     importpath = "github.com/bazelment/yoloswe/notify",
     visibility = ["//visibility:public"],
 )
 
 go_test(
     name = "notify_test",
-    srcs = ["notify_test.go"],
+    srcs = [
+        "notify_test.go",
+        "slack_test.go",
+    ],
     embed = [":notify"],
 )

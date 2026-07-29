@@ -127,11 +127,16 @@ func TestRegistry_MissingWorktreeRoot_LoadsButFailsOnUse(t *testing.T) {
 	// Repos with no local clone (sycaweave, gstack-context-budget) must be
 	// listable without breaking the whole registry, and only fail when they
 	// are the repo actually being targeted.
+	// The present repo needs a real checkout: CheckUsable verifies the root is
+	// a git work tree, not merely an existing directory.
+	presentRoot := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(presentRoot, "main", ".git"), 0o755))
+
 	r, err := LoadRegistry(writeRegistry(t, `
 repos:
   sycamore-labs/sycaweave: {}
   o/present:
-    worktree_root: /tmp
+    worktree_root: `+presentRoot+`
 `))
 	require.NoError(t, err, "a repo with no worktree_root must not break load")
 
@@ -340,4 +345,49 @@ func TestParsePRRef(t *testing.T) {
 			assert.Equal(t, tc.wantPR, pr)
 		})
 	}
+}
+
+// Under the "wt" layout, worktree_root is the bare-repo PARENT: it holds
+// `.bare` and one directory per branch, and is itself outside any work tree.
+// Running git or gh there fails with "not a git repository" — which is exactly
+// how a dispatched run died before GitDir existed.
+func TestRepoEntry_GitDir_WTLayoutUsesBaseCheckout(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	base := filepath.Join(root, "main")
+	require.NoError(t, os.MkdirAll(filepath.Join(base, ".git"), 0o755))
+
+	e := RepoEntry{WorktreeRoot: root, Layout: LayoutWT, BaseBranch: "main"}
+	assert.Equal(t, base, e.GitDir(),
+		"a wt-layout repo must resolve to its base checkout, not the bare parent")
+}
+
+func TestRepoEntry_GitDir_PlainLayoutUsesRoot(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".git"), 0o755))
+
+	e := RepoEntry{WorktreeRoot: root, Layout: LayoutPlain}
+	assert.Equal(t, root, e.GitDir(), "a plain clone IS the git dir")
+}
+
+func TestRepoEntry_CheckUsable_RejectsNonGitRoot(t *testing.T) {
+	t.Parallel()
+	// A directory that exists but holds no checkout: the failure mode that
+	// previously surfaced mid-run as an opaque gh subprocess error.
+	root := t.TempDir()
+	e := RepoEntry{WorktreeRoot: root, Layout: LayoutWT, BaseBranch: "main", Flow: "pr-polish"}
+
+	err := e.CheckUsable("bazelment/yoloswe")
+	require.Error(t, err, "a root with no work tree must fail before dispatch")
+	assert.Contains(t, err.Error(), "not a git work tree")
+}
+
+func TestRepoEntry_CheckUsable_AcceptsWTLayoutWithBaseCheckout(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "main", ".git"), 0o755))
+
+	e := RepoEntry{WorktreeRoot: root, Layout: LayoutWT, BaseBranch: "main", Flow: "pr-polish"}
+	assert.NoError(t, e.CheckUsable("bazelment/yoloswe"))
 }

@@ -21,13 +21,18 @@ func addBabysitCommands(root *cobra.Command) {
 }
 
 // resolveEntry loads the registry and resolves one repo, the shared prelude of
-// both babysit commands.
-func resolveEntry(registryPath, ownerRepo string) (prdozer.RepoEntry, error) {
+// both babysit commands. The registry itself is returned alongside the entry
+// because fleet-wide settings (notification) live on it rather than per repo.
+func resolveEntry(registryPath, ownerRepo string) (prdozer.RepoEntry, *prdozer.Registry, error) {
 	reg, err := prdozer.LoadRegistry(registryPath)
 	if err != nil {
-		return prdozer.RepoEntry{}, err
+		return prdozer.RepoEntry{}, nil, err
 	}
-	return reg.Resolve(ownerRepo)
+	entry, err := reg.Resolve(ownerRepo)
+	if err != nil {
+		return prdozer.RepoEntry{}, nil, err
+	}
+	return entry, reg, nil
 }
 
 func newBabysitCmd() *cobra.Command {
@@ -52,7 +57,7 @@ func newBabysitCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			entry, err := resolveEntry(registryPath, ownerRepo)
+			entry, reg, err := resolveEntry(registryPath, ownerRepo)
 			if err != nil {
 				return err
 			}
@@ -68,7 +73,7 @@ func newBabysitCmd() *cobra.Command {
 			}
 
 			if here {
-				return runBabysitLocal(cmd.Context(), ownerRepo, prNumber, entry, keepWorktree, false)
+				return runBabysitLocal(cmd.Context(), ownerRepo, prNumber, entry, reg, keepWorktree, false)
 			}
 
 			ssh := prdozer.DefaultSSHRunner{}
@@ -106,7 +111,7 @@ func newBabysitCmd() *cobra.Command {
 
 			if plan.RanLocal {
 				app.Logger.Info("chosen host is this box; running in-process", "host", plan.Chosen.Host)
-				return runBabysitLocal(cmd.Context(), ownerRepo, prNumber, entry, keepWorktree, false)
+				return runBabysitLocal(cmd.Context(), ownerRepo, prNumber, entry, reg, keepWorktree, false)
 			}
 			if err := prdozer.Dispatch(cmd.Context(), ssh, prdozer.DispatchRequest{
 				Host:         plan.Chosen,
@@ -145,11 +150,11 @@ func newBabysitLocalCmd() *cobra.Command {
 		Use:   "babysit-local",
 		Short: "Run the babysit worker on this box (normally invoked by dispatch)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			entry, err := resolveEntry(registryPath, ownerRepo)
+			entry, reg, err := resolveEntry(registryPath, ownerRepo)
 			if err != nil {
 				return err
 			}
-			return runBabysitLocal(cmd.Context(), ownerRepo, prNumber, entry, keepWorktree, once)
+			return runBabysitLocal(cmd.Context(), ownerRepo, prNumber, entry, reg, keepWorktree, once)
 		},
 	}
 	cmd.Flags().StringVar(&ownerRepo, "repo", "", "Repository as owner/repo (required)")
@@ -162,7 +167,7 @@ func newBabysitLocalCmd() *cobra.Command {
 	return cmd
 }
 
-func runBabysitLocal(ctx context.Context, ownerRepo string, prNumber int, entry prdozer.RepoEntry, keepWorktree, once bool) error {
+func runBabysitLocal(ctx context.Context, ownerRepo string, prNumber int, entry prdozer.RepoEntry, reg *prdozer.Registry, keepWorktree, once bool) error {
 	app := cliapp.FromContext(ctx)
 	gh := &wt.DefaultGHRunner{}
 	if err := wt.CheckGitHubAuth(ctx, gh); err != nil {
@@ -174,6 +179,7 @@ func runBabysitLocal(ctx context.Context, ownerRepo string, prNumber int, entry 
 		Entry:        entry,
 		KeepWorktree: keepWorktree,
 		Once:         once,
+		Notify:       reg.Notify.WithTarget(entry.SlackTarget),
 	})
 	state, err := b.Run(ctx)
 	if err != nil {
@@ -294,11 +300,14 @@ func newGCCmd() *cobra.Command {
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 			fmt.Fprintln(tw, "ACTION\tKIND\tPATH\tREASON")
 			for _, c := range res.Candidates {
+				// Key off Eligible, not dryRun: a dry run removes nothing, so
+				// every row would otherwise read as a pending deletion — including
+				// the ones being deliberately kept.
 				action := "skip"
 				switch {
 				case c.Removed:
 					action = "removed"
-				case dryRun:
+				case c.Eligible:
 					action = "would-remove"
 				}
 				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", action, c.Kind, c.Path, c.Reason)

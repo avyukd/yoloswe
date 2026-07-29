@@ -107,9 +107,13 @@ func PrepareWorktree(ctx context.Context, git wt.GitRunner, e RepoEntry, pr Disc
 	}
 
 	root := ExpandHome(e.WorktreeRoot)
+	// Git commands must run in a real work tree. Under the "wt" layout the
+	// root is the bare-repo parent, where every git invocation fails with
+	// "not a git repository".
+	gitDir := ExpandHome(e.GitDir())
 	// Fetch first: origin/<branch> must be current, or the worktree starts
 	// stale and the first polish round rebases onto yesterday's base.
-	if _, err := git.Run(ctx, []string{"fetch", "origin", pr.HeadRefName}, root); err != nil {
+	if _, err := git.Run(ctx, []string{"fetch", "origin", pr.HeadRefName}, gitDir); err != nil {
 		return nil, fmt.Errorf("fetch origin/%s: %w", pr.HeadRefName, err)
 	}
 
@@ -145,7 +149,7 @@ func PrepareWorktree(ctx context.Context, git wt.GitRunner, e RepoEntry, pr Disc
 		// explicitly (see pushBranch), so the local ref is never needed.
 		if res, err := git.Run(ctx, []string{
 			"worktree", "add", "--detach", path, "origin/" + pr.HeadRefName,
-		}, root); err != nil {
+		}, gitDir); err != nil {
 			return nil, fmt.Errorf("worktree add %s: %w", path, gitErr(err, res))
 		}
 	}

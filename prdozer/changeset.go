@@ -116,7 +116,7 @@ func ComputeChangeset(prev *State, snap *Snapshot) Changeset {
 	// Require an explicit SUCCESS rollup AND an explicit MERGEABLE verdict from
 	// gh. An empty rollup (no checks yet, pending, or unknown) must NOT count as
 	// mergeable — otherwise auto-merge can fire before CI has even started.
-	if snap.PR.ReviewDecision == "APPROVED" &&
+	if reviewSatisfied(snap.PR.ReviewDecision) &&
 		snap.StatusRollup == StatusSuccess &&
 		snap.PR.Mergeable == "MERGEABLE" &&
 		!cs.BaseMoved && !cs.CIFailed {
@@ -140,4 +140,27 @@ func ComputeChangeset(prev *State, snap *Snapshot) Changeset {
 	}
 
 	return cs
+}
+
+// reviewSatisfied reports whether a PR's review gate is clear.
+//
+// GitHub returns an EMPTY reviewDecision when the repository requires no
+// approving review at all — not just when a review is pending. Treating "" as
+// unapproved makes a genuinely ready PR idle forever: it is neither mergeable
+// (which wanted "APPROVED") nor needs-review (which wanted "REVIEW_REQUIRED"),
+// so it falls through both branches and no terminal state is ever reached.
+// Observed on bazelment/yoloswe#284: mergeStateStatus CLEAN, every check
+// green, reviewDecision "" — and prdozer ticked idle indefinitely.
+//
+// A repo that DOES require review reports "REVIEW_REQUIRED" until approved, so
+// accepting "" here cannot merge past a real review requirement.
+func reviewSatisfied(decision string) bool {
+	switch decision {
+	case "APPROVED", "":
+		return true
+	default:
+		// REVIEW_REQUIRED, CHANGES_REQUESTED, or anything new GitHub adds:
+		// fail closed rather than assume a gate we do not recognize is open.
+		return false
+	}
 }
