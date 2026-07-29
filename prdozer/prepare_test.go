@@ -306,6 +306,49 @@ func TestWorktreeHasUnpushedWork_IgnoresUntrackedBuildArtifacts(t *testing.T) {
 	assert.True(t, unclean, "an uncommitted edit to a tracked file is work")
 }
 
+func TestPrepareWorktree_PlainLayoutPushesToRealRemote(t *testing.T) {
+	// REGRESSION: the plain layout used to clone FROM the local worktree_root,
+	// which set origin to a local directory. The cleanup push then succeeded
+	// into that local clone, the unpushed-work check read clean, and the
+	// worktree holding the only GitHub-bound copy was removed. The commit
+	// never reached the real remote and the run reported success.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	f := newGitRepoFixture(t)
+	ctx := context.Background()
+
+	// A plain single clone of the origin, standing in for ~/w/satellite-poc.
+	plainRoot := filepath.Join(t.TempDir(), "plain")
+	f.mustRun("", "clone", f.origin, plainRoot)
+
+	entry := RepoEntry{WorktreeRoot: plainRoot, Layout: LayoutPlain, BaseBranch: "main", Flow: "pr-polish"}
+	rc, err := PrepareWorktree(ctx, f.git, entry, f.pr(42), "plain1", nil)
+	require.NoError(t, err, "a PR branch not checked out locally must still resolve")
+	require.Equal(t, LayoutPlain, rc.Layout)
+
+	// origin must be the REAL remote, not the local clone we referenced.
+	got, err := remoteURL(ctx, f.git, rc.WorktreePath)
+	require.NoError(t, err)
+	assert.Equal(t, f.origin, got, "origin must be the real remote, not the local clone")
+	assert.NotEqual(t, plainRoot, got)
+
+	// A commit here must actually reach the real origin on cleanup.
+	f.mustRun(rc.WorktreePath, "config", "user.email", "test@example.com")
+	f.mustRun(rc.WorktreePath, "config", "user.name", "Test")
+	require.NoError(t, os.WriteFile(filepath.Join(rc.WorktreePath, "plain.txt"), []byte("work\n"), 0o600))
+	f.mustRun(rc.WorktreePath, "add", ".")
+	f.mustRun(rc.WorktreePath, "commit", "-m", "plain layout work")
+
+	require.NoError(t, rc.Cleanup(ctx, f.git, false, nil))
+	assert.False(t, rc.Kept, "a successful push makes the clone safe to remove")
+	assert.NoDirExists(t, rc.WorktreePath)
+
+	res, err := f.git.Run(ctx, []string{"log", "--oneline", "feature/x"}, f.origin)
+	require.NoError(t, err)
+	assert.Contains(t, res.Stdout, "plain layout work",
+		"the commit must reach the REAL remote, not a local clone")
+}
+
 func TestCleanup_ForceSkipsSafetyCheck(t *testing.T) {
 	t.Parallel()
 	f := newGitRepoFixture(t)
