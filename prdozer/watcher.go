@@ -240,15 +240,22 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		// guard exists to prevent. The first review is never at risk: the guard
 		// needs a non-zero RoundsSinceImprovement, which only prior polish
 		// rounds can produce.
+		//
+		// What the stop DOES owe the human is a note when it lands on an
+		// unreviewed head: on a self_review repo prdozer is the only reviewer,
+		// so "not improving" and "nobody has looked at the last commit" are
+		// different things to walk into.
 		w.diverged = true
 		best := state.BestHealth
-		w.status("PR #%d is not improving after %d rounds (best: %d unresolved, ci_failing=%t) — needs a human",
-			w.pr, state.RoundsSinceImprovement, best.UnresolvedThreads, best.CIFailing)
+		unreviewed := w.needsSelfReview(snap, state)
+		w.status("PR #%d is not improving after %d rounds (best: %d unresolved, ci_failing=%t, head_reviewed=%t) — needs a human",
+			w.pr, state.RoundsSinceImprovement, best.UnresolvedThreads, best.CIFailing, !unreviewed)
 		w.logger.Warn("divergence guard tripped",
 			"rounds_since_improvement", state.RoundsSinceImprovement,
 			"polish_rounds", state.PolishRounds,
 			"best_unresolved", best.UnresolvedThreads,
-			"best_ci_failing", best.CIFailing)
+			"best_ci_failing", best.CIFailing,
+			"head_unreviewed", unreviewed)
 		return LastActionNeedsHuman
 	}
 
