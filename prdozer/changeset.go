@@ -23,13 +23,29 @@ type Changeset struct {
 	// can do. Critically, a dirty PR schedules ZERO CI runs, so an empty
 	// status rollup here means "blocked", never "CI hasn't started yet".
 	Conflicting bool
+	// ChangesRequested is set when reviewDecision is CHANGES_REQUESTED. Unlike
+	// NeedsReview this IS agent-fixable and drives polish: the reviewer asked
+	// for specific changes, and addressing them is exactly the polish loop's
+	// job. It deliberately does not distinguish bot reviewers from human ones —
+	// requested changes are actionable feedback either way, and on kernel the
+	// blocking reviewers are usually bots (sycamore-groot, coderabbitai).
+	//
+	// It must be its own trigger rather than relying on NewComments: the review
+	// comments are consumed as "seen" on an early tick, after which nothing
+	// would drive the loop and the flag would sit set forever.
+	ChangesRequested bool
 }
 
-// Empty reports whether nothing actionable changed (no new failed CI, no new
-// comments, base hasn't moved). The watcher uses this to decide "nothing to
-// do, sleep until next tick".
+// Empty reports whether nothing actionable is present — no new failed CI, no
+// new comments, base hasn't moved, and no standing block on the PR.
+//
+// ChangesRequested is included even though it is standing state rather than an
+// event: a changes-requested PR is actionable on every tick until the flag
+// clears, and reporting it as "empty" while NeedsPolish is true would be a
+// contradiction waiting to mislead a reader.
 func (c Changeset) Empty() bool {
-	return !c.BaseMoved && !c.CIFailed && !c.NewComments && !c.PRClosed && !c.Conflicting
+	return !c.BaseMoved && !c.CIFailed && !c.NewComments && !c.PRClosed &&
+		!c.Conflicting && !c.ChangesRequested
 }
 
 // NeedsPolish reports whether prdozer should invoke the polish agent.
@@ -45,7 +61,7 @@ func (c Changeset) NeedsPolish() bool {
 	if c.PRClosed || c.Mergeable {
 		return false
 	}
-	return c.BaseMoved || c.CIFailed || c.NewComments || c.Conflicting
+	return c.BaseMoved || c.CIFailed || c.NewComments || c.Conflicting || c.ChangesRequested
 }
 
 // ComputeChangeset diffs the snapshot against the previously persisted State.
@@ -131,6 +147,16 @@ func ComputeChangeset(prev *State, snap *Snapshot) Changeset {
 	// records what it observes without reacting. Without this guard, merely
 	// pointing prdozer at any PR that is waiting on a reviewer would
 	// immediately emit a terminal "needs human" notification.
+	// A reviewer asked for changes. This is work, not a wall: address the
+	// comments, push, and re-request review so the flag can clear. Unlike the
+	// other triggers this is NOT suppressed on the first run — the flag is
+	// standing state rather than an event, so there is nothing to "already
+	// know", and suppressing it would mean pointing prdozer at a
+	// changes-requested PR does nothing at all on the tick that matters.
+	if snap.PR.ReviewDecision == "CHANGES_REQUESTED" {
+		cs.ChangesRequested = true
+	}
+
 	if !firstRun &&
 		snap.PR.ReviewDecision == "REVIEW_REQUIRED" &&
 		snap.StatusRollup == StatusSuccess &&

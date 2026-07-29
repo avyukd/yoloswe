@@ -199,3 +199,48 @@ func TestAcquireLease_SurvivesProcessScopedUse(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(data), fmt.Sprintf("pid=%d", os.Getpid()))
 }
+
+// prdozer resolves the agent CLI from PATH and spawns it as a child. `claude`
+// lives in ~/.local/bin, which a non-interactive SSH shell does not include —
+// so without an explicit PATH the worker starts, detects work correctly, then
+// every polish round dies with `exec: "claude": executable file not found`.
+// Observed on kernel#8227.
+func TestDispatchRequest_RemoteCommandPutsUserBinOnPath(t *testing.T) {
+	t.Parallel()
+	req := DispatchRequest{
+		Host:      HostHealth{Host: "box", PublicDNS: "box.example", SSHUser: "ming", HasPrdozer: true},
+		OwnerRepo: "sycamore-labs/kernel",
+		PRNumber:  8227,
+	}
+	req.Host.PrdozerPath = "/home/ming/bin/prdozer"
+	cmd := req.RemoteCommand()
+	// NOT tmux -e: tmux treats PATH specially and silently ignores an -e
+	// override, so the session keeps the tmux server's PATH. (-e FOO=bar does
+	// work, which makes this easy to misdiagnose.) Only a shell wrapper takes
+	// effect.
+	assert.NotContains(t, cmd, "-e 'PATH=",
+		"tmux -e cannot override PATH; it is silently ignored")
+	assert.Contains(t, cmd, "export PATH=")
+	assert.Contains(t, cmd, "/home/ming/.local/bin",
+		"the agent CLI lives in ~/.local/bin and is resolved from PATH")
+	assert.Contains(t, cmd, "/home/ming/bin")
+	assert.Contains(t, cmd, "/usr/bin",
+		"tmux -e replaces PATH wholesale, so the base entries must be carried")
+	assert.NotContains(t, cmd, "$HOME",
+		"tmux -e does no shell expansion; the value must be literal")
+}
+
+func TestDispatchRequest_RemotePathEnvUnresolvableIsOmitted(t *testing.T) {
+	t.Parallel()
+	// A bare "prdozer" (probe could not resolve an absolute path) gives no
+	// basis for deriving the home root. Leave PATH untouched rather than
+	// setting a wrong one.
+	req := DispatchRequest{
+		Host:      HostHealth{Host: "box", PublicDNS: "box.example", SSHUser: "ming"},
+		OwnerRepo: "o/r",
+		PRNumber:  1,
+	}
+	assert.Empty(t, req.remotePathEnv())
+	assert.NotContains(t, req.RemoteCommand(), "export PATH=",
+		"no PATH export when it cannot be derived")
+}

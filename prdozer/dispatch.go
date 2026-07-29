@@ -138,11 +138,56 @@ func (r DispatchRequest) RemoteCommand() string {
 	if r.KeepWorktree {
 		inner = append(inner, "--keep-worktree")
 	}
+	// Set PATH by wrapping the command in a shell.
+	//
+	// This matters because an absolute path fixes prdozer itself but not the
+	// agent: prdozer SPAWNS the CLI as a child and resolves it from PATH, and
+	// `claude` lives in ~/.local/bin, which a non-interactive SSH shell omits.
+	// Without it the worker starts, detects work correctly, then every polish
+	// round dies with `exec: "claude": executable file not found in $PATH` —
+	// a failure with nothing to do with the PR.
+	//
+	// `tmux -e PATH=...` does NOT work here and was tried first: tmux treats
+	// PATH specially and silently ignores the override, so the session still
+	// runs with the tmux server's PATH. (`-e FOO=bar` DOES work, which makes
+	// the failure easy to misdiagnose — verify with PATH itself, not a proxy
+	// variable.) The shell wrapper costs an extra quoting level but actually
+	// takes effect.
+	cmd := strings.Join(inner, " ")
+	if pathEnv := r.remotePathEnv(); pathEnv != "" {
+		cmd = "export PATH=" + shellQuote(pathEnv) + "; exec " + cmd
+	}
 	return fmt.Sprintf("tmux new-session -d -s %s %s",
 		shellQuote(TmuxSessionName(r.OwnerRepo, r.PRNumber)),
-		shellQuote(strings.Join(inner, " ")),
+		shellQuote("sh -c "+shellQuote(cmd)),
 	)
 }
+
+// remotePathEnv builds the PATH the worker needs on the target box.
+//
+// The home directory differs per box (the Azure devbox runs as "ming", the AWS
+// boxes as "ubuntu"), and tmux -e takes a literal value with no shell
+// expansion — so $HOME cannot be used. The probe already resolved prdozer to an
+// absolute path, and its parent IS the home bin dir, so the home root is
+// derivable without another round trip. Returns "" when it cannot be derived,
+// leaving PATH untouched rather than setting a wrong one.
+func (r DispatchRequest) remotePathEnv() string {
+	bin := r.Host.PrdozerPath
+	if !strings.HasPrefix(bin, "/") {
+		return ""
+	}
+	binDir := filepath.Dir(bin)  // /home/ming/bin
+	home := filepath.Dir(binDir) // /home/ming
+	if home == "/" || home == "." {
+		return ""
+	}
+	return filepath.Join(home, ".local", "bin") + ":" + binDir + ":" + remoteBasePath
+}
+
+// remoteBasePath is the PATH a non-interactive SSH shell provides (verified on
+// both the Azure and AWS boxes). tmux -e replaces PATH wholesale rather than
+// prepending, so the base entries have to be carried explicitly.
+const remoteBasePath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 // SSHCommand renders the full ssh invocation, which is what --dry-run prints.
 func (r DispatchRequest) SSHCommand() string {

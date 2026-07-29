@@ -27,7 +27,14 @@ type Snapshot struct {
 	StatusRollup string
 	Comments     []CommentRef
 	FailedRunIDs []int64
-	PR           PRDetails
+	// ChangesRequestedBy lists the reviewers whose latest review requested
+	// changes, so they can be asked to look again once the work is pushed.
+	ChangesRequestedBy []string
+	// IsBotReviewer marks which of those are apps. Bots cannot be re-requested
+	// (GitHub 422: not a collaborator) and do not need to be — they re-review
+	// on push.
+	IsBotReviewer map[string]bool
+	PR            PRDetails
 }
 
 // PRDetails is the fields prdozer cares about from `gh pr view`.
@@ -40,8 +47,18 @@ type PRDetails struct {
 	ReviewDecision    string           `json:"reviewDecision"`
 	Mergeable         string           `json:"mergeable"`
 	StatusCheckRollup []statusCheckRow `json:"statusCheckRollup"`
+	LatestReviews     []reviewRow      `json:"latestReviews"`
 	Number            int              `json:"number"`
 	IsDraft           bool             `json:"isDraft"`
+}
+
+// reviewRow is one entry in gh's latestReviews: the most recent review per
+// reviewer, which is what decides the overall reviewDecision.
+type reviewRow struct {
+	State  string `json:"state"`
+	Author struct {
+		Login string `json:"login"`
+	} `json:"author"`
 }
 
 // statusCheckRow is a single entry in gh's statusCheckRollup. Some checks set
@@ -112,19 +129,56 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 		return nil, fmt.Errorf("comments for #%d: %w", prNumber, commentsErr)
 	}
 	return &Snapshot{
-		TakenAt:      time.Now().UTC(),
-		PR:           *pr,
-		Comments:     comments,
-		FailedRunIDs: failed,
-		BaseSHA:      baseSHA,
-		StatusRollup: summarizeRollup(pr.StatusCheckRollup),
+		TakenAt:            time.Now().UTC(),
+		PR:                 *pr,
+		Comments:           comments,
+		FailedRunIDs:       failed,
+		BaseSHA:            baseSHA,
+		StatusRollup:       summarizeRollup(pr.StatusCheckRollup),
+		ChangesRequestedBy: changesRequestedBy(pr.LatestReviews),
+		IsBotReviewer:      botReviewers(pr.LatestReviews),
 	}, nil
+}
+
+// botReviewers maps the stripped login of each app reviewer to true, keyed the
+// same way as ChangesRequestedBy so the two line up.
+func botReviewers(reviews []reviewRow) map[string]bool {
+	out := make(map[string]bool)
+	for _, r := range reviews {
+		if login, ok := strings.CutSuffix(r.Author.Login, "[bot]"); ok {
+			out[login] = true
+		}
+	}
+	return out
+}
+
+// changesRequestedBy returns the logins whose most recent review requested
+// changes. gh's latestReviews already collapses to one entry per reviewer, so
+// a reviewer who later approved does not appear here.
+func changesRequestedBy(reviews []reviewRow) []string {
+	var out []string
+	seen := make(map[string]bool, len(reviews))
+	for _, r := range reviews {
+		if r.State != "CHANGES_REQUESTED" || r.Author.Login == "" {
+			continue
+		}
+		// A bot's review author is "app-name[bot]", but it must be re-requested
+		// as "app-name" — the [bot] suffix is a display form the reviewer API
+		// does not accept.
+		login := strings.TrimSuffix(r.Author.Login, "[bot]")
+		if seen[login] {
+			continue
+		}
+		seen[login] = true
+		out = append(out, login)
+	}
+	return out
 }
 
 func fetchPRDetails(ctx context.Context, gh wt.GHRunner, dir string, n int) (*PRDetails, error) {
 	args := []string{
 		"pr", "view", strconv.Itoa(n),
-		"--json", "number,url,headRefName,baseRefName,headRefOid,state,isDraft,reviewDecision,mergeable,statusCheckRollup",
+		"--json", "number,url,headRefName,baseRefName,headRefOid,state,isDraft,reviewDecision,mergeable,statusCheckRollup,latestReviews",
 	}
 	res, err := gh.Run(ctx, args, dir)
 	if err != nil {
