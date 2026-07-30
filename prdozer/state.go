@@ -135,6 +135,23 @@ func (h PRHealth) BetterThan(other PRHealth) bool {
 	return h.UnresolvedThreads < other.UnresolvedThreads
 }
 
+// Saturated reports whether h is the best state PRHealth can express, so that
+// BetterThan(h) is false for EVERY other value.
+//
+// This is the property that makes a saturated BestHealth stop carrying
+// information: green CI cannot be improved on, and 0 unresolved threads cannot
+// be beaten because BetterThan is strict (0 < 0 is false). Once a run touches
+// this state its BestHealth is frozen there, and RoundsSinceImprovement counts
+// rounds rather than measuring divergence.
+//
+// A method rather than an inline `x == 0 && !y` at the one call site: the
+// invariant it encodes is a property of BetterThan, and the two must be read
+// and changed together. Adding a field to PRHealth that BetterThan orders on
+// obliges this to grow the same clause.
+func (h PRHealth) Saturated() bool {
+	return h.UnresolvedThreads == 0 && !h.CIFailing
+}
+
 // LoadState reads the state file at path. Returns a zero State (no error) when
 // the file does not exist.
 func LoadState(path string) (*State, error) {

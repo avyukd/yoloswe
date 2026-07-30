@@ -609,6 +609,17 @@ func (f *fakeGH) setThreads(n int) {
 	f.addPrefix("api graphql", strconv.Itoa(n))
 }
 
+// setHead moves the PR's head SHA, which is what a real polish round does when
+// it pushes a commit. Tests that exercise self-review need this: with a fixed
+// head the first review marks the SHA seen and needsSelfReview is false forever,
+// so the always-unreviewed condition that matters in production never occurs.
+func (f *fakeGH) setHead(sha string) {
+	f.addPrefix(
+		"pr view 42 --json number,url,headRefName,baseRefName,headRefOid,state,isDraft,reviewDecision,mergeable,statusCheckRollup",
+		buildPRJSON(strings.Replace(okPRJSON, `"headRefOid": "head1"`, `"headRefOid": "`+sha+`"`, 1), "FAILURE"),
+	)
+}
+
 // `gh api graphql --paginate` emits one --jq result per page, so a PR with more
 // than 100 review threads reports several counts that must be summed. Taking
 // only the first would undercount the outstanding work and read as a healthier
@@ -1190,4 +1201,215 @@ func TestAgentPolisher_RunRounds_ReportsTheOnceRoundsThatFinished(t *testing.T) 
 			assert.Equal(t, want, got)
 		})
 	}
+}
+
+// A run whose head nobody has reviewed gets one extra allowance before the
+// guard stops it.
+//
+// This isolates the UNREVIEWED arm: red CI keeps BestHealth beatable, so
+// saturation cannot be what grants the grace here. The saturated arm is covered
+// on its own by TestWatcher_DivergenceGuard_SaturatedBotReviewedRepoExtendsOnce,
+// so between them each arm is exercised without the other standing in for it.
+//
+// The production runs that motivated the exemption had both at once —
+// kernel#8297, yoloswe#288, yoloswe#291 each logged best_unresolved=0 and
+// head_unreviewed=true — which is exactly why the arms are tested apart: a
+// fixture with both true would pass even if one arm were deleted.
+func TestWatcher_DivergenceGuard_UnreviewedHeadExtendsOnce(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(0)
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 2
+	// prdozer is the only reviewer here, so every pushed round leaves the head
+	// unreviewed — the shape all three false positives had.
+	w.cfg.Polish.SelfReview = true
+
+	ctx := context.Background()
+	_, err := w.Tick(ctx)
+	require.NoError(t, err)
+	require.False(t, bestHealth(t).Saturated(),
+		"red CI must leave BestHealth beatable, else the saturated arm grants the grace and this stops testing the unreviewed one")
+
+	// Run past the plain limit, which is where the unpatched guard stops. The
+	// head moves every round because a real polish round pushes a commit —
+	// which is what keeps the head unreviewed.
+	var last TickResult
+	for i := range 3 {
+		gh.setHead(fmt.Sprintf("head-r%d", i))
+		res, err := w.Tick(ctx)
+		require.NoError(t, err)
+		last = res
+	}
+	assert.NotEqual(t, LastActionNeedsHuman, last.Action,
+		"an unreviewed head means work landed that the thread count cannot reflect yet")
+	assert.GreaterOrEqual(t, last.RoundsSinceImprovement, 2,
+		"the streak must genuinely have passed the plain limit, else the case is vacuous")
+}
+
+// The extension is bounded, and that bound is what keeps the guard able to fire
+// at all on a self_review repo: every polish round pushes a commit, moving the
+// head, so needsSelfReview is true forever. An unconditional exemption would
+// mean the run never stops — the unbounded loop the guard exists to prevent
+// (kernel#8227: 17 rounds, ~$40, threads 6 -> 2 -> 11, CI red).
+func TestWatcher_DivergenceGuard_UnreviewedHeadStillStopsAtHardLimit(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(0)
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 2
+	w.cfg.Polish.SelfReview = true
+
+	ctx := context.Background()
+	_, err := w.Tick(ctx)
+	require.NoError(t, err)
+	require.False(t, bestHealth(t).Saturated(),
+		"red CI must leave BestHealth beatable, else this bounds the saturated arm instead of the unreviewed one")
+
+	var last TickResult
+	for i := range 10 {
+		// Head moves every round, so needsSelfReview is true forever — the
+		// condition that would make an unconditional exemption unbounded.
+		gh.setHead(fmt.Sprintf("head-r%d", i))
+		res, err := w.Tick(ctx)
+		require.NoError(t, err)
+		last = res
+		if res.Action == LastActionNeedsHuman {
+			break
+		}
+	}
+	assert.Equal(t, LastActionNeedsHuman, last.Action,
+		"a perpetually unreviewed head must not buy an unbounded run")
+	assert.True(t, last.Diverged)
+	assert.GreaterOrEqual(t, last.RoundsSinceImprovement, 4,
+		"the hard limit is 2*MaxRoundsWithoutImprovement")
+}
+
+// conflictingPRJSON is a PR that needs a rebase. Used to keep a BOT-reviewed
+// repo polishing tick after tick: needsSelfReview is false there, so without a
+// standing polish trigger the watcher idles before it ever reaches the
+// divergence guard. Conflicting is the cheapest such trigger — it fires from
+// snapshot state alone, with no comment or CI bookkeeping per tick.
+var conflictingPRJSON = strings.Replace(okPRJSON, `"mergeable": "MERGEABLE"`, `"mergeable": "CONFLICTING"`, 1)
+
+// bestHealth reads the health the watcher has persisted for the fixture PR.
+//
+// Asserted on rather than inferred from the tick's action: these tests only
+// mean anything if BestHealth really is (or really is not) the saturated floor,
+// and a fixture that quietly stopped producing the intended health would
+// otherwise pass vacuously.
+func bestHealth(t *testing.T) *PRHealth {
+	t.Helper()
+	state, err := LoadState(StatePath("r", 42))
+	require.NoError(t, err)
+	require.NotNil(t, state.BestHealth, "no health recorded; the fixture never yielded a thread count")
+	return state.BestHealth
+}
+
+// A saturated run on a BOT-reviewed repo gets the same allowance as a
+// self-reviewed one. This is the kernel shape, and it is the one that hit
+// production: bots post findings, each round fixes them, threads bounce
+// 0 -> n -> 0, and BestHealth stays pinned at the saturated floor it touched on
+// tick one. Every later round then counts as "no improvement" whatever it
+// accomplished.
+//
+// The exemption must therefore key on the METRIC being uninformative, not on
+// needsSelfReview: that predicate is false whenever `self_review` is off, so
+// gating on it alone leaves every bot-reviewed repo stopping on the old
+// saturation cutoff — the false positive unfixed for the repo mode that had it.
+func TestWatcher_DivergenceGuard_SaturatedBotReviewedRepoExtendsOnce(t *testing.T) {
+	gh := setupGH(buildPRJSON(conflictingPRJSON, "SUCCESS"), "[]", "base1")
+	gh.setThreads(0)
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 2
+	// The bots are the reviewers here, so prdozer never originates a review and
+	// needsSelfReview is false on every tick. Only saturation can grant grace.
+	w.cfg.Polish.SelfReview = false
+
+	ctx := context.Background()
+	// Tick one observes {0 unresolved, ci green} and pins BestHealth to the
+	// unbeatable floor. Nothing after this can beat it.
+	_, err := w.Tick(ctx)
+	require.NoError(t, err)
+	require.True(t, bestHealth(t).Saturated(),
+		"the case is vacuous unless BestHealth really is the unbeatable floor")
+
+	var last TickResult
+	for range 3 {
+		res, err := w.Tick(ctx)
+		require.NoError(t, err)
+		last = res
+	}
+	assert.NotEqual(t, LastActionNeedsHuman, last.Action,
+		"a saturated streak is arithmetic, not evidence the run stopped making progress")
+	assert.False(t, last.Diverged)
+	assert.GreaterOrEqual(t, last.RoundsSinceImprovement, 2,
+		"the streak must genuinely have passed the plain limit, else the case is vacuous")
+}
+
+// The saturated arm is bounded by the same 2*limit as the unreviewed one. A
+// saturated BestHealth never becomes unsaturated — nothing can beat the floor —
+// so an unconditional exemption here would be permanently unbounded, on every
+// repo rather than just self-reviewed ones.
+func TestWatcher_DivergenceGuard_SaturatedBotReviewedRepoStillStopsAtHardLimit(t *testing.T) {
+	gh := setupGH(buildPRJSON(conflictingPRJSON, "SUCCESS"), "[]", "base1")
+	gh.setThreads(0)
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 2
+	w.cfg.Polish.SelfReview = false
+
+	ctx := context.Background()
+	_, err := w.Tick(ctx)
+	require.NoError(t, err)
+
+	var last TickResult
+	for range 10 {
+		res, err := w.Tick(ctx)
+		require.NoError(t, err)
+		last = res
+		if res.Action == LastActionNeedsHuman {
+			break
+		}
+	}
+	assert.Equal(t, LastActionNeedsHuman, last.Action,
+		"a permanently saturated metric must not buy an unbounded run")
+	assert.True(t, last.Diverged)
+	assert.GreaterOrEqual(t, last.RoundsSinceImprovement, 4,
+		"the hard limit is 2*MaxRoundsWithoutImprovement")
+}
+
+// The kernel#8227 shape — the case the guard was BUILT for — must still stop at
+// the plain limit on a bot-reviewed repo. Red CI means BestHealth is not
+// saturated: a green rollup would still beat it, so the streak is a real
+// measurement and neither exemption arm applies.
+//
+// This is the bound on the other axis. Widening the exemption from
+// needsSelfReview to "saturated OR unreviewed" must not soften the guard for
+// runs whose metric can still move.
+func TestWatcher_DivergenceGuard_UnsaturatedBotReviewedRepoStopsAtPlainLimit(t *testing.T) {
+	gh := setupGH(buildPRJSON(conflictingPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(0)
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 2
+	w.cfg.Polish.SelfReview = false
+
+	ctx := context.Background()
+	_, err := w.Tick(ctx)
+	require.NoError(t, err)
+	require.False(t, bestHealth(t).Saturated(),
+		"red CI must leave BestHealth beatable, else this tests the saturated path")
+
+	var last TickResult
+	for range 10 {
+		res, err := w.Tick(ctx)
+		require.NoError(t, err)
+		last = res
+		if res.Action == LastActionNeedsHuman {
+			break
+		}
+	}
+	assert.Equal(t, LastActionNeedsHuman, last.Action,
+		"a beatable BestHealth means the streak measures divergence and must stop the run")
+	assert.True(t, last.Diverged)
+	assert.Equal(t, 2, last.RoundsSinceImprovement,
+		"an unsaturated run stops at the plain limit, not the doubled one")
 }

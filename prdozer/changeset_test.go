@@ -401,6 +401,31 @@ func TestPRHealth_BetterThan(t *testing.T) {
 	assert.False(t, red1.BetterThan(green5))
 }
 
+// Saturated must mean exactly "BetterThan(h) is false for every h", because the
+// divergence guard reads it as "this streak is arithmetic, not measurement". The
+// two are asserted together so a change to BetterThan's ordering cannot silently
+// leave Saturated describing a state something can still beat.
+func TestPRHealth_Saturated(t *testing.T) {
+	t.Parallel()
+	floor := PRHealth{UnresolvedThreads: 0}
+	assert.True(t, floor.Saturated(), "0 unresolved + green CI is the best expressible state")
+
+	assert.False(t, PRHealth{UnresolvedThreads: 1}.Saturated(), "outstanding threads can still be resolved")
+	assert.False(t, PRHealth{UnresolvedThreads: 0, CIFailing: true}.Saturated(),
+		"red CI can still go green, so this is beatable — the kernel#8227 shape")
+
+	// The property that makes it load-bearing: nothing beats the floor, which is
+	// why a run pinned there keeps incrementing RoundsSinceImprovement forever.
+	for _, h := range []PRHealth{
+		floor,
+		{UnresolvedThreads: 1},
+		{UnresolvedThreads: 0, CIFailing: true},
+		{UnresolvedThreads: 9, CIFailing: true},
+	} {
+		assert.False(t, h.BetterThan(floor), "%+v must not beat the saturated floor", h)
+	}
+}
+
 // GitHub calls a PR mergeable when it has no conflicts and required checks
 // pass — that says nothing about whether reviewer feedback was addressed.
 // Treating mergeable as "done" let yoloswe#287 finish in 1.5 seconds with

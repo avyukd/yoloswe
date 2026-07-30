@@ -146,7 +146,12 @@ func TestPolishRoundsThreadCommandOutputIntoNextPrompt(t *testing.T) {
 	assert.Equal(t, "address: two findings", fake.prompts[0])
 	assert.Equal(t, map[string]bool{fix.onceKey(): true}, res.RanOnceRounds,
 		"the once round that completed must be reported so it is never repeated")
-	assert.NotZero(t, res.DurationMs)
+	// DurationMs is deliberately not asserted on. It is time.Since(start)
+	// truncated to whole milliseconds, and both rounds here are a printf and a
+	// fake provider — on a fast machine the whole Run finishes inside one
+	// millisecond and records a legitimate 0. Asserting non-zero made the test
+	// pass or fail on host speed rather than on the once-round accounting it
+	// exists to cover.
 }
 
 // A once round already recorded for this PR is dropped before it can reach the
