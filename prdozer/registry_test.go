@@ -298,8 +298,25 @@ repos:
             {{- if .PrevOutput}}
             prev: {{.PrevOutput}}
             {{- end}}
+    polish:
+      rounds:
+        - prompt: /simplify-branch
+          once: true
+        - prompt: "{{.DefaultPolishPrompt}}"
 `))
 	require.NoError(t, err)
+}
+
+// The documented way to say "do the normal polish" in a spec round. Rounds are
+// sent verbatim, so this placeholder is the only thing that carries prdozer's
+// per-tick --rounds cap into a configured round.
+func TestRenderRound_DefaultPolishPrompt(t *testing.T) {
+	t.Parallel()
+	got, err := RenderRound("{{.DefaultPolishPrompt}}", ReworkData{
+		DefaultPolishPrompt: "/pr-polish --rounds 3 8123",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "/pr-polish --rounds 3 8123", got)
 }
 
 func TestRenderRound(t *testing.T) {

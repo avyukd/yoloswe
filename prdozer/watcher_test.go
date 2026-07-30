@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -71,6 +72,10 @@ type stubPolish struct {
 	err   error
 	calls []PolishRequest
 	mu    sync.Mutex
+	// onceRan is reported as PolishResult.OnceRoundsRan, on the failure path too:
+	// a real runner reports the once-only rounds it finished even when a LATER
+	// round failed.
+	onceRan bool
 }
 
 func (s *stubPolish) Run(_ context.Context, req PolishRequest) (PolishResult, error) {
@@ -78,9 +83,9 @@ func (s *stubPolish) Run(_ context.Context, req PolishRequest) (PolishResult, er
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, req)
 	if s.err != nil {
-		return PolishResult{}, s.err
+		return PolishResult{OnceRoundsRan: s.onceRan}, s.err
 	}
-	return PolishResult{SessionID: "stub", Output: "ok"}, nil
+	return PolishResult{SessionID: "stub", Output: "ok", OnceRoundsRan: s.onceRan}, nil
 }
 
 func setupGH(prJSON, runListJSON, baseSHA string) *fakeGH {
@@ -894,7 +899,7 @@ func TestWatcher_SelfReviewOff_CleanPRStillTerminates(t *testing.T) {
 // Some polish steps must run once per RUN, not once per tick. /simplify-branch
 // is a whole-branch cleanup: it improves an initial diff but churns an evolving
 // one, so re-running it every 20 minutes is wrong.
-func TestPolishRequest_OnceRoundsRunOnlyOnTheFirstTick(t *testing.T) {
+func TestPolishRequest_OnceRoundsRunOnlyWhenAskedFor(t *testing.T) {
 	t.Parallel()
 	spec := StepSpec{Rounds: []RoundSpec{
 		{Prompt: "/simplify-branch", Once: true},
@@ -902,10 +907,10 @@ func TestPolishRequest_OnceRoundsRunOnlyOnTheFirstTick(t *testing.T) {
 		{Prompt: "address review comments"},
 	}}
 
-	first := PolishRequest{Spec: spec, FirstTick: true}.activeRounds()
+	first := PolishRequest{Spec: spec, RunOnceRounds: true}.activeRounds()
 	assert.Len(t, first, 3, "the opening tick runs every round")
 
-	later := PolishRequest{Spec: spec, FirstTick: false}.activeRounds()
+	later := PolishRequest{Spec: spec, RunOnceRounds: false}.activeRounds()
 	require.Len(t, later, 2, "later ticks skip the once-only rounds")
 	assert.Equal(t, "/pr-polish", later[0].Prompt)
 	assert.Equal(t, "address review comments", later[1].Prompt)
@@ -915,16 +920,196 @@ func TestPolishRequest_OnceRoundsRunOnlyOnTheFirstTick(t *testing.T) {
 // never opt in are unaffected.
 func TestPolishRequest_NoSpecFallsBackToTheDefaultCall(t *testing.T) {
 	t.Parallel()
-	assert.Empty(t, PolishRequest{FirstTick: true}.activeRounds(),
+	assert.Empty(t, PolishRequest{RunOnceRounds: true}.activeRounds(),
 		"an empty spec must fall through to the default /pr-polish call")
 }
 
 // A spec whose rounds are ALL once-only must not silently do nothing on later
 // ticks — activeRounds returning empty routes back to the default call, which
 // is the safe behaviour rather than a no-op polish.
-func TestPolishRequest_AllOnceRoundsFallBackAfterFirstTick(t *testing.T) {
+func TestPolishRequest_AllOnceRoundsFallBackOnceTheyAreDone(t *testing.T) {
 	t.Parallel()
 	spec := StepSpec{Rounds: []RoundSpec{{Prompt: "/simplify-branch", Once: true}}}
-	assert.Empty(t, PolishRequest{Spec: spec, FirstTick: false}.activeRounds(),
+	assert.Empty(t, PolishRequest{Spec: spec, RunOnceRounds: false}.activeRounds(),
 		"all-once spec yields no rounds later, falling back to the default call")
+}
+
+// Polish reuses StepSpec, and the registry docs point at jiradozer configs that
+// set a per-step model, so `polish.model` must actually take effect rather than
+// being silently ignored in favour of the top-level agent model.
+func TestPolishRequest_SpecModelOverridesTheAgentModel(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, "spec-model",
+		PolishRequest{Model: "agent-model", Spec: StepSpec{Model: "spec-model"}}.modelID())
+	assert.Equal(t, "agent-model",
+		PolishRequest{Model: "agent-model", Spec: StepSpec{}}.modelID(),
+		"no per-step model falls back to the run's agent model")
+}
+
+// polishStateFixture pre-seeds state so a moved base triggers a polish on the
+// very first tick rather than being absorbed as the run's baseline.
+func polishStateFixture(t *testing.T) {
+	t.Helper()
+	pre := &State{
+		PRNumber:        42,
+		Repo:            "r",
+		LastCheckAt:     time.Now(),
+		LastSeenHeadSHA: "head1",
+		LastSeenBaseSHA: "old-base",
+	}
+	require.NoError(t, pre.Save(StatePath("r", 42)))
+}
+
+// The once gate must survive a polish that FAILED after running its once-only
+// round: that round has already done its work, so repeating it is the churn
+// `once` exists to prevent. Gating on a successful-polish counter
+// (state.PolishRounds) would repeat it, because that counter only advances on a
+// tick that OBSERVES a successful round — note PolishRounds is still zero here.
+//
+// This also covers the wiring the helper-only tests above cannot: registry spec
+// → WithPolishSpec → PolishRequest.Spec/RunOnceRounds across two real ticks.
+func TestWatcher_OnceRoundsSurviveAPolishThatFailedAfterThem(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "SUCCESS"), "[]", "new-base")
+	spec := StepSpec{Rounds: []RoundSpec{
+		{Prompt: "/simplify-branch", Once: true},
+		{Prompt: "/pr-polish"},
+	}}
+	// The once round finished; the round after it blew up.
+	polish := &stubPolish{err: errors.New("second round blew up"), onceRan: true}
+	w := newWatcherForTest(t, gh, polish, WithPolishSpec(spec))
+	polishStateFixture(t)
+
+	ctx := context.Background()
+	res, err := w.Tick(ctx)
+	require.NoError(t, err)
+	require.Equal(t, LastActionFailed, res.Action)
+	require.Len(t, polish.calls, 1)
+	assert.True(t, polish.calls[0].RunOnceRounds, "the opening polish runs every round")
+	assert.Equal(t, spec, polish.calls[0].Spec, "the registry spec must reach the polisher")
+
+	// Second tick: base moves again so polish is triggered once more.
+	polish.err = nil
+	gh.addPrefix("api repos/{owner}/{repo}/git/refs/heads/main", "newer-base")
+	res, err = w.Tick(ctx)
+	require.NoError(t, err)
+	require.Equal(t, LastActionPolished, res.Action)
+	require.Len(t, polish.calls, 2)
+	assert.Zero(t, res.PolishRounds,
+		"a failed round is never counted — the precondition that made PolishRounds the wrong gate")
+	assert.False(t, polish.calls[1].RunOnceRounds,
+		"a completed once round is not owed again")
+	assert.Equal(t, []RoundSpec{{Prompt: "/pr-polish"}}, polish.calls[1].activeRounds())
+}
+
+// The mirror image: a polish that failed BEFORE reaching its once-only round
+// still owes that round. Rounds run in order, so an earlier repeatable round
+// failing means the once round never ran at all — latching the gate on dispatch
+// would silently drop it for the life of the PR.
+func TestWatcher_OnceRoundsStillOwedWhenPolishFailedBeforeThem(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "SUCCESS"), "[]", "new-base")
+	spec := StepSpec{Rounds: []RoundSpec{
+		{Prompt: "gather evidence"},
+		{Prompt: "/simplify-branch", Once: true},
+	}}
+	// Failed on round 1, so the once round never ran.
+	polish := &stubPolish{err: errors.New("first round blew up"), onceRan: false}
+	w := newWatcherForTest(t, gh, polish, WithPolishSpec(spec))
+	polishStateFixture(t)
+
+	ctx := context.Background()
+	_, err := w.Tick(ctx)
+	require.NoError(t, err)
+	require.Len(t, polish.calls, 1)
+
+	polish.err, polish.onceRan = nil, true
+	gh.addPrefix("api repos/{owner}/{repo}/git/refs/heads/main", "newer-base")
+	_, err = w.Tick(ctx)
+	require.NoError(t, err)
+	require.Len(t, polish.calls, 2)
+	assert.True(t, polish.calls[1].RunOnceRounds,
+		"a once round that never ran is still owed")
+}
+
+// The gate is persisted, not just held in memory: it is set inside decideAndAct,
+// and the tick only saves state when something marked it dirty. Miss that and
+// the next tick reloads a zero flag and re-runs every once round.
+func TestWatcher_OnceRoundsDoneIsPersisted(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "SUCCESS"), "[]", "new-base")
+	polish := &stubPolish{onceRan: true}
+	w := newWatcherForTest(t, gh, polish,
+		WithPolishSpec(StepSpec{Rounds: []RoundSpec{{Prompt: "/simplify-branch", Once: true}}}))
+	polishStateFixture(t)
+
+	_, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	state, err := LoadState(StatePath("r", 42))
+	require.NoError(t, err)
+	assert.True(t, state.OnceRoundsDone, "the once gate must outlive the tick that set it")
+}
+
+// A repo with no configured polish spec has no once rounds to gate, so the PR
+// must not accumulate once-round state — there is nothing for it to mean.
+func TestWatcher_NoPolishSpec_LeavesTheOnceGateUnset(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "SUCCESS"), "[]", "new-base")
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	polishStateFixture(t)
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, LastActionPolished, res.Action)
+	state, err := LoadState(StatePath("r", 42))
+	require.NoError(t, err)
+	assert.False(t, state.OnceRoundsDone)
+}
+
+// The accounting behind PolishResult.OnceRoundsRan, exercised through the real
+// runRounds using command rounds (no agent provider needed). Order is what makes
+// this subtle: only a failure AFTER every once round leaves them done.
+func TestAgentPolisher_RunRounds_OnceRoundsReportedOnlyWhenTheyFinished(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		rounds  []RoundSpec
+		wantRan bool
+		wantErr bool
+	}{{
+		name:    "failure after the once round still reports it done",
+		rounds:  []RoundSpec{{Command: "true", Once: true}, {Command: "exit 1"}},
+		wantRan: true,
+		wantErr: true,
+	}, {
+		name:    "failure before the once round leaves it owed",
+		rounds:  []RoundSpec{{Command: "exit 1"}, {Command: "true", Once: true}},
+		wantRan: false,
+		wantErr: true,
+	}, {
+		name:    "one of several once rounds finishing is not enough",
+		rounds:  []RoundSpec{{Command: "true", Once: true}, {Command: "exit 1", Once: true}},
+		wantRan: false,
+		wantErr: true,
+	}, {
+		name:    "every round succeeding reports them done",
+		rounds:  []RoundSpec{{Command: "true", Once: true}, {Command: "true", Once: true}},
+		wantRan: true,
+	}, {
+		name:    "a spec with no once rounds never reports them",
+		rounds:  []RoundSpec{{Command: "true"}},
+		wantRan: false,
+	}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			p := NewAgentPolisher(nil, slog.New(slog.DiscardHandler))
+			req := PolishRequest{PRNumber: 42, WorkDir: t.TempDir(), RunOnceRounds: true,
+				Spec: StepSpec{Rounds: tc.rounds}}
+			res, err := p.runRounds(context.Background(), req, tc.rounds)
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tc.wantRan, res.OnceRoundsRan)
+		})
+	}
 }

@@ -22,7 +22,7 @@ type PolishRunner interface {
 // PolishRequest carries everything the polish runner needs.
 type PolishRequest struct {
 	// Spec, when non-empty, replaces the single "/pr-polish" call with its
-	// rounds. Rounds marked `once` run only when FirstTick is true.
+	// rounds. Rounds marked `once` run only when RunOnceRounds is true.
 	Spec     StepSpec
 	WorkDir  string
 	Model    string
@@ -32,10 +32,12 @@ type PolishRequest struct {
 	Cfg      PolishConfig
 	PRNumber int
 	Local    bool
-	// FirstTick reports whether this is the run's opening polish. Rounds marked
-	// `once: true` are skipped when it is false — a whole-branch pass like
-	// /simplify-branch improves an initial diff but churns an evolving one.
-	FirstTick bool
+	// RunOnceRounds asks for this spec's `once: true` rounds to be included.
+	// The caller owns the decision — it is the only side that knows whether the
+	// PR has had them yet (see State.OnceRoundsDone) — so the polisher simply
+	// obeys. A whole-branch pass like /simplify-branch improves an initial diff
+	// but churns an evolving one, which is what these rounds are for.
+	RunOnceRounds bool
 }
 
 // PolishResult captures what came out of the polish session.
@@ -43,6 +45,15 @@ type PolishResult struct {
 	SessionID  string
 	Output     string
 	DurationMs int64
+	// OnceRoundsRan reports that every `once: true` round in this call finished.
+	// The caller latches it so those rounds are not repeated.
+	//
+	// Reported by the runner rather than assumed by the caller because only the
+	// runner knows how far it got: rounds execute in order, so a spec whose
+	// FIRST round is repeatable and fails never reaches a later once-only round
+	// — and that round must still be owed. Conversely a once round followed by a
+	// failing round has already done its work and must not be repeated.
+	OnceRoundsRan bool
 }
 
 // AgentPolisher invokes /pr-polish through multiagent/agent — the same path
@@ -66,8 +77,8 @@ func (p *AgentPolisher) Run(ctx context.Context, req PolishRequest) (PolishResul
 	return p.runOne(ctx, req, buildPolishPrompt(req.PRNumber, req.Local, req.Cfg.RoundsPerTick))
 }
 
-// activeRounds returns the rounds to run this tick: all of them on the first
-// polish, and only the repeatable ones thereafter.
+// activeRounds returns the rounds to run this tick: all of them while the
+// once-only rounds are still owed, and only the repeatable ones thereafter.
 //
 // Returning empty routes Run back to the default single "/pr-polish" call. That
 // matters for a spec whose rounds are ALL once-only: later ticks then still
@@ -77,7 +88,7 @@ func (req PolishRequest) activeRounds() []RoundSpec {
 	if req.Spec.Empty() {
 		return nil
 	}
-	if req.FirstTick {
+	if req.RunOnceRounds {
 		return req.Spec.Rounds
 	}
 	out := make([]RoundSpec, 0, len(req.Spec.Rounds))
@@ -89,6 +100,19 @@ func (req PolishRequest) activeRounds() []RoundSpec {
 	return out
 }
 
+// modelID resolves which model this polish runs on.
+//
+// A configured spec may override the top-level agent model, exactly as
+// merge_rework does — Polish reuses StepSpec, and the registry docs point at
+// jiradozer configs that set a per-step model, so silently ignoring
+// `polish.model` would misconfigure without a word.
+func (req PolishRequest) modelID() string {
+	if req.Spec.Model != "" {
+		return req.Spec.Model
+	}
+	return req.Model
+}
+
 // runRounds executes a configured polish step, threading each round's output
 // into the next as PrevOutput so a command round can gather evidence the
 // following agent round reasons about.
@@ -96,13 +120,25 @@ func (p *AgentPolisher) runRounds(ctx context.Context, req PolishRequest, rounds
 	var res PolishResult
 	prev := ""
 	start := time.Now()
+	// Counted rather than flagged on the first one seen: a spec may carry
+	// several once-only rounds, and one of them completing says nothing about
+	// the rest. They are owed until all of them are done.
+	onceOwed := 0
+	for _, r := range rounds {
+		if r.Once {
+			onceOwed++
+		}
+	}
 	for i, round := range rounds {
 		data := ReworkData{
 			Repo:       req.Repo,
 			Branch:     req.Branch,
 			PRURL:      req.PRURL,
 			PrevOutput: prev,
-			PRNumber:   req.PRNumber,
+			// So a round can ask for the wired default call rather than a bare
+			// "/pr-polish", which would drop the per-tick --rounds cap.
+			DefaultPolishPrompt: buildPolishPrompt(req.PRNumber, req.Local, req.Cfg.RoundsPerTick),
+			PRNumber:            req.PRNumber,
 		}
 		var (
 			out string
@@ -122,7 +158,14 @@ func (p *AgentPolisher) runRounds(ctx context.Context, req PolishRequest, rounds
 			}
 		}
 		if err != nil {
+			// res carries OnceRoundsRan for the rounds that DID finish, so the
+			// caller can latch them even though this call failed.
+			res.DurationMs = time.Since(start).Milliseconds()
 			return res, fmt.Errorf("polish round %d/%d: %w", i+1, len(rounds), err)
+		}
+		if round.Once {
+			onceOwed--
+			res.OnceRoundsRan = onceOwed == 0
 		}
 		prev = out
 		res.Output = out
@@ -152,9 +195,10 @@ func (p *AgentPolisher) runPolishCommand(ctx context.Context, req PolishRequest,
 }
 
 func (p *AgentPolisher) runOne(ctx context.Context, req PolishRequest, prompt string) (PolishResult, error) {
-	model, ok := agent.ModelByID(req.Model)
+	modelID := req.modelID()
+	model, ok := agent.ModelByID(modelID)
 	if !ok {
-		return PolishResult{}, fmt.Errorf("unknown model %q", req.Model)
+		return PolishResult{}, fmt.Errorf("unknown model %q", modelID)
 	}
 	provider, err := agent.NewProviderForModel(model)
 	if err != nil {
@@ -166,7 +210,7 @@ func (p *AgentPolisher) runOne(ctx context.Context, req PolishRequest, prompt st
 	logger.Info("invoking pr-polish",
 		"pr", req.PRNumber,
 		"local", req.Local,
-		"model", req.Model,
+		"model", modelID,
 		"work_dir", req.WorkDir,
 	)
 	logger.Debug("pr-polish prompt", "prompt", prompt)
@@ -184,9 +228,18 @@ func (p *AgentPolisher) runOne(ctx context.Context, req PolishRequest, prompt st
 	opts := []agent.ExecuteOption{
 		agent.WithProviderWorkDir(req.WorkDir),
 		agent.WithProviderPermissionMode(permMode),
-		agent.WithProviderModel(req.Model),
+		agent.WithProviderModel(modelID),
 		agent.WithProviderKeepUserSettings(),
 		agent.WithProviderEventHandler(handler),
+	}
+	if req.Spec.Effort != "" {
+		// Parse rather than cast: a typo'd effort should fail loudly here, not be
+		// passed through to the provider as an unrecognized value.
+		effort, err := agent.ParseEffort(req.Spec.Effort)
+		if err != nil {
+			return PolishResult{}, fmt.Errorf("polish effort: %w", err)
+		}
+		opts = append(opts, agent.WithProviderEffort(effort))
 	}
 	if req.Cfg.MaxTurns > 0 {
 		opts = append(opts, agent.WithProviderMaxTurns(req.Cfg.MaxTurns))

@@ -91,6 +91,19 @@ type State struct {
 	// RoundsSinceImprovement counts consecutive polish rounds that failed to
 	// beat BestHealth. Reset to zero whenever a new best is reached.
 	RoundsSinceImprovement int `json:"rounds_since_improvement,omitempty"`
+	// OnceRoundsDone records that this PR's polish rounds marked `once: true`
+	// have run to completion. It gates PolishRequest.RunOnceRounds.
+	//
+	// Per PR, not per process: this file outlives any single babysit run, and
+	// that is the behaviour these rounds want. A whole-branch pass like
+	// /simplify-branch is worth running on a fresh diff; a PR resumed after
+	// twenty polish rounds no longer has one, so a restart must not re-run it.
+	//
+	// Latched from PolishResult.OnceRoundsRan rather than derived from
+	// PolishRounds, which counts only rounds whose result a later tick actually
+	// OBSERVED — a failed round, or a snapshot with no thread count, leaves it at
+	// zero and would re-run every once round on the next tick.
+	OnceRoundsDone bool `json:"once_rounds_done,omitempty"`
 }
 
 // PRHealth is the cheap, externally-observable measure of whether a PR is

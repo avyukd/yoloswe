@@ -72,6 +72,17 @@ type RepoEntry struct {
 	// between rounds. So write rounds that do one pass; do not tell the agent to
 	// loop, or the divergence guard goes unconsulted for the whole call.
 	//
+	// Prompts are sent VERBATIM — nothing is appended — so a round that means
+	// "do the normal polish" must say "{{.DefaultPolishPrompt}}" rather than a
+	// bare "/pr-polish", which would run the skill at ITS default round budget
+	// instead of this repo's rounds_per_tick:
+	//
+	//	polish:
+	//	  rounds:
+	//	    - prompt: /simplify-branch
+	//	      once: true
+	//	    - prompt: "{{.DefaultPolishPrompt}}"
+	//
 	// Empty keeps the default behaviour: one "/pr-polish --rounds N" call.
 	Polish StepSpec `yaml:"polish"`
 	// MergeRework declares the rounds run after a failed merge. A repo that
@@ -111,13 +122,17 @@ func (s StepSpec) Empty() bool { return len(s.Rounds) == 0 }
 type RoundSpec struct {
 	Prompt  string `yaml:"prompt"`
 	Command string `yaml:"command"`
-	// Once restricts this round to the first tick of a run.
+	// Once restricts this round to the first polish a PR receives.
 	//
 	// Polish rounds repeat on every tick, which is right for "address review
 	// comments" but wrong for whole-branch passes: /simplify-branch cleans up
 	// the entire diff, and re-running it every 20 minutes on an evolving branch
 	// churns rather than improves. Mark those `once: true` so they run in the
-	// opening tick and are skipped thereafter.
+	// opening polish and are skipped thereafter.
+	//
+	// Once per PR, not per babysit process: the record is kept in the PR's state
+	// file (State.OnceRoundsDone), so a restarted run does not repeat them on a
+	// branch that has already been worked.
 	Once bool `yaml:"once"`
 }
 
@@ -140,21 +155,32 @@ type ReworkData struct {
 	// PrevOutput is the output of the preceding round, so a command round can
 	// feed evidence to the agent round after it.
 	PrevOutput string
-	PRNumber   int
-	Attempt    int
+	// DefaultPolishPrompt is prdozer's own fully-wired "/pr-polish" invocation:
+	// the exact prompt the default (spec-less) path sends, PR number and flags
+	// included. Set for polish rounds only; empty for merge_rework.
+	//
+	// A round's prompt is sent VERBATIM, so a round written as a bare
+	// "/pr-polish" drops the "--rounds" cap that keeps a single tick bounded and
+	// the divergence guard consultable (see buildPolishPrompt). Write
+	// "{{.DefaultPolishPrompt}}" to get the wired call instead of hand-copying
+	// flags that then rot.
+	DefaultPolishPrompt string
+	PRNumber            int
+	Attempt             int
 }
 
 // sampleReworkData supplies non-zero values so eager validation traverses
 // {{- if .X}} branches that a zero-value pass would skip.
 var sampleReworkData = ReworkData{
-	Repo:        "sycamore-labs/kernel",
-	MergeError:  "Pull request is in an unmergeable state",
-	Branch:      "feature/example",
-	PRURL:       "https://github.com/sycamore-labs/kernel/pull/8123",
-	MergePolicy: string(MergePolicyQueue),
-	PrevOutput:  "MERGEABLE",
-	PRNumber:    8123,
-	Attempt:     2,
+	Repo:                "sycamore-labs/kernel",
+	MergeError:          "Pull request is in an unmergeable state",
+	Branch:              "feature/example",
+	PRURL:               "https://github.com/sycamore-labs/kernel/pull/8123",
+	MergePolicy:         string(MergePolicyQueue),
+	PrevOutput:          "MERGEABLE",
+	DefaultPolishPrompt: "/pr-polish --rounds 3 8123",
+	PRNumber:            8123,
+	Attempt:             2,
 }
 
 // DefaultRegistryPath is where the fleet-shared registry lives, beside the
@@ -235,8 +261,11 @@ func validateReworkTemplate(label, tmpl string) error {
 	if err != nil {
 		return fmt.Errorf("%s template: %w", label, err)
 	}
-	for _, sample := range []ReworkData{{}, sampleReworkData} {
-		if err := t.Execute(io.Discard, sample); err != nil {
+	// Indexed rather than ranged by value: ReworkData is large enough that
+	// copying it per iteration trips gocritic's rangeValCopy.
+	samples := []ReworkData{{}, sampleReworkData}
+	for i := range samples {
+		if err := t.Execute(io.Discard, &samples[i]); err != nil {
 			return fmt.Errorf("%s template: %w", label, err)
 		}
 	}

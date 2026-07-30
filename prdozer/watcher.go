@@ -164,10 +164,14 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 	w.diverged = false
 	priorAttempts, priorMergeErr := state.MergeAttempts, state.LastMergeError
 	priorSelfReviewed := state.SelfReviewedSHA
+	priorOnceDone := state.OnceRoundsDone
 	action := w.decideAndAct(ctx, snap, cs, state)
 	mergeStateDirty := state.MergeAttempts != priorAttempts ||
 		state.LastMergeError != priorMergeErr ||
-		state.SelfReviewedSHA != priorSelfReviewed
+		state.SelfReviewedSHA != priorSelfReviewed ||
+		// Load-bearing: without this the flag can be set and never saved, so the
+		// next tick reloads OnceRoundsDone=false and re-runs every once round.
+		state.OnceRoundsDone != priorOnceDone
 
 	res := TickResult{Snapshot: snap, Changeset: cs, Action: action,
 		Diverged: w.diverged, PolishRounds: state.PolishRounds,
@@ -287,12 +291,17 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		Repo:     w.repo,
 		Branch:   snap.PR.HeadRefName,
 		PRURL:    snap.PR.URL,
-		// A run's opening polish: state.PolishRounds is only incremented after a
-		// round is observed, so zero means nothing has run yet. Rounds marked
-		// `once` are gated on this.
-		FirstTick: state.PolishRounds == 0,
+		// Rounds marked `once` are still owed until the PR has had them.
+		RunOnceRounds: !state.OnceRoundsDone,
 	}
-	if _, err := w.polish.Run(ctx, req); err != nil {
+	polishRes, err := w.polish.Run(ctx, req)
+	// Latched before the error check: a spec whose LATER round failed has still
+	// run its once-only rounds, and repeating one is the churn `once` exists to
+	// prevent. The runner reports what actually finished — see PolishResult.
+	if polishRes.OnceRoundsRan {
+		state.OnceRoundsDone = true
+	}
+	if err != nil {
 		// Log the scrubbed STRING, not a wrapped error: a provider error can
 		// embed the endpoint config (API key / key-bearing env var), and these
 		// messages are persisted and Slacked.
