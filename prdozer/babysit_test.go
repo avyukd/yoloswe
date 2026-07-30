@@ -190,10 +190,18 @@ func TestBabysitter_RefusesWhenLeaseHeld(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = held.Release() })
 
+	// A USABLE entry, because Run checks the layout before it ever reaches the
+	// lease: a bare temp dir fails that first check, and the test would then
+	// pass on the wrong error while the lease went unexercised.
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "main", ".git"), 0o755))
+
 	b := NewBabysitter(newFakeGH(), &fakeGit{}, nil, nil, BabysitOptions{
 		OwnerRepo: "o/r",
 		PRNumber:  42,
-		Entry:     RepoEntry{WorktreeRoot: t.TempDir(), Flow: "pr-polish", Layout: LayoutWT},
+		Entry: RepoEntry{
+			WorktreeRoot: root, Layout: LayoutWT, BaseBranch: "main", Flow: "pr-polish",
+		},
 	})
 	_, err = b.Run(context.Background())
 	require.Error(t, err)

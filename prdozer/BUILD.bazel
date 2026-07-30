@@ -36,10 +36,13 @@ go_library(
 go_test(
     name = "prdozer_test",
     srcs = [
+        "agent_test.go",
+        "babysit_test.go",
         "changeset_test.go",
         "config_test.go",
         "discovery_test.go",
         "dispatch_test.go",
+        "gc_test.go",
         "notify_test.go",
         "orchestrator_test.go",
         "prepare_test.go",
@@ -52,6 +55,8 @@ go_test(
     ],
     embed = [":prdozer"],
     deps = [
+        "//multiagent/agent",
+        "//notify",
         "//wt",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",

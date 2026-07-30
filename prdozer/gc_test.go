@@ -57,10 +57,14 @@ func TestRunGC_DryRunLabelsOnlyEligibleCandidates(t *testing.T) {
 	assert.False(t, byPath[old].Removed, "a dry run must not mark anything removed")
 }
 
+// Rooted under PlainWorktreeRoot deliberately: the plain layout removes the
+// directory itself, so a mock git can still prove the on-disk effect. Under the
+// wt layout the removal IS `git worktree remove`, which only real git performs —
+// TestGC_ReapsOnlyBabysitOrphans covers that against a real repository.
 func TestRunGC_RemovesExpiredWorktree(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	repoRoot := filepath.Join(home, "worktrees", "yoloswe")
+	repoRoot := filepath.Join(ExpandHome(PlainWorktreeRoot), "yoloswe")
 	old := newGCWorktree(t, repoRoot, "285-old", 96*time.Hour)
 
 	res, err := RunGC(context.Background(), fakeGit{}, GCOptions{

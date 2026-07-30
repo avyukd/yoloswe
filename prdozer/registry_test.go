@@ -3,6 +3,7 @@ package prdozer
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -238,6 +239,52 @@ repos:
 			wantErr: "merge_policy",
 		},
 		{
+			// A typo'd model must fail at LOAD. Caught only at dispatch it would
+			// strand a live PR mid-run, after the run has already started.
+			name: "unknown model on a polish step",
+			body: `
+repos:
+  o/r:
+    polish:
+      model: gpt-does-not-exist
+      rounds:
+        - prompt: /pr-polish
+`,
+			wantErr: "polish.model",
+		},
+		{
+			// Same knob, other step: validateStepSpec covers both, so neither can
+			// drift into accepting garbage.
+			name: "invalid effort on a merge_rework step",
+			body: `
+repos:
+  o/r:
+    merge_rework:
+      effort: turbo
+      rounds:
+        - prompt: fix the merge
+`,
+			wantErr: "merge_rework.effort",
+		},
+		{
+			// Two once rounds with the same text share an onceKey, so the record
+			// of one completing retires both — and within a tick both still run.
+			// Neither reading is what the author meant, so the load fails.
+			name: "duplicate once rounds on a polish step",
+			body: `
+repos:
+  o/r:
+    polish:
+      rounds:
+        - prompt: /simplify-branch
+          once: true
+        - prompt: /pr-polish
+        - prompt: /simplify-branch
+          once: true
+`,
+			wantErr: "repeats the once round at index 0",
+		},
+		{
 			name: "invalid layout",
 			body: `
 repos:
@@ -298,8 +345,116 @@ repos:
             {{- if .PrevOutput}}
             prev: {{.PrevOutput}}
             {{- end}}
+    polish:
+      rounds:
+        - prompt: /simplify-branch
+          once: true
+        - prompt: "{{.DefaultPolishPrompt}}"
 `))
 	require.NoError(t, err)
+}
+
+// A field the consumer never fills renders as "" at runtime — a prompt that
+// quietly loses its evidence, or a command that runs with an empty argument.
+// Validation knows which consumer a step belongs to, so it rejects those.
+func TestLoadRegistry_RejectsFieldsTheRouteNeverFills(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{
+			name: "polish round naming a merge_rework field",
+			body: `
+repos:
+  o/r:
+    polish:
+      rounds:
+        - prompt: "the merge failed: {{.MergeError}}"
+`,
+			wantErr: "MergeError",
+		},
+		{
+			name: "polish round naming the merge attempt",
+			body: `
+repos:
+  o/r:
+    polish:
+      rounds:
+        - command: "gh pr view {{.PRNumber}} --json state # attempt {{.Attempt}}"
+`,
+			wantErr: "Attempt",
+		},
+		{
+			name: "merge_rework round naming the polish default prompt",
+			body: `
+repos:
+  o/r:
+    merge_rework:
+      rounds:
+        - prompt: "{{.DefaultPolishPrompt}}"
+`,
+			wantErr: "DefaultPolishPrompt",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := LoadRegistry(writeRegistry(t, tc.body))
+			require.Error(t, err, "a field the route never fills must fail at load")
+			assert.Contains(t, err.Error(), tc.wantErr)
+			assert.Contains(t, err.Error(), "round is given:",
+				"the error must say what the route DOES supply")
+		})
+	}
+}
+
+// The routes together must account for every ReworkData field. A field claimed
+// by neither is unreachable from any template; one silently added to the struct
+// and to only one producer is the drift this catches.
+func TestReworkDataFieldsAreRouted(t *testing.T) {
+	t.Parallel()
+	routed := make(map[string]bool)
+	for _, r := range []stepRoute{routePolish, routeMergeRework} {
+		for _, f := range r.fields() {
+			routed[f] = true
+		}
+	}
+	typ := reflect.TypeOf(ReworkData{})
+	for i := range typ.NumField() {
+		name := typ.Field(i).Name
+		assert.True(t, routed[name],
+			"ReworkData.%s is filled by no route, so no template can ever use it", name)
+	}
+}
+
+// Only the once gate cannot tell two identical rounds apart. A round that
+// repeats every tick anyway may appear twice — rejecting that would outlaw a
+// legitimate spec.
+func TestLoadRegistry_DuplicateRepeatableRoundsAllowed(t *testing.T) {
+	t.Parallel()
+	_, err := LoadRegistry(writeRegistry(t, `
+repos:
+  o/r:
+    polish:
+      rounds:
+        - prompt: /pr-polish
+        - prompt: /pr-polish
+`))
+	require.NoError(t, err)
+}
+
+// The documented way to say "do the normal polish" in a spec round. Rounds are
+// sent verbatim, so this placeholder is the only thing that carries prdozer's
+// per-tick --rounds cap into a configured round.
+func TestRenderRound_DefaultPolishPrompt(t *testing.T) {
+	t.Parallel()
+	got, err := RenderRound("{{.DefaultPolishPrompt}}", ReworkData{
+		DefaultPolishPrompt: "/pr-polish --rounds 3 8123",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "/pr-polish --rounds 3 8123", got)
 }
 
 func TestRenderRound(t *testing.T) {
@@ -416,4 +571,77 @@ repos:
 		require.NoError(t, rerr)
 		assert.True(t, e.SelfReview, "%s must have self_review enabled", name)
 	}
+}
+
+// A step that declares only model/effort has no rounds, so merging the whole
+// step behind one Empty() check replaced it wholesale with the default and threw
+// the override away — even though modelID()/applyEffort() are written to honor
+// it on the default single-call path.
+func TestRegistry_Resolve_StepModelOnlyOverrideSurvivesMerge(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "main", ".git"), 0o755))
+
+	r, err := LoadRegistry(writeRegistry(t, `
+defaults:
+  polish:
+    rounds:
+      - prompt: /pr-polish
+  merge_rework:
+    rounds:
+      - prompt: /fix-merge
+repos:
+  o/modelonly:
+    worktree_root: `+root+`
+    polish:
+      model: opus
+      effort: high
+    merge_rework:
+      model: sonnet
+`))
+	require.NoError(t, err)
+
+	e, err := r.Resolve("o/modelonly")
+	require.NoError(t, err)
+	assert.Equal(t, "opus", e.Polish.Model, "a model-only polish override must survive merging")
+	assert.Equal(t, "high", e.Polish.Effort, "an effort-only polish override must survive merging")
+	// The same bug, same fix, on the sibling StepSpec field.
+	assert.Equal(t, "sonnet", e.MergeRework.Model, "merge_rework overrides merge the same way")
+
+	// Declaring no rounds still inherits the default rounds — the override is
+	// additive to the default step, not a replacement of it.
+	require.Len(t, e.Polish.Rounds, 1)
+	assert.Equal(t, "/pr-polish", e.Polish.Rounds[0].Prompt)
+	require.Len(t, e.MergeRework.Rounds, 1)
+	assert.Equal(t, "/fix-merge", e.MergeRework.Rounds[0].Prompt)
+}
+
+// Rounds must keep replacing rather than appending or inheriting, even now that
+// model/effort merge field-wise around them.
+func TestRegistry_Resolve_StepRoundsStillReplaceUnderFieldwiseMerge(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "main", ".git"), 0o755))
+
+	r, err := LoadRegistry(writeRegistry(t, `
+defaults:
+  polish:
+    model: sonnet
+    rounds:
+      - prompt: /generic
+repos:
+  o/ownrounds:
+    worktree_root: `+root+`
+    polish:
+      rounds:
+        - prompt: /specific
+`))
+	require.NoError(t, err)
+
+	e, err := r.Resolve("o/ownrounds")
+	require.NoError(t, err)
+	require.Len(t, e.Polish.Rounds, 1, "repo rounds replace the default entirely")
+	assert.Equal(t, "/specific", e.Polish.Rounds[0].Prompt)
+	assert.Equal(t, "sonnet", e.Polish.Model,
+		"model still falls back to the default like every other scalar")
 }

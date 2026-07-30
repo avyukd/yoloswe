@@ -1,16 +1,21 @@
 package prdozer
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"text/template"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/bazelment/yoloswe/multiagent/agent"
 )
 
 // Layout describes how a repo's checkouts are arranged on disk, which decides
@@ -62,6 +67,29 @@ type RepoEntry struct {
 	// RequiredChecks names the checks that must pass. Prefer the aggregating
 	// gate job over its individual sub-jobs.
 	RequiredChecks []string `yaml:"required_checks"`
+	// Polish declares the rounds run each time the PR needs work, replacing the
+	// default single "/pr-polish" call.
+	//
+	// Modeled on jiradozer's validate step so a config ports over directly. The
+	// difference is where the iteration lives: jiradozer repeats inside one
+	// agent call ("repeat until coderabbit is happy"), whereas prdozer's tick
+	// loop IS the repetition — it re-snapshots, re-measures health, and can stop
+	// between rounds. So write rounds that do one pass; do not tell the agent to
+	// loop, or the divergence guard goes unconsulted for the whole call.
+	//
+	// Prompts are sent VERBATIM — nothing is appended — so a round that means
+	// "do the normal polish" must say "{{.DefaultPolishPrompt}}" rather than a
+	// bare "/pr-polish", which would run the skill at ITS default round budget
+	// instead of this repo's rounds_per_tick:
+	//
+	//	polish:
+	//	  rounds:
+	//	    - prompt: /simplify-branch
+	//	      once: true
+	//	    - prompt: "{{.DefaultPolishPrompt}}"
+	//
+	// Empty keeps the default behaviour: one "/pr-polish --rounds N" call.
+	Polish StepSpec `yaml:"polish"`
 	// MergeRework declares the rounds run after a failed merge. A repo that
 	// sets this REPLACES the default rounds entirely rather than appending, so
 	// a repo-specific playbook is never diluted by a generic one.
@@ -95,15 +123,75 @@ type StepSpec struct {
 // Empty reports whether this step has nothing to run.
 func (s StepSpec) Empty() bool { return len(s.Rounds) == 0 }
 
+// mergeInto fills zero-valued fields of s from d, field by field.
+//
+// Rounds still REPLACE rather than append — s keeps exactly its own rounds, or
+// exactly d's, never both. But model and effort are ordinary scalar overrides
+// and merge like every other scalar in merged().
+//
+// Merging the whole step behind one Empty() check instead dropped a model-only
+// override on the floor: `polish: {model: X}` declares no rounds, so Empty() was
+// true and the step was replaced wholesale by the default — even though
+// modelID() and runOne() are written to honor Spec.Model on the default
+// single-call path. The override was accepted, validated, and then silently
+// discarded before anything could read it.
+func (s StepSpec) mergeInto(d StepSpec) StepSpec {
+	if len(s.Rounds) == 0 {
+		s.Rounds = d.Rounds
+	}
+	if s.Model == "" {
+		s.Model = d.Model
+	}
+	if s.Effort == "" {
+		s.Effort = d.Effort
+	}
+	return s
+}
+
 // RoundSpec is exactly one of an agent prompt or a shell command.
 type RoundSpec struct {
 	Prompt  string `yaml:"prompt"`
 	Command string `yaml:"command"`
+	// Once restricts this round to the first polish a PR receives.
+	//
+	// Polish rounds repeat on every tick, which is right for "address review
+	// comments" but wrong for whole-branch passes: /simplify-branch cleans up
+	// the entire diff, and re-running it every 20 minutes on an evolving branch
+	// churns rather than improves. Mark those `once: true` so they run in the
+	// opening polish and are skipped thereafter.
+	//
+	// Once per PR, not per babysit process: the record is kept in the PR's state
+	// file (State.OnceRoundsDone), so a restarted run does not repeat them on a
+	// branch that has already been worked.
+	Once bool `yaml:"once"`
 }
 
 // IsCommand reports whether this round runs a shell command rather than an
 // agent session.
 func (r RoundSpec) IsCommand() bool { return r.Command != "" }
+
+// onceKey identifies a `once: true` round in the PR's completed-rounds record
+// (State.OnceRoundsDone), so progress survives a spec whose later round failed.
+//
+// Keyed by CONTENT rather than by position: the record outlives edits to the
+// registry, and a positional index would silently mis-attribute completion the
+// moment a round is inserted or reordered. The consequence is deliberate — an
+// edited once round is a different round and runs again, which is what a human
+// changing its text is asking for.
+//
+// The step's model and effort are deliberately NOT part of the key. They are how
+// a round runs, not what it does: /simplify-branch has already simplified the
+// branch, and re-running it because the fleet moved to a new model is exactly the
+// churn `once` exists to prevent. Worse, model and effort are step-level, so
+// including them would re-run every once round on every babysat PR the moment
+// someone tunes one knob.
+//
+// Two once rounds with the same content would therefore collide; validateStepSpec
+// rejects that at load so nothing downstream has to reason about it.
+func (r RoundSpec) onceKey() string {
+	sum := sha256.Sum256([]byte(r.Command + "\x00" + r.Prompt))
+	return hex.EncodeToString(sum[:8])
+}
 
 // ReworkData is the template context available to merge_rework rounds. Field
 // names are part of the config contract — renaming one breaks every registry
@@ -120,21 +208,72 @@ type ReworkData struct {
 	// PrevOutput is the output of the preceding round, so a command round can
 	// feed evidence to the agent round after it.
 	PrevOutput string
-	PRNumber   int
-	Attempt    int
+	// DefaultPolishPrompt is prdozer's own fully-wired "/pr-polish" invocation:
+	// the exact prompt the default (spec-less) path sends, PR number and flags
+	// included. Set for polish rounds only; a merge_rework template naming it is
+	// rejected at load rather than left to render as "" (see stepRoute).
+	//
+	// A round's prompt is sent VERBATIM, so a round written as a bare
+	// "/pr-polish" drops the "--rounds" cap that keeps a single tick bounded and
+	// the divergence guard consultable (see buildPolishPrompt). Write
+	// "{{.DefaultPolishPrompt}}" to get the wired call instead of hand-copying
+	// flags that then rot.
+	DefaultPolishPrompt string
+	PRNumber            int
+	Attempt             int
+}
+
+// stepRoute names which consumer runs a step's rounds. The two consumers fill
+// DIFFERENT subsets of ReworkData — merge_rework has a merge error and an
+// attempt number, polish has the wired default prompt — so a template that is
+// correct for one renders as an empty string for the other. The route is what
+// lets load-time validation tell those apart instead of accepting both.
+type stepRoute string
+
+const (
+	routePolish      stepRoute = "polish"
+	routeMergeRework stepRoute = "merge_rework"
+)
+
+// fields lists the ReworkData fields this route actually populates. Anything
+// else is the zero value at runtime, which in a prompt is a silent no-op —
+// precisely the config mistake eager validation exists to catch.
+//
+// Written out rather than derived: the list IS the promise each consumer makes
+// to config authors. TestReworkDataFieldsAreRouted fails if a field is added to
+// ReworkData without deciding which consumers fill it.
+func (r stepRoute) fields() []string {
+	common := []string{"Repo", "Branch", "PRURL", "PrevOutput", "PRNumber"}
+	if r == routePolish {
+		return append(common, "DefaultPolishPrompt")
+	}
+	return append(common, "MergeError", "MergePolicy", "Attempt")
+}
+
+// sample projects d down to the fields this route fills. A map rather than the
+// struct: with missingkey=error, a template naming a field the route leaves out
+// fails to execute — against the struct it would quietly render "".
+func (r stepRoute) sample(d *ReworkData) map[string]any {
+	v := reflect.ValueOf(*d)
+	out := make(map[string]any, v.NumField())
+	for _, name := range r.fields() {
+		out[name] = v.FieldByName(name).Interface()
+	}
+	return out
 }
 
 // sampleReworkData supplies non-zero values so eager validation traverses
 // {{- if .X}} branches that a zero-value pass would skip.
 var sampleReworkData = ReworkData{
-	Repo:        "sycamore-labs/kernel",
-	MergeError:  "Pull request is in an unmergeable state",
-	Branch:      "feature/example",
-	PRURL:       "https://github.com/sycamore-labs/kernel/pull/8123",
-	MergePolicy: string(MergePolicyQueue),
-	PrevOutput:  "MERGEABLE",
-	PRNumber:    8123,
-	Attempt:     2,
+	Repo:                "sycamore-labs/kernel",
+	MergeError:          "Pull request is in an unmergeable state",
+	Branch:              "feature/example",
+	PRURL:               "https://github.com/sycamore-labs/kernel/pull/8123",
+	MergePolicy:         string(MergePolicyQueue),
+	PrevOutput:          "MERGEABLE",
+	DefaultPolishPrompt: "/pr-polish --rounds 3 8123",
+	PRNumber:            8123,
+	Attempt:             2,
 }
 
 // DefaultRegistryPath is where the fleet-shared registry lives, beside the
@@ -181,10 +320,36 @@ func validateEntry(name string, e RepoEntry) error {
 	if e.Layout != "" && !e.Layout.Valid() {
 		return fmt.Errorf("%s: layout %q is invalid (want wt or plain)", name, e.Layout)
 	}
-	return validateStepSpec(name+".merge_rework", e.MergeRework)
+	if err := validateStepSpec(name+".polish", e.Polish, routePolish); err != nil {
+		return err
+	}
+	return validateStepSpec(name+".merge_rework", e.MergeRework, routeMergeRework)
 }
 
-func validateStepSpec(label string, s StepSpec) error {
+func validateStepSpec(label string, s StepSpec, route stepRoute) error {
+	// Model and effort are checked here rather than where they are consumed:
+	// registry validation is eager precisely so a typo fails at load, not
+	// mid-run on a live PR after the agent has already been dispatched.
+	if s.Model != "" {
+		if _, ok := agent.ModelByID(s.Model); !ok {
+			return fmt.Errorf("%s.model %q is not a known model", label, s.Model)
+		}
+	}
+	if s.Effort != "" {
+		if _, err := agent.ParseEffort(s.Effort); err != nil {
+			return fmt.Errorf("%s.effort: %w", label, err)
+		}
+	}
+	// Two `once` rounds with identical content share an onceKey, which the
+	// once-gate cannot tell apart: within a tick both run (activeRounds consults
+	// the record as it stood BEFORE the tick), and afterwards one completion
+	// record retires both. Reject the spec rather than pick which reading to
+	// honour — a duplicated once round is a config mistake, and load time is
+	// where it can still be pointed at a line number.
+	//
+	// Only `once` rounds: repeating a plain round twice in a tick is a legitimate
+	// thing to ask for.
+	onceAt := make(map[string]int, len(s.Rounds))
 	for i, round := range s.Rounds {
 		switch {
 		case round.Prompt != "" && round.Command != "":
@@ -192,29 +357,41 @@ func validateStepSpec(label string, s StepSpec) error {
 		case round.Prompt == "" && round.Command == "":
 			return fmt.Errorf("%s.rounds[%d]: set exactly one of prompt or command", label, i)
 		case round.Prompt != "":
-			if err := validateReworkTemplate(fmt.Sprintf("%s.rounds[%d].prompt", label, i), round.Prompt); err != nil {
+			if err := validateReworkTemplate(fmt.Sprintf("%s.rounds[%d].prompt", label, i), round.Prompt, route); err != nil {
 				return err
 			}
 		default:
-			if err := validateReworkTemplate(fmt.Sprintf("%s.rounds[%d].command", label, i), round.Command); err != nil {
+			if err := validateReworkTemplate(fmt.Sprintf("%s.rounds[%d].command", label, i), round.Command, route); err != nil {
 				return err
 			}
+		}
+		if round.Once {
+			if prev, dup := onceAt[round.onceKey()]; dup {
+				return fmt.Errorf("%s.rounds[%d]: repeats the once round at index %d verbatim; once rounds must be distinct", label, i, prev)
+			}
+			onceAt[round.onceKey()] = i
 		}
 	}
 	return nil
 }
 
 // validateReworkTemplate parses tmpl once and executes it against a zero-value
-// and a filled sample. The two passes matter: a zero-value pass alone skips
-// {{- if .X}} branches, which is exactly where a typo hides.
-func validateReworkTemplate(label, tmpl string) error {
+// and a filled sample of what ROUTE actually supplies. The two passes matter: a
+// zero-value pass alone skips {{- if .X}} branches, which is exactly where a
+// typo hides. The route matters because a field the consumer never fills is a
+// silent empty string at runtime, not an error.
+func validateReworkTemplate(label, tmpl string, route stepRoute) error {
 	t, err := template.New(label).Option("missingkey=error").Parse(tmpl)
 	if err != nil {
 		return fmt.Errorf("%s template: %w", label, err)
 	}
-	for _, sample := range []ReworkData{{}, sampleReworkData} {
-		if err := t.Execute(io.Discard, sample); err != nil {
-			return fmt.Errorf("%s template: %w", label, err)
+	// Indexed rather than ranged by value: ReworkData is large enough that
+	// copying it per iteration trips gocritic's rangeValCopy.
+	samples := []ReworkData{{}, sampleReworkData}
+	for i := range samples {
+		if err := t.Execute(io.Discard, route.sample(&samples[i])); err != nil {
+			return fmt.Errorf("%s template: %w (a %s round is given: %s)",
+				label, err, route, strings.Join(route.fields(), ", "))
 		}
 	}
 	return nil
@@ -279,11 +456,12 @@ func (r *Registry) merged(e RepoEntry) RepoEntry {
 	if len(e.RequiredChecks) == 0 {
 		e.RequiredChecks = d.RequiredChecks
 	}
-	// merge_rework REPLACES rather than appends: a repo that declares its own
-	// rounds gets exactly those, never its rounds plus the generic default.
-	if e.MergeRework.Empty() {
-		e.MergeRework = d.MergeRework
-	}
+	// polish and merge_rework REPLACE rather than append: a repo that declares
+	// its own rounds gets exactly those, never its rounds plus a generic default.
+	// mergeInto keeps that for rounds while letting model/effort fall back like
+	// any other scalar — see mergeInto for why a whole-step swap was wrong.
+	e.Polish = e.Polish.mergeInto(d.Polish)
+	e.MergeRework = e.MergeRework.mergeInto(d.MergeRework)
 	if e.PollInterval == 0 {
 		e.PollInterval = d.PollInterval
 	}

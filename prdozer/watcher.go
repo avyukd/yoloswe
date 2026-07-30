@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 	"time"
 
@@ -23,11 +24,18 @@ type Watcher struct {
 	workDir    string
 	self       string
 	reworkSpec StepSpec
+	polishSpec StepSpec
 	pr         int
 	dryRun     bool
 	// diverged is set by the divergence guard within a tick so Tick can
 	// report WHY it stopped. Reset at the top of every tick.
 	diverged bool
+}
+
+// WithPolishSpec attaches configured polish rounds, replacing the default
+// single "/pr-polish" call. Empty keeps the default.
+func WithPolishSpec(spec StepSpec) WatcherOption {
+	return func(w *Watcher) { w.polishSpec = spec }
 }
 
 // WithRework attaches the merge-rework runner and the rounds it should run,
@@ -157,10 +165,16 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 	w.diverged = false
 	priorAttempts, priorMergeErr := state.MergeAttempts, state.LastMergeError
 	priorSelfReviewed := state.SelfReviewedSHA
+	// Counted, not compared by identity: decideAndAct adds keys to the SAME map
+	// when one already exists, so a pointer comparison would see no change.
+	priorOnceDone := len(state.OnceRoundsDone)
 	action := w.decideAndAct(ctx, snap, cs, state)
 	mergeStateDirty := state.MergeAttempts != priorAttempts ||
 		state.LastMergeError != priorMergeErr ||
-		state.SelfReviewedSHA != priorSelfReviewed
+		state.SelfReviewedSHA != priorSelfReviewed ||
+		// Load-bearing: without this a newly completed once round is never saved,
+		// so the next tick reloads without it and runs it again.
+		len(state.OnceRoundsDone) != priorOnceDone
 
 	res := TickResult{Snapshot: snap, Changeset: cs, Action: action,
 		Diverged: w.diverged, PolishRounds: state.PolishRounds,
@@ -276,8 +290,27 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		Local:    w.cfg.Polish.Local,
 		Cfg:      w.cfg.Polish,
 		Model:    w.cfg.Agent.Model,
+		Spec:     w.polishSpec,
+		Repo:     w.repo,
+		Branch:   snap.PR.HeadRefName,
+		PRURL:    snap.PR.URL,
+		// Rounds marked `once` are owed until this PR has completed them. Cloned,
+		// not shared: the request crosses the PolishRunner boundary, and handing
+		// out the live state map would let a runner mutate persisted state (and
+		// make the request's contents change under it as this tick records more).
+		DoneOnceRounds: maps.Clone(state.OnceRoundsDone),
 	}
-	if _, err := w.polish.Run(ctx, req); err != nil {
+	polishRes, err := w.polish.Run(ctx, req)
+	// Recorded before the error check: a spec whose LATER round failed has still
+	// run the once-only rounds before it, and repeating one is the churn `once`
+	// exists to prevent. The runner reports what actually finished.
+	for key := range polishRes.RanOnceRounds {
+		if state.OnceRoundsDone == nil {
+			state.OnceRoundsDone = make(map[string]bool)
+		}
+		state.OnceRoundsDone[key] = true
+	}
+	if err != nil {
 		// Log the scrubbed STRING, not a wrapped error: a provider error can
 		// embed the endpoint config (API key / key-bearing env var), and these
 		// messages are persisted and Slacked.
