@@ -122,6 +122,31 @@ type StepSpec struct {
 // Empty reports whether this step has nothing to run.
 func (s StepSpec) Empty() bool { return len(s.Rounds) == 0 }
 
+// mergeInto fills zero-valued fields of s from d, field by field.
+//
+// Rounds still REPLACE rather than append — s keeps exactly its own rounds, or
+// exactly d's, never both. But model and effort are ordinary scalar overrides
+// and merge like every other scalar in merged().
+//
+// Merging the whole step behind one Empty() check instead dropped a model-only
+// override on the floor: `polish: {model: X}` declares no rounds, so Empty() was
+// true and the step was replaced wholesale by the default — even though
+// modelID() and runOne() are written to honor Spec.Model on the default
+// single-call path. The override was accepted, validated, and then silently
+// discarded before anything could read it.
+func (s StepSpec) mergeInto(d StepSpec) StepSpec {
+	if len(s.Rounds) == 0 {
+		s.Rounds = d.Rounds
+	}
+	if s.Model == "" {
+		s.Model = d.Model
+	}
+	if s.Effort == "" {
+		s.Effort = d.Effort
+	}
+	return s
+}
+
 // RoundSpec is exactly one of an agent prompt or a shell command.
 type RoundSpec struct {
 	Prompt  string `yaml:"prompt"`
@@ -370,12 +395,10 @@ func (r *Registry) merged(e RepoEntry) RepoEntry {
 	}
 	// polish and merge_rework REPLACE rather than append: a repo that declares
 	// its own rounds gets exactly those, never its rounds plus a generic default.
-	if e.Polish.Empty() {
-		e.Polish = d.Polish
-	}
-	if e.MergeRework.Empty() {
-		e.MergeRework = d.MergeRework
-	}
+	// mergeInto keeps that for rounds while letting model/effort fall back like
+	// any other scalar — see mergeInto for why a whole-step swap was wrong.
+	e.Polish = e.Polish.mergeInto(d.Polish)
+	e.MergeRework = e.MergeRework.mergeInto(d.MergeRework)
 	if e.PollInterval == 0 {
 		e.PollInterval = d.PollInterval
 	}

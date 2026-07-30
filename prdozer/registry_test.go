@@ -462,3 +462,76 @@ repos:
 		assert.True(t, e.SelfReview, "%s must have self_review enabled", name)
 	}
 }
+
+// A step that declares only model/effort has no rounds, so merging the whole
+// step behind one Empty() check replaced it wholesale with the default and threw
+// the override away — even though modelID()/applyEffort() are written to honor
+// it on the default single-call path.
+func TestRegistry_Resolve_StepModelOnlyOverrideSurvivesMerge(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "main", ".git"), 0o755))
+
+	r, err := LoadRegistry(writeRegistry(t, `
+defaults:
+  polish:
+    rounds:
+      - prompt: /pr-polish
+  merge_rework:
+    rounds:
+      - prompt: /fix-merge
+repos:
+  o/modelonly:
+    worktree_root: `+root+`
+    polish:
+      model: opus
+      effort: high
+    merge_rework:
+      model: sonnet
+`))
+	require.NoError(t, err)
+
+	e, err := r.Resolve("o/modelonly")
+	require.NoError(t, err)
+	assert.Equal(t, "opus", e.Polish.Model, "a model-only polish override must survive merging")
+	assert.Equal(t, "high", e.Polish.Effort, "an effort-only polish override must survive merging")
+	// The same bug, same fix, on the sibling StepSpec field.
+	assert.Equal(t, "sonnet", e.MergeRework.Model, "merge_rework overrides merge the same way")
+
+	// Declaring no rounds still inherits the default rounds — the override is
+	// additive to the default step, not a replacement of it.
+	require.Len(t, e.Polish.Rounds, 1)
+	assert.Equal(t, "/pr-polish", e.Polish.Rounds[0].Prompt)
+	require.Len(t, e.MergeRework.Rounds, 1)
+	assert.Equal(t, "/fix-merge", e.MergeRework.Rounds[0].Prompt)
+}
+
+// Rounds must keep replacing rather than appending or inheriting, even now that
+// model/effort merge field-wise around them.
+func TestRegistry_Resolve_StepRoundsStillReplaceUnderFieldwiseMerge(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "main", ".git"), 0o755))
+
+	r, err := LoadRegistry(writeRegistry(t, `
+defaults:
+  polish:
+    model: sonnet
+    rounds:
+      - prompt: /generic
+repos:
+  o/ownrounds:
+    worktree_root: `+root+`
+    polish:
+      rounds:
+        - prompt: /specific
+`))
+	require.NoError(t, err)
+
+	e, err := r.Resolve("o/ownrounds")
+	require.NoError(t, err)
+	require.Len(t, e.Polish.Rounds, 1, "repo rounds replace the default entirely")
+	assert.Equal(t, "/specific", e.Polish.Rounds[0].Prompt)
+	assert.Equal(t, "sonnet", e.Polish.Model,
+		"model still falls back to the default like every other scalar")
+}
