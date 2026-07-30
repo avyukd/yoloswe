@@ -295,9 +295,11 @@ func WithProviderMaxToolErrorRetries(n int) ExecuteOption {
 // The duration passed REPLACES the default rather than extending it, so a value
 // below DefaultStreamTurnGracePeriod narrows the window. Callers that want a
 // longer window must name the full duration; callers that want the default must
-// not call this at all. Two prdozer changes (#283, #290) read "override" as
-// "extend", passed 60s meaning to widen a 10m window, and cut it 10x — which
-// force-completed turns mid-flight and drained the retry budget.
+// not call this at all. prdozer #283 read "override" as "extend", passed 60s
+// meaning to widen a 10m window, and cut it 10x instead — force-completing turns
+// mid-flight and draining the retry budget. The same misreading recurred on a
+// later prdozer branch before review caught it, which is why this is spelled out
+// here rather than only at the resolver.
 func WithProviderStreamTurnGracePeriod(d time.Duration) ExecuteOption {
 	return func(c *ExecuteConfig) { c.StreamTurnGracePeriod = d }
 }
