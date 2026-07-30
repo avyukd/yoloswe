@@ -191,7 +191,9 @@ func (p *AgentPolisher) runPolishCommand(ctx context.Context, req PolishRequest,
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if err != nil {
-		return text, fmt.Errorf("command %q: %w", truncate(cmdStr, 80), err)
+		return text, &CommandRoundError{
+			Err: fmt.Errorf("command %q: %w", truncate(cmdStr, 80), err),
+		}
 	}
 	return text, nil
 }

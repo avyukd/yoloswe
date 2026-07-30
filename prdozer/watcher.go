@@ -2,6 +2,7 @@ package prdozer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude/render"
+	"github.com/bazelment/yoloswe/multiagent/agent"
 	"github.com/bazelment/yoloswe/wt"
 )
 
@@ -318,6 +320,9 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		// embed the endpoint config (API key / key-bearing env var), and these
 		// messages are persisted and Slacked.
 		safe := safeErrString(err)
+		if action, ok := w.classifyAgentFailure("polish", err, safe); ok {
+			return action
+		}
 		w.logger.Error("polish failed", "error", safe)
 		w.status("PR #%d polish failed: %s", w.pr, safe)
 		return LastActionFailed
@@ -390,6 +395,45 @@ func (w *Watcher) rerequestReviews(ctx context.Context, snap *Snapshot) {
 	}
 }
 
+// classifyAgentFailure reports whether an agent-round error was a provider-side
+// outage rather than a fact about this PR, and if so returns the action that
+// keeps it off the failure brake.
+//
+// A provider outage is not a fact about this PR. Counting it toward the failure
+// brake spends the budget meant for "this PR is not converging" on "Anthropic
+// returned 529", and three of those bought kernel#8031 a two-hour cooldown while
+// nothing was wrong with the branch.
+//
+// Verified against the real strings: an API 529 classifies http_5xx and a
+// force-completed turn classifies grace_forced, while a bare "exit status 1"
+// stays non-transient and still counts.
+//
+// Every arm that turns an agent-round error into a LastAction routes through
+// here, so the exemption cannot drift between the polish and merge-rework paths
+// — a provider blip has to mean the same thing whichever round hit it.
+//
+// safe must already be scrubbed: a provider error can embed the endpoint config
+// (API key / key-bearing env var), and these messages are persisted and Slacked.
+func (w *Watcher) classifyAgentFailure(stage string, err error, safe string) (LastAction, bool) {
+	// A shell round never talks to the provider, so it can never have suffered a
+	// provider outage. Checked BEFORE classification rather than after: the
+	// classifier matches error text, and a command error carries captured
+	// stdout/stderr, so a real failure whose output mentions "529" or "timeout"
+	// would otherwise be exempted from the brake. See CommandRoundError.
+	var cmdErr *CommandRoundError
+	if errors.As(err, &cmdErr) {
+		return "", false
+	}
+	transient, reason := agent.ClassifyTransient(err)
+	if !transient {
+		return "", false
+	}
+	w.logger.Warn(stage+" hit a transient provider error; not counting it toward the failure brake",
+		"error", safe, "reason", reason)
+	w.status("PR #%d %s interrupted (%s) — retrying next tick", w.pr, stage, reason)
+	return LastActionTransient, true
+}
+
 // reworkAfterFailedMerge decides what happens after a merge attempt fails.
 //
 // A merge can fail in ways /pr-polish will never fix, because they are about
@@ -433,6 +477,9 @@ func (w *Watcher) reworkAfterFailedMerge(ctx context.Context, snap *Snapshot, st
 		// Scrub before logging: a provider error can embed the endpoint
 		// config that produced it, and these logs are persisted and Slacked.
 		safe := safeErrString(err)
+		if action, ok := w.classifyAgentFailure("merge rework", err, safe); ok {
+			return action
+		}
 		w.logger.Error("merge rework failed", "error", safe, "attempt", state.MergeAttempts)
 		w.status("PR #%d merge rework failed: %s", w.pr, safe)
 		return LastActionFailed
@@ -701,6 +748,18 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 		dirty = true
 	}
 	switch action {
+	// A provider-side failure is not a fact about the PR, so it neither counts
+	// toward the brake nor clears a streak already accumulated. Both arms below
+	// are explicit case lists, so an unlisted action would already fall through
+	// untouched; naming it here states the intent and makes adding it to the
+	// success list — which would let one 529 launder a real streak back to
+	// zero — a visible change rather than a silent one.
+	case LastActionTransient:
+		// ConsecutiveFailures deliberately untouched. Scoped to THIS counter: the
+		// merge-attempt brake below still applies, because its increments are real
+		// merge rejections that happened before rework was ever reached, and an
+		// outage in the rework does not un-reject them. See
+		// TestWatcher_RepeatedTransientRework_StillTripsMergeBrake.
 	// LastActionReworked shares the failure arm so a straight run of reworks
 	// still trips the ordinary backoff.
 	case LastActionFailed, LastActionReworked:
