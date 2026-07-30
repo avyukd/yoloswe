@@ -1640,12 +1640,15 @@ func TestWatcher_StaleDivergenceVerdict_ResetIsPersisted(t *testing.T) {
 	assert.Equal(t, "head1", got.LastSeenHeadSHA,
 		"the scored head must advance, or the retirement re-fires forever")
 	// BestHealth is cleared by the retirement and then immediately rebaselined by
-	// recordHealth against the live snapshot, so the assertion that matters is
-	// that it no longer holds the stale run's unbeatable-looking value.
-	if got.BestHealth != nil {
-		assert.Equal(t, 9, got.BestHealth.UnresolvedThreads,
-			"BestHealth must be rebaselined from the current snapshot, not inherited")
-	}
+	// recordHealth against the live snapshot. Asserted unconditionally: this
+	// fixture serves a readable snapshot (setThreads(9), FAILURE rollup), so
+	// recordHealth's nil branch always fires and a nil here is a regression, not
+	// a legal outcome. Guarding the assertion would let a reset that clears the
+	// stale value but never writes a new one pass silently.
+	require.NotNil(t, got.BestHealth,
+		"retirement must rebaseline BestHealth, not just clear it")
+	assert.Equal(t, PRHealth{UnresolvedThreads: 9, CIFailing: true}, *got.BestHealth,
+		"BestHealth must come from the current snapshot, not the stale run's unbeatable-looking {1}")
 }
 
 // A resumed run looking at the SAME commits keeps the verdict: nothing has
