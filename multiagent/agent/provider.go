@@ -209,7 +209,12 @@ type ExecuteConfig struct {
 	// StreamTurnGracePeriod overrides the provider's default grace period —
 	// how long a turn waits, after completion, for an outstanding background
 	// tool_use to terminate before the turn is force-completed. Zero uses the
-	// provider default.
+	// provider default (DefaultStreamTurnGracePeriod).
+	//
+	// A positive value REPLACES the default; it does not extend it. Setting a
+	// value below DefaultStreamTurnGracePeriod therefore narrows the window,
+	// which is the opposite of what "give the turn more room" callers expect —
+	// see WithProviderStreamTurnGracePeriod.
 	StreamTurnGracePeriod time.Duration
 }
 
@@ -285,7 +290,14 @@ func WithProviderMaxToolErrorRetries(n int) ExecuteOption {
 // WithProviderStreamTurnGracePeriod overrides how long a turn waits, after
 // completion, for an outstanding background tool_use to terminate before the
 // turn is force-completed. Zero (the default) uses the provider's built-in
-// grace period.
+// grace period, DefaultStreamTurnGracePeriod.
+//
+// The duration passed REPLACES the default rather than extending it, so a value
+// below DefaultStreamTurnGracePeriod narrows the window. Callers that want a
+// longer window must name the full duration; callers that want the default must
+// not call this at all. Two prdozer changes (#283, #290) read "override" as
+// "extend", passed 60s meaning to widen a 10m window, and cut it 10x — which
+// force-completed turns mid-flight and drained the retry budget.
 func WithProviderStreamTurnGracePeriod(d time.Duration) ExecuteOption {
 	return func(c *ExecuteConfig) { c.StreamTurnGracePeriod = d }
 }
