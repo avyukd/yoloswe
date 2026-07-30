@@ -444,3 +444,23 @@ func ghError(err error, res *wt.CmdResult) error {
 	}
 	return err
 }
+
+// GitHubOutageError marks a merge-path failure where GitHub itself was
+// unreachable, rather than GitHub reaching a verdict about this PR.
+//
+// It is the merge-path twin of CommandRoundError, and exists for the same
+// reason: the transient exemption classifies by matching rendered error text,
+// and ghError embeds GitHub's stderr verbatim. Without a marker the matcher is
+// reading arbitrary API output, so a merge GitHub actively REJECTED — "required
+// status check 'test_connection_timeout' failed", "base branch was modified" —
+// could match a transient-sounding token and skip the failure brake. That is
+// strictly worse than the over-braking this change set out to fix: a PR that
+// can never land would loop forever with no cooldown.
+//
+// So the exemption is opt-in at the producer, which is the only place that knows
+// which of the two happened. A rejection is a fact about the PR and keeps
+// charging the brake; only an outage — the call never got a verdict — is marked.
+type GitHubOutageError struct{ Err error }
+
+func (e *GitHubOutageError) Error() string { return e.Err.Error() }
+func (e *GitHubOutageError) Unwrap() error { return e.Err }

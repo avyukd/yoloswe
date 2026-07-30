@@ -1508,17 +1508,57 @@ func TestClassifyAgentFailure_CommandErrorNeverTransient(t *testing.T) {
 		"command failed: exit status 1: connection reset by peer",
 	} {
 		cmdErr := &CommandRoundError{Err: errors.New(text)}
-		action, ok := w.classifyAgentFailure("merge rework", cmdErr, text)
+		action, ok := w.classifyTransientFailure("merge rework", cmdErr, text)
 		assert.False(t, ok, "a shell round never talks to the provider: %s", text)
 		assert.Empty(t, string(action))
 
 		// Control: the SAME text without the marker is exempted. Without this the
 		// test would still pass if the strings simply never matched, and would
 		// prove nothing about the marker.
-		_, bare := w.classifyAgentFailure("merge rework", errors.New(text), text)
+		_, bare := w.classifyTransientFailure("merge rework", errors.New(text), text)
 		assert.True(t, bare,
 			"control: this text must be classifier-matchable, else the case is vacuous: %s", text)
 	}
+}
+
+// A marked GitHub outage is exempt on its own authority, without the text
+// having to look transient.
+//
+// This is the inverse of the CommandRoundError case above: there the marker
+// SUPPRESSES a text match, here it SUPPLIES one the text cannot. GitHub's
+// unreachable-endpoint errors are not required to carry a classifier-matchable
+// token, and the producer already knows the call never got a verdict — so the
+// marker is trusted directly rather than re-derived from arbitrary API stderr.
+func TestClassifyTransientFailure_GitHubOutageIsTransient(t *testing.T) {
+	t.Parallel()
+	w := &Watcher{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	// Deliberately text that the classifier alone would NOT match, so the case
+	// proves the marker is doing the work.
+	text := "exit status 1: could not resolve host api.github.com"
+	_, bare := w.classifyTransientFailure("merge", errors.New(text), text)
+	require.False(t, bare,
+		"control: this text must NOT be classifier-matchable, else the case is vacuous")
+
+	outage := &GitHubOutageError{Err: errors.New(text)}
+	action, ok := w.classifyTransientFailure("merge", outage, text)
+	assert.True(t, ok, "a marked outage is exempt regardless of its wording")
+	assert.Equal(t, LastActionTransient, action)
+}
+
+// The marker must not become a blanket exemption for the merge path: an
+// UNMARKED merge error whose text merely mentions a transient-sounding token is
+// still a fact about the PR and still brakes.
+func TestClassifyTransientFailure_UnmarkedGHRejectionNotExempt(t *testing.T) {
+	t.Parallel()
+	w := &Watcher{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	// ghError embeds GitHub's stderr verbatim, which is why the merge path marks
+	// at the producer instead of trusting this text.
+	cmdErr := &CommandRoundError{Err: errors.New(
+		"exit status 1: required status check \"e2e_timed_out\" is failing")}
+	_, ok := w.classifyTransientFailure("merge", cmdErr, cmdErr.Error())
+	assert.False(t, ok, "a rejection is not exempted just because its text says 'timed out'")
 }
 
 // The exemption must still apply to a genuine provider failure on the same
@@ -1528,7 +1568,7 @@ func TestClassifyAgentFailure_ProviderErrorStillTransient(t *testing.T) {
 	w := &Watcher{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 
 	err := errors.New("merge_rework round 1/1: agent execution: API Error: 529 Overloaded")
-	action, ok := w.classifyAgentFailure("merge rework", err, err.Error())
+	action, ok := w.classifyTransientFailure("merge rework", err, err.Error())
 	assert.True(t, ok)
 	assert.Equal(t, LastActionTransient, action)
 }

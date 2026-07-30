@@ -452,14 +452,14 @@ func TestAgentRework_CommandFailure_IsNeverTransient(t *testing.T) {
 	require.Error(t, err)
 
 	w := &Watcher{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	action, ok := w.classifyAgentFailure("merge rework", err, err.Error())
+	action, ok := w.classifyTransientFailure("merge rework", err, err.Error())
 	assert.False(t, ok, "a shell round never talks to the provider, so it is never a provider outage")
 	assert.Empty(t, string(action))
 
 	// Control: strip the marker and the SAME text is exempted. Without this the
 	// assertion above would also pass if "529" simply stopped matching, proving
 	// nothing about the marker.
-	_, bare := w.classifyAgentFailure("merge rework", errors.New(err.Error()), err.Error())
+	_, bare := w.classifyTransientFailure("merge rework", errors.New(err.Error()), err.Error())
 	assert.True(t, bare,
 		"control: this error text must be classifier-matchable, else the case is vacuous")
 }
@@ -617,6 +617,77 @@ func TestWatcher_RepeatedTransientRework_StillTripsMergeBrake(t *testing.T) {
 		"repeated REJECTED MERGES must still rate-limit, even when rework died on an outage")
 	assert.Equal(t, 2, s2.CooldownFromAttempt,
 		"the cooldown records its attempt watermark so the run gets a fresh allowance")
+}
+
+// A GitHub outage during the merge itself must not be charged to EITHER brake.
+//
+// This is the merge-layer twin of the rework exemption above, and the counters
+// answer the same two questions. ConsecutiveFailures asks "is this run
+// converging?" and MergeAttempts asks "how many times has GitHub REJECTED this
+// merge?". An unreachable GitHub is no evidence for either: the attempt never
+// got a verdict, so there is no rejection to record. Without the rollback the
+// increment survives, nothing ever resets MergeAttempts, and a run of 529s trips
+// the merge cooldown — precisely the outage-driven brake spend this PR exists to
+// stop, just relocated from one counter to the other.
+//
+// The outage is injected on the `api ... --jq .merged` verify step, which is the
+// read-only probe: it can only fail by being unreachable, never by GitHub
+// rejecting the merge.
+func TestWatcher_MergeOutage_ChargesNeitherBrake(t *testing.T) {
+	gh := approvedGreenGH("false")
+	gh.failPrefix("api repos/o/r/pulls/42 --jq .merged", "HTTP 503: Service Unavailable")
+	rework := &stubRework{}
+	w := newWatcherForTest(t, gh, &stubPolish{}, WithRework(rework, oneRoundSpec()))
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicySquash
+	statePath := StatePath("r", 42)
+
+	// newWatcherForTest sets MaxConsecutiveFailures=2, so two ticks are enough to
+	// trip either brake if the outage were being charged to one.
+	for i := 1; i <= 2; i++ {
+		res, err := w.Tick(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, LastActionTransient, res.Action,
+			"tick %d: an unreachable GitHub is not a fact about the PR", i)
+
+		s, err := LoadState(statePath)
+		require.NoError(t, err)
+		assert.Equal(t, 0, s.ConsecutiveFailures,
+			"tick %d: an outage must not spend the failure brake", i)
+		assert.Equal(t, 0, s.MergeAttempts,
+			"tick %d: the attempt got no verdict, so it is not a recorded rejection", i)
+		assert.True(t, s.CooldownUntil.IsZero(),
+			"tick %d: no brake was spent, so nothing may trip a cooldown", i)
+	}
+
+	assert.Equal(t, 0, rework.callCount(),
+		"there is nothing for an agent to fix when GitHub is simply down")
+}
+
+// The other half of that arm: a merge GitHub actively REJECTED still brakes, so
+// the exemption above cannot be read as "the merge path never brakes".
+//
+// This is the case the GitHubOutageError marker exists to protect. The rejection
+// text here mentions "timed out" — a token the transient classifier matches — so
+// a text-based exemption would wrongly skip the brake and let an unmergeable PR
+// loop forever. Only the producer-marked outage is exempt.
+func TestWatcher_MergeRejection_StillChargesBrake(t *testing.T) {
+	gh := approvedGreenGH("false")
+	gh.failPrefix("pr merge", "required status check \"e2e_timed_out\" is failing")
+	rework := &stubRework{}
+	w := newWatcherForTest(t, gh, &stubPolish{}, WithRework(rework, oneRoundSpec()))
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicySquash
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionReworked, res.Action,
+		"a real rejection is a fact about the PR and routes to rework")
+
+	s, err := LoadState(StatePath("r", 42))
+	require.NoError(t, err)
+	assert.Equal(t, 1, s.MergeAttempts,
+		"GitHub reached a verdict, so the rejection is recorded even though it says 'timed out'")
 }
 
 // The non-transient half of the same arm: an ordinary rework failure still

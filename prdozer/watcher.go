@@ -219,6 +219,17 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 			// Scrub once, at the source: this message is logged, persisted to
 			// the state file, and fed verbatim into the rework prompt.
 			safe := safeErrString(err)
+			// A GitHub outage means the attempt never got a verdict, so it is not
+			// a merge rejection and must not be charged to EITHER brake. Roll back
+			// the increment before returning: MergeAttempts is documented as
+			// counting real rejections (it is what the merge brake measures), and
+			// nothing else resets it, so leaving an outage in it would let a run of
+			// 529s trip the cooldown exactly the way this PR exists to prevent.
+			// Rework is skipped too — there is nothing for an agent to fix.
+			if action, ok := w.classifyTransientFailure("merge", err, safe); ok {
+				state.MergeAttempts--
+				return action
+			}
 			w.logger.Error("auto-merge failed",
 				"error", safe, "policy", w.cfg.Polish.MergePolicy, "attempt", state.MergeAttempts)
 			w.status("PR #%d merge attempt %d failed: %s", w.pr, state.MergeAttempts, safe)
@@ -320,7 +331,7 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		// embed the endpoint config (API key / key-bearing env var), and these
 		// messages are persisted and Slacked.
 		safe := safeErrString(err)
-		if action, ok := w.classifyAgentFailure("polish", err, safe); ok {
+		if action, ok := w.classifyTransientFailure("polish", err, safe); ok {
 			return action
 		}
 		w.logger.Error("polish failed", "error", safe)
@@ -395,26 +406,27 @@ func (w *Watcher) rerequestReviews(ctx context.Context, snap *Snapshot) {
 	}
 }
 
-// classifyAgentFailure reports whether an agent-round error was a provider-side
-// outage rather than a fact about this PR, and if so returns the action that
-// keeps it off the failure brake.
+// classifyTransientFailure reports whether a failure was a provider-side outage
+// rather than a fact about this PR, and if so returns the action that keeps it
+// off the failure brake.
 //
 // A provider outage is not a fact about this PR. Counting it toward the failure
 // brake spends the budget meant for "this PR is not converging" on "Anthropic
 // returned 529", and three of those bought kernel#8031 a two-hour cooldown while
-// nothing was wrong with the branch.
+// nothing was wrong with the branch. The same reasoning applies to the merge
+// path: GitHub being unreachable says nothing about whether the PR can land.
 //
 // Verified against the real strings: an API 529 classifies http_5xx and a
 // force-completed turn classifies grace_forced, while a bare "exit status 1"
 // stays non-transient and still counts.
 //
-// Every arm that turns an agent-round error into a LastAction routes through
-// here, so the exemption cannot drift between the polish and merge-rework paths
-// — a provider blip has to mean the same thing whichever round hit it.
+// Every arm that turns a failure into a LastAction routes through here, so the
+// exemption cannot drift between the polish, merge-rework, and merge paths — a
+// provider blip has to mean the same thing whichever stage hit it.
 //
 // safe must already be scrubbed: a provider error can embed the endpoint config
 // (API key / key-bearing env var), and these messages are persisted and Slacked.
-func (w *Watcher) classifyAgentFailure(stage string, err error, safe string) (LastAction, bool) {
+func (w *Watcher) classifyTransientFailure(stage string, err error, safe string) (LastAction, bool) {
 	// A shell round never talks to the provider, so it can never have suffered a
 	// provider outage. Checked BEFORE classification rather than after: the
 	// classifier matches error text, and a command error carries captured
@@ -423,6 +435,16 @@ func (w *Watcher) classifyAgentFailure(stage string, err error, safe string) (La
 	var cmdErr *CommandRoundError
 	if errors.As(err, &cmdErr) {
 		return "", false
+	}
+	// A marked GitHub outage is trusted directly rather than re-derived from the
+	// text. The producer knows the call never got a verdict; the text does not,
+	// because ghError embeds GitHub's stderr verbatim. See GitHubOutageError.
+	var outageErr *GitHubOutageError
+	if errors.As(err, &outageErr) {
+		w.logger.Warn(stage+" hit a GitHub outage; not counting it toward the failure brake",
+			"error", safe)
+		w.status("PR #%d %s interrupted (github unreachable) — retrying next tick", w.pr, stage)
+		return LastActionTransient, true
 	}
 	transient, reason := agent.ClassifyTransient(err)
 	if !transient {
@@ -477,7 +499,7 @@ func (w *Watcher) reworkAfterFailedMerge(ctx context.Context, snap *Snapshot, st
 		// Scrub before logging: a provider error can embed the endpoint
 		// config that produced it, and these logs are persisted and Slacked.
 		safe := safeErrString(err)
-		if action, ok := w.classifyAgentFailure("merge rework", err, safe); ok {
+		if action, ok := w.classifyTransientFailure("merge rework", err, safe); ok {
 			return action
 		}
 		w.logger.Error("merge rework failed", "error", safe, "attempt", state.MergeAttempts)
@@ -694,13 +716,17 @@ func (w *Watcher) merge(ctx context.Context, snap *Snapshot) (mergeOutcome, erro
 }
 
 // verifyMerged reports the authoritative merged bit from the GitHub API.
+//
+// This is a read-only probe, so a failure here is never GitHub rejecting the
+// merge — it is GitHub being unreachable. That makes it unambiguously an outage,
+// and it is marked as one so the failure brake is not spent on it.
 func (w *Watcher) verifyMerged(ctx context.Context, owner, repo string) (bool, error) {
 	res, err := w.gh.Run(ctx, []string{
 		"api", fmt.Sprintf("repos/%s/%s/pulls/%d", owner, repo, w.pr),
 		"--jq", ".merged",
 	}, w.workDir)
 	if err != nil {
-		return false, ghError(err, res)
+		return false, &GitHubOutageError{Err: ghError(err, res)}
 	}
 	return strings.EqualFold(strings.TrimSpace(res.Stdout), "true"), nil
 }
