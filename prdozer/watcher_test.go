@@ -1600,6 +1600,54 @@ func TestWatcher_StaleDivergenceVerdict_NotRetiredMidRun(t *testing.T) {
 	assert.True(t, res.Diverged)
 }
 
+// Retiring the verdict must reach DISK, not just the TickResult.
+//
+// The retirement only helps if the next tick reloads a cleared streak; a reset
+// that lives in memory and is dropped on the way to state.json would let the
+// stale verdict come back on the very next tick. The other tests here assert on
+// the returned action, which the reset survives regardless of whether it was
+// saved, so they cannot catch that.
+//
+// Persistence currently rides on recordSnapshot marking state dirty when the
+// head SHA differs — necessarily true here, since a moved head is what triggers
+// retirement in the first place — with Tick's healthDirty fold as a second path
+// to the same save. Asserting on the reloaded file pins the OUTCOME, so either
+// mechanism may change as long as the reset still lands.
+func TestWatcher_StaleDivergenceVerdict_ResetIsPersisted(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(9)
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 3
+	statePath := StatePath("r", 42)
+
+	stale := &State{
+		LastCheckAt:            time.Now(),
+		LastSeenHeadSHA:        "an-older-head",
+		LastSeenBaseSHA:        "base1",
+		LastAction:             LastActionNeedsHuman,
+		RoundsSinceImprovement: 3,
+		BestHealth:             &PRHealth{UnresolvedThreads: 1},
+	}
+	require.NoError(t, stale.Save(statePath))
+
+	_, err := w.Tick(context.Background())
+	require.NoError(t, err)
+
+	got, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Zero(t, got.RoundsSinceImprovement,
+		"the cleared streak must survive the save, or the next tick inherits it again")
+	assert.Equal(t, "head1", got.LastSeenHeadSHA,
+		"the scored head must advance, or the retirement re-fires forever")
+	// BestHealth is cleared by the retirement and then immediately rebaselined by
+	// recordHealth against the live snapshot, so the assertion that matters is
+	// that it no longer holds the stale run's unbeatable-looking value.
+	if got.BestHealth != nil {
+		assert.Equal(t, 9, got.BestHealth.UnresolvedThreads,
+			"BestHealth must be rebaselined from the current snapshot, not inherited")
+	}
+}
+
 // A resumed run looking at the SAME commits keeps the verdict: nothing has
 // changed, so the previous judgment still applies.
 func TestWatcher_StaleDivergenceVerdict_KeptWhenHeadUnchanged(t *testing.T) {
