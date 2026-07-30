@@ -215,3 +215,55 @@ func TestPolishRoundsSkipCompletedOnceRound(t *testing.T) {
 	assert.Equal(t, []string{"/pr-polish-comments"}, fake.prompts)
 	assert.Empty(t, res.RanOnceRounds)
 }
+
+// The polish route must reach the provider with the stream turn grace period
+// set. This is a regression test for a specific production failure, and for the
+// pattern behind it.
+//
+// /pr-polish drives review skills that background a tool call right at turn
+// end. Without a grace period the turn is force-completed while that call is
+// still outstanding, which the provider reports as "stream idle: turn forced
+// complete after grace period gated on background". merge_rework set the option
+// from the day it landed; polish never did. kernel#8031 spent three ticks
+// failing that way and entered a 2h cooldown, and kernel#8042 failed the same
+// way at round 2/3.
+//
+// Asserting the value reaches the provider is the point: the option was present
+// in the codebase and correct, just not on this route, so any test that only
+// checked it existed would have passed throughout.
+func TestPolishSetsStreamTurnGracePeriod(t *testing.T) {
+	t.Parallel()
+	p, fake := polisherWithFake(t)
+
+	_, err := p.Run(context.Background(), PolishRequest{
+		Model:    "opus",
+		WorkDir:  t.TempDir(),
+		PRNumber: 8031,
+		Local:    true,
+		Cfg:      PolishConfig{RoundsPerTick: 3},
+	})
+	require.NoError(t, err)
+	require.Len(t, fake.cfgs, 1)
+	assert.Equal(t, streamTurnGrace, fake.cfgs[0].StreamTurnGracePeriod,
+		"polish must set the grace period; without it a backgrounded tool call at turn end force-completes the turn")
+}
+
+// Both agent routes must build the same base provider options.
+//
+// Four separate defects have come from polish and merge_rework maintaining
+// independent option lists, and polish lost the behavior every time: model and
+// effort (#288), command logging and error output (#288), and the grace period
+// (this change). Asserting the shared constructor covers what both need makes
+// the next divergence fail here rather than in production.
+func TestBaseProviderOptsCoversBothRoutes(t *testing.T) {
+	t.Parallel()
+	var cfg agent.ExecuteConfig
+	for _, o := range baseProviderOpts("/w", "bypass", "opus", nil) {
+		o(&cfg)
+	}
+	assert.Equal(t, "/w", cfg.WorkDir)
+	assert.Equal(t, "bypass", cfg.PermissionMode)
+	assert.Equal(t, streamTurnGrace, cfg.StreamTurnGracePeriod)
+	assert.True(t, cfg.KeepUserSettings,
+		"without KeepUserSettings a prompt invoking a user-level skill silently resolves to nothing")
+}

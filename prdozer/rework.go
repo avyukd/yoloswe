@@ -191,20 +191,7 @@ func (r *AgentRework) runAgent(ctx context.Context, req ReworkRequest, tmpl stri
 	if permMode == "" {
 		permMode = "bypass"
 	}
-	opts := []agent.ExecuteOption{
-		agent.WithProviderWorkDir(req.WorkDir),
-		agent.WithProviderPermissionMode(permMode),
-		agent.WithProviderModel(modelID),
-		// Load-bearing: without it the spawned agent cannot resolve
-		// user-level skills, so a prompt invoking one silently resolves to
-		// nothing.
-		agent.WithProviderKeepUserSettings(),
-		agent.WithProviderEventHandler(handler),
-		// Rework prompts drive skills that may background a tool call right at
-		// turn end. Give the turn room to finish rather than force-completing
-		// it mid-flight.
-		agent.WithProviderStreamTurnGracePeriod(streamTurnGrace),
-	}
+	opts := baseProviderOpts(req.WorkDir, permMode, modelID, handler)
 	if req.Spec.Effort != "" {
 		// Parse rather than cast: a typo'd effort should fail loudly here, not
 		// be passed through to the provider as an unrecognized value.
@@ -240,3 +227,38 @@ func (r *AgentRework) runAgent(ctx context.Context, req ReworkRequest, tmpl stri
 // streamTurnGrace gives a turn time to settle an outstanding background tool
 // call before it is force-completed.
 const streamTurnGrace = 60 * time.Second
+
+// baseProviderOpts builds the provider options every prdozer agent session
+// needs, whatever route it came in on.
+//
+// It exists because the polish and merge_rework paths kept diverging. Each was
+// written as its own option list, and each time polish was the one that lost a
+// behavior rework already had: polish.model/effort honored only for rework
+// (#288 round 1), command rounds logging only on success and dropping their
+// output on failure (#288 rounds 6 and the follow-up), and this — the stream
+// turn grace period, set for rework since it landed and never for polish.
+//
+// That last omission is why kernel#8031 burned three ticks into a 2h cooldown
+// with "stream idle: turn forced complete after grace period gated on
+// background", and why kernel#8042 failed the same way at round 2/3. Both are
+// /pr-polish sessions, which drive review skills that background a tool call
+// right at turn end — exactly the case the grace period was added for, arriving
+// through the one route that did not set it.
+//
+// Callers append their own route-specific options (effort, turn caps, budget);
+// this covers only what both must have.
+func baseProviderOpts(workDir, permMode, modelID string, handler agent.EventHandler) []agent.ExecuteOption {
+	return []agent.ExecuteOption{
+		agent.WithProviderWorkDir(workDir),
+		agent.WithProviderPermissionMode(permMode),
+		agent.WithProviderModel(modelID),
+		// Load-bearing: without it the spawned agent cannot resolve user-level
+		// skills, so a prompt invoking one silently resolves to nothing.
+		agent.WithProviderKeepUserSettings(),
+		agent.WithProviderEventHandler(handler),
+		// Both routes drive skills that may background a tool call right at turn
+		// end. Give the turn room to finish rather than force-completing it
+		// mid-flight.
+		agent.WithProviderStreamTurnGracePeriod(streamTurnGrace),
+	}
+}
