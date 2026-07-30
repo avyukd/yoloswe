@@ -64,6 +64,29 @@ func NewAgentRework(renderer *render.Renderer, logger *slog.Logger, runLog *RunL
 // the watcher loop forever.
 const commandTimeout = 10 * time.Minute
 
+// CommandRoundError marks a failure that came from a shell round rather than
+// from the provider.
+//
+// The transient exemption classifies by matching the rendered error text, which
+// is what lets it recognize an untyped upstream 529. Command rounds deliberately
+// embed up to 500 characters of captured stdout/stderr in their error, because
+// that output is usually the diagnostic — so without this marker the matcher is
+// reading arbitrary program output and a genuine failure whose output merely
+// MENTIONS a transient-sounding token is exempted from the failure brake.
+//
+// Measured, not hypothetical: "exit status 1: request failed with 529 from
+// upstream" classifies http_5xx, and a failing test named
+// "test_retry_on_timeout" classifies timeout. Both are real failures that would
+// have skipped the brake, which is worse than the over-braking this change set
+// out to fix — a broken PR would loop forever with no cooldown.
+//
+// A shell round never talks to the provider, so a command failure is never a
+// provider outage and never needs the exemption.
+type CommandRoundError struct{ Err error }
+
+func (e *CommandRoundError) Error() string { return e.Err.Error() }
+func (e *CommandRoundError) Unwrap() error { return e.Err }
+
 // Run executes the configured rounds in order. Each round's output is threaded
 // into the next round's template as PrevOutput, so a command round can gather
 // evidence (e.g. `gh pr view --json mergeStateStatus`) that the following agent
@@ -131,7 +154,9 @@ func (r *AgentRework) runCommand(ctx context.Context, req ReworkRequest, tmpl st
 		// round. Its output is valuable even on a non-zero exit (that is often
 		// the diagnostic), so return it alongside the error rather than
 		// discarding it.
-		return string(out), fmt.Errorf("command failed: %w: %s", err, truncate(strings.TrimSpace(string(out)), 500))
+		return string(out), &CommandRoundError{
+			Err: fmt.Errorf("command failed: %w: %s", err, truncate(strings.TrimSpace(string(out)), 500)),
+		}
 	}
 	return string(out), nil
 }

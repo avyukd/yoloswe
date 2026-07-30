@@ -2,6 +2,7 @@ package prdozer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -414,6 +415,15 @@ func (w *Watcher) rerequestReviews(ctx context.Context, snap *Snapshot) {
 // safe must already be scrubbed: a provider error can embed the endpoint config
 // (API key / key-bearing env var), and these messages are persisted and Slacked.
 func (w *Watcher) classifyAgentFailure(stage string, err error, safe string) (LastAction, bool) {
+	// A shell round never talks to the provider, so it can never have suffered a
+	// provider outage. Checked BEFORE classification rather than after: the
+	// classifier matches error text, and a command error carries captured
+	// stdout/stderr, so a real failure whose output mentions "529" or "timeout"
+	// would otherwise be exempted from the brake. See CommandRoundError.
+	var cmdErr *CommandRoundError
+	if errors.As(err, &cmdErr) {
+		return "", false
+	}
 	transient, reason := agent.ClassifyTransient(err)
 	if !transient {
 		return "", false

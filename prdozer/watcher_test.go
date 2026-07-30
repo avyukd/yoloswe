@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -1481,4 +1482,53 @@ func TestWatcher_Tick_TransientDoesNotClearRealFailureStreak(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, s3.ConsecutiveFailures)
 	assert.False(t, s3.CooldownUntil.IsZero(), "the real streak still reaches the cooldown")
+}
+
+// A shell round's failure must never be exempted from the brake, however its
+// captured output happens to read.
+//
+// The transient classifier matches error TEXT — that is what lets it recognize
+// an untyped upstream 529 — but command rounds embed up to 500 characters of
+// captured stdout/stderr because that output is the diagnostic. Without the
+// CommandRoundError marker the classifier reads arbitrary program output, and
+// these two real failures were measured classifying as transient:
+//
+//	"exit status 1: request failed with 529 from upstream"  -> http_5xx
+//	"exit status 2: ERROR test_retry_on_timeout FAILED"     -> timeout
+//
+// Exempting those is worse than the over-braking this change set out to fix: a
+// genuinely broken PR would loop forever with no cooldown at all.
+func TestClassifyAgentFailure_CommandErrorNeverTransient(t *testing.T) {
+	t.Parallel()
+	w := &Watcher{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	for _, text := range []string{
+		"command failed: exit status 1: request failed with 529 from upstream",
+		"command failed: exit status 2: ERROR test_retry_on_timeout FAILED",
+		"command failed: exit status 1: connection reset by peer",
+	} {
+		cmdErr := &CommandRoundError{Err: errors.New(text)}
+		action, ok := w.classifyAgentFailure("merge rework", cmdErr, text)
+		assert.False(t, ok, "a shell round never talks to the provider: %s", text)
+		assert.Empty(t, string(action))
+
+		// Control: the SAME text without the marker is exempted. Without this the
+		// test would still pass if the strings simply never matched, and would
+		// prove nothing about the marker.
+		_, bare := w.classifyAgentFailure("merge rework", errors.New(text), text)
+		assert.True(t, bare,
+			"control: this text must be classifier-matchable, else the case is vacuous: %s", text)
+	}
+}
+
+// The exemption must still apply to a genuine provider failure on the same
+// route, so the marker narrows the classification rather than disabling it.
+func TestClassifyAgentFailure_ProviderErrorStillTransient(t *testing.T) {
+	t.Parallel()
+	w := &Watcher{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	err := errors.New("merge_rework round 1/1: agent execution: API Error: 529 Overloaded")
+	action, ok := w.classifyAgentFailure("merge rework", err, err.Error())
+	assert.True(t, ok)
+	assert.Equal(t, LastActionTransient, action)
 }
