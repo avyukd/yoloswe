@@ -250,10 +250,12 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		// polish round pushes a commit, which moves the head SHA, which makes
 		// needsSelfReview true again — so a self_review repo re-arms its own
 		// trigger forever and this guard is the ONLY thing that can end the
-		// loop. Exempting self-review here would restore the unbounded run the
-		// guard exists to prevent. The first review is never at risk: the guard
-		// needs a non-zero RoundsSinceImprovement, which only prior polish
-		// rounds can produce.
+		// loop. The first review is never at risk: the guard needs a non-zero
+		// RoundsSinceImprovement, which only prior polish rounds can produce.
+		//
+		// diverging() grants an unreviewed head ONE extra allowance (see there),
+		// which is why this ordering still terminates: the exemption expires at
+		// 2*limit, so a run whose head is perpetually unreviewed still stops.
 		//
 		// What the stop DOES owe the human is a note when it lands on an
 		// unreviewed head: on a self_review repo prdozer is the only reviewer,
@@ -497,7 +499,47 @@ func (w *Watcher) diverging(snap *Snapshot, state *State) bool {
 	if _, ok := snap.Health(); !ok {
 		return false
 	}
-	return state.RoundsSinceImprovement >= limit
+	if state.RoundsSinceImprovement < limit {
+		return false
+	}
+	// The streak alone is not enough, because the metric it counts can stop
+	// carrying information.
+	//
+	// BestHealth is a floor: BetterThan is strict, so once a run touches
+	// {0 unresolved, ci green} nothing can ever beat it — 0 < 0 is false. From
+	// that moment every polish round increments RoundsSinceImprovement no matter
+	// what it accomplishes, and the guard degenerates into a plain round counter.
+	//
+	// Three production runs stopped this way, each having done real work:
+	// kernel#8297 (5 commits, 3 new bugs found), yoloswe#288 (6 of 7 rounds
+	// landed fixes, including a High-severity gating bug), yoloswe#291 (3 rounds:
+	// the rework-arm exemption, multi-tick brake coverage, and producer-level
+	// tests that caught a hole in the round before it). All three logged
+	// best_unresolved=0 — saturated — and all three logged head_unreviewed=true.
+	//
+	// So require corroboration: a stop needs the streak AND a head that
+	// reviewers have already judged. An unreviewed head means the run pushed
+	// commits whose effect is not in the thread count yet, which is the opposite
+	// of evidence that it has stopped making progress. A genuinely stuck run
+	// keeps re-polishing without moving the head, so its head stays reviewed and
+	// it still stops — which is the case the guard was built for (kernel#8227:
+	// 17 rounds, ~$40, threads 6 -> 2 -> 11, CI red).
+	//
+	// The grace is BOUNDED, and that bound is load-bearing. On a self_review
+	// repo every polish round pushes a commit, which moves the head, which makes
+	// needsSelfReview true again — so an unconditional unreviewed-head exemption
+	// would mean the guard can never fire there at all, restoring the unbounded
+	// run it exists to prevent. Doubling the limit buys a saturated run a second
+	// allowance to show progress and no more: past 2*limit the streak stands on
+	// its own however the head looks.
+	if state.RoundsSinceImprovement < 2*limit && w.needsSelfReview(snap, state) {
+		w.logger.Info("divergence streak reached but head is unreviewed; extending once",
+			"rounds_since_improvement", state.RoundsSinceImprovement,
+			"hard_limit", 2*limit,
+			"head", snap.PR.HeadRefOid)
+		return false
+	}
+	return true
 }
 
 // recordHealth folds this tick's observed health into the run's best-so-far,

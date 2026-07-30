@@ -609,6 +609,17 @@ func (f *fakeGH) setThreads(n int) {
 	f.addPrefix("api graphql", strconv.Itoa(n))
 }
 
+// setHead moves the PR's head SHA, which is what a real polish round does when
+// it pushes a commit. Tests that exercise self-review need this: with a fixed
+// head the first review marks the SHA seen and needsSelfReview is false forever,
+// so the always-unreviewed condition that matters in production never occurs.
+func (f *fakeGH) setHead(sha string) {
+	f.addPrefix(
+		"pr view 42 --json number,url,headRefName,baseRefName,headRefOid,state,isDraft,reviewDecision,mergeable,statusCheckRollup",
+		buildPRJSON(strings.Replace(okPRJSON, `"headRefOid": "head1"`, `"headRefOid": "`+sha+`"`, 1), "FAILURE"),
+	)
+}
+
 // `gh api graphql --paginate` emits one --jq result per page, so a PR with more
 // than 100 review threads reports several counts that must be summed. Taking
 // only the first would undercount the outstanding work and read as a healthier
@@ -1190,4 +1201,77 @@ func TestAgentPolisher_RunRounds_ReportsTheOnceRoundsThatFinished(t *testing.T) 
 			assert.Equal(t, want, got)
 		})
 	}
+}
+
+// A saturated run whose head nobody has reviewed gets one extra allowance
+// before the guard stops it.
+//
+// BestHealth is a floor: BetterThan is strict, so once a run touches
+// {0 unresolved, ci green} nothing can beat it and every later round counts as
+// "no improvement" whatever it accomplished. Three production runs stopped that
+// way with real work in flight — kernel#8297, yoloswe#288, yoloswe#291 — each
+// logging best_unresolved=0 and head_unreviewed=true.
+func TestWatcher_DivergenceGuard_UnreviewedHeadExtendsOnce(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(0)
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 2
+	// prdozer is the only reviewer here, so every pushed round leaves the head
+	// unreviewed — the shape all three false positives had.
+	w.cfg.Polish.SelfReview = true
+
+	ctx := context.Background()
+	_, err := w.Tick(ctx)
+	require.NoError(t, err)
+
+	// Run past the plain limit. The streak is saturated the whole way, so the
+	// unpatched guard stops at 2. The head moves every round because a real
+	// polish round pushes a commit — which is what keeps the head unreviewed.
+	var last TickResult
+	for i := range 3 {
+		gh.setHead(fmt.Sprintf("head-r%d", i))
+		res, err := w.Tick(ctx)
+		require.NoError(t, err)
+		last = res
+	}
+	assert.NotEqual(t, LastActionNeedsHuman, last.Action,
+		"an unreviewed head means work landed that the thread count cannot reflect yet")
+	assert.GreaterOrEqual(t, last.RoundsSinceImprovement, 2,
+		"the streak must genuinely have passed the plain limit, else the case is vacuous")
+}
+
+// The extension is bounded, and that bound is what keeps the guard able to fire
+// at all on a self_review repo: every polish round pushes a commit, moving the
+// head, so needsSelfReview is true forever. An unconditional exemption would
+// mean the run never stops — the unbounded loop the guard exists to prevent
+// (kernel#8227: 17 rounds, ~$40, threads 6 -> 2 -> 11, CI red).
+func TestWatcher_DivergenceGuard_UnreviewedHeadStillStopsAtHardLimit(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(0)
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 2
+	w.cfg.Polish.SelfReview = true
+
+	ctx := context.Background()
+	_, err := w.Tick(ctx)
+	require.NoError(t, err)
+
+	var last TickResult
+	for i := range 10 {
+		// Head moves every round, so needsSelfReview is true forever — the
+		// condition that would make an unconditional exemption unbounded.
+		gh.setHead(fmt.Sprintf("head-r%d", i))
+		res, err := w.Tick(ctx)
+		require.NoError(t, err)
+		last = res
+		if res.Action == LastActionNeedsHuman {
+			break
+		}
+	}
+	assert.Equal(t, LastActionNeedsHuman, last.Action,
+		"a perpetually unreviewed head must not buy an unbounded run")
+	assert.True(t, last.Diverged)
+	assert.GreaterOrEqual(t, last.RoundsSinceImprovement, 4,
+		"the hard limit is 2*MaxRoundsWithoutImprovement")
 }
