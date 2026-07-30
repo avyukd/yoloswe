@@ -725,7 +725,22 @@ func (w *Watcher) merge(ctx context.Context, snap *Snapshot) (mergeOutcome, erro
 
 	res, err := w.gh.Run(ctx, args, w.workDir)
 	if err != nil {
-		return 0, ghError(err, res)
+		// Distinguish "GitHub rejected this merge" from "GitHub was unreachable"
+		// WITHOUT reading the rejection text. Parsing this stderr is not an
+		// option: it is GitHub's verdict rendered into a string, real rejections
+		// name the failing check, and a check called "test_connection_timeout"
+		// would read as an outage — see classifyMergeFailure.
+		//
+		// So ask instead of guess. verifyMerged is a read-only probe on the same
+		// endpoint: if it answers, GitHub is up and this failure was a real
+		// verdict; if it too fails, the API is unreachable and the merge never got
+		// one. That makes the outage marker come from an observation rather than
+		// from the untrusted text.
+		mergeErr := ghError(err, res)
+		if _, probeErr := w.verifyMerged(ctx, owner, repo); probeErr != nil {
+			return 0, &GitHubOutageError{Err: mergeErr}
+		}
+		return 0, mergeErr
 	}
 
 	merged, err := w.verifyMerged(ctx, owner, repo)

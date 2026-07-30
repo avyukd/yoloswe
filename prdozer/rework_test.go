@@ -696,6 +696,62 @@ func TestWatcher_MergeRejection_StillChargesBrake(t *testing.T) {
 		"GitHub reached a verdict, so the rejection is recorded even though it says 'timed out'")
 }
 
+// An outage during `gh pr merge` itself is exempt too — the other half of the
+// invariant from the verifyMerged case above.
+//
+// The merge command's stderr cannot be trusted to say which happened, so merge()
+// asks rather than guesses: it re-probes with the read-only verifyMerged call. If
+// GitHub does not answer that either, the API is down and the merge never got a
+// verdict. Here BOTH calls fail, so the failure is marked as an outage and
+// charges neither brake.
+func TestWatcher_MergeCommandOutage_ChargesNeitherBrake(t *testing.T) {
+	gh := approvedGreenGH("false")
+	// Both the mutation and the read-only probe fail: GitHub is unreachable.
+	gh.failPrefix("pr merge", "HTTP 503: Service Unavailable")
+	gh.failPrefix("api repos/o/r/pulls/42 --jq .merged", "HTTP 503: Service Unavailable")
+	rework := &stubRework{}
+	w := newWatcherForTest(t, gh, &stubPolish{}, WithRework(rework, oneRoundSpec()))
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicySquash
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, LastActionTransient, res.Action,
+		"the merge command never got a verdict, so it is not a rejection")
+
+	s, err := LoadState(StatePath("r", 42))
+	require.NoError(t, err)
+	assert.Equal(t, 0, s.MergeAttempts, "an outage is not a recorded rejection")
+	assert.Equal(t, 0, s.ConsecutiveFailures, "an outage must not spend the failure brake")
+	assert.Zero(t, rework.callCount(), "nothing for an agent to fix when GitHub is down")
+}
+
+// The discriminator must work in the other direction: when the merge command
+// fails but GitHub ANSWERS the probe, GitHub was up and reached a verdict, so
+// the rejection is real and still brakes.
+//
+// This is what stops the probe from becoming a blanket merge-path exemption.
+// TestWatcher_MergeRejection_StillChargesBrake covers the same rule with a
+// rejection whose text looks transient; this one pins the probe mechanism itself.
+func TestWatcher_MergeRejection_WithHealthyAPI_StillCharges(t *testing.T) {
+	gh := approvedGreenGH("false") // the .merged probe answers normally
+	gh.failPrefix("pr merge", "HTTP 503: Service Unavailable")
+	rework := &stubRework{}
+	w := newWatcherForTest(t, gh, &stubPolish{}, WithRework(rework, oneRoundSpec()))
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicySquash
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionReworked, res.Action,
+		"GitHub answered the probe, so the merge failure was a real verdict")
+
+	s, err := LoadState(StatePath("r", 42))
+	require.NoError(t, err)
+	assert.Equal(t, 1, s.MergeAttempts,
+		"a verdict reached while the API is healthy is a recorded rejection, 503 text notwithstanding")
+}
+
 // The non-transient half of the same arm: an ordinary rework failure still
 // counts, so the exemption above cannot be read as "rework never brakes".
 func TestWatcher_FailedMerge_RealReworkErrorStillCountsTowardBrake(t *testing.T) {
