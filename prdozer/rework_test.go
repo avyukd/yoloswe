@@ -495,3 +495,44 @@ func TestSafeErrString_ScrubsThroughWrapping(t *testing.T) {
 	assert.Contains(t, got, "auth rejected")
 	assert.Empty(t, safeErrString(nil), "a nil error renders as empty")
 }
+
+// The failure brake exempts provider outages wherever an agent round hits one,
+// not just in polish. Merge rework runs the same kind of agent against the same
+// backend, so a 529 there is exactly as uninformative about the PR — counting it
+// would spend the brake on the outage and impose a cooldown on a healthy branch.
+func TestWatcher_FailedMerge_TransientReworkErrorDoesNotCountTowardBrake(t *testing.T) {
+	gh := failingMergeGH(t)
+	rework := &stubRework{err: fmt.Errorf(
+		"merge rework round 1/1: agent execution: API Error: 529 Overloaded. This is a server-side issue, usually temporary")}
+	w := newWatcherForTest(t, gh, &stubPolish{}, WithRework(rework, oneRoundSpec()))
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicySquash
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionTransient, res.Action,
+		"a provider outage during rework is not a PR failure")
+
+	s, err := LoadState(StatePath("r", 42))
+	require.NoError(t, err)
+	assert.Equal(t, 0, s.ConsecutiveFailures)
+	assert.True(t, s.CooldownUntil.IsZero(), "transient rework errors must not trip the cooldown")
+}
+
+// The non-transient half of the same arm: an ordinary rework failure still
+// counts, so the exemption above cannot be read as "rework never brakes".
+func TestWatcher_FailedMerge_RealReworkErrorStillCountsTowardBrake(t *testing.T) {
+	gh := failingMergeGH(t)
+	rework := &stubRework{err: fmt.Errorf("merge rework round 1/1: exit status 1")}
+	w := newWatcherForTest(t, gh, &stubPolish{}, WithRework(rework, oneRoundSpec()))
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicySquash
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionFailed, res.Action)
+
+	s, err := LoadState(StatePath("r", 42))
+	require.NoError(t, err)
+	assert.Equal(t, 1, s.ConsecutiveFailures, "a real rework failure still spends the brake")
+}

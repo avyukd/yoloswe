@@ -319,19 +319,8 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		// embed the endpoint config (API key / key-bearing env var), and these
 		// messages are persisted and Slacked.
 		safe := safeErrString(err)
-		// A provider outage is not a fact about this PR. Counting it toward the
-		// failure brake spends the budget meant for "this PR is not converging"
-		// on "Anthropic returned 529", and three of those bought kernel#8031 a
-		// two-hour cooldown while nothing was wrong with the branch.
-		//
-		// Verified against the real strings: an API 529 classifies http_5xx and
-		// a force-completed turn classifies grace_forced, while a bare
-		// "exit status 1" stays non-transient and still counts.
-		if transient, reason := agent.ClassifyTransient(err); transient {
-			w.logger.Warn("polish hit a transient provider error; not counting it toward the failure brake",
-				"error", safe, "reason", reason)
-			w.status("PR #%d polish interrupted (%s) — retrying next tick", w.pr, reason)
-			return LastActionTransient
+		if action, ok := w.classifyAgentFailure("polish", err, safe); ok {
+			return action
 		}
 		w.logger.Error("polish failed", "error", safe)
 		w.status("PR #%d polish failed: %s", w.pr, safe)
@@ -405,6 +394,36 @@ func (w *Watcher) rerequestReviews(ctx context.Context, snap *Snapshot) {
 	}
 }
 
+// classifyAgentFailure reports whether an agent-round error was a provider-side
+// outage rather than a fact about this PR, and if so returns the action that
+// keeps it off the failure brake.
+//
+// A provider outage is not a fact about this PR. Counting it toward the failure
+// brake spends the budget meant for "this PR is not converging" on "Anthropic
+// returned 529", and three of those bought kernel#8031 a two-hour cooldown while
+// nothing was wrong with the branch.
+//
+// Verified against the real strings: an API 529 classifies http_5xx and a
+// force-completed turn classifies grace_forced, while a bare "exit status 1"
+// stays non-transient and still counts.
+//
+// Every arm that turns an agent-round error into a LastAction routes through
+// here, so the exemption cannot drift between the polish and merge-rework paths
+// — a provider blip has to mean the same thing whichever round hit it.
+//
+// safe must already be scrubbed: a provider error can embed the endpoint config
+// (API key / key-bearing env var), and these messages are persisted and Slacked.
+func (w *Watcher) classifyAgentFailure(stage string, err error, safe string) (LastAction, bool) {
+	transient, reason := agent.ClassifyTransient(err)
+	if !transient {
+		return "", false
+	}
+	w.logger.Warn(stage+" hit a transient provider error; not counting it toward the failure brake",
+		"error", safe, "reason", reason)
+	w.status("PR #%d %s interrupted (%s) — retrying next tick", w.pr, stage, reason)
+	return LastActionTransient, true
+}
+
 // reworkAfterFailedMerge decides what happens after a merge attempt fails.
 //
 // A merge can fail in ways /pr-polish will never fix, because they are about
@@ -448,6 +467,9 @@ func (w *Watcher) reworkAfterFailedMerge(ctx context.Context, snap *Snapshot, st
 		// Scrub before logging: a provider error can embed the endpoint
 		// config that produced it, and these logs are persisted and Slacked.
 		safe := safeErrString(err)
+		if action, ok := w.classifyAgentFailure("merge rework", err, safe); ok {
+			return action
+		}
 		w.logger.Error("merge rework failed", "error", safe, "attempt", state.MergeAttempts)
 		w.status("PR #%d merge rework failed: %s", w.pr, safe)
 		return LastActionFailed
