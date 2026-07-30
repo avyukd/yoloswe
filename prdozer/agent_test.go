@@ -2,6 +2,7 @@ package prdozer
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
@@ -152,6 +153,46 @@ func TestPolishRoundsThreadCommandOutputIntoNextPrompt(t *testing.T) {
 	// millisecond and records a legitimate 0. Asserting non-zero made the test
 	// pass or fail on host speed rather than on the once-round accounting it
 	// exists to cover.
+}
+
+// The polish path's shell rounds carry the same producer obligation as merge
+// rework's: a failing command must reach the watcher marked as a shell-round
+// failure, so its captured output is never text-matched into the transient
+// exemption.
+//
+// This is the polish half of the boundary that
+// TestClassifyAgentFailure_CommandErrorNeverTransient pins on the consumer
+// side. That test hand-builds the marker, so it stays green even if
+// runPolishCommand reverts to a bare fmt.Errorf — only this assertion on the
+// real error would catch it.
+func TestPolishCommandFailure_IsNeverTransient(t *testing.T) {
+	t.Parallel()
+	p, _ := polisherWithFake(t)
+
+	_, err := p.Run(context.Background(), PolishRequest{
+		// A genuine failure whose command text mentions a transient token —
+		// runPolishCommand embeds the command string in the error, so the
+		// classifier would otherwise read it as a provider outage.
+		Spec:     StepSpec{Rounds: []RoundSpec{{Command: `echo "connection reset by peer"; exit 1`}}},
+		Model:    "sonnet",
+		WorkDir:  t.TempDir(),
+		PRNumber: 291,
+	})
+	require.Error(t, err)
+
+	var cmdErr *CommandRoundError
+	require.ErrorAs(t, err, &cmdErr,
+		"a polish shell round's failure must reach the watcher marked, through the round wrapper")
+
+	w := &Watcher{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	action, ok := w.classifyAgentFailure("polish", err, err.Error())
+	assert.False(t, ok, "a shell round never talks to the provider")
+	assert.Empty(t, string(action))
+
+	// Control: the same text unmarked IS exempted, so the case is not vacuous.
+	_, bare := w.classifyAgentFailure("polish", errors.New(err.Error()), err.Error())
+	assert.True(t, bare,
+		"control: this error text must be classifier-matchable, else the case proves nothing")
 }
 
 // A once round already recorded for this PR is dropped before it can reach the

@@ -2,7 +2,10 @@ package prdozer
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -416,6 +419,49 @@ func TestAgentRework_CommandFailureAborts(t *testing.T) {
 	assert.Contains(t, err.Error(), "round 1/1", "the failing round must be identified")
 	assert.Contains(t, err.Error(), "diagnostic detail",
 		"the command's output is the diagnosis and must be surfaced")
+
+	// The marker is what keeps this failure out of the transient exemption, and
+	// it has to survive Run's "merge_rework round %d/%d: %w" wrapping to reach
+	// the watcher. Asserting it on the REAL error is the point: a consumer test
+	// that hand-builds a CommandRoundError still passes if this producer quietly
+	// reverts to a bare fmt.Errorf.
+	var cmdErr *CommandRoundError
+	require.ErrorAs(t, err, &cmdErr,
+		"a shell round's failure must reach the watcher marked, through the round wrapper")
+}
+
+// The producer boundary, end to end: a real failing shell round whose captured
+// output reads transient must still be braked.
+//
+// TestClassifyAgentFailure_CommandErrorNeverTransient pins the consumer half
+// with a synthetic marker; this pins the half that test cannot see. If
+// runCommand stopped attaching CommandRoundError — or wrapped with %v so
+// errors.As no longer matched — the consumer test would still pass while the
+// hole silently reopened.
+func TestAgentRework_CommandFailure_IsNeverTransient(t *testing.T) {
+	t.Parallel()
+	r := NewAgentRework(nil, nil, nil)
+	_, err := r.Run(context.Background(), ReworkRequest{
+		WorkDir: t.TempDir(),
+		Spec: StepSpec{Rounds: []RoundSpec{
+			// A genuine failure whose diagnostic merely MENTIONS a transient
+			// token — the exact shape that used to win the exemption.
+			{Command: `echo "request failed with 529 from upstream" >&2; exit 1`},
+		}},
+	})
+	require.Error(t, err)
+
+	w := &Watcher{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	action, ok := w.classifyAgentFailure("merge rework", err, err.Error())
+	assert.False(t, ok, "a shell round never talks to the provider, so it is never a provider outage")
+	assert.Empty(t, string(action))
+
+	// Control: strip the marker and the SAME text is exempted. Without this the
+	// assertion above would also pass if "529" simply stopped matching, proving
+	// nothing about the marker.
+	_, bare := w.classifyAgentFailure("merge rework", errors.New(err.Error()), err.Error())
+	assert.True(t, bare,
+		"control: this error text must be classifier-matchable, else the case is vacuous")
 }
 
 func TestAgentRework_BadTemplateFails(t *testing.T) {
