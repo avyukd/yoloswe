@@ -331,3 +331,28 @@ func TestFleetHost_IsSelf(t *testing.T) {
 	assert.True(t, h.IsSelf("", "ip-172-31-23-21"), "falls back to hostname")
 	assert.False(t, h.IsSelf("other.example", "other-host"))
 }
+
+// The probe must report leases actually HELD, not lease files present.
+// Release() deliberately leaves the file behind, so a file count is a count of
+// babysits the box has ever run — and with MaxLeasesPerHost=2 every host
+// permanently excluded itself after two runs. Observed 2026-07-30: two of three
+// boxes reported "already holds 2 babysit leases" with zero live workers.
+func TestProbeCommand_CountsHeldLeasesNotFiles(t *testing.T) {
+	t.Parallel()
+	assert.Contains(t, probeScript, "flock -n",
+		"lease occupancy must be tested with flock, not by counting files")
+	assert.NotContains(t, probeScript, "ls ~/.prdozer/leases/ 2>/dev/null | wc -l",
+		"the file-count form is what caused the fleet to exclude every host")
+}
+
+// A stale lease file (no holder) must not make a host ineligible.
+func TestEligible_StaleLeaseFilesDoNotExcludeAHost(t *testing.T) {
+	t.Parallel()
+	h := HostHealth{
+		Host: "box", Reachable: true, HasPrdozer: true,
+		Cores: 8, Load1: 1.0, DiskFreeGB: 100,
+		Leases: 0, // files may exist on disk; none are held
+	}
+	ok, reason := h.Eligible(ProbeOptions{MaxLeasesPerHost: 2, MinDiskGB: 40})
+	assert.True(t, ok, "a host with no HELD leases is eligible: %s", reason)
+}

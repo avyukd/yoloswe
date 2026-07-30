@@ -21,7 +21,7 @@ const probeScript = `echo "__NPROC__"; nproc
 echo "__LOAD__"; cat /proc/loadavg
 echo "__DF__"; df -P "$HOME"; df -P /mnt/nvme 2>/dev/null
 echo "__TMUX__"; tmux list-windows -a 2>/dev/null | wc -l
-echo "__LEASES__"; ls ~/.prdozer/leases/ 2>/dev/null | wc -l
+echo "__LEASES__"; { cd ~/.prdozer/leases 2>/dev/null && held=0; for f in *.lock; do [ -e "$f" ] || continue; flock -n "$f" true 2>/dev/null || held=$((held+1)); done; echo "${held:-0}"; } || echo 0
 echo "__PRDOZER__"; command -v prdozer || ([ -x "$HOME/bin/prdozer" ] && echo "$HOME/bin/prdozer") || echo MISSING
 echo "__END__"`
 
@@ -36,11 +36,20 @@ type HostHealth struct {
 	Load1       float64
 	NVMeFreeGB  int
 	TmuxWindows int
-	Leases      int
-	Cores       int
-	HasPrdozer  bool
-	Reachable   bool
-	IsSelf      bool
+	// Leases counts babysit leases actually HELD on this host, tested with
+	// flock -n rather than by counting files in the lease directory.
+	//
+	// Release() deliberately leaves the lock file behind — removing it races a
+	// process that just opened it and is about to flock. So a file count is a
+	// count of babysits this box has EVER run, and with MaxLeasesPerHost=2
+	// every host permanently excluded itself after two runs. Observed
+	// 2026-07-30: two of three boxes reported "already holds 2 babysit leases"
+	// with zero live workers, leaving only the most overloaded host eligible.
+	Leases     int
+	Cores      int
+	HasPrdozer bool
+	Reachable  bool
+	IsSelf     bool
 }
 
 // Target returns the ssh destination for this host.
