@@ -503,15 +503,6 @@ const (
 	mergeOutcomeArmed
 )
 
-// merge lands the PR according to the configured policy and then VERIFIES the
-// result against the GitHub API.
-//
-// Verification is not optional paranoia. `gh pr merge` exiting 0 does not mean
-// the PR merged: under `--auto` it means auto-merge was armed, and a merge
-// queue can report a populated merge_commit_sha for a candidate it only
-// speculatively built. Likewise `state: CLOSED` is ambiguous — a PR closed
-// without merging looks identical. The single unambiguous signal is
-// `.merged == true` on the pulls endpoint, so that is the only thing we trust.
 // needsSelfReview reports whether prdozer must ORIGINATE a review for this
 // commit, on a repo that has no automated review bots.
 //
@@ -534,12 +525,6 @@ func (w *Watcher) needsSelfReview(snap *Snapshot, state *State) bool {
 	return state.SelfReviewedSHA != snap.PR.HeadRefOid
 }
 
-// diverging reports whether polishing has stopped making the PR better.
-//
-// It is deliberately evaluated BEFORE the polish call and AFTER this tick's
-// recordHealth, so the decision uses the outcome of work already done rather
-// than predicting the next round — and so a snapshot that finally improves is
-// scored before it can be used to stop the run.
 // expireStaleDivergence clears a divergence verdict inherited from a previous
 // run whose subject no longer exists. Reports whether it changed anything.
 //
@@ -586,6 +571,12 @@ func (w *Watcher) expireStaleDivergence(state *State, snap *Snapshot) bool {
 	return true
 }
 
+// diverging reports whether polishing has stopped making the PR better.
+//
+// It is deliberately evaluated BEFORE the polish call and AFTER this tick's
+// recordHealth, so the decision uses the outcome of work already done rather
+// than predicting the next round — and so a snapshot that finally improves is
+// scored before it can be used to stop the run.
 func (w *Watcher) diverging(snap *Snapshot, state *State) bool {
 	limit := w.cfg.Backoff.MaxRoundsWithoutImprovement
 	if limit <= 0 || state.BestHealth == nil {
@@ -702,6 +693,15 @@ func (w *Watcher) recordHealth(state *State, snap *Snapshot) bool {
 	return polished
 }
 
+// merge lands the PR according to the configured policy and then VERIFIES the
+// result against the GitHub API.
+//
+// Verification is not optional paranoia. `gh pr merge` exiting 0 does not mean
+// the PR merged: under `--auto` it means auto-merge was armed, and a merge
+// queue can report a populated merge_commit_sha for a candidate it only
+// speculatively built. Likewise `state: CLOSED` is ambiguous — a PR closed
+// without merging looks identical. The single unambiguous signal is
+// `.merged == true` on the pulls endpoint, so that is the only thing we trust.
 func (w *Watcher) merge(ctx context.Context, snap *Snapshot) (mergeOutcome, error) {
 	policy := w.cfg.Polish.MergePolicy
 	args, ok := policy.MergeArgs(w.pr)
