@@ -152,6 +152,13 @@ func (r RoundSpec) IsCommand() bool { return r.Command != "" }
 // moment a round is inserted or reordered. The consequence is deliberate — an
 // edited once round is a different round and runs again, which is what a human
 // changing its text is asking for.
+//
+// The step's model and effort are deliberately NOT part of the key. They are how
+// a round runs, not what it does: /simplify-branch has already simplified the
+// branch, and re-running it because the fleet moved to a new model is exactly the
+// churn `once` exists to prevent. Worse, model and effort are step-level, so
+// including them would re-run every once round on every babysat PR the moment
+// someone tunes one knob.
 func (r RoundSpec) onceKey() string {
 	sum := sha256.Sum256([]byte(r.Command + "\x00" + r.Prompt))
 	return hex.EncodeToString(sum[:8])
