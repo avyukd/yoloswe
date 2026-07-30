@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"text/template"
@@ -209,7 +210,8 @@ type ReworkData struct {
 	PrevOutput string
 	// DefaultPolishPrompt is prdozer's own fully-wired "/pr-polish" invocation:
 	// the exact prompt the default (spec-less) path sends, PR number and flags
-	// included. Set for polish rounds only; empty for merge_rework.
+	// included. Set for polish rounds only; a merge_rework template naming it is
+	// rejected at load rather than left to render as "" (see stepRoute).
 	//
 	// A round's prompt is sent VERBATIM, so a round written as a bare
 	// "/pr-polish" drops the "--rounds" cap that keeps a single tick bounded and
@@ -219,6 +221,45 @@ type ReworkData struct {
 	DefaultPolishPrompt string
 	PRNumber            int
 	Attempt             int
+}
+
+// stepRoute names which consumer runs a step's rounds. The two consumers fill
+// DIFFERENT subsets of ReworkData — merge_rework has a merge error and an
+// attempt number, polish has the wired default prompt — so a template that is
+// correct for one renders as an empty string for the other. The route is what
+// lets load-time validation tell those apart instead of accepting both.
+type stepRoute string
+
+const (
+	routePolish      stepRoute = "polish"
+	routeMergeRework stepRoute = "merge_rework"
+)
+
+// fields lists the ReworkData fields this route actually populates. Anything
+// else is the zero value at runtime, which in a prompt is a silent no-op —
+// precisely the config mistake eager validation exists to catch.
+//
+// Written out rather than derived: the list IS the promise each consumer makes
+// to config authors. TestReworkDataFieldsAreRouted fails if a field is added to
+// ReworkData without deciding which consumers fill it.
+func (r stepRoute) fields() []string {
+	common := []string{"Repo", "Branch", "PRURL", "PrevOutput", "PRNumber"}
+	if r == routePolish {
+		return append(common, "DefaultPolishPrompt")
+	}
+	return append(common, "MergeError", "MergePolicy", "Attempt")
+}
+
+// sample projects d down to the fields this route fills. A map rather than the
+// struct: with missingkey=error, a template naming a field the route leaves out
+// fails to execute — against the struct it would quietly render "".
+func (r stepRoute) sample(d *ReworkData) map[string]any {
+	v := reflect.ValueOf(*d)
+	out := make(map[string]any, v.NumField())
+	for _, name := range r.fields() {
+		out[name] = v.FieldByName(name).Interface()
+	}
+	return out
 }
 
 // sampleReworkData supplies non-zero values so eager validation traverses
@@ -279,13 +320,13 @@ func validateEntry(name string, e RepoEntry) error {
 	if e.Layout != "" && !e.Layout.Valid() {
 		return fmt.Errorf("%s: layout %q is invalid (want wt or plain)", name, e.Layout)
 	}
-	if err := validateStepSpec(name+".polish", e.Polish); err != nil {
+	if err := validateStepSpec(name+".polish", e.Polish, routePolish); err != nil {
 		return err
 	}
-	return validateStepSpec(name+".merge_rework", e.MergeRework)
+	return validateStepSpec(name+".merge_rework", e.MergeRework, routeMergeRework)
 }
 
-func validateStepSpec(label string, s StepSpec) error {
+func validateStepSpec(label string, s StepSpec, route stepRoute) error {
 	// Model and effort are checked here rather than where they are consumed:
 	// registry validation is eager precisely so a typo fails at load, not
 	// mid-run on a live PR after the agent has already been dispatched.
@@ -316,11 +357,11 @@ func validateStepSpec(label string, s StepSpec) error {
 		case round.Prompt == "" && round.Command == "":
 			return fmt.Errorf("%s.rounds[%d]: set exactly one of prompt or command", label, i)
 		case round.Prompt != "":
-			if err := validateReworkTemplate(fmt.Sprintf("%s.rounds[%d].prompt", label, i), round.Prompt); err != nil {
+			if err := validateReworkTemplate(fmt.Sprintf("%s.rounds[%d].prompt", label, i), round.Prompt, route); err != nil {
 				return err
 			}
 		default:
-			if err := validateReworkTemplate(fmt.Sprintf("%s.rounds[%d].command", label, i), round.Command); err != nil {
+			if err := validateReworkTemplate(fmt.Sprintf("%s.rounds[%d].command", label, i), round.Command, route); err != nil {
 				return err
 			}
 		}
@@ -335,9 +376,11 @@ func validateStepSpec(label string, s StepSpec) error {
 }
 
 // validateReworkTemplate parses tmpl once and executes it against a zero-value
-// and a filled sample. The two passes matter: a zero-value pass alone skips
-// {{- if .X}} branches, which is exactly where a typo hides.
-func validateReworkTemplate(label, tmpl string) error {
+// and a filled sample of what ROUTE actually supplies. The two passes matter: a
+// zero-value pass alone skips {{- if .X}} branches, which is exactly where a
+// typo hides. The route matters because a field the consumer never fills is a
+// silent empty string at runtime, not an error.
+func validateReworkTemplate(label, tmpl string, route stepRoute) error {
 	t, err := template.New(label).Option("missingkey=error").Parse(tmpl)
 	if err != nil {
 		return fmt.Errorf("%s template: %w", label, err)
@@ -346,8 +389,9 @@ func validateReworkTemplate(label, tmpl string) error {
 	// copying it per iteration trips gocritic's rangeValCopy.
 	samples := []ReworkData{{}, sampleReworkData}
 	for i := range samples {
-		if err := t.Execute(io.Discard, &samples[i]); err != nil {
-			return fmt.Errorf("%s template: %w", label, err)
+		if err := t.Execute(io.Discard, route.sample(&samples[i])); err != nil {
+			return fmt.Errorf("%s template: %w (a %s round is given: %s)",
+				label, err, route, strings.Join(route.fields(), ", "))
 		}
 	}
 	return nil

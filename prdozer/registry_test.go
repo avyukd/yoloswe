@@ -3,6 +3,7 @@ package prdozer
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -351,6 +352,81 @@ repos:
         - prompt: "{{.DefaultPolishPrompt}}"
 `))
 	require.NoError(t, err)
+}
+
+// A field the consumer never fills renders as "" at runtime — a prompt that
+// quietly loses its evidence, or a command that runs with an empty argument.
+// Validation knows which consumer a step belongs to, so it rejects those.
+func TestLoadRegistry_RejectsFieldsTheRouteNeverFills(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{
+			name: "polish round naming a merge_rework field",
+			body: `
+repos:
+  o/r:
+    polish:
+      rounds:
+        - prompt: "the merge failed: {{.MergeError}}"
+`,
+			wantErr: "MergeError",
+		},
+		{
+			name: "polish round naming the merge attempt",
+			body: `
+repos:
+  o/r:
+    polish:
+      rounds:
+        - command: "gh pr view {{.PRNumber}} --json state # attempt {{.Attempt}}"
+`,
+			wantErr: "Attempt",
+		},
+		{
+			name: "merge_rework round naming the polish default prompt",
+			body: `
+repos:
+  o/r:
+    merge_rework:
+      rounds:
+        - prompt: "{{.DefaultPolishPrompt}}"
+`,
+			wantErr: "DefaultPolishPrompt",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := LoadRegistry(writeRegistry(t, tc.body))
+			require.Error(t, err, "a field the route never fills must fail at load")
+			assert.Contains(t, err.Error(), tc.wantErr)
+			assert.Contains(t, err.Error(), "round is given:",
+				"the error must say what the route DOES supply")
+		})
+	}
+}
+
+// The routes together must account for every ReworkData field. A field claimed
+// by neither is unreachable from any template; one silently added to the struct
+// and to only one producer is the drift this catches.
+func TestReworkDataFieldsAreRouted(t *testing.T) {
+	t.Parallel()
+	routed := make(map[string]bool)
+	for _, r := range []stepRoute{routePolish, routeMergeRework} {
+		for _, f := range r.fields() {
+			routed[f] = true
+		}
+	}
+	typ := reflect.TypeOf(ReworkData{})
+	for i := range typ.NumField() {
+		name := typ.Field(i).Name
+		assert.True(t, routed[name],
+			"ReworkData.%s is filled by no route, so no template can ever use it", name)
+	}
 }
 
 // Only the once gate cannot tell two identical rounds apart. A round that
