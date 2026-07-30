@@ -151,11 +151,44 @@ If the envelope reports `status: "error"` but `review.raw_text` contains a fence
 
 ## Step 5: Triage
 
-Each envelope finding has a `severity` (`high`/`medium`/`low`/`nit`), `path`/`line`, and `description`. For each:
+First, read the envelope shape correctly — this is where it's easy to go wrong. The
+top-level verdict lives at `.review.verdict` and is `accepted` / `rejected` (a coarse
+signal, not your final word). The findings array is `.review.issues[]` — **not**
+`.review.findings`. Reading the wrong key makes a real finding look like "0 findings"
+and a rejected PR look clean. Each issue carries:
 
-- Apply the blocking test from "Approval bias" above.
-- Cross-reference the cited file:line. If it isn't in the diff, demote to optional (pre-existing) or drop (stale).
-- Disagree with the model's severity when warranted — a `high` style nit is optional; a `low` real bug is blocking.
+- `severity` (`high`/`medium`/`low`/`nit`) and `confidence` (0–1)
+- `message` (what's wrong) and `suggestion` (what to do)
+- `file` + `line`, plus `sites[]` ({file, line}) when the concern spans call sites
+- `invariant` — the rule the issue claims is violated
+
+There's also `.review.sufficiency.is_confident_complete` — the reviewer's own read on
+whether it covered the diff. A `false` there means treat the pass as partial.
+
+A robust extractor (don't hand-eyeball the JSON):
+
+```bash
+jq -r '{verdict: .review.verdict, complete: .review.sufficiency.is_confident_complete,
+        n: ((.review.issues // []) | length)}' "$ENVELOPE"
+jq -r '(.review.issues // [])[] | "--- [\(.severity) conf=\(.confidence)] \(.file):\(.line)\n\(.message)\nfix: \(.suggestion)\nsites: \([.sites[]? | "\(.file):\(.line)"] | join(", "))"' "$ENVELOPE"
+```
+
+The verdict and the issues can disagree — a `rejected` with a one-paragraph summary but
+an empty `issues[]` happens when the reviewer described a concern in prose but didn't
+emit a structured finding. When that happens, dig into `.review.summary` and recover the
+real concern; don't report "0 findings" just because the array is empty.
+
+Then, for each issue:
+
+- Apply the blocking test from "Calibrating findings" above. The model's `accepted`/
+  `rejected` and per-issue `severity` are inputs, not the verdict — you re-decide.
+- Cross-reference the cited `file:line` against the *post-diff* file (line numbers shift;
+  `sites[]` line numbers are the model's, verify them). If the cited file isn't in
+  `git diff --name-only`, demote to optional (pre-existing) or drop (stale).
+- Disagree with severity when warranted — a `high` style nit is optional; a `low`/`medium`
+  real bug on a hot path is blocking. A narrow ordering-race finding on a state machine
+  the diff is rewriting is usually "APPROVE with suggestions", not "REQUEST CHANGES" —
+  weigh how reachable the bad path actually is, not just whether it exists.
 
 ## Step 6: Print the verdict
 
@@ -186,11 +219,21 @@ Verdict:
 
 ## Step 7: Ask before posting
 
-First, idempotency check — has the current user already reviewed this SHA?
+**Know whose name goes on the review first.** `gh pr review` posts as whoever `gh` is
+authenticated as (`gh api user --jq .login`) — which on a personal machine is usually the
+human, not a bot. Surface that in the ask: "posting will submit this review as
+`<login>`." If the user would rather it land under a bot identity, that's a different
+auth path (e.g. a GitHub App / `pr-bot-wraper`-style wrapper), not something `gh pr
+review` does — say so rather than posting under their name silently.
+
+Idempotency check — has *that same login* already reviewed this exact SHA? (Filter by the
+current login; other reviewers, bots, and stale-SHA reviews don't count as a re-fire.)
 
 ```bash
+ME=$(gh api user --jq .login)
 gh pr view "$PR_NUM" --repo "$OWNER/$REPO" --json reviews,headRefOid \
-  --jq '.headRefOid as $sha | .reviews[] | select(.commit.oid == $sha) | {author: .author.login, state}'
+  | jq --arg me "$ME" '.headRefOid as $sha | .reviews[]
+     | select(.commit.oid == $sha and .author.login == $me) | {state}'
 ```
 
 If yes (likely a re-fire), offer *Update existing*, *Post anyway*, *Skip* — default Skip.
@@ -203,6 +246,10 @@ Otherwise ask via `AskUserQuestion`:
 - **Skip** (default).
 
 Always `--body-file`, never `--body "..."` — long markdown breaks shell quoting.
+
+After posting, confirm it registered: re-read `reviewDecision` (and the current-SHA
+review state for your login) so you're reporting what GitHub actually recorded, not just
+that the `gh` call exited 0.
 
 ## Step 8: Cleanup
 
