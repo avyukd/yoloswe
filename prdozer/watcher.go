@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude/render"
+	"github.com/bazelment/yoloswe/multiagent/agent"
 	"github.com/bazelment/yoloswe/wt"
 )
 
@@ -318,6 +319,20 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		// embed the endpoint config (API key / key-bearing env var), and these
 		// messages are persisted and Slacked.
 		safe := safeErrString(err)
+		// A provider outage is not a fact about this PR. Counting it toward the
+		// failure brake spends the budget meant for "this PR is not converging"
+		// on "Anthropic returned 529", and three of those bought kernel#8031 a
+		// two-hour cooldown while nothing was wrong with the branch.
+		//
+		// Verified against the real strings: an API 529 classifies http_5xx and
+		// a force-completed turn classifies grace_forced, while a bare
+		// "exit status 1" stays non-transient and still counts.
+		if transient, reason := agent.ClassifyTransient(err); transient {
+			w.logger.Warn("polish hit a transient provider error; not counting it toward the failure brake",
+				"error", safe, "reason", reason)
+			w.status("PR #%d polish interrupted (%s) — retrying next tick", w.pr, reason)
+			return LastActionTransient
+		}
 		w.logger.Error("polish failed", "error", safe)
 		w.status("PR #%d polish failed: %s", w.pr, safe)
 		return LastActionFailed
@@ -701,6 +716,14 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 		dirty = true
 	}
 	switch action {
+	// A provider-side failure is not a fact about the PR, so it neither counts
+	// toward the brake nor clears a streak already accumulated. Both arms below
+	// are explicit case lists, so an unlisted action would already fall through
+	// untouched; naming it here states the intent and makes adding it to the
+	// success list — which would let one 529 launder a real streak back to
+	// zero — a visible change rather than a silent one.
+	case LastActionTransient:
+		// ConsecutiveFailures deliberately untouched.
 	// LastActionReworked shares the failure arm so a straight run of reworks
 	// still trips the ordinary backoff.
 	case LastActionFailed, LastActionReworked:

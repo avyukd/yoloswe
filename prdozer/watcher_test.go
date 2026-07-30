@@ -1413,3 +1413,72 @@ func TestWatcher_DivergenceGuard_UnsaturatedBotReviewedRepoStopsAtPlainLimit(t *
 	assert.Equal(t, 2, last.RoundsSinceImprovement,
 		"an unsaturated run stops at the plain limit, not the doubled one")
 }
+
+// A provider outage must not spend the failure brake. The brake exists to stop
+// a run that is not converging; an API 529 says nothing about the PR.
+//
+// This is the real kernel#8031 sequence: three ticks died on provider errors
+// (529, force-completed turn, 529) and the run entered a 2h cooldown with a
+// perfectly healthy branch.
+func TestWatcher_Tick_TransientPolishError_DoesNotCountTowardBrake(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	polish := &stubPolish{err: fmt.Errorf(
+		"polish round 1/3: agent execution: API Error: 529 Overloaded. This is a server-side issue, usually temporary")}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	pre := &State{LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1"}
+	require.NoError(t, pre.Save(statePath))
+
+	// Three ticks — enough to trip the brake twice over if they counted.
+	for range 3 {
+		_, err := w.Tick(context.Background())
+		require.NoError(t, err)
+	}
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 0, s.ConsecutiveFailures, "a provider outage is not a PR failure")
+	assert.True(t, s.CooldownUntil.IsZero(), "transient errors must not trip the cooldown")
+	assert.Equal(t, LastActionTransient, s.LastAction)
+	assert.Len(t, polish.calls, 3, "every tick should still attempt polish; nothing is braking")
+}
+
+// The other half: a transient landing mid-streak must not launder real failures
+// back to zero. Reaching the success arm would reset the counter, which is the
+// specific mistake this action's own switch arm exists to prevent.
+func TestWatcher_Tick_TransientDoesNotClearRealFailureStreak(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	polish := &stubPolish{err: fmt.Errorf("boom")}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	pre := &State{LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1"}
+	require.NoError(t, pre.Save(statePath))
+
+	// One real failure.
+	_, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	s1, err := LoadState(statePath)
+	require.NoError(t, err)
+	require.Equal(t, 1, s1.ConsecutiveFailures)
+
+	// A provider blip lands next.
+	polish.err = fmt.Errorf("agent execution: API Error: 529 Overloaded")
+	_, err = w.Tick(context.Background())
+	require.NoError(t, err)
+	s2, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 1, s2.ConsecutiveFailures,
+		"the transient neither adds to nor clears the real failure that preceded it")
+
+	// The next real failure resumes the streak and trips the brake, proving the
+	// transient did not reset progress toward it.
+	polish.err = fmt.Errorf("boom again")
+	_, err = w.Tick(context.Background())
+	require.NoError(t, err)
+	s3, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 2, s3.ConsecutiveFailures)
+	assert.False(t, s3.CooldownUntil.IsZero(), "the real streak still reaches the cooldown")
+}

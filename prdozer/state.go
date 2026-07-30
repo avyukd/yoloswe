@@ -29,6 +29,17 @@ const (
 	LastActionClosed   LastAction = "closed"
 	LastActionFailed   LastAction = "failed"
 	LastActionDryRun   LastAction = "dry_run"
+	// LastActionTransient means the polish round died on a provider-side
+	// failure — an API 5xx, a rate limit, a force-completed turn — rather than
+	// on anything about this PR.
+	//
+	// It deliberately neither increments nor resets ConsecutiveFailures. Not
+	// increment, because the failure brake exists to stop a run that is not
+	// converging, and a 529 is not evidence of that: three of them spent
+	// kernel#8031's entire brake budget and imposed a 2h cooldown while the
+	// branch was fine. Not reset, because a provider blip in the middle of a
+	// genuine failure streak must not launder that streak back to zero.
+	LastActionTransient LastAction = "transient"
 	// LastActionArmed means auto-merge was armed on a merge-queue repo. The
 	// PR has NOT landed yet — the queue lands it asynchronously — so this is a
 	// non-terminal state that keeps the watcher polling until `.merged` is true.
