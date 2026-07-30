@@ -233,13 +233,7 @@ func (p *AgentPolisher) runOne(ctx context.Context, req PolishRequest, prompt st
 	if permMode == "" {
 		permMode = "bypass"
 	}
-	opts := []agent.ExecuteOption{
-		agent.WithProviderWorkDir(req.WorkDir),
-		agent.WithProviderPermissionMode(permMode),
-		agent.WithProviderModel(modelID),
-		agent.WithProviderKeepUserSettings(),
-		agent.WithProviderEventHandler(handler),
-	}
+	opts := baseProviderOpts(req.WorkDir, permMode, modelID, handler)
 	if req.Spec.Effort != "" {
 		// Parse rather than cast: a typo'd effort should fail loudly here, not be
 		// passed through to the provider as an unrecognized value.

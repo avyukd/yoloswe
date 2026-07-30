@@ -50,6 +50,12 @@ type AgentRework struct {
 	logger   *slog.Logger
 	// runLog, when set, receives per-round logs and events.
 	runLog *RunLog
+	// newProvider builds the agent provider a round runs on. It is a field only
+	// so tests can substitute a fake and observe the options runAgent assembles;
+	// production always leaves it at agent.NewProviderForModel. AgentPolisher
+	// carries the same seam — without it here, nothing could assert that both
+	// routes really share baseProviderOpts.
+	newProvider func(agent.AgentModel) (agent.Provider, error)
 }
 
 // NewAgentRework builds a rework runner. runLog may be nil.
@@ -57,7 +63,12 @@ func NewAgentRework(renderer *render.Renderer, logger *slog.Logger, runLog *RunL
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &AgentRework{renderer: renderer, logger: logger, runLog: runLog}
+	return &AgentRework{
+		renderer:    renderer,
+		logger:      logger,
+		runLog:      runLog,
+		newProvider: agent.NewProviderForModel,
+	}
 }
 
 // commandTimeout bounds a single shell round so a hung command cannot wedge
@@ -175,7 +186,11 @@ func (r *AgentRework) runAgent(ctx context.Context, req ReworkRequest, tmpl stri
 	if !ok {
 		return "", fmt.Errorf("unknown model %q", modelID)
 	}
-	provider, err := agent.NewProviderForModel(model)
+	newProvider := r.newProvider
+	if newProvider == nil {
+		newProvider = agent.NewProviderForModel
+	}
+	provider, err := newProvider(model)
 	if err != nil {
 		return "", fmt.Errorf("create provider: %w", err)
 	}
@@ -191,20 +206,7 @@ func (r *AgentRework) runAgent(ctx context.Context, req ReworkRequest, tmpl stri
 	if permMode == "" {
 		permMode = "bypass"
 	}
-	opts := []agent.ExecuteOption{
-		agent.WithProviderWorkDir(req.WorkDir),
-		agent.WithProviderPermissionMode(permMode),
-		agent.WithProviderModel(modelID),
-		// Load-bearing: without it the spawned agent cannot resolve
-		// user-level skills, so a prompt invoking one silently resolves to
-		// nothing.
-		agent.WithProviderKeepUserSettings(),
-		agent.WithProviderEventHandler(handler),
-		// Rework prompts drive skills that may background a tool call right at
-		// turn end. Give the turn room to finish rather than force-completing
-		// it mid-flight.
-		agent.WithProviderStreamTurnGracePeriod(streamTurnGrace),
-	}
+	opts := baseProviderOpts(req.WorkDir, permMode, modelID, handler)
 	if req.Spec.Effort != "" {
 		// Parse rather than cast: a typo'd effort should fail loudly here, not
 		// be passed through to the provider as an unrecognized value.
@@ -237,6 +239,40 @@ func (r *AgentRework) runAgent(ctx context.Context, req ReworkRequest, tmpl stri
 	return result.Text, nil
 }
 
-// streamTurnGrace gives a turn time to settle an outstanding background tool
-// call before it is force-completed.
-const streamTurnGrace = 60 * time.Second
+// baseProviderOpts builds the provider options every prdozer agent session
+// needs, whatever route it came in on.
+//
+// It exists because the polish and merge_rework paths kept diverging. Each was
+// written as its own option list, and each time polish was the one that lost a
+// behavior rework already had: polish.model/effort honored only for rework
+// (#288 round 1), and command rounds logging only on success and dropping their
+// output on failure (#288 rounds 6 and the follow-up).
+//
+// Deliberately absent: WithProviderStreamTurnGracePeriod. Both routes drive
+// skills that may background a tool call right at turn end, and the provider
+// default (agent.DefaultStreamTurnGracePeriod, 10m) is tuned for exactly that —
+// bramble reviewers under /pr-polish routinely run 3-7+ minutes before emitting
+// a terminal event. merge_rework carried a hardcoded 60s override from #283
+// whose stated intent was to widen that window; because a positive override
+// replaces the default rather than extending it, it narrowed the window 10x
+// instead. Polish, which set nothing, was the route that had it right.
+//
+// This is why kernel#8031 burned three ticks into a 2h cooldown with "stream
+// idle: turn forced complete after grace period gated on background", and why
+// kernel#8042 failed the same way at round 2/3. Unifying the two routes on the
+// provider default fixes rework and leaves polish where it already was; any
+// future tightening belongs in a config knob, not a constant here.
+//
+// Callers append their own route-specific options (effort, turn caps, budget);
+// this covers only what both must have.
+func baseProviderOpts(workDir, permMode, modelID string, handler agent.EventHandler) []agent.ExecuteOption {
+	return []agent.ExecuteOption{
+		agent.WithProviderWorkDir(workDir),
+		agent.WithProviderPermissionMode(permMode),
+		agent.WithProviderModel(modelID),
+		// Load-bearing: without it the spawned agent cannot resolve user-level
+		// skills, so a prompt invoking one silently resolves to nothing.
+		agent.WithProviderKeepUserSettings(),
+		agent.WithProviderEventHandler(handler),
+	}
+}

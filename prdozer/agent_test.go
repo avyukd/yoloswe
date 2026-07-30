@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -214,4 +215,75 @@ func TestPolishRoundsSkipCompletedOnceRound(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"/pr-polish-comments"}, fake.prompts)
 	assert.Empty(t, res.RanOnceRounds)
+}
+
+// effectiveGracePeriod mirrors the provider's resolveGracePeriod: a positive
+// override replaces the default, anything else falls back to it. The tests
+// below assert on the resolved window rather than on the raw field, because
+// the field's zero value is the *good* case and an equality assertion on it
+// reads backwards.
+func effectiveGracePeriod(cfg agent.ExecuteConfig) time.Duration {
+	if cfg.StreamTurnGracePeriod > 0 {
+		return cfg.StreamTurnGracePeriod
+	}
+	return agent.DefaultStreamTurnGracePeriod
+}
+
+// The polish route must reach the provider with a grace period long enough for
+// a review skill's backgrounded tool call to terminate. This is a regression
+// test for a specific production failure, and for the pattern behind it.
+//
+// /pr-polish drives review skills that background a tool call right at turn
+// end. If the turn is force-completed while that call is still outstanding the
+// provider reports "stream idle: turn forced complete after grace period gated
+// on background", KillGroup tears the reviewers down, and the retry budget
+// drains re-running work from scratch. kernel#8031 spent three ticks failing
+// that way and entered a 2h cooldown; kernel#8042 failed the same way at round
+// 2/3.
+//
+// The assertion is a lower bound on the resolved window, not an equality check
+// on the option: what protects the session is how long the turn actually waits,
+// and both "no override" and "an override >= the default" satisfy that. An
+// equality check against a prdozer-local constant is what let a 60s override —
+// 10x *below* the default it replaced — look like the fix.
+func TestPolishGracePeriodCoversReviewerRuntime(t *testing.T) {
+	t.Parallel()
+	p, fake := polisherWithFake(t)
+
+	_, err := p.Run(context.Background(), PolishRequest{
+		Model:    "opus",
+		WorkDir:  t.TempDir(),
+		PRNumber: 8031,
+		Local:    true,
+		Cfg:      PolishConfig{RoundsPerTick: 3},
+	})
+	require.NoError(t, err)
+	require.Len(t, fake.cfgs, 1)
+	assert.GreaterOrEqual(t, effectiveGracePeriod(fake.cfgs[0]), agent.DefaultStreamTurnGracePeriod,
+		"polish drives bramble reviewers that run 3-7+ minutes; its turn grace must not fall below the provider default")
+}
+
+// Both agent routes must build the same base provider options.
+//
+// Three separate defects have come from polish and merge_rework maintaining
+// independent option lists: model and effort honored only for rework (#288),
+// command logging dropping output on failure (#288), and rework's 60s grace
+// override that no one applied to polish — the one divergence where polish had
+// it right. Asserting the shared constructor covers what both need makes the
+// next divergence fail here rather than in production.
+func TestBaseProviderOptsCoversBothRoutes(t *testing.T) {
+	t.Parallel()
+	var cfg agent.ExecuteConfig
+	for _, o := range baseProviderOpts("/w", "bypass", "opus", nil) {
+		o(&cfg)
+	}
+	assert.Equal(t, "/w", cfg.WorkDir)
+	assert.Equal(t, "bypass", cfg.PermissionMode)
+	assert.Equal(t, "opus", cfg.Model)
+	assert.True(t, cfg.KeepUserSettings,
+		"without KeepUserSettings a prompt invoking a user-level skill silently resolves to nothing")
+	assert.Zero(t, cfg.StreamTurnGracePeriod,
+		"prdozer must not override the turn grace period: an override replaces the provider default rather than extending it, and the default is the value tuned for these workloads")
+	assert.GreaterOrEqual(t, effectiveGracePeriod(cfg), agent.DefaultStreamTurnGracePeriod,
+		"whatever prdozer sets, the resolved window must cover a reviewer's runtime")
 }

@@ -737,7 +737,7 @@ func TestConsumeTurnEvents_ClosedStreamAfterErrorPreservesError(t *testing.T) {
 // reviewers driven by /pr-polish) raise the grace period above the default.
 func TestResolveGracePeriod(t *testing.T) {
 	// Unset (zero) -> provider default.
-	require.Equal(t, streamTurnGracePeriod, resolveGracePeriod(ExecuteConfig{}),
+	require.Equal(t, DefaultStreamTurnGracePeriod, resolveGracePeriod(ExecuteConfig{}),
 		"a zero override must fall back to the provider default")
 
 	// Positive override -> used verbatim.

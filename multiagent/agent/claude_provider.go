@@ -56,7 +56,7 @@ func AppendUnresolvedToolErrorMarker(text string, e UnresolvedToolError) string 
 
 const minRetryWallClockBudget = 10 * time.Minute
 
-// streamTurnGracePeriod bounds how long streamTurn waits, after a
+// DefaultStreamTurnGracePeriod bounds how long streamTurn waits, after a
 // TurnCompleteEvent has been observed, for an outstanding background
 // tool_use to produce a terminal event. On expiry the turn is forced done.
 // This is the backstop for an agent that backgrounds a tool that never
@@ -68,18 +68,25 @@ const minRetryWallClockBudget = 10 * time.Minute
 // and KillGroup tears down those processes, so retries restart from scratch
 // and exhaust the retry budget. Callers that need a different bound set it via
 // ExecuteConfig.StreamTurnGracePeriod (WithProviderStreamTurnGracePeriod).
-const streamTurnGracePeriod = 10 * time.Minute
+//
+// Exported so callers that must not fall below it — anything driving a review
+// skill — can assert against it rather than restating the number.
+const DefaultStreamTurnGracePeriod = 10 * time.Minute
 
 // resolveGracePeriod returns the per-execution grace period: the caller's
 // override (ExecuteConfig.StreamTurnGracePeriod) when set to a positive value,
 // otherwise the provider default. A zero or negative override means "use the
 // default" — config validation rejects negatives upstream, so this only guards
 // against the zero value reaching the option boundary.
+//
+// An override REPLACES the default; it never extends it. A caller that wants a
+// longer window than 10m must ask for that duration outright, and a caller that
+// wants the default must pass nothing at all.
 func resolveGracePeriod(cfg ExecuteConfig) time.Duration {
 	if cfg.StreamTurnGracePeriod > 0 {
 		return cfg.StreamTurnGracePeriod
 	}
-	return streamTurnGracePeriod
+	return DefaultStreamTurnGracePeriod
 }
 
 // terminalReturn resolves a closed-stream (EOF) turn. It returns result.Error

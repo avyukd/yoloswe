@@ -12,6 +12,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/bazelment/yoloswe/multiagent/agent"
 )
 
 // stubRework records calls and returns a configurable error, mirroring
@@ -473,6 +475,43 @@ func TestAgentRework_BadTemplateFails(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "Nope")
+}
+
+// The merge_rework route must reach the provider through the same base options
+// as polish, with a turn grace window that covers a review skill's backgrounded
+// tool call.
+//
+// This is the other half of TestBaseProviderOptsCoversBothRoutes: that test
+// pins what the shared constructor produces, this one pins that rework actually
+// goes through it. Rework carried a hardcoded 60s override from #283 — intended
+// to widen the window, but an override replaces the provider default rather
+// than extending it, so it narrowed the window 10x instead. Nothing caught that
+// because no test looked at what rework handed the provider.
+func TestAgentRework_AgentRoundUsesBaseProviderOpts(t *testing.T) {
+	t.Parallel()
+	fake := &fakeProvider{}
+	r := NewAgentRework(nil, nil, nil)
+	r.newProvider = func(agent.AgentModel) (agent.Provider, error) { return fake, nil }
+
+	workDir := t.TempDir()
+	_, err := r.Run(context.Background(), ReworkRequest{
+		WorkDir:  workDir,
+		PRNumber: 8042,
+		Spec: StepSpec{
+			Model:  "opus",
+			Rounds: []RoundSpec{{Prompt: "fix the merge conflict"}},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, fake.cfgs, 1)
+
+	cfg := fake.cfgs[0]
+	assert.Equal(t, workDir, cfg.WorkDir)
+	assert.Equal(t, "bypass", cfg.PermissionMode)
+	assert.True(t, cfg.KeepUserSettings,
+		"without KeepUserSettings a prompt invoking a user-level skill silently resolves to nothing")
+	assert.GreaterOrEqual(t, effectiveGracePeriod(cfg), agent.DefaultStreamTurnGracePeriod,
+		"merge_rework drives the same review skills as polish; its turn grace must not fall below the provider default")
 }
 
 func TestRedactSecrets(t *testing.T) {
