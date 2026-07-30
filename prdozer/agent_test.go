@@ -185,12 +185,12 @@ func TestPolishCommandFailure_IsNeverTransient(t *testing.T) {
 		"a polish shell round's failure must reach the watcher marked, through the round wrapper")
 
 	w := &Watcher{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	action, ok := w.classifyTransientFailure("polish", err, err.Error())
+	action, ok := w.classifyAgentRoundFailure("polish", err, err.Error())
 	assert.False(t, ok, "a shell round never talks to the provider")
 	assert.Empty(t, string(action))
 
 	// Control: the same text unmarked IS exempted, so the case is not vacuous.
-	_, bare := w.classifyTransientFailure("polish", errors.New(err.Error()), err.Error())
+	_, bare := w.classifyAgentRoundFailure("polish", errors.New(err.Error()), err.Error())
 	assert.True(t, bare,
 		"control: this error text must be classifier-matchable, else the case proves nothing")
 }

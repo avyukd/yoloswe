@@ -452,14 +452,14 @@ func TestAgentRework_CommandFailure_IsNeverTransient(t *testing.T) {
 	require.Error(t, err)
 
 	w := &Watcher{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	action, ok := w.classifyTransientFailure("merge rework", err, err.Error())
+	action, ok := w.classifyAgentRoundFailure("merge rework", err, err.Error())
 	assert.False(t, ok, "a shell round never talks to the provider, so it is never a provider outage")
 	assert.Empty(t, string(action))
 
 	// Control: strip the marker and the SAME text is exempted. Without this the
 	// assertion above would also pass if "529" simply stopped matching, proving
 	// nothing about the marker.
-	_, bare := w.classifyTransientFailure("merge rework", errors.New(err.Error()), err.Error())
+	_, bare := w.classifyAgentRoundFailure("merge rework", errors.New(err.Error()), err.Error())
 	assert.True(t, bare,
 		"control: this error text must be classifier-matchable, else the case is vacuous")
 }
@@ -667,13 +667,19 @@ func TestWatcher_MergeOutage_ChargesNeitherBrake(t *testing.T) {
 // The other half of that arm: a merge GitHub actively REJECTED still brakes, so
 // the exemption above cannot be read as "the merge path never brakes".
 //
-// This is the case the GitHubOutageError marker exists to protect. The rejection
-// text here mentions "timed out" — a token the transient classifier matches — so
-// a text-based exemption would wrongly skip the brake and let an unmergeable PR
-// loop forever. Only the producer-marked outage is exempt.
+// This is the case the marker-only rule exists to protect. The rejection text
+// names a required check called "test_connection_timeout", which contains the
+// classifier's "timeout" token — so a text-based exemption would roll back the
+// attempt, skip rework, and let an unmergeable PR loop forever with no cooldown.
+// Only a producer-marked outage is exempt on this path.
+//
+// The token must be a real one: an earlier version used "e2e_timed_out", whose
+// underscore breaks the "timed out" match, so it exercised nothing.
+// TestClassifyMergeFailure_UnmarkedRejectionNeverExempt pins the matchability of
+// this exact string.
 func TestWatcher_MergeRejection_StillChargesBrake(t *testing.T) {
 	gh := approvedGreenGH("false")
-	gh.failPrefix("pr merge", "required status check \"e2e_timed_out\" is failing")
+	gh.failPrefix("pr merge", "required status check \"test_connection_timeout\" failed")
 	rework := &stubRework{}
 	w := newWatcherForTest(t, gh, &stubPolish{}, WithRework(rework, oneRoundSpec()))
 	w.cfg.Polish.AutoMerge = true

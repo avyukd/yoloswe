@@ -226,7 +226,7 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 			// nothing else resets it, so leaving an outage in it would let a run of
 			// 529s trip the cooldown exactly the way this PR exists to prevent.
 			// Rework is skipped too — there is nothing for an agent to fix.
-			if action, ok := w.classifyTransientFailure("merge", err, safe); ok {
+			if action, ok := w.classifyMergeFailure(err, safe); ok {
 				state.MergeAttempts--
 				return action
 			}
@@ -331,7 +331,7 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		// embed the endpoint config (API key / key-bearing env var), and these
 		// messages are persisted and Slacked.
 		safe := safeErrString(err)
-		if action, ok := w.classifyTransientFailure("polish", err, safe); ok {
+		if action, ok := w.classifyAgentRoundFailure("polish", err, safe); ok {
 			return action
 		}
 		w.logger.Error("polish failed", "error", safe)
@@ -426,7 +426,11 @@ func (w *Watcher) rerequestReviews(ctx context.Context, snap *Snapshot) {
 //
 // safe must already be scrubbed: a provider error can embed the endpoint config
 // (API key / key-bearing env var), and these messages are persisted and Slacked.
-func (w *Watcher) classifyTransientFailure(stage string, err error, safe string) (LastAction, bool) {
+//
+// textOK says whether an UNMARKED error may still be exempted by matching its
+// text. It is false on the merge path, where the only trustworthy signal is a
+// producer marker — see classifyMergeFailure.
+func (w *Watcher) classifyTransientFailure(stage string, err error, safe string, textOK bool) (LastAction, bool) {
 	// A shell round never talks to the provider, so it can never have suffered a
 	// provider outage. Checked BEFORE classification rather than after: the
 	// classifier matches error text, and a command error carries captured
@@ -446,6 +450,9 @@ func (w *Watcher) classifyTransientFailure(stage string, err error, safe string)
 		w.status("PR #%d %s interrupted (github unreachable) — retrying next tick", w.pr, stage)
 		return LastActionTransient, true
 	}
+	if !textOK {
+		return "", false
+	}
 	transient, reason := agent.ClassifyTransient(err)
 	if !transient {
 		return "", false
@@ -454,6 +461,28 @@ func (w *Watcher) classifyTransientFailure(stage string, err error, safe string)
 		"error", safe, "reason", reason)
 	w.status("PR #%d %s interrupted (%s) — retrying next tick", w.pr, stage, reason)
 	return LastActionTransient, true
+}
+
+// classifyAgentRoundFailure is the agent-round entry point: an agent error is
+// usually untyped, so text matching is the only signal available and is allowed.
+func (w *Watcher) classifyAgentRoundFailure(stage string, err error, safe string) (LastAction, bool) {
+	return w.classifyTransientFailure(stage, err, safe, true)
+}
+
+// classifyMergeFailure is the merge-path entry point, and is MARKER-ONLY.
+//
+// Text matching is refused here because a merge error is GitHub's verdict about
+// this PR rendered into a string, and ghError embeds that stderr verbatim. Real
+// rejections carry check names, and check names contain words: a required check
+// called "test_connection_timeout" matches the classifier's "timeout" token, so
+// a text-based exemption would roll back MergeAttempts, skip rework, and spend
+// neither brake on a PR that can never land — a permanent silent loop, which is
+// strictly worse than the over-braking this change set out to fix.
+//
+// Only a producer that knows the call never got a verdict may exempt the merge
+// path, by marking its error GitHubOutageError.
+func (w *Watcher) classifyMergeFailure(err error, safe string) (LastAction, bool) {
+	return w.classifyTransientFailure("merge", err, safe, false)
 }
 
 // reworkAfterFailedMerge decides what happens after a merge attempt fails.
@@ -499,7 +528,7 @@ func (w *Watcher) reworkAfterFailedMerge(ctx context.Context, snap *Snapshot, st
 		// Scrub before logging: a provider error can embed the endpoint
 		// config that produced it, and these logs are persisted and Slacked.
 		safe := safeErrString(err)
-		if action, ok := w.classifyTransientFailure("merge rework", err, safe); ok {
+		if action, ok := w.classifyAgentRoundFailure("merge rework", err, safe); ok {
 			return action
 		}
 		w.logger.Error("merge rework failed", "error", safe, "attempt", state.MergeAttempts)
