@@ -1532,3 +1532,147 @@ func TestClassifyAgentFailure_ProviderErrorStillTransient(t *testing.T) {
 	assert.True(t, ok)
 	assert.Equal(t, LastActionTransient, action)
 }
+
+// A divergence verdict from a previous run must not stop a run looking at
+// different code.
+//
+// State outlives the run that wrote it, which is right for the once-round record
+// and the merge-attempt count. RoundsSinceImprovement is different: it says "the
+// last N rounds did not improve THIS head". After a rebase or a push the next
+// run inherits a judgment about commits that are gone and stops on tick one.
+//
+// Hand-cleared three times in one day (yoloswe#290, yoloswe#291, kernel#8297).
+func TestWatcher_StaleDivergenceVerdict_RetiredWhenHeadMoved(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(9)
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 3
+	statePath := StatePath("r", 42)
+
+	// Exactly kernel#8297's file: a terminal verdict scoring a head the PR has
+	// since moved past, with a BestHealth that is unbeatable-looking but NOT
+	// saturated — so the saturation exemption cannot rescue it.
+	stale := &State{
+		LastCheckAt:            time.Now(),
+		LastSeenHeadSHA:        "an-older-head",
+		LastSeenBaseSHA:        "base1",
+		LastAction:             LastActionNeedsHuman,
+		RoundsSinceImprovement: 3,
+		BestHealth:             &PRHealth{UnresolvedThreads: 1},
+	}
+	require.NoError(t, stale.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.NotEqual(t, LastActionNeedsHuman, res.Action,
+		"a verdict about commits that are gone must not end the run on tick one")
+	assert.False(t, res.Diverged)
+	assert.NotEmpty(t, polish.calls, "the run must actually get to work")
+}
+
+// The retirement must NOT fire mid-run. Every polish round pushes a commit, so
+// the head moves constantly; keying on head movement alone would reset the
+// streak every round and disable the guard completely — an unbounded loop,
+// which is worse than the false positive being fixed.
+func TestWatcher_StaleDivergenceVerdict_NotRetiredMidRun(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(9)
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 3
+	statePath := StatePath("r", 42)
+
+	// Same moved head, but the run is mid-flight: the previous tick POLISHED.
+	midRun := &State{
+		LastCheckAt:            time.Now(),
+		LastSeenHeadSHA:        "an-older-head",
+		LastSeenBaseSHA:        "base1",
+		LastAction:             LastActionPolished,
+		RoundsSinceImprovement: 3,
+		BestHealth:             &PRHealth{UnresolvedThreads: 1},
+	}
+	require.NoError(t, midRun.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionNeedsHuman, res.Action,
+		"a mid-run streak still stops the run; the head moving is just the last round's push")
+	assert.True(t, res.Diverged)
+}
+
+// Retiring the verdict must reach DISK, not just the TickResult.
+//
+// The retirement only helps if the next tick reloads a cleared streak; a reset
+// that lives in memory and is dropped on the way to state.json would let the
+// stale verdict come back on the very next tick. The other tests here assert on
+// the returned action, which the reset survives regardless of whether it was
+// saved, so they cannot catch that.
+//
+// Persistence currently rides on recordSnapshot marking state dirty when the
+// head SHA differs — necessarily true here, since a moved head is what triggers
+// retirement in the first place — with Tick's healthDirty fold as a second path
+// to the same save. Asserting on the reloaded file pins the OUTCOME, so either
+// mechanism may change as long as the reset still lands.
+func TestWatcher_StaleDivergenceVerdict_ResetIsPersisted(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(9)
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 3
+	statePath := StatePath("r", 42)
+
+	stale := &State{
+		LastCheckAt:            time.Now(),
+		LastSeenHeadSHA:        "an-older-head",
+		LastSeenBaseSHA:        "base1",
+		LastAction:             LastActionNeedsHuman,
+		RoundsSinceImprovement: 3,
+		BestHealth:             &PRHealth{UnresolvedThreads: 1},
+	}
+	require.NoError(t, stale.Save(statePath))
+
+	_, err := w.Tick(context.Background())
+	require.NoError(t, err)
+
+	got, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Zero(t, got.RoundsSinceImprovement,
+		"the cleared streak must survive the save, or the next tick inherits it again")
+	assert.Equal(t, "head1", got.LastSeenHeadSHA,
+		"the scored head must advance, or the retirement re-fires forever")
+	// BestHealth is cleared by the retirement and then immediately rebaselined by
+	// recordHealth against the live snapshot. Asserted unconditionally: this
+	// fixture serves a readable snapshot (setThreads(9), FAILURE rollup), so
+	// recordHealth's nil branch always fires and a nil here is a regression, not
+	// a legal outcome. Guarding the assertion would let a reset that clears the
+	// stale value but never writes a new one pass silently.
+	require.NotNil(t, got.BestHealth,
+		"retirement must rebaseline BestHealth, not just clear it")
+	assert.Equal(t, PRHealth{UnresolvedThreads: 9, CIFailing: true}, *got.BestHealth,
+		"BestHealth must come from the current snapshot, not the stale run's unbeatable-looking {1}")
+}
+
+// A resumed run looking at the SAME commits keeps the verdict: nothing has
+// changed, so the previous judgment still applies.
+func TestWatcher_StaleDivergenceVerdict_KeptWhenHeadUnchanged(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(9)
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxRoundsWithoutImprovement = 3
+	statePath := StatePath("r", 42)
+
+	same := &State{
+		LastCheckAt:            time.Now(),
+		LastSeenHeadSHA:        "head1", // what the fake gh serves
+		LastSeenBaseSHA:        "base1",
+		LastAction:             LastActionNeedsHuman,
+		RoundsSinceImprovement: 3,
+		BestHealth:             &PRHealth{UnresolvedThreads: 1},
+	}
+	require.NoError(t, same.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionNeedsHuman, res.Action,
+		"same code, same verdict — re-dispatching must not launder a real stop")
+	assert.True(t, res.Diverged)
+}

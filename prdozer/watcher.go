@@ -131,6 +131,9 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 	}
 	cs := ComputeChangeset(state, snap)
 
+	// Retire a divergence verdict that judged code which no longer exists.
+	healthDirty := w.expireStaleDivergence(state, snap)
+
 	// Fold this tick's observed health into the run's best-so-far BEFORE
 	// deciding what to do. The divergence guard runs inside decideAndAct, so
 	// scoring afterward would hand it the PREVIOUS tick's streak: a snapshot
@@ -143,7 +146,7 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 	// recordHealth reads state.LastAction, which recordSnapshot does not update
 	// until the end of the tick, so it still charges against the PREVIOUS tick's
 	// action from here.
-	healthDirty := w.recordHealth(state, snap)
+	healthDirty = w.recordHealth(state, snap) || healthDirty
 
 	w.logger.Info("snapshot",
 		"head", snap.PR.HeadRefOid,
@@ -500,15 +503,6 @@ const (
 	mergeOutcomeArmed
 )
 
-// merge lands the PR according to the configured policy and then VERIFIES the
-// result against the GitHub API.
-//
-// Verification is not optional paranoia. `gh pr merge` exiting 0 does not mean
-// the PR merged: under `--auto` it means auto-merge was armed, and a merge
-// queue can report a populated merge_commit_sha for a candidate it only
-// speculatively built. Likewise `state: CLOSED` is ambiguous — a PR closed
-// without merging looks identical. The single unambiguous signal is
-// `.merged == true` on the pulls endpoint, so that is the only thing we trust.
 // needsSelfReview reports whether prdozer must ORIGINATE a review for this
 // commit, on a repo that has no automated review bots.
 //
@@ -529,6 +523,52 @@ func (w *Watcher) needsSelfReview(snap *Snapshot, state *State) bool {
 		return false
 	}
 	return state.SelfReviewedSHA != snap.PR.HeadRefOid
+}
+
+// expireStaleDivergence clears a divergence verdict inherited from a previous
+// run whose subject no longer exists. Reports whether it changed anything.
+//
+// State outlives the run that wrote it, by design — that is what lets a resumed
+// babysit keep its once-round record and its merge-attempt count. But
+// RoundsSinceImprovement is a judgment about SPECIFIC CODE: "the last N polish
+// rounds did not make THIS head better". When a run ends at needs_human and the
+// branch is then rebased or pushed to, the next run loads a streak that scored
+// commits that are gone, and stops on tick one having done nothing.
+//
+// Seen three times in one day (yoloswe#290, yoloswe#291, kernel#8297), each
+// needing the state file hand-edited to let the PR proceed. #8297 is the case
+// that shows why the saturation exemption does not cover this: its stale
+// BestHealth was {unresolved: 1}, unbeatable-looking but not saturated, while
+// the live PR had nine unresolved threads. The verdict was not wrong about the
+// code it saw; it was about different code.
+//
+// Two conditions, both required:
+//
+//   - the previous run ENDED (LastAction is a terminal state). A mid-run tick
+//     moves the head on every polish round, so keying on head movement alone
+//     would reset the streak every round and disable the guard entirely — the
+//     exact mistake that makes an unbounded loop.
+//   - the head moved since that ending. A resumed run looking at the SAME
+//     commits inherits a verdict that still applies, and must keep it.
+func (w *Watcher) expireStaleDivergence(state *State, snap *Snapshot) bool {
+	if state.RoundsSinceImprovement == 0 && state.BestHealth == nil {
+		return false
+	}
+	if state.LastAction != LastActionNeedsHuman {
+		return false
+	}
+	// No recorded head, or an unreadable one, is not evidence the code changed.
+	if state.LastSeenHeadSHA == "" || snap.PR.HeadRefOid == "" ||
+		state.LastSeenHeadSHA == snap.PR.HeadRefOid {
+		return false
+	}
+	w.logger.Info("retiring a divergence verdict that judged a previous head",
+		"scored_head", state.LastSeenHeadSHA,
+		"current_head", snap.PR.HeadRefOid,
+		"rounds_since_improvement", state.RoundsSinceImprovement)
+	state.RoundsSinceImprovement = 0
+	state.BestHealth = nil
+	return true
 }
 
 // diverging reports whether polishing has stopped making the PR better.
@@ -653,6 +693,15 @@ func (w *Watcher) recordHealth(state *State, snap *Snapshot) bool {
 	return polished
 }
 
+// merge lands the PR according to the configured policy and then VERIFIES the
+// result against the GitHub API.
+//
+// Verification is not optional paranoia. `gh pr merge` exiting 0 does not mean
+// the PR merged: under `--auto` it means auto-merge was armed, and a merge
+// queue can report a populated merge_commit_sha for a candidate it only
+// speculatively built. Likewise `state: CLOSED` is ambiguous — a PR closed
+// without merging looks identical. The single unambiguous signal is
+// `.merged == true` on the pulls endpoint, so that is the only thing we trust.
 func (w *Watcher) merge(ctx context.Context, snap *Snapshot) (mergeOutcome, error) {
 	policy := w.cfg.Polish.MergePolicy
 	args, ok := policy.MergeArgs(w.pr)
