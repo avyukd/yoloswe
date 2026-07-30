@@ -1203,14 +1203,18 @@ func TestAgentPolisher_RunRounds_ReportsTheOnceRoundsThatFinished(t *testing.T) 
 	}
 }
 
-// A saturated run whose head nobody has reviewed gets one extra allowance
-// before the guard stops it.
+// A run whose head nobody has reviewed gets one extra allowance before the
+// guard stops it.
 //
-// BestHealth is a floor: BetterThan is strict, so once a run touches
-// {0 unresolved, ci green} nothing can beat it and every later round counts as
-// "no improvement" whatever it accomplished. Three production runs stopped that
-// way with real work in flight — kernel#8297, yoloswe#288, yoloswe#291 — each
-// logging best_unresolved=0 and head_unreviewed=true.
+// This isolates the UNREVIEWED arm: red CI keeps BestHealth beatable, so
+// saturation cannot be what grants the grace here. The saturated arm is covered
+// on its own by TestWatcher_DivergenceGuard_SaturatedBotReviewedRepoExtendsOnce,
+// so between them each arm is exercised without the other standing in for it.
+//
+// The production runs that motivated the exemption had both at once —
+// kernel#8297, yoloswe#288, yoloswe#291 each logged best_unresolved=0 and
+// head_unreviewed=true — which is exactly why the arms are tested apart: a
+// fixture with both true would pass even if one arm were deleted.
 func TestWatcher_DivergenceGuard_UnreviewedHeadExtendsOnce(t *testing.T) {
 	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
 	gh.setThreads(0)
@@ -1224,10 +1228,12 @@ func TestWatcher_DivergenceGuard_UnreviewedHeadExtendsOnce(t *testing.T) {
 	ctx := context.Background()
 	_, err := w.Tick(ctx)
 	require.NoError(t, err)
+	require.False(t, bestHealth(t).Saturated(),
+		"red CI must leave BestHealth beatable, else the saturated arm grants the grace and this stops testing the unreviewed one")
 
-	// Run past the plain limit. The streak is saturated the whole way, so the
-	// unpatched guard stops at 2. The head moves every round because a real
-	// polish round pushes a commit — which is what keeps the head unreviewed.
+	// Run past the plain limit, which is where the unpatched guard stops. The
+	// head moves every round because a real polish round pushes a commit —
+	// which is what keeps the head unreviewed.
 	var last TickResult
 	for i := range 3 {
 		gh.setHead(fmt.Sprintf("head-r%d", i))
@@ -1256,6 +1262,8 @@ func TestWatcher_DivergenceGuard_UnreviewedHeadStillStopsAtHardLimit(t *testing.
 	ctx := context.Background()
 	_, err := w.Tick(ctx)
 	require.NoError(t, err)
+	require.False(t, bestHealth(t).Saturated(),
+		"red CI must leave BestHealth beatable, else this bounds the saturated arm instead of the unreviewed one")
 
 	var last TickResult
 	for i := range 10 {
