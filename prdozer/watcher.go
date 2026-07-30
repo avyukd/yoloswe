@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 	"time"
 
@@ -164,14 +165,16 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 	w.diverged = false
 	priorAttempts, priorMergeErr := state.MergeAttempts, state.LastMergeError
 	priorSelfReviewed := state.SelfReviewedSHA
-	priorOnceDone := state.OnceRoundsDone
+	// Counted, not compared by identity: decideAndAct adds keys to the SAME map
+	// when one already exists, so a pointer comparison would see no change.
+	priorOnceDone := len(state.OnceRoundsDone)
 	action := w.decideAndAct(ctx, snap, cs, state)
 	mergeStateDirty := state.MergeAttempts != priorAttempts ||
 		state.LastMergeError != priorMergeErr ||
 		state.SelfReviewedSHA != priorSelfReviewed ||
-		// Load-bearing: without this the flag can be set and never saved, so the
-		// next tick reloads OnceRoundsDone=false and re-runs every once round.
-		state.OnceRoundsDone != priorOnceDone
+		// Load-bearing: without this a newly completed once round is never saved,
+		// so the next tick reloads without it and runs it again.
+		len(state.OnceRoundsDone) != priorOnceDone
 
 	res := TickResult{Snapshot: snap, Changeset: cs, Action: action,
 		Diverged: w.diverged, PolishRounds: state.PolishRounds,
@@ -291,15 +294,21 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		Repo:     w.repo,
 		Branch:   snap.PR.HeadRefName,
 		PRURL:    snap.PR.URL,
-		// Rounds marked `once` are still owed until the PR has had them.
-		RunOnceRounds: !state.OnceRoundsDone,
+		// Rounds marked `once` are owed until this PR has completed them. Cloned,
+		// not shared: the request crosses the PolishRunner boundary, and handing
+		// out the live state map would let a runner mutate persisted state (and
+		// make the request's contents change under it as this tick records more).
+		DoneOnceRounds: maps.Clone(state.OnceRoundsDone),
 	}
 	polishRes, err := w.polish.Run(ctx, req)
-	// Latched before the error check: a spec whose LATER round failed has still
-	// run its once-only rounds, and repeating one is the churn `once` exists to
-	// prevent. The runner reports what actually finished — see PolishResult.
-	if polishRes.OnceRoundsRan {
-		state.OnceRoundsDone = true
+	// Recorded before the error check: a spec whose LATER round failed has still
+	// run the once-only rounds before it, and repeating one is the churn `once`
+	// exists to prevent. The runner reports what actually finished.
+	for key := range polishRes.RanOnceRounds {
+		if state.OnceRoundsDone == nil {
+			state.OnceRoundsDone = make(map[string]bool)
+		}
+		state.OnceRoundsDone[key] = true
 	}
 	if err != nil {
 		// Log the scrubbed STRING, not a wrapped error: a provider error can

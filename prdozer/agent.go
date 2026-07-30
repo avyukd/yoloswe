@@ -22,38 +22,40 @@ type PolishRunner interface {
 // PolishRequest carries everything the polish runner needs.
 type PolishRequest struct {
 	// Spec, when non-empty, replaces the single "/pr-polish" call with its
-	// rounds. Rounds marked `once` run only when RunOnceRounds is true.
-	Spec     StepSpec
-	WorkDir  string
-	Model    string
-	Branch   string
-	PRURL    string
-	Repo     string
-	Cfg      PolishConfig
-	PRNumber int
-	Local    bool
-	// RunOnceRounds asks for this spec's `once: true` rounds to be included.
-	// The caller owns the decision — it is the only side that knows whether the
-	// PR has had them yet (see State.OnceRoundsDone) — so the polisher simply
-	// obeys. A whole-branch pass like /simplify-branch improves an initial diff
-	// but churns an evolving one, which is what these rounds are for.
-	RunOnceRounds bool
+	// rounds. Rounds marked `once` are dropped once DoneOnceRounds keys them.
+	Spec StepSpec
+	// DoneOnceRounds keys the `once: true` rounds this PR has already completed,
+	// so they are dropped from this call. The caller owns the decision — it is
+	// the only side that knows the PR's history (see State.OnceRoundsDone) — so
+	// the polisher simply obeys. A whole-branch pass like /simplify-branch
+	// improves an initial diff but churns an evolving one, which is what these
+	// rounds are for.
+	DoneOnceRounds map[string]bool
+	WorkDir        string
+	Model          string
+	Branch         string
+	PRURL          string
+	Repo           string
+	Cfg            PolishConfig
+	PRNumber       int
+	Local          bool
 }
 
 // PolishResult captures what came out of the polish session.
 type PolishResult struct {
-	SessionID  string
-	Output     string
-	DurationMs int64
-	// OnceRoundsRan reports that every `once: true` round in this call finished.
-	// The caller latches it so those rounds are not repeated.
+	// RanOnceRounds keys the `once: true` rounds that finished in this call. The
+	// caller unions them into the PR's record so they are never repeated.
 	//
-	// Reported by the runner rather than assumed by the caller because only the
-	// runner knows how far it got: rounds execute in order, so a spec whose
-	// FIRST round is repeatable and fails never reaches a later once-only round
-	// — and that round must still be owed. Conversely a once round followed by a
-	// failing round has already done its work and must not be repeated.
-	OnceRoundsRan bool
+	// Per round rather than one all-or-nothing flag, and reported by the runner
+	// rather than assumed by the caller, because only the runner knows how far it
+	// got. Rounds execute in order and stop at the first error, so a spec with
+	// two once rounds whose second fails must keep the first's progress: a single
+	// bool would either lose it (re-running a completed whole-branch pass) or
+	// over-claim the second (dropping it for the life of the PR).
+	RanOnceRounds map[string]bool
+	SessionID     string
+	Output        string
+	DurationMs    int64
 }
 
 // AgentPolisher invokes /pr-polish through multiagent/agent — the same path
@@ -77,8 +79,8 @@ func (p *AgentPolisher) Run(ctx context.Context, req PolishRequest) (PolishResul
 	return p.runOne(ctx, req, buildPolishPrompt(req.PRNumber, req.Local, req.Cfg.RoundsPerTick))
 }
 
-// activeRounds returns the rounds to run this tick: all of them while the
-// once-only rounds are still owed, and only the repeatable ones thereafter.
+// activeRounds returns the rounds to run this tick: the repeatable ones plus
+// any once-only round this PR has not completed yet.
 //
 // Returning empty routes Run back to the default single "/pr-polish" call. That
 // matters for a spec whose rounds are ALL once-only: later ticks then still
@@ -88,14 +90,12 @@ func (req PolishRequest) activeRounds() []RoundSpec {
 	if req.Spec.Empty() {
 		return nil
 	}
-	if req.RunOnceRounds {
-		return req.Spec.Rounds
-	}
 	out := make([]RoundSpec, 0, len(req.Spec.Rounds))
 	for _, r := range req.Spec.Rounds {
-		if !r.Once {
-			out = append(out, r)
+		if r.Once && req.DoneOnceRounds[r.onceKey()] {
+			continue
 		}
+		out = append(out, r)
 	}
 	return out
 }
@@ -120,15 +120,6 @@ func (p *AgentPolisher) runRounds(ctx context.Context, req PolishRequest, rounds
 	var res PolishResult
 	prev := ""
 	start := time.Now()
-	// Counted rather than flagged on the first one seen: a spec may carry
-	// several once-only rounds, and one of them completing says nothing about
-	// the rest. They are owed until all of them are done.
-	onceOwed := 0
-	for _, r := range rounds {
-		if r.Once {
-			onceOwed++
-		}
-	}
 	for i, round := range rounds {
 		data := ReworkData{
 			Repo:       req.Repo,
@@ -158,14 +149,16 @@ func (p *AgentPolisher) runRounds(ctx context.Context, req PolishRequest, rounds
 			}
 		}
 		if err != nil {
-			// res carries OnceRoundsRan for the rounds that DID finish, so the
-			// caller can latch them even though this call failed.
+			// res carries RanOnceRounds for the rounds that DID finish, so the
+			// caller keeps their progress even though this call failed.
 			res.DurationMs = time.Since(start).Milliseconds()
 			return res, fmt.Errorf("polish round %d/%d: %w", i+1, len(rounds), err)
 		}
 		if round.Once {
-			onceOwed--
-			res.OnceRoundsRan = onceOwed == 0
+			if res.RanOnceRounds == nil {
+				res.RanOnceRounds = make(map[string]bool)
+			}
+			res.RanOnceRounds[round.onceKey()] = true
 		}
 		prev = out
 		res.Output = out

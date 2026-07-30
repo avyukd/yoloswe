@@ -238,6 +238,34 @@ repos:
 			wantErr: "merge_policy",
 		},
 		{
+			// A typo'd model must fail at LOAD. Caught only at dispatch it would
+			// strand a live PR mid-run, after the run has already started.
+			name: "unknown model on a polish step",
+			body: `
+repos:
+  o/r:
+    polish:
+      model: gpt-does-not-exist
+      rounds:
+        - prompt: /pr-polish
+`,
+			wantErr: "polish.model",
+		},
+		{
+			// Same knob, other step: validateStepSpec covers both, so neither can
+			// drift into accepting garbage.
+			name: "invalid effort on a merge_rework step",
+			body: `
+repos:
+  o/r:
+    merge_rework:
+      effort: turbo
+      rounds:
+        - prompt: fix the merge
+`,
+			wantErr: "merge_rework.effort",
+		},
+		{
 			name: "invalid layout",
 			body: `
 repos:

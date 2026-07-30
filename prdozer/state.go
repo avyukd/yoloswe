@@ -49,9 +49,26 @@ const (
 // State is the per-PR persisted state, used to detect change between ticks
 // and to back off after repeated failures.
 type State struct {
-	LastCheckAt     time.Time `json:"last_check_at,omitempty"`
-	CooldownUntil   time.Time `json:"cooldown_until,omitempty"`
-	LastSeenHeadSHA string    `json:"last_seen_head_sha,omitempty"`
+	// OnceRoundsDone keys the polish rounds marked `once: true` that this PR has
+	// already completed (RoundSpec.onceKey). It gates PolishRequest.
+	//
+	// Per round, not one flag for the whole step: rounds stop at the first error,
+	// so a spec with two once rounds whose second fails must keep the first's
+	// progress rather than repeat it on the next tick.
+	//
+	// Per PR, not per process: this file outlives any single babysit run, and
+	// that is the behaviour these rounds want. A whole-branch pass like
+	// /simplify-branch is worth running on a fresh diff; a PR resumed after
+	// twenty polish rounds no longer has one, so a restart must not re-run it.
+	//
+	// Unioned from PolishResult.RanOnceRounds rather than derived from
+	// PolishRounds, which counts only rounds whose result a later tick actually
+	// OBSERVED — a failed round, or a snapshot with no thread count, leaves it at
+	// zero and would re-run every once round on the next tick.
+	OnceRoundsDone  map[string]bool `json:"once_rounds_done,omitempty"`
+	LastCheckAt     time.Time       `json:"last_check_at,omitempty"`
+	CooldownUntil   time.Time       `json:"cooldown_until,omitempty"`
+	LastSeenHeadSHA string          `json:"last_seen_head_sha,omitempty"`
 	// SelfReviewedSHA is the head SHA prdozer last originated a review for on a
 	// self_review repo. Keyed by SHA so the review happens once per commit: an
 	// unconditional trigger would re-review an idle PR on every tick forever.
@@ -91,19 +108,6 @@ type State struct {
 	// RoundsSinceImprovement counts consecutive polish rounds that failed to
 	// beat BestHealth. Reset to zero whenever a new best is reached.
 	RoundsSinceImprovement int `json:"rounds_since_improvement,omitempty"`
-	// OnceRoundsDone records that this PR's polish rounds marked `once: true`
-	// have run to completion. It gates PolishRequest.RunOnceRounds.
-	//
-	// Per PR, not per process: this file outlives any single babysit run, and
-	// that is the behaviour these rounds want. A whole-branch pass like
-	// /simplify-branch is worth running on a fresh diff; a PR resumed after
-	// twenty polish rounds no longer has one, so a restart must not re-run it.
-	//
-	// Latched from PolishResult.OnceRoundsRan rather than derived from
-	// PolishRounds, which counts only rounds whose result a later tick actually
-	// OBSERVED — a failed round, or a snapshot with no thread count, leaves it at
-	// zero and would re-run every once round on the next tick.
-	OnceRoundsDone bool `json:"once_rounds_done,omitempty"`
 }
 
 // PRHealth is the cheap, externally-observable measure of whether a PR is

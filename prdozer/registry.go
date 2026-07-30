@@ -1,6 +1,8 @@
 package prdozer
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +13,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/bazelment/yoloswe/multiagent/agent"
 )
 
 // Layout describes how a repo's checkouts are arranged on disk, which decides
@@ -140,6 +144,19 @@ type RoundSpec struct {
 // agent session.
 func (r RoundSpec) IsCommand() bool { return r.Command != "" }
 
+// onceKey identifies a `once: true` round in the PR's completed-rounds record
+// (State.OnceRoundsDone), so progress survives a spec whose later round failed.
+//
+// Keyed by CONTENT rather than by position: the record outlives edits to the
+// registry, and a positional index would silently mis-attribute completion the
+// moment a round is inserted or reordered. The consequence is deliberate — an
+// edited once round is a different round and runs again, which is what a human
+// changing its text is asking for.
+func (r RoundSpec) onceKey() string {
+	sum := sha256.Sum256([]byte(r.Command + "\x00" + r.Prompt))
+	return hex.EncodeToString(sum[:8])
+}
+
 // ReworkData is the template context available to merge_rework rounds. Field
 // names are part of the config contract — renaming one breaks every registry
 // template that references it.
@@ -234,6 +251,19 @@ func validateEntry(name string, e RepoEntry) error {
 }
 
 func validateStepSpec(label string, s StepSpec) error {
+	// Model and effort are checked here rather than where they are consumed:
+	// registry validation is eager precisely so a typo fails at load, not
+	// mid-run on a live PR after the agent has already been dispatched.
+	if s.Model != "" {
+		if _, ok := agent.ModelByID(s.Model); !ok {
+			return fmt.Errorf("%s.model %q is not a known model", label, s.Model)
+		}
+	}
+	if s.Effort != "" {
+		if _, err := agent.ParseEffort(s.Effort); err != nil {
+			return fmt.Errorf("%s.effort: %w", label, err)
+		}
+	}
 	for i, round := range s.Rounds {
 		switch {
 		case round.Prompt != "" && round.Command != "":
