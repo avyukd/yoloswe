@@ -148,6 +148,7 @@ func (b *Babysitter) loop(ctx context.Context, rc *RunContext, runLog *RunLog, p
 	w := NewWatcher(cfg, b.gh, polish, o.PRNumber, rc.WorktreePath, o.OwnerRepo, b.logger,
 		WithRenderer(b.renderer),
 		WithRework(rework, o.Entry.MergeRework),
+		WithPolishSpec(o.Entry.Polish),
 	)
 
 	interval := o.PollInterval

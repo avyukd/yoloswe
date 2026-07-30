@@ -62,6 +62,18 @@ type RepoEntry struct {
 	// RequiredChecks names the checks that must pass. Prefer the aggregating
 	// gate job over its individual sub-jobs.
 	RequiredChecks []string `yaml:"required_checks"`
+	// Polish declares the rounds run each time the PR needs work, replacing the
+	// default single "/pr-polish" call.
+	//
+	// Modeled on jiradozer's validate step so a config ports over directly. The
+	// difference is where the iteration lives: jiradozer repeats inside one
+	// agent call ("repeat until coderabbit is happy"), whereas prdozer's tick
+	// loop IS the repetition — it re-snapshots, re-measures health, and can stop
+	// between rounds. So write rounds that do one pass; do not tell the agent to
+	// loop, or the divergence guard goes unconsulted for the whole call.
+	//
+	// Empty keeps the default behaviour: one "/pr-polish --rounds N" call.
+	Polish StepSpec `yaml:"polish"`
 	// MergeRework declares the rounds run after a failed merge. A repo that
 	// sets this REPLACES the default rounds entirely rather than appending, so
 	// a repo-specific playbook is never diluted by a generic one.
@@ -99,6 +111,14 @@ func (s StepSpec) Empty() bool { return len(s.Rounds) == 0 }
 type RoundSpec struct {
 	Prompt  string `yaml:"prompt"`
 	Command string `yaml:"command"`
+	// Once restricts this round to the first tick of a run.
+	//
+	// Polish rounds repeat on every tick, which is right for "address review
+	// comments" but wrong for whole-branch passes: /simplify-branch cleans up
+	// the entire diff, and re-running it every 20 minutes on an evolving branch
+	// churns rather than improves. Mark those `once: true` so they run in the
+	// opening tick and are skipped thereafter.
+	Once bool `yaml:"once"`
 }
 
 // IsCommand reports whether this round runs a shell command rather than an
@@ -180,6 +200,9 @@ func validateEntry(name string, e RepoEntry) error {
 	}
 	if e.Layout != "" && !e.Layout.Valid() {
 		return fmt.Errorf("%s: layout %q is invalid (want wt or plain)", name, e.Layout)
+	}
+	if err := validateStepSpec(name+".polish", e.Polish); err != nil {
+		return err
 	}
 	return validateStepSpec(name+".merge_rework", e.MergeRework)
 }
@@ -279,8 +302,11 @@ func (r *Registry) merged(e RepoEntry) RepoEntry {
 	if len(e.RequiredChecks) == 0 {
 		e.RequiredChecks = d.RequiredChecks
 	}
-	// merge_rework REPLACES rather than appends: a repo that declares its own
-	// rounds gets exactly those, never its rounds plus the generic default.
+	// polish and merge_rework REPLACE rather than append: a repo that declares
+	// its own rounds gets exactly those, never its rounds plus a generic default.
+	if e.Polish.Empty() {
+		e.Polish = d.Polish
+	}
 	if e.MergeRework.Empty() {
 		e.MergeRework = d.MergeRework
 	}

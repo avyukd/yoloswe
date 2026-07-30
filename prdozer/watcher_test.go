@@ -890,3 +890,41 @@ func TestWatcher_SelfReviewOff_CleanPRStillTerminates(t *testing.T) {
 	assert.Equal(t, LastActionNeedsHuman, res.Action)
 	assert.Empty(t, polish.calls, "no self-review means no origination")
 }
+
+// Some polish steps must run once per RUN, not once per tick. /simplify-branch
+// is a whole-branch cleanup: it improves an initial diff but churns an evolving
+// one, so re-running it every 20 minutes is wrong.
+func TestPolishRequest_OnceRoundsRunOnlyOnTheFirstTick(t *testing.T) {
+	t.Parallel()
+	spec := StepSpec{Rounds: []RoundSpec{
+		{Prompt: "/simplify-branch", Once: true},
+		{Prompt: "/pr-polish"},
+		{Prompt: "address review comments"},
+	}}
+
+	first := PolishRequest{Spec: spec, FirstTick: true}.activeRounds()
+	assert.Len(t, first, 3, "the opening tick runs every round")
+
+	later := PolishRequest{Spec: spec, FirstTick: false}.activeRounds()
+	require.Len(t, later, 2, "later ticks skip the once-only rounds")
+	assert.Equal(t, "/pr-polish", later[0].Prompt)
+	assert.Equal(t, "address review comments", later[1].Prompt)
+}
+
+// No configured spec keeps the existing single-call behaviour, so repos that
+// never opt in are unaffected.
+func TestPolishRequest_NoSpecFallsBackToTheDefaultCall(t *testing.T) {
+	t.Parallel()
+	assert.Empty(t, PolishRequest{FirstTick: true}.activeRounds(),
+		"an empty spec must fall through to the default /pr-polish call")
+}
+
+// A spec whose rounds are ALL once-only must not silently do nothing on later
+// ticks — activeRounds returning empty routes back to the default call, which
+// is the safe behaviour rather than a no-op polish.
+func TestPolishRequest_AllOnceRoundsFallBackAfterFirstTick(t *testing.T) {
+	t.Parallel()
+	spec := StepSpec{Rounds: []RoundSpec{{Prompt: "/simplify-branch", Once: true}}}
+	assert.Empty(t, PolishRequest{Spec: spec, FirstTick: false}.activeRounds(),
+		"all-once spec yields no rounds later, falling back to the default call")
+}

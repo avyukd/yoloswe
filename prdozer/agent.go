@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os/exec"
 	"regexp"
 	"strings"
 	"time"
@@ -20,11 +21,21 @@ type PolishRunner interface {
 
 // PolishRequest carries everything the polish runner needs.
 type PolishRequest struct {
+	// Spec, when non-empty, replaces the single "/pr-polish" call with its
+	// rounds. Rounds marked `once` run only when FirstTick is true.
+	Spec     StepSpec
 	WorkDir  string
 	Model    string
+	Branch   string
+	PRURL    string
+	Repo     string
 	Cfg      PolishConfig
 	PRNumber int
 	Local    bool
+	// FirstTick reports whether this is the run's opening polish. Rounds marked
+	// `once: true` are skipped when it is false — a whole-branch pass like
+	// /simplify-branch improves an initial diff but churns an evolving one.
+	FirstTick bool
 }
 
 // PolishResult captures what came out of the polish session.
@@ -49,6 +60,98 @@ func NewAgentPolisher(renderer *render.Renderer, logger *slog.Logger) *AgentPoli
 }
 
 func (p *AgentPolisher) Run(ctx context.Context, req PolishRequest) (PolishResult, error) {
+	if rounds := req.activeRounds(); len(rounds) > 0 {
+		return p.runRounds(ctx, req, rounds)
+	}
+	return p.runOne(ctx, req, buildPolishPrompt(req.PRNumber, req.Local, req.Cfg.RoundsPerTick))
+}
+
+// activeRounds returns the rounds to run this tick: all of them on the first
+// polish, and only the repeatable ones thereafter.
+//
+// Returning empty routes Run back to the default single "/pr-polish" call. That
+// matters for a spec whose rounds are ALL once-only: later ticks then still
+// polish rather than silently doing nothing, which would leave a PR needing
+// work with no way to get it.
+func (req PolishRequest) activeRounds() []RoundSpec {
+	if req.Spec.Empty() {
+		return nil
+	}
+	if req.FirstTick {
+		return req.Spec.Rounds
+	}
+	out := make([]RoundSpec, 0, len(req.Spec.Rounds))
+	for _, r := range req.Spec.Rounds {
+		if !r.Once {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// runRounds executes a configured polish step, threading each round's output
+// into the next as PrevOutput so a command round can gather evidence the
+// following agent round reasons about.
+func (p *AgentPolisher) runRounds(ctx context.Context, req PolishRequest, rounds []RoundSpec) (PolishResult, error) {
+	var res PolishResult
+	prev := ""
+	start := time.Now()
+	for i, round := range rounds {
+		data := ReworkData{
+			Repo:       req.Repo,
+			Branch:     req.Branch,
+			PRURL:      req.PRURL,
+			PrevOutput: prev,
+			PRNumber:   req.PRNumber,
+		}
+		var (
+			out string
+			err error
+		)
+		if round.IsCommand() {
+			out, err = p.runPolishCommand(ctx, req, round.Command, data)
+		} else {
+			prompt, rerr := RenderRound(round.Prompt, data)
+			if rerr != nil {
+				return res, fmt.Errorf("polish round %d/%d: render: %w", i+1, len(rounds), rerr)
+			}
+			r, rerr := p.runOne(ctx, req, prompt)
+			out, err = r.Output, rerr
+			if rerr == nil {
+				res.SessionID = r.SessionID
+			}
+		}
+		if err != nil {
+			return res, fmt.Errorf("polish round %d/%d: %w", i+1, len(rounds), err)
+		}
+		prev = out
+		res.Output = out
+	}
+	res.DurationMs = time.Since(start).Milliseconds()
+	return res, nil
+}
+
+// runPolishCommand runs a shell round, bounded so a hung command cannot wedge
+// the watcher loop.
+func (p *AgentPolisher) runPolishCommand(ctx context.Context, req PolishRequest, tmpl string, data ReworkData) (string, error) {
+	cmdStr, err := RenderRound(tmpl, data)
+	if err != nil {
+		return "", fmt.Errorf("render command: %w", err)
+	}
+	cctx, cancel := context.WithTimeout(ctx, commandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "sh", "-c", cmdStr)
+	cmd.Dir = req.WorkDir
+	out, err := cmd.CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if err != nil {
+		return text, fmt.Errorf("command %q: %w", truncate(cmdStr, 80), err)
+	}
+	p.logger.Info("polish command round complete", "pr", req.PRNumber, "command", truncate(cmdStr, 80))
+	return text, nil
+}
+
+func (p *AgentPolisher) runOne(ctx context.Context, req PolishRequest, prompt string) (PolishResult, error) {
 	model, ok := agent.ModelByID(req.Model)
 	if !ok {
 		return PolishResult{}, fmt.Errorf("unknown model %q", req.Model)
@@ -58,8 +161,6 @@ func (p *AgentPolisher) Run(ctx context.Context, req PolishRequest) (PolishResul
 		return PolishResult{}, fmt.Errorf("create provider: %w", err)
 	}
 	defer provider.Close()
-
-	prompt := buildPolishPrompt(req.PRNumber, req.Local, req.Cfg.RoundsPerTick)
 
 	logger := p.logger
 	logger.Info("invoking pr-polish",

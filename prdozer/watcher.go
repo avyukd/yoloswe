@@ -23,11 +23,18 @@ type Watcher struct {
 	workDir    string
 	self       string
 	reworkSpec StepSpec
+	polishSpec StepSpec
 	pr         int
 	dryRun     bool
 	// diverged is set by the divergence guard within a tick so Tick can
 	// report WHY it stopped. Reset at the top of every tick.
 	diverged bool
+}
+
+// WithPolishSpec attaches configured polish rounds, replacing the default
+// single "/pr-polish" call. Empty keeps the default.
+func WithPolishSpec(spec StepSpec) WatcherOption {
+	return func(w *Watcher) { w.polishSpec = spec }
 }
 
 // WithRework attaches the merge-rework runner and the rounds it should run,
@@ -276,6 +283,14 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		Local:    w.cfg.Polish.Local,
 		Cfg:      w.cfg.Polish,
 		Model:    w.cfg.Agent.Model,
+		Spec:     w.polishSpec,
+		Repo:     w.repo,
+		Branch:   snap.PR.HeadRefName,
+		PRURL:    snap.PR.URL,
+		// A run's opening polish: state.PolishRounds is only incremented after a
+		// round is observed, so zero means nothing has run yet. Rounds marked
+		// `once` are gated on this.
+		FirstTick: state.PolishRounds == 0,
 	}
 	if _, err := w.polish.Run(ctx, req); err != nil {
 		// Log the scrubbed STRING, not a wrapped error: a provider error can
