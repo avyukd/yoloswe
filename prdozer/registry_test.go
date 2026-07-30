@@ -266,6 +266,24 @@ repos:
 			wantErr: "merge_rework.effort",
 		},
 		{
+			// Two once rounds with the same text share an onceKey, so the record
+			// of one completing retires both — and within a tick both still run.
+			// Neither reading is what the author meant, so the load fails.
+			name: "duplicate once rounds on a polish step",
+			body: `
+repos:
+  o/r:
+    polish:
+      rounds:
+        - prompt: /simplify-branch
+          once: true
+        - prompt: /pr-polish
+        - prompt: /simplify-branch
+          once: true
+`,
+			wantErr: "repeats the once round at index 0",
+		},
+		{
 			name: "invalid layout",
 			body: `
 repos:
@@ -331,6 +349,22 @@ repos:
         - prompt: /simplify-branch
           once: true
         - prompt: "{{.DefaultPolishPrompt}}"
+`))
+	require.NoError(t, err)
+}
+
+// Only the once gate cannot tell two identical rounds apart. A round that
+// repeats every tick anyway may appear twice — rejecting that would outlaw a
+// legitimate spec.
+func TestLoadRegistry_DuplicateRepeatableRoundsAllowed(t *testing.T) {
+	t.Parallel()
+	_, err := LoadRegistry(writeRegistry(t, `
+repos:
+  o/r:
+    polish:
+      rounds:
+        - prompt: /pr-polish
+        - prompt: /pr-polish
 `))
 	require.NoError(t, err)
 }

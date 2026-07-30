@@ -184,6 +184,9 @@ func (r RoundSpec) IsCommand() bool { return r.Command != "" }
 // churn `once` exists to prevent. Worse, model and effort are step-level, so
 // including them would re-run every once round on every babysat PR the moment
 // someone tunes one knob.
+//
+// Two once rounds with the same content would therefore collide; validateStepSpec
+// rejects that at load so nothing downstream has to reason about it.
 func (r RoundSpec) onceKey() string {
 	sum := sha256.Sum256([]byte(r.Command + "\x00" + r.Prompt))
 	return hex.EncodeToString(sum[:8])
@@ -296,6 +299,16 @@ func validateStepSpec(label string, s StepSpec) error {
 			return fmt.Errorf("%s.effort: %w", label, err)
 		}
 	}
+	// Two `once` rounds with identical content share an onceKey, which the
+	// once-gate cannot tell apart: within a tick both run (activeRounds consults
+	// the record as it stood BEFORE the tick), and afterwards one completion
+	// record retires both. Reject the spec rather than pick which reading to
+	// honour — a duplicated once round is a config mistake, and load time is
+	// where it can still be pointed at a line number.
+	//
+	// Only `once` rounds: repeating a plain round twice in a tick is a legitimate
+	// thing to ask for.
+	onceAt := make(map[string]int, len(s.Rounds))
 	for i, round := range s.Rounds {
 		switch {
 		case round.Prompt != "" && round.Command != "":
@@ -310,6 +323,12 @@ func validateStepSpec(label string, s StepSpec) error {
 			if err := validateReworkTemplate(fmt.Sprintf("%s.rounds[%d].command", label, i), round.Command); err != nil {
 				return err
 			}
+		}
+		if round.Once {
+			if prev, dup := onceAt[round.onceKey()]; dup {
+				return fmt.Errorf("%s.rounds[%d]: repeats the once round at index %d verbatim; once rounds must be distinct", label, i, prev)
+			}
+			onceAt[round.onceKey()] = i
 		}
 	}
 	return nil

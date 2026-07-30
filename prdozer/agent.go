@@ -63,13 +63,19 @@ type PolishResult struct {
 type AgentPolisher struct {
 	renderer *render.Renderer
 	logger   *slog.Logger
+	// newProvider builds the agent provider a round runs on. It is a field only
+	// so tests can substitute a fake: everything runOne resolves — the model,
+	// the effort, the permission mode, the per-tick caps — is observable
+	// nowhere else, and asserting it through the real providers would mean
+	// dispatching a live agent session.
+	newProvider func(agent.AgentModel) (agent.Provider, error)
 }
 
 func NewAgentPolisher(renderer *render.Renderer, logger *slog.Logger) *AgentPolisher {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &AgentPolisher{renderer: renderer, logger: logger}
+	return &AgentPolisher{renderer: renderer, logger: logger, newProvider: agent.NewProviderForModel}
 }
 
 func (p *AgentPolisher) Run(ctx context.Context, req PolishRequest) (PolishResult, error) {
@@ -176,6 +182,10 @@ func (p *AgentPolisher) runPolishCommand(ctx context.Context, req PolishRequest,
 	}
 	cctx, cancel := context.WithTimeout(ctx, commandTimeout)
 	defer cancel()
+	// Log BEFORE running, as merge_rework's command round does: a hung command
+	// sits here for the whole commandTimeout, and a log written only on success
+	// is exactly the log a stalled watcher never produces.
+	p.logger.Info("polish command round", "pr", req.PRNumber, "command", truncate(cmdStr, 200))
 	cmd := exec.CommandContext(cctx, "sh", "-c", cmdStr)
 	cmd.Dir = req.WorkDir
 	out, err := cmd.CombinedOutput()
@@ -183,7 +193,6 @@ func (p *AgentPolisher) runPolishCommand(ctx context.Context, req PolishRequest,
 	if err != nil {
 		return text, fmt.Errorf("command %q: %w", truncate(cmdStr, 80), err)
 	}
-	p.logger.Info("polish command round complete", "pr", req.PRNumber, "command", truncate(cmdStr, 80))
 	return text, nil
 }
 
@@ -193,7 +202,11 @@ func (p *AgentPolisher) runOne(ctx context.Context, req PolishRequest, prompt st
 	if !ok {
 		return PolishResult{}, fmt.Errorf("unknown model %q", modelID)
 	}
-	provider, err := agent.NewProviderForModel(model)
+	newProvider := p.newProvider
+	if newProvider == nil {
+		newProvider = agent.NewProviderForModel
+	}
+	provider, err := newProvider(model)
 	if err != nil {
 		return PolishResult{}, fmt.Errorf("create provider: %w", err)
 	}
