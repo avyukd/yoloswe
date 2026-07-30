@@ -745,7 +745,11 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 	// success list — which would let one 529 launder a real streak back to
 	// zero — a visible change rather than a silent one.
 	case LastActionTransient:
-		// ConsecutiveFailures deliberately untouched.
+		// ConsecutiveFailures deliberately untouched. Scoped to THIS counter: the
+		// merge-attempt brake below still applies, because its increments are real
+		// merge rejections that happened before rework was ever reached, and an
+		// outage in the rework does not un-reject them. See
+		// TestWatcher_RepeatedTransientRework_StillTripsMergeBrake.
 	// LastActionReworked shares the failure arm so a straight run of reworks
 	// still trips the ordinary backoff.
 	case LastActionFailed, LastActionReworked:

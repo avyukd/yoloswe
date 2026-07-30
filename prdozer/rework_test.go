@@ -519,6 +519,60 @@ func TestWatcher_FailedMerge_TransientReworkErrorDoesNotCountTowardBrake(t *test
 	assert.True(t, s.CooldownUntil.IsZero(), "transient rework errors must not trip the cooldown")
 }
 
+// The transient exemption covers ConsecutiveFailures ONLY — the merge-attempt
+// brake still applies, and that is deliberate.
+//
+// The two counters answer different questions. ConsecutiveFailures asks "is this
+// run converging?", and a 529 is no evidence either way, so it is exempt.
+// MergeAttempts asks "how many times has GitHub rejected this merge?" — and each
+// increment here is a real rejection that happened BEFORE rework was reached
+// (see decideAndAct: MergeAttempts++ precedes w.merge). A provider outage in the
+// rework that follows does not un-reject the merge; it means the PR is still
+// unmergeable AND nothing is fixing it, which is exactly the budget burn the
+// merge brake exists to rate-limit. Cooldown here is a rate limiter, not a
+// verdict: CooldownFromAttempt hands the run a fresh allowance afterwards
+// (TestWatcher_MergeBrake_ResumesAfterCooldown).
+//
+// Pinned because the single-tick tests above never reach the threshold, so
+// nothing else would catch a change to this behaviour in either direction.
+func TestWatcher_RepeatedTransientRework_StillTripsMergeBrake(t *testing.T) {
+	gh := failingMergeGH(t)
+	rework := &stubRework{err: fmt.Errorf(
+		"merge rework round 1/1: agent execution: API Error: 529 Overloaded. This is a server-side issue, usually temporary")}
+	w := newWatcherForTest(t, gh, &stubPolish{}, WithRework(rework, oneRoundSpec()))
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicySquash
+	// newWatcherForTest sets MaxConsecutiveFailures=2, Cooldown=1h.
+	statePath := StatePath("r", 42)
+
+	// First failed merge + transient rework: one real merge rejection recorded,
+	// no failure-brake spend.
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, LastActionTransient, res.Action)
+	s1, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 1, s1.MergeAttempts, "the merge really was attempted and rejected")
+	assert.Equal(t, 0, s1.ConsecutiveFailures, "the outage must not spend the failure brake")
+	assert.True(t, s1.CooldownUntil.IsZero(), "one merge attempt is below the threshold")
+
+	// Second one reaches the merge-attempt threshold. ConsecutiveFailures is
+	// still zero — so this cooldown comes from MergeAttempts alone, which is the
+	// whole point of having a separate brake.
+	res, err = w.Tick(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, LastActionTransient, res.Action)
+	s2, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 2, s2.MergeAttempts)
+	assert.Equal(t, 0, s2.ConsecutiveFailures,
+		"transient rework must never spend the failure brake, however often it repeats")
+	assert.False(t, s2.CooldownUntil.IsZero(),
+		"repeated REJECTED MERGES must still rate-limit, even when rework died on an outage")
+	assert.Equal(t, 2, s2.CooldownFromAttempt,
+		"the cooldown records its attempt watermark so the run gets a fresh allowance")
+}
+
 // The non-transient half of the same arm: an ordinary rework failure still
 // counts, so the exemption above cannot be read as "rework never brakes".
 func TestWatcher_FailedMerge_RealReworkErrorStillCountsTowardBrake(t *testing.T) {
