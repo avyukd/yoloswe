@@ -303,34 +303,110 @@ func TestNextPollDelay_MeasuresFromTickStart(t *testing.T) {
 	interval := 20 * time.Minute
 
 	// A tick shorter than the interval waits only the remainder.
-	assert.Equal(t, 15*time.Minute, nextPollDelay(interval, 5*time.Minute, false),
+	assert.Equal(t, 15*time.Minute, nextPollDelay(interval, 5*time.Minute),
 		"a 5-minute tick on a 20-minute interval leaves 15 minutes, not a fresh 20")
 
 	// A tick that already outlasted the interval is overdue: go now.
-	assert.Equal(t, time.Duration(0), nextPollDelay(interval, 29*time.Minute, false),
+	assert.Equal(t, time.Duration(0), nextPollDelay(interval, 29*time.Minute),
 		"the next look is overdue once the tick outlasts the interval")
 
 	// Exactly at the boundary is also due.
-	assert.Equal(t, time.Duration(0), nextPollDelay(interval, interval, false))
+	assert.Equal(t, time.Duration(0), nextPollDelay(interval, interval))
 }
 
-// A round that polished pushed commits, which starts CI and re-triggers
-// reviewers. The state prdozer polls for is guaranteed to be changing, so
-// waiting only delays noticing it.
-func TestNextPollDelay_PolishedSkipsTheWait(t *testing.T) {
-	t.Parallel()
-	assert.Equal(t, time.Duration(0), nextPollDelay(20*time.Minute, time.Second, true),
-		"a push means fresh CI and fresh review; look again immediately")
-}
-
-// The busy-loop guard. Only a polish skips the wait — every other action keeps
-// full pacing, which is what protects the GitHub API budget. An idle PR polled
-// without delay would burn the hourly limit in minutes.
-func TestNextPollDelay_NonPolishingTicksKeepPacing(t *testing.T) {
+// The busy-loop guard. A tick that finished inside its budget keeps the full
+// remaining pacing no matter what it did — including a polish round, whose
+// pushed commit re-arms self_review and would otherwise chain rounds
+// back-to-back on agent budget until the divergence guard trips. Pacing is the
+// only other brake on that loop.
+func TestNextPollDelay_FastTicksKeepPacing(t *testing.T) {
 	t.Parallel()
 	interval := 20 * time.Minute
-	// A fast idle tick must still wait nearly the whole interval.
-	got := nextPollDelay(interval, 2*time.Second, false)
+	got := nextPollDelay(interval, 2*time.Second)
 	assert.Greater(t, got, 19*time.Minute,
-		"an idle tick must not spin: pacing is the API budget's only protection")
+		"a fast tick must not spin: pacing is the API and agent budget's only protection")
+}
+
+// The zero-wait path is reached after ticks that outlasted the interval — the
+// long, expensive ones, after which a shutdown is most likely pending. Skipping
+// the pause must not also skip the cancellation check.
+func TestWaitForNextPoll_ZeroWaitStillHonorsCancellation(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.False(t, waitForNextPoll(ctx, 0),
+		"an overdue tick on a cancelled babysit must stop, not start another tick")
+	assert.False(t, waitForNextPoll(ctx, -time.Minute),
+		"a negative delay is the same overdue case")
+}
+
+func TestWaitForNextPoll_ZeroWaitProceedsWhenLive(t *testing.T) {
+	t.Parallel()
+	assert.True(t, waitForNextPoll(context.Background(), 0),
+		"an overdue tick on a live babysit runs immediately")
+}
+
+func TestWaitForNextPoll_CancelInterruptsALongWait(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan bool, 1)
+	go func() { done <- waitForNextPoll(ctx, time.Hour) }()
+	cancel()
+	select {
+	case ok := <-done:
+		assert.False(t, ok, "cancelling mid-wait ends the loop instead of sleeping out the hour")
+	case <-time.After(5 * time.Second):
+		t.Fatal("waitForNextPoll did not return after its context was cancelled")
+	}
+}
+
+func TestWaitForNextPoll_ElapsedWaitProceeds(t *testing.T) {
+	t.Parallel()
+	assert.True(t, waitForNextPoll(context.Background(), time.Millisecond),
+		"a wait that simply elapses means the next tick is due")
+}
+
+// The helpers above are unit-level; this one runs the real loop so the wiring
+// is covered too — that the elapsed time handed to nextPollDelay is measured
+// from the tick's start, and that the resulting wait actually gates the next
+// tick.
+//
+// The interval is a nanosecond, so every tick outlasts it and the loop takes
+// the zero-wait path on every pass. A loop that skipped the cancellation check
+// there would spin forever on a cancelled context, so this hangs — hence the
+// hard deadline — rather than silently passing.
+func TestBabysitLoop_ZeroWaitPathStopsOnCancel(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	gh := newFakeGH() // no responses registered: every tick errors and keeps polling
+
+	runLog, err := NewRunLog(RunMeta{Repo: "o/r", PRNumber: 42, RunID: "cancel-test"})
+	require.NoError(t, err)
+
+	b := NewBabysitter(gh, nil, nil, nil, BabysitOptions{
+		OwnerRepo:    "o/r",
+		PRNumber:     42,
+		PollInterval: time.Nanosecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	type result struct {
+		state  TerminalState
+		detail string
+	}
+	done := make(chan result, 1)
+	go func() {
+		state, detail := b.loop(ctx, &RunContext{WorktreePath: t.TempDir()}, runLog, DiscoveredPR{Number: 42})
+		done <- result{state, detail}
+	}()
+
+	select {
+	case got := <-done:
+		assert.Equal(t, TerminalRunning, got.state)
+		assert.Equal(t, "context cancelled", got.detail,
+			"an overdue tick must still observe cancellation before starting the next one")
+	case <-time.After(10 * time.Second):
+		t.Fatal("loop did not stop on a cancelled context: the zero-wait path is spinning")
+	}
 }

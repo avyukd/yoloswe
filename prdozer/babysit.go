@@ -192,14 +192,8 @@ func (b *Babysitter) loop(ctx context.Context, rc *RunContext, runLog *RunLog, p
 		if o.Once {
 			return TerminalRunning, "single tick requested"
 		}
-		wait := nextPollDelay(interval, time.Since(tickStart), err == nil && res.Action == LastActionPolished)
-		if wait <= 0 {
-			continue
-		}
-		select {
-		case <-ctx.Done():
+		if !waitForNextPoll(ctx, nextPollDelay(interval, time.Since(tickStart))) {
 			return TerminalRunning, "context cancelled"
-		case <-time.After(wait):
 		}
 	}
 }
@@ -217,23 +211,51 @@ func (b *Babysitter) loop(ctx context.Context, rc *RunContext, runLog *RunLog, p
 // 29 and 20 minutes against a 20-minute setting. About 64% of that run was
 // waiting, nearly all of it this drift.
 //
-// Two corrections, and the second is the larger win on an active PR:
+// The correction is to measure the interval from the tick's START. If the tick
+// already outlasted it, the next look is overdue and runs immediately — which
+// is what collapses those 96- and 81-minute gaps back to the 20 minutes that
+// was configured.
 //
-//   - Measure the interval from the tick's START. If the tick already outlasted
-//     it, the next look is overdue and runs immediately.
-//   - Skip the wait entirely after a round that polished. Polishing pushes
-//     commits, which starts CI and re-triggers reviewers — the state prdozer
-//     polls for is guaranteed to be changing, so sleeping only delays noticing.
-//     Other actions (idle, armed, a failed tick) have no such guarantee and keep
-//     the full pacing, which is what protects the API budget.
-func nextPollDelay(interval, elapsed time.Duration, polished bool) time.Duration {
-	if polished {
-		return 0
-	}
+// Deliberately NOT here: skipping the wait outright after a round that
+// polished. Polishing does push commits, and CI and reviewers do re-trigger —
+// but neither reports back within the zero seconds an unpaced re-tick waits,
+// so the immediate next tick sees no new external signal. What it does see is
+// a moved head SHA, which re-arms self_review (see the divergence guard in
+// watcher.go: "a self_review repo re-arms its own trigger forever and this
+// guard is the ONLY thing that can end the loop"). Pacing is the other brake
+// on that loop, and dropping it lets polish rounds chain back-to-back on agent
+// budget until divergence trips. A long polish round already gets its
+// immediate re-tick from the overdue rule above; a short one is exactly the
+// case where chaining is cheap and the wait is worth keeping.
+func nextPollDelay(interval, elapsed time.Duration) time.Duration {
 	if remaining := interval - elapsed; remaining > 0 {
 		return remaining
 	}
 	return 0
+}
+
+// waitForNextPoll pauses until the next tick is due, reporting false if the
+// context was cancelled instead.
+//
+// The zero-wait case still checks cancellation. It is reached whenever a tick
+// outlasts the interval — precisely the long, expensive ticks after which a
+// shutdown is most likely to be pending — and a bare `continue` there would
+// start another one instead of stopping.
+func waitForNextPoll(ctx context.Context, wait time.Duration) bool {
+	if wait <= 0 {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+			return true
+		}
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(wait):
+		return true
+	}
 }
 
 // terminalFor maps a tick result onto a terminal state, if it is one.
