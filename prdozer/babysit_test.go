@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -288,4 +289,48 @@ func TestTerminalFor_ArmedIsNotTerminal(t *testing.T) {
 	// as terminal would report "merged" for a PR still sitting in the queue.
 	_, _, done := terminalFor(TickResult{Action: LastActionArmed}, DiscoveredPR{Number: 1})
 	assert.False(t, done, "an armed auto-merge must keep polling until .merged is true")
+}
+
+// poll_interval bounds how OFTEN prdozer looks at a PR. Sleeping the full
+// interval AFTER each tick instead adds the wait to however long the tick took,
+// so a long polish round is penalized twice.
+//
+// kernel#8374: 4.1h of agent work spread over 11.5h wall-clock, with gaps of 96,
+// 81, 73, 62, 59, 55, 55, 51, 43, 33, 33, 29 and 20 minutes against a 20-minute
+// interval. ~64% of that run was waiting.
+func TestNextPollDelay_MeasuresFromTickStart(t *testing.T) {
+	t.Parallel()
+	interval := 20 * time.Minute
+
+	// A tick shorter than the interval waits only the remainder.
+	assert.Equal(t, 15*time.Minute, nextPollDelay(interval, 5*time.Minute, false),
+		"a 5-minute tick on a 20-minute interval leaves 15 minutes, not a fresh 20")
+
+	// A tick that already outlasted the interval is overdue: go now.
+	assert.Equal(t, time.Duration(0), nextPollDelay(interval, 29*time.Minute, false),
+		"the next look is overdue once the tick outlasts the interval")
+
+	// Exactly at the boundary is also due.
+	assert.Equal(t, time.Duration(0), nextPollDelay(interval, interval, false))
+}
+
+// A round that polished pushed commits, which starts CI and re-triggers
+// reviewers. The state prdozer polls for is guaranteed to be changing, so
+// waiting only delays noticing it.
+func TestNextPollDelay_PolishedSkipsTheWait(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, time.Duration(0), nextPollDelay(20*time.Minute, time.Second, true),
+		"a push means fresh CI and fresh review; look again immediately")
+}
+
+// The busy-loop guard. Only a polish skips the wait — every other action keeps
+// full pacing, which is what protects the GitHub API budget. An idle PR polled
+// without delay would burn the hourly limit in minutes.
+func TestNextPollDelay_NonPolishingTicksKeepPacing(t *testing.T) {
+	t.Parallel()
+	interval := 20 * time.Minute
+	// A fast idle tick must still wait nearly the whole interval.
+	got := nextPollDelay(interval, 2*time.Second, false)
+	assert.Greater(t, got, 19*time.Minute,
+		"an idle tick must not spin: pacing is the API budget's only protection")
 }

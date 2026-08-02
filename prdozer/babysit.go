@@ -159,6 +159,7 @@ func (b *Babysitter) loop(ctx context.Context, rc *RunContext, runLog *RunLog, p
 	cooldownReported := time.Time{}
 
 	for {
+		tickStart := time.Now()
 		res, err := w.Tick(ctx)
 		if err != nil {
 			safe := safeErrString(err)
@@ -191,12 +192,48 @@ func (b *Babysitter) loop(ctx context.Context, rc *RunContext, runLog *RunLog, p
 		if o.Once {
 			return TerminalRunning, "single tick requested"
 		}
+		wait := nextPollDelay(interval, time.Since(tickStart), err == nil && res.Action == LastActionPolished)
+		if wait <= 0 {
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return TerminalRunning, "context cancelled"
-		case <-time.After(interval):
+		case <-time.After(wait):
 		}
 	}
+}
+
+// nextPollDelay reports how long to wait before the next tick.
+//
+// poll_interval is meant to bound how OFTEN prdozer looks at the PR, but the
+// loop used to sleep the full interval after each tick finished — so the wait
+// was added to however long the tick took rather than measured from its start.
+// A polish round that ran 29 minutes then slept 20 produced a 49-minute gap on
+// a 20-minute interval.
+//
+// Measured on kernel#8374: 4.1 hours of agent work spread over 11.5 hours of
+// wall-clock, with observed gaps of 96, 81, 73, 62, 59, 55, 55, 51, 43, 33, 33,
+// 29 and 20 minutes against a 20-minute setting. About 64% of that run was
+// waiting, nearly all of it this drift.
+//
+// Two corrections, and the second is the larger win on an active PR:
+//
+//   - Measure the interval from the tick's START. If the tick already outlasted
+//     it, the next look is overdue and runs immediately.
+//   - Skip the wait entirely after a round that polished. Polishing pushes
+//     commits, which starts CI and re-triggers reviewers — the state prdozer
+//     polls for is guaranteed to be changing, so sleeping only delays noticing.
+//     Other actions (idle, armed, a failed tick) have no such guarantee and keep
+//     the full pacing, which is what protects the API budget.
+func nextPollDelay(interval, elapsed time.Duration, polished bool) time.Duration {
+	if polished {
+		return 0
+	}
+	if remaining := interval - elapsed; remaining > 0 {
+		return remaining
+	}
+	return 0
 }
 
 // terminalFor maps a tick result onto a terminal state, if it is one.
