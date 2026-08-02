@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -366,10 +367,9 @@ func TestWaitForNextPoll_ElapsedWaitProceeds(t *testing.T) {
 		"a wait that simply elapses means the next tick is due")
 }
 
-// The helpers above are unit-level; this one runs the real loop so the wiring
-// is covered too — that the elapsed time handed to nextPollDelay is measured
-// from the tick's start, and that the resulting wait actually gates the next
-// tick.
+// Guards one thing: that the loop's zero-wait path is still an interruption
+// point. It says nothing about the interval math — see
+// TestBabysitLoop_SpacesTicksFromTickStart for that.
 //
 // The interval is a nanosecond, so every tick outlasts it and the loop takes
 // the zero-wait path on every pass. A loop that skipped the cancellation check
@@ -409,4 +409,84 @@ func TestBabysitLoop_ZeroWaitPathStopsOnCancel(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("loop did not stop on a cancelled context: the zero-wait path is spinning")
 	}
+}
+
+// pacedGH times how the loop spaces its ticks. Every Run call is one tick's
+// first gh call — the snapshot bails there because nothing parses — so the
+// recorded times ARE the tick start times. The first call blocks for tickCost
+// to stand in for a slow tick, which is the whole point: the interval must be
+// measured across that cost, not added to it.
+type pacedGH struct {
+	secondTick chan struct{}
+	starts     []time.Time
+	tickCost   time.Duration
+	mu         sync.Mutex
+}
+
+func (p *pacedGH) Run(_ context.Context, _ []string, _ string) (*wt.CmdResult, error) {
+	p.mu.Lock()
+	p.starts = append(p.starts, time.Now())
+	n := len(p.starts)
+	p.mu.Unlock()
+	switch n {
+	case 1:
+		time.Sleep(p.tickCost) // simulated tick work, not synchronization
+	case 2:
+		close(p.secondTick)
+	}
+	return &wt.CmdResult{}, nil
+}
+
+func (p *pacedGH) tickStarts() []time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]time.Time(nil), p.starts...)
+}
+
+// The drift regression, pinned at the loop rather than on nextPollDelay alone:
+// a tick that costs 1.5s on a 2s interval must be followed by the next tick 2s
+// after it STARTED, not 3.5s later.
+//
+// This is what fails if tickStart moves below the Tick call, if time.Since is
+// dropped, or if the loop goes back to sleeping the full interval afterwards —
+// none of which the helper unit tests or the cancellation test can see.
+//
+// The assertion window is the midpoint between the two behaviours, so it has
+// 750ms of slack in each direction.
+func TestBabysitLoop_SpacesTicksFromTickStart(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	const (
+		interval = 2 * time.Second
+		tickCost = 1500 * time.Millisecond
+	)
+	gh := &pacedGH{tickCost: tickCost, secondTick: make(chan struct{})}
+
+	runLog, err := NewRunLog(RunMeta{Repo: "o/r", PRNumber: 42, RunID: "drift-test"})
+	require.NoError(t, err)
+
+	b := NewBabysitter(gh, nil, nil, nil, BabysitOptions{
+		OwnerRepo:    "o/r",
+		PRNumber:     42,
+		PollInterval: interval,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.loop(ctx, &RunContext{WorktreePath: t.TempDir()}, runLog, DiscoveredPR{Number: 42})
+
+	select {
+	case <-gh.secondTick:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the loop never started a second tick")
+	}
+	cancel()
+
+	starts := gh.tickStarts()
+	require.GreaterOrEqual(t, len(starts), 2)
+	gap := starts[1].Sub(starts[0])
+	assert.Less(t, gap, interval+tickCost/2,
+		"the interval is measured from the tick's start, so a 1.5s tick on a 2s interval "+
+			"must not push the next tick out to 3.5s")
+	assert.GreaterOrEqual(t, gap, interval-tickCost/2,
+		"pacing still applies: a tick that finished inside its budget waits out the remainder")
 }
