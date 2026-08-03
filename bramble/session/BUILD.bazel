@@ -46,6 +46,7 @@ go_test(
         "store_test.go",
         "summary_test.go",
         "tmux_name_test.go",
+        "tmux_runner_env_test.go",
         "tmux_test.go",
     ],
     embed = [":session"],

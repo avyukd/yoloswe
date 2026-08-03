@@ -35,7 +35,10 @@ go_binary(
 
 go_test(
     name = "bramble_test",
-    srcs = ["main_test.go"],
+    srcs = [
+        "main_test.go",
+        "notify_session_id_test.go",
+    ],
     embed = [":bramble_lib"],
     deps = [
         "@com_github_stretchr_testify//assert",

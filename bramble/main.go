@@ -646,6 +646,21 @@ var newSessionCmd = &cobra.Command{
 	},
 }
 
+// resolveOwnSessionID picks the session a self-referential command (notify)
+// reports on. Unlike capture-pane/send-input, whose --session-id names a *peer*,
+// notify always speaks for its caller, so a tmux-launched agent can omit the
+// flag and let $BRAMBLE_SESSION_ID supply its own return address. The flag wins
+// when set, keeping the baked-in stop hook and out-of-band callers unchanged.
+func resolveOwnSessionID(flagID, envID string) (string, error) {
+	if flagID != "" {
+		return flagID, nil
+	}
+	if envID != "" {
+		return envID, nil
+	}
+	return "", fmt.Errorf("no session: pass --session-id or run inside a bramble session ($%s)", session.SessionIDEnvVar)
+}
+
 var notifyCmd = &cobra.Command{
 	Use:   "notify",
 	Short: "Notify bramble that a session needs attention",
@@ -662,7 +677,14 @@ var notifyCmd = &cobra.Command{
 			}
 			return err
 		}
-		sessionID, _ := cmd.Flags().GetString("session-id")
+		flagID, _ := cmd.Flags().GetString("session-id")
+		sessionID, err := resolveOwnSessionID(flagID, os.Getenv(session.SessionIDEnvVar))
+		if err != nil {
+			if silent {
+				return nil
+			}
+			return err
+		}
 		resp, err := client.Send(&ipc.Request{
 			Type:   ipc.RequestNotify,
 			ID:     "cli-notify",
@@ -911,9 +933,10 @@ func init() {
 	newSessionCmd.Flags().Bool("create-worktree", false, "Create a new worktree for the branch")
 	newSessionCmd.Flags().StringP("repo", "r", "", "Target repo name (auto-detected from cwd if omitted)")
 
-	notifyCmd.Flags().String("session-id", "", "Session ID to notify")
+	// Not MarkFlagRequired: inside a tmux session $BRAMBLE_SESSION_ID supplies
+	// the caller's own ID, and RunE errors when neither source yields one.
+	notifyCmd.Flags().String("session-id", "", "Session ID to notify (defaults to $"+session.SessionIDEnvVar+")")
 	notifyCmd.Flags().Bool("silent", false, "Suppress errors silently (used by stop hooks)")
-	_ = notifyCmd.MarkFlagRequired("session-id")
 
 	capturePaneCmd.Flags().String("session-id", "", "Session ID to capture pane from")
 	capturePaneCmd.Flags().Int("lines", 10, "Number of lines to capture")
