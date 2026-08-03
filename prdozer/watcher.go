@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude/render"
+	transientmeta "github.com/bazelment/yoloswe/agent-cli-wrapper/transient"
 	"github.com/bazelment/yoloswe/multiagent/agent"
 	"github.com/bazelment/yoloswe/wt"
 )
@@ -323,13 +324,51 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		// embed the endpoint config (API key / key-bearing env var), and these
 		// messages are persisted and Slacked.
 		safe := safeErrString(err)
-		if action, ok := w.classifyAgentFailure("polish", err, safe); ok {
+		action, classified := w.classifyAgentFailure("polish", err, safe)
+
+		// This invocation produced no round result, so every round-keyed counter
+		// (PolishRounds, RoundsSinceImprovement, BestHealth) stays exactly where
+		// it was. Counted here, at the one place that knows the round did not
+		// return, so no failure mode can burn invocations invisibly.
+		//
+		// A provider outage is excluded, and that exclusion is the whole reason
+		// this is not simply "count every failed invocation": a downed provider
+		// recovers on its own, and stopping the run for it would re-introduce
+		// exactly the kernel#8031 behaviour LastActionTransient exists to
+		// prevent. A stall is NOT excluded — it recurs on retry, which is what
+		// makes it worth bounding.
+		if action != LastActionTransient {
+			state.InvocationsSinceRound++
+			// Deliberately WIDER than MaxConsecutiveFailures. The ordinary brake
+			// should get to work first: it pauses for a cooldown and lets the run
+			// recover, where this stops it for a human. Sharing one threshold
+			// makes whichever is checked first the only one that ever fires — at
+			// parity this guard preempted the cooldown entirely, and because
+			// needs_human is a terminal arm it also reset ConsecutiveFailures on
+			// its way out, so the stall brake became dead code.
+			if limit := 2 * w.cfg.Backoff.MaxConsecutiveFailures; limit > 0 && state.InvocationsSinceRound >= limit {
+				w.logger.Warn("stopping: polish invocations are not producing rounds",
+					"invocations_since_round", state.InvocationsSinceRound,
+					"polish_rounds", state.PolishRounds,
+					"error", safe)
+				w.status("PR #%d stopped: %d polish invocations produced no completed round (last: %s)",
+					w.pr, state.InvocationsSinceRound, safe)
+				return LastActionNeedsHuman
+			}
+		}
+
+		if classified {
 			return action
 		}
 		w.logger.Error("polish failed", "error", safe)
 		w.status("PR #%d polish failed: %s", w.pr, safe)
 		return LastActionFailed
 	}
+	// The round returned, so the round-keyed counters can move again and the
+	// no-progress streak is over. Reset on RESULT rather than on success: a
+	// round that returned a result did the work this counter exists to detect
+	// the absence of, whatever that result says about the PR.
+	state.InvocationsSinceRound = 0
 	w.status("PR #%d polish completed", w.pr)
 
 	// Mark this commit as self-reviewed. Recorded on SUCCESS only: a failed
@@ -398,14 +437,25 @@ func (w *Watcher) rerequestReviews(ctx context.Context, snap *Snapshot) {
 	}
 }
 
-// classifyAgentFailure reports whether an agent-round error was a provider-side
-// outage rather than a fact about this PR, and if so returns the action that
-// keeps it off the failure brake.
+// classifyAgentFailure maps an agent-round error to the action that decides
+// whether it counts toward the failure brake.
 //
-// A provider outage is not a fact about this PR. Counting it toward the failure
-// brake spends the budget meant for "this PR is not converging" on "Anthropic
-// returned 529", and three of those bought kernel#8031 a two-hour cooldown while
-// nothing was wrong with the branch.
+// Three outcomes, because "transient" turned out to cover two unlike things:
+//
+//   - A PROVIDER outage (http_5xx, rate limit) is not a fact about this PR.
+//     Counting it spends the budget meant for "this PR is not converging" on
+//     "Anthropic returned 529", and three of those bought kernel#8031 a two-hour
+//     cooldown while nothing was wrong with the branch. -> LastActionTransient,
+//     exempt.
+//   - A STALL (grace_forced) is our own deadline firing against a local
+//     condition that is still there next time. Retrying re-runs the round from
+//     scratch and hits the same wall; kernel#8374 did exactly that three times
+//     for 62 minutes and zero completed rounds. -> LastActionStalled, counts.
+//   - Anything else is a real failure. -> not handled here, counts.
+//
+// The distinction is whether the next attempt has a materially different chance
+// of succeeding. A downed provider recovers on its own; our own expired deadline
+// does not.
 //
 // Verified against the real strings: an API 529 classifies http_5xx and a
 // force-completed turn classifies grace_forced, while a bare "exit status 1"
@@ -430,6 +480,17 @@ func (w *Watcher) classifyAgentFailure(stage string, err error, safe string) (La
 	transient, reason := agent.ClassifyTransient(err)
 	if !transient {
 		return "", false
+	}
+	// Classified transient by the shared classifier, which answers "is a retry
+	// worth attempting" — correct for its callers, and deliberately left alone
+	// here: it lives in multiagent/agent and is used well beyond prdozer. What
+	// prdozer needs on top is whether the retry should be FREE, and for a stall
+	// it must not be.
+	if reason == transientmeta.ReasonGraceForced {
+		w.logger.Warn(stage+" was cut off mid-round by the turn grace period; counting it toward the failure brake",
+			"error", safe, "reason", reason)
+		w.status("PR #%d %s stalled mid-round (%s) — counts toward the brake", w.pr, stage, reason)
+		return LastActionStalled, true
 	}
 	w.logger.Warn(stage+" hit a transient provider error; not counting it toward the failure brake",
 		"error", safe, "reason", reason)
@@ -810,8 +871,10 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 		// outage in the rework does not un-reject them. See
 		// TestWatcher_RepeatedTransientRework_StillTripsMergeBrake.
 	// LastActionReworked shares the failure arm so a straight run of reworks
-	// still trips the ordinary backoff.
-	case LastActionFailed, LastActionReworked:
+	// still trips the ordinary backoff. LastActionStalled shares it for the same
+	// reason: our own expired deadline recurs on retry, so an unbroken run of
+	// stalls has to reach the cooldown rather than loop for free (kernel#8374).
+	case LastActionFailed, LastActionReworked, LastActionStalled:
 		s.ConsecutiveFailures++
 		dirty = true
 		if w.cfg.Backoff.MaxConsecutiveFailures > 0 && s.ConsecutiveFailures >= w.cfg.Backoff.MaxConsecutiveFailures && w.cfg.Backoff.Cooldown > 0 {

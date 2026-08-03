@@ -1676,3 +1676,162 @@ func TestWatcher_StaleDivergenceVerdict_KeptWhenHeadUnchanged(t *testing.T) {
 		"same code, same verdict — re-dispatching must not launder a real stop")
 	assert.True(t, res.Diverged)
 }
+
+// A stall is our own deadline firing, not the provider going down, so it must
+// reach the brake.
+//
+// The real kernel#8374 string. Three invocations (22:15, 22:45, 23:17) each
+// armed a /pr-polish reviewer background join, each was force-completed ten
+// minutes later, and each was exempted as a provider outage. 62 minutes and
+// three full bootstraps produced zero completed rounds and no brake ever fired.
+func TestClassifyAgentFailure_GraceForcedCountsTowardBrake(t *testing.T) {
+	t.Parallel()
+	w := &Watcher{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	err := errors.New("polish round 1/2: agent execution: transient CLI error: " +
+		"stream idle: turn forced complete after grace period gated on background tool_use")
+	action, ok := w.classifyAgentFailure("polish", err, err.Error())
+	assert.True(t, ok, "a stall is still classified, just not exempted")
+	assert.Equal(t, LastActionStalled, action,
+		"grace_forced must not share the provider-outage exemption")
+}
+
+// The other arm, asserted in the same shape. Without this a wholesale deletion
+// of the exemption would still pass the grace_forced test above, and kernel#8031
+// would regress silently.
+func TestClassifyAgentFailure_ProviderOutageStillExempt(t *testing.T) {
+	t.Parallel()
+	w := &Watcher{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	for _, text := range []string{
+		"polish round 1/3: agent execution: API Error: 529 Overloaded",
+		"polish round 1/3: agent execution: API Error: 503 Service Unavailable",
+	} {
+		action, ok := w.classifyAgentFailure("polish", errors.New(text), text)
+		assert.True(t, ok, "%s", text)
+		assert.Equal(t, LastActionTransient, action,
+			"a provider outage must stay exempt from the brake: %s", text)
+	}
+}
+
+// End to end: a run that keeps stalling has to stop, where before it looped.
+//
+// Asserts the full mechanism rather than the classification alone — the action
+// has to reach recordSnapshot's failure arm for the cooldown to exist.
+func TestWatcher_Tick_RepeatedStalls_TripTheBrake(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	polish := &stubPolish{err: fmt.Errorf("polish round 1/2: agent execution: " +
+		"transient CLI error: stream idle: turn forced complete after grace period " +
+		"gated on background tool_use")}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	pre := &State{LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1"}
+	require.NoError(t, pre.Save(statePath))
+
+	for range 3 {
+		_, err := w.Tick(context.Background())
+		require.NoError(t, err)
+	}
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Positive(t, s.ConsecutiveFailures,
+		"a stall recurs on retry, so it must count toward the brake")
+}
+
+// The no-progress guard: invocations that never yield a round must stop the run,
+// whatever ate them.
+//
+// This is the backstop for the CLASS that grace_forced is one instance of. Every
+// other guard keys off round COMPLETION, so a run whose rounds die before
+// returning shows PolishRounds=0 and RoundsSinceImprovement=0 forever and the
+// divergence guard cannot fire. kernel#8374 burned three invocations that way.
+//
+// Uses the stall error, because that is the class the guard is FOR: a plain
+// failure already trips the ordinary cooldown after two ticks and never reaches
+// here. Only an error that keeps the run alive tick after tick can burn
+// invocations indefinitely, which is exactly what kernel#8374 did.
+func TestWatcher_Tick_InvocationsWithoutRounds_StopTheRun(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	polish := &stubPolish{err: fmt.Errorf("polish round 1/2: agent execution: " +
+		"transient CLI error: stream idle: turn forced complete after grace period " +
+		"gated on background tool_use")}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	pre := &State{LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1"}
+	require.NoError(t, pre.Save(statePath))
+
+	// Cooldown disabled so this test isolates the no-progress guard: otherwise the
+	// run pauses on the stall brake and never reaches enough invocations.
+	w.cfg.Backoff.Cooldown = 0
+
+	var last LastAction
+	for range 6 {
+		res, err := w.Tick(context.Background())
+		require.NoError(t, err)
+		last = res.Action
+	}
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, LastActionNeedsHuman, last,
+		"invocations that never produce a round must stop the run")
+	assert.Equal(t, 0, s.PolishRounds,
+		"premise: no round ever completed, so the round-keyed guards saw nothing")
+}
+
+// A provider outage must NOT trip the no-progress guard, or D2 quietly
+// re-introduces the kernel#8031 over-braking that the transient exemption
+// exists to prevent. This is the pairing assertion for the counter.
+func TestWatcher_Tick_ProviderOutage_DoesNotTripNoProgressGuard(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	polish := &stubPolish{err: fmt.Errorf(
+		"polish round 1/3: agent execution: API Error: 529 Overloaded")}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	pre := &State{LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1"}
+	require.NoError(t, pre.Save(statePath))
+
+	for range 4 {
+		_, err := w.Tick(context.Background())
+		require.NoError(t, err)
+	}
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 0, s.InvocationsSinceRound,
+		"a downed provider recovers on its own; it must not count as no-progress")
+	assert.Equal(t, LastActionTransient, s.LastAction)
+	assert.Len(t, polish.calls, 4, "nothing should be braking a pure outage")
+}
+
+// The counter must RESET when a round returns, or it climbs monotonically across
+// a long healthy run and eventually stops a PR that is working fine.
+func TestWatcher_Tick_CompletedRound_ResetsNoProgressCounter(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	polish := &stubPolish{err: fmt.Errorf("boom: round died before returning")}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	pre := &State{LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1"}
+	require.NoError(t, pre.Save(statePath))
+
+	_, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	require.Equal(t, 1, s.InvocationsSinceRound, "premise: the streak started")
+
+	// Now let the round return.
+	polish.err = nil
+	_, err = w.Tick(context.Background())
+	require.NoError(t, err)
+
+	s, err = LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 0, s.InvocationsSinceRound,
+		"a returned round ends the no-progress streak")
+}
