@@ -412,6 +412,11 @@ type ManagerConfig struct { //nolint:govet // fieldalignment: readability over p
 	// Used to propagate BRAMBLE_SOCK to tmux windows so hook commands
 	// can call back to the TUI. Set by main after startIPCServer.
 	IPCSockPath string
+	// ControlSockPath is the path to the bramble control Unix domain socket.
+	// Propagated to tmux windows as BRAMBLE_CONTROL_SOCK so a session can
+	// drive its peers (send-input, send-key). Set by main after
+	// startControlServer.
+	ControlSockPath string
 	// Registry is the shared session registry for cross-repo IPC lookups.
 	// Propagated through sharedManagerConfig so that openRepo can register
 	// new managers automatically.
@@ -525,6 +530,18 @@ func (m *Manager) IPCSockPath() string {
 // before the IPC server.
 func (m *Manager) SetIPCSockPath(path string) {
 	m.config.IPCSockPath = path
+}
+
+// ControlSockPath returns the control socket path, if configured.
+func (m *Manager) ControlSockPath() string {
+	return m.config.ControlSockPath
+}
+
+// SetControlSockPath updates the control socket path after the server has
+// started. Like SetIPCSockPath, this is called from main because the manager
+// is created before the control server.
+func (m *Manager) SetControlSockPath(path string) {
+	m.config.ControlSockPath = path
 }
 
 // SubscribeStateChanges registers a channel to receive copies of all
@@ -1425,6 +1442,7 @@ func (m *Manager) runSession(session *Session, prompt string) {
 			sessionID:       string(session.ID),
 			brambleBin:      brambleBin,
 			brambleSock:     m.config.IPCSockPath,
+			controlSock:     m.config.ControlSockPath,
 			yoloMode:        m.config.YoloMode,
 			killOnStop:      false, // Never kill on Stop(); cleanup happens in Close() if TmuxExitOnQuit is set
 		}

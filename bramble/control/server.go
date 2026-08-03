@@ -7,11 +7,15 @@ import (
 	"net"
 	"os"
 	"sync"
+
+	"github.com/bazelment/yoloswe/bramble/session"
 )
 
 // SockEnvVar is the environment variable carrying the control socket path,
 // discovered by CLI subcommands (parallel to ipc.SockEnvVar for the legacy IPC).
-const SockEnvVar = "BRAMBLE_CONTROL_SOCK"
+// The literal lives in package session because session injects it into tmux
+// windows and cannot import control (control imports session).
+const SockEnvVar = session.ControlSockEnvVar
 
 // UnixServer listens on a Unix domain socket and serves the control protocol
 // against a Dispatcher. It is the local transport for bramble's own CLI

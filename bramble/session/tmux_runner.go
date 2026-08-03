@@ -11,6 +11,20 @@ import (
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude"
 )
 
+// ControlSockEnvVar is the environment variable carrying the control socket
+// path. It is declared here rather than in package control because control
+// imports session, so session cannot import control. control.SockEnvVar
+// aliases this constant to keep a single source of truth.
+const ControlSockEnvVar = "BRAMBLE_CONTROL_SOCK"
+
+// SessionIDEnvVar carries a session's own bramble session ID into its tmux
+// window, giving the agent inside a return address it can hand to peers.
+const SessionIDEnvVar = "BRAMBLE_SESSION_ID"
+
+// ipcSockEnvVar mirrors ipc.SockEnvVar, which session cannot import (ipc
+// imports session).
+const ipcSockEnvVar = "BRAMBLE_SOCK"
+
 // tmuxRunner implements sessionRunner by creating a tmux window that runs the agent CLI.
 type tmuxRunner struct {
 	windowName      string // tmux window name (e.g., "happy-tiger")
@@ -24,8 +38,32 @@ type tmuxRunner struct {
 	sessionID       string // bramble session ID for IPC notification hook
 	brambleBin      string // absolute path to the bramble binary for hook commands
 	brambleSock     string // IPC socket path to pass to hook commands
+	controlSock     string // control socket path, so the session can drive peers
 	yoloMode        bool   // skip all permission prompts
 	killOnStop      bool   // kill tmux window on Stop()
+}
+
+// envArgs returns the "-e VAR=value" pairs that give the agent inside the
+// window its bramble identity and the sockets it needs to reach the TUI and
+// its peers. Empty values are omitted so a partially configured manager still
+// produces a valid tmux invocation.
+//
+// The session ID is the agent's own return address: list-sessions reports it,
+// and capture-pane/send-input take it as --session-id. The control socket is
+// the only write path into another session's pane. Without both, sessions can
+// observe each other but can never reply.
+func (r *tmuxRunner) envArgs() []string {
+	var args []string
+	for _, kv := range [][2]string{
+		{ipcSockEnvVar, r.brambleSock},
+		{SessionIDEnvVar, r.sessionID},
+		{ControlSockEnvVar, r.controlSock},
+	} {
+		if kv[1] != "" {
+			args = append(args, "-e", kv[0]+"="+kv[1])
+		}
+	}
+	return args
 }
 
 // Start creates a new tmux window in the current session and launches the claude CLI in it.
@@ -57,9 +95,7 @@ func (r *tmuxRunner) Start(ctx context.Context) error {
 	// -e: set environment variable in the new window
 	// -n: window name, -c: working directory
 	tmuxArgs := []string{"new-window", "-P", "-F", "#{window_id}"}
-	if r.brambleSock != "" {
-		tmuxArgs = append(tmuxArgs, "-e", "BRAMBLE_SOCK="+r.brambleSock)
-	}
+	tmuxArgs = append(tmuxArgs, r.envArgs()...)
 	tmuxArgs = append(tmuxArgs, "-n", r.windowName, "-c", r.workDir, cmdStr)
 	createCmd := exec.Command("tmux", tmuxArgs...)
 

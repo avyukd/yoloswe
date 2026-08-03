@@ -257,6 +257,11 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	if controlServer != nil {
 		defer controlServer.Close()
 		os.Setenv(control.SockEnvVar, controlServer.SocketPath())
+		// Mirror the IPCSockPath plumbing: propagate through the manager (and
+		// the shared config template used by openRepo) so tmux windows get
+		// BRAMBLE_CONTROL_SOCK without relying on os.Getenv.
+		sessionManager.SetControlSockPath(controlServer.SocketPath())
+		sharedManagerConfig.ControlSockPath = controlServer.SocketPath()
 	}
 
 	// If a hub is configured, dial out to it so the user can reach this
