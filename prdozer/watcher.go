@@ -1053,7 +1053,18 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 	// brake never charged for. So the brake fires on a later tick instead —
 	// once, since that firing does advance the watermark. Reviewers read the
 	// stale-looking watermark as a lost write; it is the intended record.
-	if !streakArmedCooldown && w.mergeBrakeTripped(s) {
+	//
+	// endsTheRun is the other exclusion, and it is about the brake's PREMISE
+	// rather than about a collision. The brake is a rate limiter on merge
+	// attempts still to come; a tick that ends the run has none to limit, and
+	// mergeBrakeCause would describe it wrongly — loudest on the merged tick,
+	// where the cause reads "N merge attempts without landing" about the very
+	// attempt that landed. A terminal tick took the clearing arm above, so
+	// without this the brake re-arms the window that arm just cleared.
+	// LastActionArmed is deliberately NOT terminal here: the queue has not
+	// landed the PR, ticks continue, and a repeatedly-dequeued PR is exactly
+	// what the brake is for (TestWatcher_QueuePolicy_RepeatedDequeueStillBrakes).
+	if !streakArmedCooldown && !endsTheRun(action) && w.mergeBrakeTripped(s) {
 		s.CooldownUntil = time.Now().Add(w.cfg.Backoff.Cooldown)
 		s.CooldownFromAttempt = s.MergeAttempts
 		// Unconditionally a merge cause, whatever this tick's action was:
@@ -1124,6 +1135,21 @@ func mergeBrakeCause(s *State) string {
 			s.MergeAttempts, s.LastMergeError)
 	}
 	return fmt.Sprintf("%d merge attempts without landing", s.MergeAttempts)
+}
+
+// endsTheRun reports whether an action stops the babysit loop for good.
+//
+// It must agree with terminalFor in babysit.go, which is what actually ends the
+// loop; this is the watcher-side reading of the same question, kept here so the
+// cooldown code does not have to reach into the babysit layer. The two are
+// pinned against each other over the full action set by
+// TestEndsTheRun_MatchesTerminalFor, so they cannot drift apart silently.
+func endsTheRun(action LastAction) bool {
+	switch action {
+	case LastActionMerged, LastActionClosed, LastActionNeedsHuman:
+		return true
+	}
+	return false
 }
 
 // mergeBrakeTripped reports whether enough merge attempts have accumulated
