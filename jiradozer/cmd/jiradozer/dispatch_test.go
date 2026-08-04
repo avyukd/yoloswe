@@ -415,23 +415,44 @@ func TestHereRefusesToStartASecondRunOfAHeldTask(t *testing.T) {
 }
 
 // A fleet directory that EXISTS but cannot be read fully is a partial view, not
-// an empty one. It must fail closed: fleet.Load reports a vanished or malformed
-// entry as fs.ErrNotExist-wrapped too, so matching that sentinel on Load's error
-// would let a half-readable registry skip the guard entirely.
-func TestGuardFailsClosedOnAnUnreadableFleet(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	dir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "boxa.json"), []byte("{not json"), 0o600))
+// an empty one, and must fail closed.
+//
+// The vanished-entry case is the one that motivated stat-ing the root instead of
+// matching fs.ErrNotExist on Load's error: fleet.Load surfaces BOTH a missing
+// registry root and an entry that disappeared between ReadDir and ReadFile as
+// fs.ErrNotExist, so the sentinel alone cannot tell "this box has no fleet" from
+// "I could not see all of it". A dangling symlink reproduces the latter
+// deterministically — it is listed by ReadDir and then fails ReadFile.
+func TestGuardFailsClosedOnAPartiallyReadableFleet(t *testing.T) {
+	for _, tc := range []struct {
+		setup func(t *testing.T, dir string)
+		name  string
+	}{
+		{name: "malformed entry", setup: func(t *testing.T, dir string) {
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "boxa.json"), []byte("{not json"), 0o600))
+		}},
+		{name: "vanished entry", setup: func(t *testing.T, dir string) {
+			// Listed by ReadDir, absent by ReadFile: fs.ErrNotExist from a fleet
+			// that is emphatically NOT absent.
+			require.NoError(t, os.Symlink(filepath.Join(dir, "gone.json"), filepath.Join(dir, "boxa.json")))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			dir := t.TempDir()
+			tc.setup(t, dir)
 
-	oldDir := guardFleetDir
-	guardFleetDir = dir
-	t.Cleanup(func() { guardFleetDir = oldDir })
+			oldDir := guardFleetDir
+			guardFleetDir = dir
+			t.Cleanup(func() { guardFleetDir = oldDir })
 
-	err := guardDuplicateRun(context.Background(),
-		execArgs{description: "x", repo: "yoloswe"}, 0, testMainLogger(t))
+			err := guardDuplicateRun(context.Background(),
+				execArgs{description: "x", repo: "yoloswe"}, 0, testMainLogger(t))
 
-	require.Error(t, err, "a fleet that is present but unreadable must not read as 'nobody is running it'")
-	assert.Contains(t, err.Error(), "cannot rule out a second run")
+			require.Error(t, err, "a fleet present but only partly readable must not read as 'nobody is running it'")
+			assert.Contains(t, err.Error(), "cannot rule out a second run")
+		})
+	}
 }
 
 // A --description run has no tracker-side claim, so its lease target is derived
