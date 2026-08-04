@@ -49,7 +49,7 @@ echo "__LOAD__"; cat /proc/loadavg
 echo "__DF__"; df -P "$HOME"; df -P /mnt/nvme 2>/dev/null
 echo "__TMUX__"; tmux list-windows -a 2>/dev/null | wc -l
 echo "__LEASES__"; { cd ` + leaseDir + ` 2>/dev/null && for f in *.lock; do [ -e "$f" ] || continue; flock -n "$f" true 2>/dev/null || echo "$f"; done; } 2>/dev/null || true
-echo "__BIN__"; command -v ` + t.Name + ` || ([ -x "$HOME/bin/` + t.Name + `" ] && echo "$HOME/bin/` + t.Name + `") || echo MISSING
+echo "__BIN__"; command -v ` + t.Name + ` || ([ -x "$HOME/bin/` + t.Name + `" ] && echo "$HOME/bin/` + t.Name + `") || ([ -x "$HOME/.local/bin/` + t.Name + `" ] && echo "$HOME/.local/bin/` + t.Name + `") || echo MISSING
 echo "__END__"`
 }
 

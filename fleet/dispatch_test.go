@@ -157,3 +157,21 @@ func TestRemoteCommandQuotesArgumentsContainingSpaces(t *testing.T) {
 	assert.False(t, strings.Contains(cmd, "; rm -rf / "),
 		"an unquoted argument would let a task description run as a command")
 }
+
+// Both install shapes are real: a symlink at ~/bin on a box that builds the
+// binary, and a copied artifact at ~/.local/bin on a box carrying no worktree.
+// Deriving the home root by walking up one level breaks on the second, yielding
+// ~/.local/.local/bin and dropping the directory the binary actually lives in.
+func TestRemotePathEnvHandlesALocalBinInstall(t *testing.T) {
+	t.Parallel()
+	req := Request{
+		Host:        HostHealth{PublicDNS: "b.example", HasBinary: true, BinaryPath: "/home/ming/.local/bin/jiradozer"},
+		SessionName: "s",
+		Args:        []string{"exec"},
+	}
+	cmd := req.RemoteCommand()
+	assert.Contains(t, cmd, "/home/ming/.local/bin")
+	assert.NotContains(t, cmd, "/home/ming/.local/.local/bin",
+		"the home root must not be derived as ~/.local")
+	assert.Contains(t, cmd, "/usr/bin", "the base PATH entries must still be carried")
+}

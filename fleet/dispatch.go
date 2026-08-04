@@ -74,12 +74,23 @@ func (r Request) remotePathEnv() string {
 	if !strings.HasPrefix(bin, "/") {
 		return ""
 	}
-	binDir := filepath.Dir(bin)  // /home/ming/bin
-	home := filepath.Dir(binDir) // /home/ming
+	binDir := filepath.Dir(bin) // /home/ming/bin OR /home/ming/.local/bin
+	home := filepath.Dir(binDir)
+	// Both install shapes are in use: a symlink at ~/bin on boxes that build the
+	// binary, and a copied artifact at ~/.local/bin on boxes with no worktree.
+	// Walking up one level from the second yields ~/.local, which would produce
+	// a PATH containing ~/.local/.local/bin and silently omit the real one.
+	if filepath.Base(home) == ".local" {
+		home = filepath.Dir(home)
+	}
 	if home == "/" || home == "." {
 		return ""
 	}
-	return filepath.Join(home, ".local", "bin") + ":" + binDir + ":" + remoteBasePath
+	localBin := filepath.Join(home, ".local", "bin")
+	if binDir == localBin {
+		return localBin + ":" + filepath.Join(home, "bin") + ":" + remoteBasePath
+	}
+	return localBin + ":" + binDir + ":" + remoteBasePath
 }
 
 // remoteBasePath is the PATH a non-interactive SSH shell provides (verified on
