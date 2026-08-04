@@ -941,6 +941,9 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 
 	firstRun := s.LastCheckAt.IsZero()
 	dirty := firstRun || mergeStateDirty
+	// Set by the failure-streak arm below and read by the merge brake after it.
+	// See the brake's comment for why the two cannot both claim this tick.
+	streakArmedCooldown := false
 
 	if s.LastSeenHeadSHA != snap.PR.HeadRefOid {
 		s.LastSeenHeadSHA = snap.PR.HeadRefOid
@@ -989,6 +992,7 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 		if w.cfg.Backoff.MaxConsecutiveFailures > 0 && s.ConsecutiveFailures >= w.cfg.Backoff.MaxConsecutiveFailures && w.cfg.Backoff.Cooldown > 0 {
 			s.CooldownUntil = time.Now().Add(w.cfg.Backoff.Cooldown)
 			s.LastCooldownCause = w.cooldownCause(s, action)
+			streakArmedCooldown = true
 			w.logger.Warn("entering cooldown after repeated failures",
 				"failures", s.ConsecutiveFailures,
 				"cause", s.LastCooldownCause,
@@ -1021,20 +1025,21 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 	// nothing resets it — so brake on that instead. Merge attempts remain
 	// unbounded in the sense that the run resumes after each cooldown and
 	// keeps climbing; the cooldown just rate-limits it and makes it visible.
-	if w.mergeBrakeTripped(s) {
+	// streakArmedCooldown, not mergeBrakeTripped's own "already cooling down"
+	// guard, is what keeps the brake off a tick the failure streak just claimed.
+	// That guard asks time.Now().Before(s.CooldownUntil), which is a question
+	// about the CLOCK: under a sub-microsecond Backoff.Cooldown the window the
+	// arm just opened is already expired by the time the brake looks, and the
+	// brake would overwrite the cause below — the exact misattribution this
+	// branch exists to fix, resurrected by a config value. An explicit flag
+	// makes "one tick arms at most one cooldown" hold for every cooldown length.
+	if !streakArmedCooldown && w.mergeBrakeTripped(s) {
 		s.CooldownUntil = time.Now().Add(w.cfg.Backoff.Cooldown)
 		s.CooldownFromAttempt = s.MergeAttempts
 		// Unconditionally a merge cause, whatever this tick's action was:
 		// reaching here means the brake is what armed the window, and the brake
-		// counts merge attempts, so LastMergeError IS its reason.
-		//
-		// This cannot steal the window from the failure-streak arm above, even
-		// though it writes the same field afterwards: that arm opens the
-		// cooldown on this very tick, and mergeBrakeTripped declines to fire
-		// into an already-open window. So a tick where the streak arms never
-		// reaches here, and the stall/rework cause it wrote survives —
-		// TestWatcher_ReworkStallArmedCooldown_NamesTheGraceError pins exactly
-		// that collision.
+		// counts merge attempts, so LastMergeError IS its reason. The guard
+		// above is what makes "reaching here" imply that.
 		s.LastCooldownCause = mergeBrakeCause(s)
 		dirty = true
 		w.logger.Warn("entering cooldown after repeated merge attempts",
@@ -1107,6 +1112,10 @@ func mergeBrakeCause(s *State) string {
 // It measures attempts SINCE the previous cooldown (CooldownFromAttempt) so a
 // run that resumes after backing off gets a fresh allowance rather than
 // re-tripping on every subsequent tick forever.
+//
+// Its open-window check is deliberately clock-based, which makes it the wrong
+// tool for "did something else already arm a cooldown on THIS tick" — see
+// streakArmedCooldown in recordSnapshot, which answers that question directly.
 func (w *Watcher) mergeBrakeTripped(s *State) bool {
 	maxAttempts := w.cfg.Backoff.MaxConsecutiveFailures
 	if maxAttempts <= 0 || w.cfg.Backoff.Cooldown <= 0 {

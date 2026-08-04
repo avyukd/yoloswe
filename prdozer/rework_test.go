@@ -723,3 +723,44 @@ func TestWatcher_ReworkStallArmedCooldown_NamesTheGraceError(t *testing.T) {
 	assert.Contains(t, s.LastCooldownCause, "merge rework round stalled",
 		"the cause must name the round that actually stalled")
 }
+
+// The same collision under a cooldown short enough to expire within the tick
+// that opened it.
+//
+// The brake's own "already cooling down" guard is a question about the clock
+// (time.Now().Before(CooldownUntil)), so at this cooldown length it answers
+// "not cooling down" microseconds after the stall armed the window — and the
+// brake would overwrite the stall cause with its own. Only the explicit
+// streakArmedCooldown flag keeps the attribution right here, which is why the
+// one-hour case above cannot stand in for this one.
+func TestWatcher_ReworkStallArmedCooldown_ShortCooldown_StillNamesTheStall(t *testing.T) {
+	gh := failingMergeGH(t)
+	rework := &stubRework{err: fmt.Errorf("merge rework: agent execution: " +
+		"transient CLI error: stream idle: turn forced complete after grace period " +
+		"gated on background tool_use")}
+	w := newWatcherForTest(t, gh, &stubPolish{}, WithRework(rework, oneRoundSpec()))
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicySquash
+	// Positive, so the streak arm still fires, but far shorter than the work
+	// between arming the window and the brake's check.
+	w.cfg.Backoff.Cooldown = time.Nanosecond
+
+	for range 2 {
+		res, err := w.Tick(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, LastActionStalled, res.Action,
+			"premise: a grace-forced rework must classify as a stall")
+	}
+
+	s, err := LoadState(StatePath("r", 42))
+	require.NoError(t, err)
+	require.False(t, s.CooldownUntil.IsZero(), "premise: repeated stalls must arm the cooldown")
+	require.Equal(t, 2, s.MergeAttempts,
+		"premise: the merge brake's threshold is reached on the same tick")
+	assert.Zero(t, s.CooldownFromAttempt,
+		"the merge brake must not claim a tick the failure streak already armed")
+	assert.Contains(t, s.LastCooldownCause, "grace period",
+		"a stall-armed cooldown must name the grace-period error at any cooldown length")
+	assert.Contains(t, s.LastCooldownCause, "merge rework round stalled",
+		"the cause must name the round that actually stalled")
+}
