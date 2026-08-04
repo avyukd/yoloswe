@@ -671,6 +671,12 @@ func (g *recordingGH) Run(_ context.Context, args []string, _ string) (*wt.CmdRe
 // anything.
 //
 // This asserts the argv, which is the only part a fake can get wrong for free.
+//
+// Whole-argv equality, not Contains: ".merged" is a substring of ".mergedAt",
+// so a containment check passes a regression to `--jq .mergedAt` — which REST
+// spells merged_at, so it returns null, Merged errors, and gc goes back to
+// failing closed on every worktree. The one selector that answers the question
+// has to be the one asserted.
 func TestGHPRCheckerAsksTheAPIForMerged(t *testing.T) {
 	gh := &recordingGH{stdout: "true\n"}
 	merged, err := GHPRChecker{GH: gh}.Merged(context.Background(),
@@ -678,12 +684,11 @@ func TestGHPRCheckerAsksTheAPIForMerged(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, merged)
 
-	joined := strings.Join(gh.args, " ")
-	require.Equal(t, "api", gh.args[0],
-		"`gh pr view --json merged` is not a valid query; merged is not one of its fields")
-	require.Contains(t, joined, "repos/bazelment/yoloswe/pulls/302")
-	require.Contains(t, joined, ".merged",
-		"state/mergeStateStatus/mergeCommit do not answer 'did this land'")
+	require.Equal(t,
+		[]string{"api", "repos/bazelment/yoloswe/pulls/302", "--jq", ".merged"},
+		gh.args,
+		"`gh pr view --json merged` is not a valid query, and state/mergeStateStatus/"+
+			"mergeCommit/mergedAt do not answer 'did this land'")
 }
 
 func TestGHPRCheckerReadsFalseAndRejectsNonsense(t *testing.T) {
