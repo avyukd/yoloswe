@@ -57,6 +57,15 @@ func (f *fakeGH) failPrefix(prefix, stderr string) {
 	f.failures[prefix] = &wt.CmdResult{Stderr: stderr, ExitCode: 1}
 }
 
+// recoverPrefix drops a previously registered failure, so a test can make a gh
+// call fail on one tick and succeed on the next — the shape of a transient
+// outage, which is the only way to prove a blip does not corrupt saved state.
+func (f *fakeGH) recoverPrefix(prefix string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.failures, prefix)
+}
+
 func (f *fakeGH) Run(_ context.Context, args []string, _ string) (*wt.CmdResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -123,9 +132,14 @@ func (s *stubPolish) Run(_ context.Context, req PolishRequest) (PolishResult, er
 	return res, nil
 }
 
+// prViewPrefix is the args prefix of the snapshot's `gh pr view` call. Named so
+// a test can re-register it and REPLACE the response; a second, differently
+// spelled prefix that also matched would be resolved by map iteration order.
+const prViewPrefix = "pr view 42 --json number,url,headRefName,baseRefName,headRefOid,state,isDraft,reviewDecision,mergeable,statusCheckRollup"
+
 func setupGH(prJSON, runListJSON, baseSHA string) *fakeGH {
 	gh := newFakeGH()
-	gh.addPrefix("pr view 42 --json number,url,headRefName,baseRefName,headRefOid,state,isDraft,reviewDecision,mergeable,statusCheckRollup", prJSON)
+	gh.addPrefix(prViewPrefix, prJSON)
 	gh.addPrefix("run list --branch feature --status failure", runListJSON)
 	gh.addPrefix("api repos/{owner}/{repo}/git/refs/heads/main", baseSHA)
 	gh.addPrefix("api --paginate repos/o/r/pulls/42/comments", "[]")
@@ -2490,8 +2504,11 @@ func TestCommitCount_ExactCountBeatsTheTruncatedList(t *testing.T) {
 
 	assert.Equal(t, 137, PRDetails{Commits: saturated, TotalCommits: 137}.CommitCount(),
 		"the GraphQL scalar is the real count; the list is capped at 100")
-	assert.Equal(t, 100, PRDetails{Commits: saturated}.CommitCount(),
-		"without an exact count the list length is the best available answer")
+	assert.Zero(t, PRDetails{Commits: saturated}.CommitCount(),
+		"a saturated list is unknown, not 100 — reporting the cap as a count "+
+			"poisons the baseline and fakes growth on the next tick")
+	assert.Equal(t, 99, PRDetails{Commits: saturated[:99]}.CommitCount(),
+		"under the cap the list is exact, so it is still the fallback")
 	assert.Zero(t, PRDetails{}.CommitCount(),
 		"no list and no count is unknown, and the caller floors it")
 }
@@ -2578,6 +2595,69 @@ func TestWatcher_FallsBackToTheCommitListWhenTheExactCountFails(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 3, after.PolishCommits, "the list still counts when the scalar is unavailable")
 	assert.Equal(t, 5, after.LastSeenCommitCount)
+}
+
+// A transient GraphQL failure on a PR past the cap must not poison the
+// baseline. If the truncated 100 were persisted over a real 137, the next
+// successful tick would read 37 commits of growth that never happened and slam
+// a limit of 12 shut on a run that pushed two commits.
+func TestWatcher_TransientCountFailureDoesNotPoisonTheBaseline(t *testing.T) {
+	rows := make([]string, 100)
+	for i := range rows {
+		rows[i] = fmt.Sprintf(`{"oid":"c%d"}`, i)
+	}
+	prJSON := func(head string) string {
+		return buildPRJSON(fmt.Sprintf(`{
+  "number": 42,
+  "url": "https://github.com/o/r/pull/42",
+  "headRefName": "feature",
+  "baseRefName": "main",
+  "headRefOid": %q,
+  "state": "OPEN",
+  "isDraft": false,
+  "reviewDecision": "REVIEW_REQUIRED",
+  "mergeable": "MERGEABLE",
+  "additions": 900,
+  "commits": [%s]
+}`, head, strings.Join(rows, ",")), "FAILURE")
+	}
+	const countQuery = "api graphql -f query=query($owner:String!,$repo:String!,$pr:Int!){"
+
+	gh := setupGH(prJSON("head2"), "[]", "base1")
+	gh.failPrefix(countQuery, "gone")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	statePath := StatePath("r", 42)
+
+	// The PR really carries 137 commits and the last tick knew it.
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		LastSeenCommitCount: 137, LastAction: LastActionPolished,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	// Tick one: a push landed, but the exact count is unavailable.
+	_, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	after, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 1, after.PolishCommits, "an unknown count charges the floor of one")
+	assert.Equal(t, 137, after.LastSeenCommitCount,
+		"the truncated 100 must not overwrite the last authoritative count")
+
+	// Tick two: GraphQL recovers and another two commits have landed.
+	gh.recoverPrefix(countQuery)
+	gh.addContains("commits{ totalCount }", "139\n")
+	// Same key setupGH registered, so this REPLACES the response rather than
+	// racing it: two prefixes both matching would resolve by map order.
+	gh.addPrefix(prViewPrefix, prJSON("head3"))
+
+	_, err = w.Tick(context.Background())
+	require.NoError(t, err)
+	after, err = LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 3, after.PolishCommits,
+		"one floored tick plus the two commits actually pushed — not 39")
+	assert.Equal(t, 139, after.LastSeenCommitCount)
 }
 
 // The stop must reach the operator as a SCOPE stop. The guard sets w.ratcheted

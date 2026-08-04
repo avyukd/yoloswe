@@ -106,6 +106,11 @@ type commitRow struct {
 	OID string `json:"oid"`
 }
 
+// commitListCap is the page size `gh pr view --json commits` fetches. The query
+// is unpaginated, so a list this long is a truncation and its length says only
+// "at least this many".
+const commitListCap = 100
+
 // CommitCount reports how many commits the PR carries, or 0 when that is
 // unknown.
 //
@@ -116,13 +121,22 @@ type commitRow struct {
 // floor of one instead of the true delta — the scope brake under-counting,
 // which is the one direction it must not be wrong in.
 //
-// The list length survives as the fallback rather than being dropped: when the
-// GraphQL call fails it is still exact for the PRs small enough to fit under
-// the cap, which is nearly all of them, and a saturated 100 recorded as the
-// baseline still beats recording nothing at all.
+// The list length survives as the fallback rather than being dropped: for the
+// PRs that fit under the cap — nearly all of them — it is exact, and dropping it
+// would floor every push to one whenever the GraphQL call blipped.
+//
+// A saturated list is reported as UNKNOWN rather than as 100, because a caller
+// cannot tell the two apart and both misuse it. Persisting 100 as the baseline
+// for a 137-commit PR makes the next successful tick read 37 commits of growth
+// that never happened and slam the brake shut; charging against it goes wrong
+// the same way. Unknown costs a floor charge of one for that tick and leaves
+// the last authoritative baseline intact.
 func (p PRDetails) CommitCount() int {
 	if p.TotalCommits > 0 {
 		return p.TotalCommits
+	}
+	if len(p.Commits) >= commitListCap {
+		return 0
 	}
 	return len(p.Commits)
 }
