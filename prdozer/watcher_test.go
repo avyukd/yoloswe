@@ -1881,6 +1881,43 @@ func TestWatcher_Tick_ProviderOutage_DoesNotTripNoProgressGuard(t *testing.T) {
 	assert.Len(t, polish.calls, 4, "nothing should be braking a pure outage")
 }
 
+// An invocation that COMPLETED rounds is not a no-progress invocation, even
+// though it returned an error.
+//
+// Rounds execute in order and stop at the first error, so a multi-round spec can
+// finish round 1 and fail round 2 — which is why PolishResult.RanOnceRounds
+// exists and why decideAndAct banks it before the error check. Keying the brake
+// on `err != nil` alone counts those productive invocations as barren, and a run
+// doing real work on every single tick gets halted for making no progress.
+func TestWatcher_Tick_PartiallyCompletedRounds_DoNotCountAsNoProgress(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	// A later round failed, but an earlier once-round finished first.
+	polish := &stubPolish{
+		err:     fmt.Errorf("polish round 2/2: agent execution: exit status 1"),
+		ranOnce: []string{"simplify-branch"},
+	}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	pre := &State{LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1"}
+	require.NoError(t, pre.Save(statePath))
+
+	// Well past the limit, had every one of these counted.
+	for range 2*w.cfg.Backoff.MaxConsecutiveFailures + 2 {
+		res, err := w.Tick(context.Background())
+		require.NoError(t, err)
+		require.False(t, res.Stalled,
+			"an invocation that finished a round is progress, whatever the error says")
+	}
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 0, s.InvocationsSinceRound,
+		"completed work resets the streak, exactly as a fully returned round does")
+	assert.True(t, s.OnceRoundsDone["simplify-branch"],
+		"premise: the round really did complete and was banked")
+}
+
 // The counter must RESET when a round returns, or it climbs monotonically across
 // a long healthy run and eventually stops a PR that is working fine.
 func TestWatcher_Tick_CompletedRound_ResetsNoProgressCounter(t *testing.T) {
