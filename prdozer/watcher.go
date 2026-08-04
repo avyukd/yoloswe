@@ -1033,6 +1033,14 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 	// brake would overwrite the cause below — the exact misattribution this
 	// branch exists to fix, resurrected by a config value. An explicit flag
 	// makes "one tick arms at most one cooldown" hold for every cooldown length.
+	//
+	// Skipping the brake deliberately leaves CooldownFromAttempt where it was.
+	// The watermark records the attempts a MERGE-BRAKE cooldown accounted for,
+	// and no merge-brake cooldown happened on this tick; advancing it here would
+	// make the field claim otherwise and silently forgive real rejections the
+	// brake never charged for. So the brake fires on a later tick instead —
+	// once, since that firing does advance the watermark. Reviewers read the
+	// stale-looking watermark as a lost write; it is the intended record.
 	if !streakArmedCooldown && w.mergeBrakeTripped(s) {
 		s.CooldownUntil = time.Now().Add(w.cfg.Backoff.Cooldown)
 		s.CooldownFromAttempt = s.MergeAttempts
