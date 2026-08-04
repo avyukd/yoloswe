@@ -37,10 +37,13 @@ go_test(
     name = "bramble_test",
     srcs = [
         "main_test.go",
+        "notify_cmd_test.go",
         "notify_session_id_test.go",
     ],
     embed = [":bramble_lib"],
     deps = [
+        "//bramble/ipc",
+        "//bramble/session",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
     ],

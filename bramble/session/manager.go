@@ -1349,6 +1349,39 @@ func resolveAgentModel(modelID string, registry *agent.ModelRegistry) (agent.Age
 	return agent.AgentModel{}, fmt.Errorf("unknown model %q: no curated entry and no recognized prefix (%s)", modelID, agent.KnownModelPrefixes())
 }
 
+// newTmuxRunner builds the runner for a tmux-mode session, copying the
+// manager's configured sockets into the runner that exports them to the
+// window. It is a method rather than inline construction so the
+// config → runner → env plumbing can be asserted without a live tmux server:
+// dropping a socket here is what silently strands a session, and envArgs()
+// alone cannot catch it.
+func (m *Manager) newTmuxRunner(session *Session, prompt, tmuxName string, agentModel agent.AgentModel) *tmuxRunner {
+	permissionMode := ""
+	if session.Type == SessionTypePlanner || session.Type == SessionTypeCodeTalk {
+		permissionMode = "plan"
+	}
+
+	brambleBin, _ := os.Executable()
+	if brambleBin == "" {
+		brambleBin = "bramble" // fallback to PATH lookup
+	}
+	return &tmuxRunner{
+		windowName:      tmuxName,
+		workDir:         session.WorktreePath,
+		prompt:          prompt,
+		model:           agentModel.ID,
+		provider:        agentModel.Provider,
+		permissionMode:  permissionMode,
+		resumeSessionID: session.CLISessionID,
+		sessionID:       string(session.ID),
+		brambleBin:      brambleBin,
+		brambleSock:     m.config.IPCSockPath,
+		controlSock:     m.config.ControlSockPath,
+		yoloMode:        m.config.YoloMode,
+		killOnStop:      false, // Never kill on Stop(); cleanup happens in Close() if TmuxExitOnQuit is set
+	}
+}
+
 // runSession runs a session in a goroutine, handling both planner and builder types.
 // Both types follow the same lifecycle: start → run turns → idle → follow-up → ...
 func (m *Manager) runSession(session *Session, prompt string) {
@@ -1422,30 +1455,7 @@ func (m *Manager) runSession(session *Session, prompt string) {
 		session.RunnerType = RunnerTypeTmux
 		session.mu.Unlock()
 
-		permissionMode := ""
-		if session.Type == SessionTypePlanner || session.Type == SessionTypeCodeTalk {
-			permissionMode = "plan"
-		}
-
-		brambleBin, _ := os.Executable()
-		if brambleBin == "" {
-			brambleBin = "bramble" // fallback to PATH lookup
-		}
-		runner = &tmuxRunner{
-			windowName:      tmuxName,
-			workDir:         session.WorktreePath,
-			prompt:          prompt,
-			model:           agentModel.ID,
-			provider:        agentModel.Provider,
-			permissionMode:  permissionMode,
-			resumeSessionID: session.CLISessionID,
-			sessionID:       string(session.ID),
-			brambleBin:      brambleBin,
-			brambleSock:     m.config.IPCSockPath,
-			controlSock:     m.config.ControlSockPath,
-			yoloMode:        m.config.YoloMode,
-			killOnStop:      false, // Never kill on Stop(); cleanup happens in Close() if TmuxExitOnQuit is set
-		}
+		runner = m.newTmuxRunner(session, prompt, tmuxName, agentModel)
 		// No event handler for tmux mode - all output is in the tmux window
 	} else {
 		// TUI mode: create in-process runner
