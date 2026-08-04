@@ -53,9 +53,19 @@ type PolishResult struct {
 	// bool would either lose it (re-running a completed whole-branch pass) or
 	// over-claim the second (dropping it for the life of the PR).
 	RanOnceRounds map[string]bool
-	SessionID     string
-	Output        string
-	DurationMs    int64
+	// CompletedRounds counts the rounds that finished in this call, of EVERY
+	// kind. RanOnceRounds cannot answer "did this invocation accomplish
+	// anything" because it records only `once: true` rounds — a spec of ordinary
+	// repeatable rounds whose first succeeds and second fails leaves it empty
+	// while real work was done.
+	//
+	// The no-progress brake needs exactly that question: a run whose rounds keep
+	// completing before a later one fails is making progress on every tick, and
+	// halting it as barren is a false stop.
+	SessionID       string
+	Output          string
+	DurationMs      int64
+	CompletedRounds int
 }
 
 // AgentPolisher invokes /pr-polish through multiagent/agent — the same path
@@ -155,11 +165,16 @@ func (p *AgentPolisher) runRounds(ctx context.Context, req PolishRequest, rounds
 			}
 		}
 		if err != nil {
-			// res carries RanOnceRounds for the rounds that DID finish, so the
-			// caller keeps their progress even though this call failed.
+			// res carries RanOnceRounds and CompletedRounds for the rounds that DID
+			// finish, so the caller keeps their progress even though this call
+			// failed.
 			res.DurationMs = time.Since(start).Milliseconds()
 			return res, fmt.Errorf("polish round %d/%d: %w", i+1, len(rounds), err)
 		}
+		// Counted for EVERY round kind, before the once-only bookkeeping below:
+		// this is the signal for "did anything finish", which RanOnceRounds
+		// cannot carry because it is silent on repeatable rounds.
+		res.CompletedRounds++
 		if round.Once {
 			if res.RanOnceRounds == nil {
 				res.RanOnceRounds = make(map[string]bool)

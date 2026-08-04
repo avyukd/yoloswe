@@ -76,19 +76,27 @@ type stubPolish struct {
 	// path too: a real runner reports the once-only rounds it completed even when
 	// a LATER round failed.
 	ranOnce []string
-	mu      sync.Mutex
+	// completedRounds is how many rounds finished before the error, of any kind.
+	// Separate from ranOnce because the real runner counts every round here but
+	// keys only `once: true` ones in RanOnceRounds — the whole distinction the
+	// no-progress reset depends on.
+	completedRounds int
+	mu              sync.Mutex
 }
 
 func (s *stubPolish) Run(_ context.Context, req PolishRequest) (PolishResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, req)
-	res := PolishResult{}
+	res := PolishResult{CompletedRounds: s.completedRounds}
 	for _, key := range s.ranOnce {
 		if res.RanOnceRounds == nil {
 			res.RanOnceRounds = make(map[string]bool)
 		}
 		res.RanOnceRounds[key] = true
+		// A once round that finished is a round that finished. Mirrors the real
+		// runner, which increments CompletedRounds for every round kind.
+		res.CompletedRounds++
 	}
 	if s.err != nil {
 		return res, s.err
@@ -1916,6 +1924,44 @@ func TestWatcher_Tick_PartiallyCompletedRounds_DoNotCountAsNoProgress(t *testing
 		"completed work resets the streak, exactly as a fully returned round does")
 	assert.True(t, s.OnceRoundsDone["simplify-branch"],
 		"premise: the round really did complete and was banked")
+}
+
+// The same rule for REPEATABLE rounds, which is the larger case: most specs have
+// no `once: true` rounds at all.
+//
+// RanOnceRounds cannot answer "did this invocation accomplish anything" — it
+// records only once rounds, so an ordinary two-round spec whose first round
+// succeeds and second fails leaves it empty while real work was done. Keying the
+// reset on it would still false-stop exactly the runs this brake is least
+// entitled to touch. CompletedRounds counts every kind, which is why the reset
+// uses it.
+func TestWatcher_Tick_CompletedRepeatableRounds_DoNotCountAsNoProgress(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	// Round 1 of 2 finished; round 2 failed. No once rounds anywhere in the spec,
+	// so RanOnceRounds is empty and only CompletedRounds carries the progress.
+	polish := &stubPolish{
+		err:             fmt.Errorf("polish round 2/2: agent execution: exit status 1"),
+		completedRounds: 1,
+	}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	pre := &State{LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1"}
+	require.NoError(t, pre.Save(statePath))
+
+	for range 2*w.cfg.Backoff.MaxConsecutiveFailures + 2 {
+		res, err := w.Tick(context.Background())
+		require.NoError(t, err)
+		require.False(t, res.Stalled,
+			"a finished repeatable round is progress just as a once round is")
+	}
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 0, s.InvocationsSinceRound,
+		"completed work resets the streak whatever the round's kind")
+	assert.Empty(t, s.OnceRoundsDone,
+		"premise: no once rounds ran, so RanOnceRounds could not have carried this")
 }
 
 // The counter must RESET when a round returns, or it climbs monotonically across

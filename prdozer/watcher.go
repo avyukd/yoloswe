@@ -369,11 +369,13 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		// An invocation that COMPLETED work is excluded too, and for a stricter
 		// reason: it is not a no-progress invocation at all, so counting it is
 		// simply wrong. Rounds execute in order and stop at the first error, so a
-		// multi-round spec can finish round 1 and fail round 2 — the runner
-		// reports the finished ones in RanOnceRounds, which the loop above has
-		// already banked into OnceRoundsDone. Without this, a run doing real work
-		// on every tick is halted for making no progress.
-		if len(polishRes.RanOnceRounds) > 0 {
+		// multi-round spec can finish round 1 and fail round 2.
+		//
+		// Keyed on CompletedRounds rather than RanOnceRounds: the latter records
+		// only `once: true` rounds, so a spec of ordinary repeatable rounds whose
+		// first succeeds and second fails every tick would leave it empty and the
+		// run would still be halted while doing real work each time.
+		if polishRes.CompletedRounds > 0 {
 			// RESET, not merely skip: a round finished, which is the very thing
 			// this counter exists to detect the absence of. Same rule as the
 			// success path below — the streak is "consecutive invocations that
