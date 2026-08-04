@@ -650,3 +650,65 @@ func TestGCSaysWhichRootHasNoRemover(t *testing.T) {
 	require.Zero(t, res.Removed)
 	requireReason(t, res, "worktree", "/roots/gone")
 }
+
+// recordingGH captures the argv gc hands to gh.
+type recordingGH struct {
+	err    error
+	stdout string
+	args   []string
+}
+
+func (g *recordingGH) Run(_ context.Context, args []string, _ string) (*wt.CmdResult, error) {
+	g.args = args
+	return &wt.CmdResult{Stdout: g.stdout}, g.err
+}
+
+// The real GHPRChecker was never exercised — every gc test used a fake
+// PRChecker — so it shipped calling `gh pr view --json merged`, which gh
+// rejects with "Unknown JSON field: merged" on EVERY call. gc then failed
+// closed on every worktree with a plausible "could not determine PR state",
+// which is indistinguishable from a sweeper being careful. It never reclaimed
+// anything.
+//
+// This asserts the argv, which is the only part a fake can get wrong for free.
+func TestGHPRCheckerAsksTheAPIForMerged(t *testing.T) {
+	gh := &recordingGH{stdout: "true\n"}
+	merged, err := GHPRChecker{GH: gh}.Merged(context.Background(),
+		"https://github.com/bazelment/yoloswe/pull/302")
+	require.NoError(t, err)
+	require.True(t, merged)
+
+	joined := strings.Join(gh.args, " ")
+	require.Equal(t, "api", gh.args[0],
+		"`gh pr view --json merged` is not a valid query; merged is not one of its fields")
+	require.Contains(t, joined, "repos/bazelment/yoloswe/pulls/302")
+	require.Contains(t, joined, ".merged",
+		"state/mergeStateStatus/mergeCommit do not answer 'did this land'")
+}
+
+func TestGHPRCheckerReadsFalseAndRejectsNonsense(t *testing.T) {
+	gh := &recordingGH{stdout: "false\n"}
+	merged, err := GHPRChecker{GH: gh}.Merged(context.Background(),
+		"https://github.com/o/r/pull/1")
+	require.NoError(t, err)
+	require.False(t, merged)
+
+	// A reply that is not true/false is not an answer. Reporting it as "not
+	// merged" would be the safe direction but would hide a broken query
+	// forever — which is exactly how the pr-view bug survived.
+	bad := &recordingGH{stdout: `{"merged":true}`}
+	_, err = GHPRChecker{GH: bad}.Merged(context.Background(), "https://github.com/o/r/pull/1")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unexpected")
+}
+
+func TestParsePRURL(t *testing.T) {
+	o, r, n, err := parsePRURL("https://github.com/bazelment/yoloswe/pull/302")
+	require.NoError(t, err)
+	require.Equal(t, "bazelment", o)
+	require.Equal(t, "yoloswe", r)
+	require.Equal(t, 302, n)
+
+	_, _, _, err = parsePRURL("not a url")
+	require.Error(t, err)
+}
