@@ -75,8 +75,70 @@ type PRDetails struct {
 	Mergeable         string           `json:"mergeable"`
 	StatusCheckRollup []statusCheckRow `json:"statusCheckRollup"`
 	LatestReviews     []reviewRow      `json:"latestReviews"`
-	Number            int              `json:"number"`
-	IsDraft           bool             `json:"isDraft"`
+	// Commits is the PR's commit list, carried only so the scope guard can
+	// measure how many commits a push actually added. Counting pushes instead
+	// under-counts badly: a polish invocation commits once per round and
+	// force-pushes ONCE at the end, so a 5-round invocation reads as a single
+	// commit and a cap of 12 would sit ~60 commits deep before firing.
+	//
+	// Read it through CommitCount, never directly: gh caps this list at 100
+	// entries with no pagination, so on a large PR its length is a truncation
+	// artifact rather than a count.
+	Commits []commitRow `json:"commits"`
+	// TotalCommits is the exact commit count from GraphQL, which reports it as
+	// a scalar and so is immune to the 100-entry cap on Commits. Zero when the
+	// query failed; CommitCount falls back to the list length in that case.
+	TotalCommits int `json:"-"`
+	Number       int `json:"number"`
+	// Additions/Deletions/ChangedFiles size the PR's diff. Fetched in the same
+	// gh call as everything else, so the scope guard costs no extra round trip.
+	Additions    int  `json:"additions"`
+	Deletions    int  `json:"deletions"`
+	ChangedFiles int  `json:"changedFiles"`
+	IsDraft      bool `json:"isDraft"`
+}
+
+// commitRow is one entry in gh's commits list. Only the count is ever read —
+// the guard needs to know how many commits arrived, not what is in them — but
+// `gh pr view --json` exposes no count-only field, so the list is decoded and
+// measured.
+type commitRow struct {
+	OID string `json:"oid"`
+}
+
+// commitListCap is the page size `gh pr view --json commits` fetches. The query
+// is unpaginated, so a list this long is a truncation and its length says only
+// "at least this many".
+const commitListCap = 100
+
+// CommitCount reports how many commits the PR carries, or 0 when that is
+// unknown.
+//
+// The exact GraphQL count wins over the list length because `gh pr view --json
+// commits` issues an unpaginated `commits(first:100)` and silently truncates
+// there. On a PR already 100 commits deep the list length is pinned at 100, so
+// every subsequent push measures as zero growth and pushedCommits charges its
+// floor of one instead of the true delta — the scope brake under-counting,
+// which is the one direction it must not be wrong in.
+//
+// The list length survives as the fallback rather than being dropped: for the
+// PRs that fit under the cap — nearly all of them — it is exact, and dropping it
+// would floor every push to one whenever the GraphQL call blipped.
+//
+// A saturated list is reported as UNKNOWN rather than as 100, because a caller
+// cannot tell the two apart and both misuse it. Persisting 100 as the baseline
+// for a 137-commit PR makes the next successful tick read 37 commits of growth
+// that never happened and slam the brake shut; charging against it goes wrong
+// the same way. Unknown costs a floor charge of one for that tick and leaves
+// the last authoritative baseline intact.
+func (p PRDetails) CommitCount() int {
+	if p.TotalCommits > 0 {
+		return p.TotalCommits
+	}
+	if len(p.Commits) >= commitListCap {
+		return 0
+	}
+	return len(p.Commits)
 }
 
 // reviewRow is one entry in gh's latestReviews: the most recent review per
@@ -132,9 +194,17 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 		comments               []CommentRef
 		baseSHA                string
 		unresolved             int
+		totalCommits           int
 		failedErr, commentsErr error
 	)
-	wg.Add(4)
+	wg.Add(5)
+	go func() {
+		defer wg.Done()
+		// Best-effort: an unreadable count leaves PRDetails.TotalCommits at
+		// zero and CommitCount falls back to the (possibly truncated) list,
+		// which is what the scope guard read before this query existed.
+		totalCommits, _ = fetchCommitCount(ctx, gh, dir, owner, repo, prNumber)
+	}()
 	go func() {
 		defer wg.Done()
 		// Best-effort, like base detection: an unreadable thread count only
@@ -167,6 +237,7 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 	if commentsErr != nil {
 		return nil, fmt.Errorf("comments for #%d: %w", prNumber, commentsErr)
 	}
+	pr.TotalCommits = totalCommits
 	return &Snapshot{
 		TakenAt:            time.Now().UTC(),
 		PR:                 *pr,
@@ -178,6 +249,53 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 		IsBotReviewer:      botReviewers(pr.LatestReviews),
 		UnresolvedThreads:  unresolved,
 	}, nil
+}
+
+// fetchCommitCount reads the PR's exact commit count.
+//
+// GraphQL exposes it as a scalar `totalCount`, so one unpaginated query is
+// enough — unlike `gh pr view --json commits`, which fetches a `first:100` page
+// and reports its length. That difference is the whole point of this call: the
+// scope guard charges pushes by commit delta, and a length pinned at 100
+// charges a growing PR its floor of one per tick forever.
+//
+// The missing `first:`/`last:` is deliberate, not an oversight: GitHub only
+// demands a page size when the selection reaches into the connection's
+// `nodes`/`edges`. A selection of nothing but the `totalCount` scalar is served
+// as-is — verified against this very PR, which answers `{"totalCount":9}`. No
+// unit test can pin that, since the schema lives on GitHub's side; adding a
+// page size would be harmless but would also re-import the 100-cap thinking
+// this call exists to escape.
+func fetchCommitCount(ctx context.Context, gh wt.GHRunner, dir, owner, repo string, prNumber int) (int, error) {
+	const query = `query($owner:String!,$repo:String!,$pr:Int!){
+  repository(owner:$owner,name:$repo){
+    pullRequest(number:$pr){
+      commits{ totalCount }
+    }
+  }
+}`
+	res, err := gh.Run(ctx, []string{
+		"api", "graphql",
+		"-f", "query=" + query,
+		"-F", "owner=" + owner,
+		"-F", "repo=" + repo,
+		"-F", fmt.Sprintf("pr=%d", prNumber),
+		"--jq", `.data.repository.pullRequest.commits.totalCount`,
+	}, dir)
+	if err != nil {
+		return 0, ghError(err, res)
+	}
+	out := strings.TrimSpace(res.Stdout)
+	if out == "" {
+		// Unknown, not zero: zero would read as a PR with no commits and hand
+		// the next push the floor charge instead of its real delta.
+		return 0, fmt.Errorf("empty commit count")
+	}
+	n, err := strconv.Atoi(out)
+	if err != nil {
+		return 0, fmt.Errorf("parse commit count %q: %w", out, err)
+	}
+	return n, nil
 }
 
 // fetchUnresolvedThreads counts review threads that are neither resolved nor
@@ -270,7 +388,7 @@ func changesRequestedBy(reviews []reviewRow) []string {
 func fetchPRDetails(ctx context.Context, gh wt.GHRunner, dir string, n int) (*PRDetails, error) {
 	args := []string{
 		"pr", "view", strconv.Itoa(n),
-		"--json", "number,url,headRefName,baseRefName,headRefOid,state,isDraft,reviewDecision,mergeable,statusCheckRollup,latestReviews",
+		"--json", "number,url,headRefName,baseRefName,headRefOid,state,isDraft,reviewDecision,mergeable,statusCheckRollup,latestReviews,additions,deletions,changedFiles,commits",
 	}
 	res, err := gh.Run(ctx, args, dir)
 	if err != nil {
@@ -443,4 +561,22 @@ func ghError(err error, res *wt.CmdResult) error {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(res.Stderr))
 	}
 	return err
+}
+
+// CurrentGitHubLogin reports the login `gh` is authenticated as, for
+// self-comment filtering.
+//
+// Load-bearing rather than cosmetic: a snapshot marks a comment IsSelf only
+// when its author matches, and NewComments is an unconditional polish trigger.
+// With no login every reply prdozer posts comes back as somebody else's new
+// comment, so the run polishes in response to itself. See WithSelfLogin.
+func CurrentGitHubLogin(ctx context.Context, gh wt.GHRunner) (string, error) {
+	res, err := gh.Run(ctx, []string{"api", "user", "--jq", ".login"}, "")
+	if err != nil {
+		if res != nil && res.Stderr != "" {
+			return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(res.Stderr))
+		}
+		return "", err
+	}
+	return strings.TrimSpace(res.Stdout), nil
 }

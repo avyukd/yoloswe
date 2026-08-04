@@ -152,6 +152,27 @@ type BackoffConfig struct {
 	//
 	// Zero disables the guard. Default 3, matching the failure brake.
 	MaxRoundsWithoutImprovement int `yaml:"max_rounds_without_improvement"`
+	// MaxPolishCommits stops polishing once prdozer's own rounds have added this
+	// many commits to a PR, cumulative across every run on it.
+	//
+	// The scope brake, and deliberately not a liveness one. kernel#8374 reached
+	// 23 commits and +2509/-88 across 13 files — six times the diff it opened
+	// with, spreading into three services it never originally touched — while
+	// every existing guard read it as healthy, because each round really did
+	// close the findings the previous round drew. Three separate chains there
+	// show the shape: a fix lands, the next round finds a flaw IN that fix, and
+	// the round after fixes the fix. The lock-reaper chain nets out to a reaper
+	// that largely cannot run.
+	//
+	// Counted per PR rather than per run: #8374's commits came from two runs of
+	// 3 and 4 rounds, so a per-run cap would have caught none of them.
+	//
+	// Twelve, against fast converges that took ONE round. High enough that a
+	// legitimately deep PR is not cut off mid-thought, low enough that a ratchet
+	// is stopped days before it reaches 23.
+	//
+	// Zero disables the guard.
+	MaxPolishCommits int `yaml:"max_polish_commits"`
 }
 
 // DefaultConfig returns the built-in defaults with validate() applied so the
@@ -191,6 +212,7 @@ func defaultConfig() Config {
 		Backoff: BackoffConfig{
 			MaxConsecutiveFailures:      3,
 			MaxRoundsWithoutImprovement: 3,
+			MaxPolishCommits:            12,
 			Cooldown:                    2 * time.Hour,
 		},
 	}

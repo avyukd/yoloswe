@@ -137,19 +137,46 @@ func (b *Babysitter) Run(ctx context.Context) (state TerminalState, err error) {
 	return state, nil
 }
 
-// loop ticks the watcher until the PR reaches a terminal state.
-func (b *Babysitter) loop(ctx context.Context, rc *RunContext, runLog *RunLog, pr DiscoveredPR) (TerminalState, string) {
+// newWatcher builds the watcher loop drives.
+//
+// Split out of loop so the wiring can be asserted directly. The bug that made
+// this whole path worth testing was an option that was simply never passed, and
+// nothing observable from outside a running loop would have caught it.
+func (b *Babysitter) newWatcher(ctx context.Context, rc *RunContext, runLog *RunLog) *Watcher {
 	o := b.opts
-	cfg := b.watcherConfig(rc)
-
 	polish := PolishRunner(NewAgentPolisher(b.renderer, b.logger))
 	rework := ReworkRunner(NewAgentRework(b.renderer, b.logger, runLog))
 
-	w := NewWatcher(cfg, b.gh, polish, o.PRNumber, rc.WorktreePath, o.OwnerRepo, b.logger,
+	// Self-comment filtering. The orchestrator has always passed this; the
+	// babysit path never did, so w.self stayed "" and IsSelf was never true.
+	//
+	// That is not cosmetic: NewComments is an unconditional polish trigger, so
+	// every reply prdozer posts ("Fixed in <sha>") came back on the next
+	// snapshot as somebody else's new comment and started another round. On
+	// kernel#7040 the PR read UNRES=0 / SUCCESS / APPROVED on every single tick
+	// and still ran six rounds, its comment count climbing in lockstep with the
+	// rounds producing them; new=0 appeared only after polishing stopped.
+	//
+	// Best-effort: a failed lookup disables the filter rather than the run,
+	// which is the behaviour the orchestrator already has.
+	self, err := CurrentGitHubLogin(ctx, b.gh)
+	if err != nil {
+		b.logger.Warn("could not determine GitHub login; self-comment filtering disabled",
+			"error", safeErrString(err))
+	}
+
+	return NewWatcher(b.watcherConfig(rc), b.gh, polish, o.PRNumber, rc.WorktreePath, o.OwnerRepo, b.logger,
 		WithRenderer(b.renderer),
 		WithRework(rework, o.Entry.MergeRework),
 		WithPolishSpec(o.Entry.Polish),
+		WithSelfLogin(self),
 	)
+}
+
+// loop ticks the watcher until the PR reaches a terminal state.
+func (b *Babysitter) loop(ctx context.Context, rc *RunContext, runLog *RunLog, pr DiscoveredPR) (TerminalState, string) {
+	o := b.opts
+	w := b.newWatcher(ctx, rc, runLog)
 
 	interval := o.PollInterval
 	if interval <= 0 {
@@ -282,6 +309,19 @@ func terminalFor(res TickResult, pr DiscoveredPR) (TerminalState, string, bool) 
 			return TerminalNeedsHuman, fmt.Sprintf(
 				"PR #%d stalled: %d polish invocations produced no completed round, so the run was halted rather than burning further attempts. Nothing is wrong with the PR itself — check the agent backend. Last error: %s",
 				pr.Number, res.InvocationsSinceRound, res.StallError), true
+		}
+		// Ordered ahead of divergence to mirror decideAndAct, where the scope
+		// guard is evaluated first. The two cannot both fire in one tick today,
+		// and keeping the precedence identical in both places is what keeps that
+		// true if either guard's condition ever widens.
+		if res.Ratcheted {
+			// The fourth kind, and the one the generic message inverts: every
+			// round SUCCEEDED. Saying "blocked on a review approval" would send
+			// the operator to find a reviewer, when the PR's problem is that it
+			// has already grown past what one review can usefully cover.
+			return TerminalNeedsHuman, fmt.Sprintf(
+				"PR #%d grew past its scope cap: prdozer's own rounds have added %d commits (limit %d, %d rounds total). Nothing failed — every round succeeded, which is why no other guard caught it. Decide what to cut or split before resuming.",
+				pr.Number, res.PolishCommits, res.PolishCommitLimit, res.PolishRounds), true
 		}
 		if res.Diverged {
 			// Report the streak the guard tripped on, NOT the run's cumulative

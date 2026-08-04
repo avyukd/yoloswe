@@ -50,6 +50,10 @@ type Watcher struct {
 	// diverged is set by the divergence guard within a tick so Tick can
 	// report WHY it stopped. Reset at the top of every tick.
 	diverged bool
+	// ratcheted is set by the scope guard, for the same reason: needs_human
+	// otherwise reads as "waiting on an approval", and "this PR grew too far"
+	// needs a different response — a human deciding what to cut, not a review.
+	ratcheted bool
 	// stalled is set by the no-progress guard within a tick, for the same
 	// reason as diverged: both stop the run with LastActionNeedsHuman, and
 	// without a distinct signal the terminal report cannot tell "waiting on an
@@ -147,6 +151,14 @@ type TickResult struct {
 	// reported for the same reason RoundsSinceImprovement is: the operator needs
 	// the number that actually caused the stop.
 	InvocationsSinceRound int
+	// PolishCommits is the count the scope guard trips on, reported alongside
+	// Ratcheted for the same reason: "this PR needs a human" is unactionable
+	// without the number that made it true.
+	PolishCommits int
+	// PolishCommitLimit is the configured cap, carried so the report can say how
+	// far past it the PR went rather than quoting a bare count the operator
+	// would have to look up in config to interpret.
+	PolishCommitLimit int
 	// Diverged reports that NeedsHuman was reached because the PR stopped
 	// improving, rather than because it is waiting on an approval. The two need
 	// opposite responses, so the notification must tell them apart.
@@ -157,6 +169,12 @@ type TickResult struct {
 	// third distinct response: nothing about the PR is wrong, the agent never
 	// came back.
 	Stalled bool
+	// Ratcheted reports that NeedsHuman was reached because polish grew the PR
+	// past its scope cap. A fourth distinct cause, and the one least like the
+	// others: nothing failed, nothing stalled, nothing stopped improving — every
+	// round succeeded, and that is the problem. The response is a human deciding
+	// what to cut, not a reviewer approving another round.
+	Ratcheted bool
 }
 
 func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
@@ -217,7 +235,7 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 		"rounds_since_improvement", state.RoundsSinceImprovement,
 	)
 
-	w.diverged = false
+	w.diverged, w.ratcheted = false, false
 	w.stalled, w.lastStallError, w.lastStallStage = false, "", ""
 	w.lastFailureError = ""
 	priorAttempts, priorMergeErr := state.MergeAttempts, state.LastMergeError
@@ -251,7 +269,9 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 		Diverged: w.diverged, PolishRounds: state.PolishRounds,
 		RoundsSinceImprovement: state.RoundsSinceImprovement,
 		Stalled:                w.stalled, StallError: w.lastStallError,
-		InvocationsSinceRound: state.InvocationsSinceRound}
+		InvocationsSinceRound: state.InvocationsSinceRound,
+		Ratcheted:             w.ratcheted, PolishCommits: state.PolishCommits,
+		PolishCommitLimit: w.cfg.Backoff.MaxPolishCommits}
 	if w.recordSnapshot(state, snap, action, mergeStateDirty || healthDirty) {
 		if err := state.Save(statePath); err != nil {
 			// State save failure is serious: the action already ran (maybe merged
@@ -314,6 +334,13 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 	case !cs.NeedsPolish() && !w.needsSelfReview(snap, state):
 		w.status("PR #%d unchanged — idle", w.pr)
 		return LastActionIdle
+	case w.ratcheting(snap, cs, state):
+		// The PR has grown past what polishing should produce. Ordered BEFORE
+		// the divergence guard because the two answer different questions and
+		// this one is the only guard that can fire on a run whose every round
+		// succeeded — which is exactly the state kernel#8374 stayed in for five
+		// days and 23 commits.
+		return LastActionNeedsHuman
 	case w.diverging(snap, state):
 		// More polish rounds are not producing a better PR. Stop and hand it
 		// to a human rather than burning rounds — and money — making it worse.
@@ -753,6 +780,76 @@ func (w *Watcher) expireStaleDivergence(state *State, snap *Snapshot) bool {
 	return true
 }
 
+// ratcheting reports whether prdozer's own rounds have grown this PR past the
+// point where more polishing is the right answer.
+//
+// This is the scope brake, and it is the only guard here that is not a liveness
+// check. ConsecutiveFailures watches for rounds that error, RoundsSinceImprovement
+// for rounds that do not improve, InvocationsSinceRound for rounds that never
+// return. kernel#8374 evaded all three by SUCCEEDING: every round genuinely
+// closed the findings the previous round drew, so BestHealth kept being beaten
+// and RoundsSinceImprovement sat at zero across eight consecutive ticks — while
+// the PR went from 6 files/+407 to 13 files/+2509 and spread into three services
+// it never originally touched.
+//
+// Stops on the COMMIT count, not the diff size. Diff growth is reported but
+// never terminal: kernel#8466's round-one restructure was large and correct, and
+// a size threshold tuned to catch #8374 would have aborted it. The commit count
+// is the sharper signal because it measures how many times prdozer decided the
+// PR was not done yet.
+func (w *Watcher) ratcheting(snap *Snapshot, cs Changeset, state *State) bool {
+	limit := w.cfg.Backoff.MaxPolishCommits
+	if limit <= 0 || state.PolishCommits < limit {
+		return false
+	}
+	// A tick with nothing to polish and an unreviewed head is about to produce a
+	// REVIEW, not a commit — the one thing this guard does not measure. Stopping
+	// it charges the scope brake for work that cannot grow the scope, and on a
+	// self_review repo it is the worse failure of the two: prdozer IS the
+	// reviewer there, so a green PR whose last commit nobody has read gets
+	// handed back with the review still owed, and auto-merge is gated on
+	// needsSelfReview so the PR cannot land either.
+	//
+	// Same bounded shape as diverging's allowance, and bounded for the same
+	// reason: if that review round does push commits, the head moves,
+	// needsSelfReview re-arms, and an unconditional exemption would mean the
+	// brake can never fire on a self_review repo at all — restoring the
+	// unbounded run it exists to prevent. Past 2*limit the count stands on its
+	// own however the head looks. The other exit is quieter and more common: a
+	// review that pushes nothing marks the SHA seen, needsSelfReview goes false,
+	// and the next tick idles or merges without ever consulting this guard.
+	if state.PolishCommits < 2*limit && !cs.NeedsPolish() && w.needsSelfReview(snap, state) {
+		w.logger.Info("scope limit reached on an unreviewed head; extending once so the review can run",
+			"polish_commits", state.PolishCommits,
+			"limit", limit,
+			"hard_limit", 2*limit,
+			"head", snap.PR.HeadRefOid)
+		return false
+	}
+	grew := ""
+	if state.BaselineAdditions > 0 && snap.PR.Additions > state.BaselineAdditions {
+		grew = fmt.Sprintf(" diff +%d->+%d additions across %d files",
+			state.BaselineAdditions, snap.PR.Additions, snap.PR.ChangedFiles)
+	}
+	// Reported for the same reason divergence reports it: on a self_review repo
+	// "prdozer added N commits" and "nobody has read the last one" are different
+	// things to walk into, and only the second tells the human to start by
+	// reading rather than by cutting.
+	unreviewed := w.needsSelfReview(snap, state)
+	w.ratcheted = true
+	w.logger.Warn("stopping: polish has added enough commits that the PR needs a human look",
+		"polish_commits", state.PolishCommits,
+		"limit", limit,
+		"polish_rounds", state.PolishRounds,
+		"additions", snap.PR.Additions,
+		"baseline_additions", state.BaselineAdditions,
+		"changed_files", snap.PR.ChangedFiles,
+		"head_unreviewed", unreviewed)
+	w.status("PR #%d stopped: prdozer has added %d commits (limit %d, head_reviewed=%t).%s",
+		w.pr, state.PolishCommits, limit, !unreviewed, grew)
+	return true
+}
+
 // diverging reports whether polishing has stopped making the PR better.
 //
 // It is deliberately evaluated BEFORE the polish call and AFTER this tick's
@@ -848,21 +945,24 @@ func (w *Watcher) diverging(snap *Snapshot, state *State) bool {
 // guard trips one tick later than the round that actually caused the
 // divergence.
 func (w *Watcher) recordHealth(state *State, snap *Snapshot) bool {
-	h, ok := snap.Health()
-	if !ok {
-		return false
-	}
 	// A round counts only when one is actually outstanding — i.e. the PREVIOUS
 	// tick polished and this snapshot is the first look at its result. Charging
 	// on the current action instead would mis-attribute by one tick; charging on
 	// every tick would count a PR that is merely waiting for CI, having done no
 	// work at all.
 	polished := state.LastAction == LastActionPolished
-	if polished {
-		// Cumulative: counted whether or not the round helped, so the terminal
-		// report can say how much work the run did as well as how long it has
-		// been stuck.
-		state.PolishRounds++
+	// Work accounting runs BEFORE the health gate and independently of it.
+	// snap.Health() is unreadable whenever the unresolved-thread lookup fails,
+	// and recordSnapshot advances LastSeenHeadSHA and LastSeenCommitCount at the
+	// end of the tick either way — so a push charged after the gate is lost for
+	// good on such a tick, and the scope brake would silently under-count the
+	// very commits it exists to stop. The round happened; a failed side query
+	// does not un-happen it.
+	workDirty := w.recordPolishWork(state, snap, polished)
+
+	h, ok := snap.Health()
+	if !ok {
+		return workDirty
 	}
 	if state.BestHealth == nil || h.BetterThan(*state.BestHealth) {
 		state.BestHealth = &h
@@ -872,7 +972,88 @@ func (w *Watcher) recordHealth(state *State, snap *Snapshot) bool {
 	if polished {
 		state.RoundsSinceImprovement++
 	}
-	return polished
+	return polished || workDirty
+}
+
+// recordPolishWork charges this tick against the run's cumulative work counters
+// and the PR's scope budget, reporting whether it changed anything persistable.
+//
+// Split out of recordHealth so it can run before — and regardless of — the
+// health gate: a tick whose thread lookup failed still saw the round, and the
+// scope brake is only as good as the pushes it manages to count.
+func (w *Watcher) recordPolishWork(state *State, snap *Snapshot, polished bool) bool {
+	dirty := false
+	if polished {
+		// Cumulative: counted whether or not the round helped, so the terminal
+		// report can say how much work the run did as well as how long it has
+		// been stuck.
+		state.PolishRounds++
+		dirty = true
+	}
+	if n := pushedCommits(state, snap); n > 0 {
+		state.PolishCommits += n
+		dirty = true
+	}
+	// Record where this PR started so growth is reported against its real
+	// baseline rather than against zero. First observation only.
+	if state.BaselineAdditions == 0 && snap.PR.Additions > 0 {
+		state.BaselineAdditions = snap.PR.Additions
+		dirty = true
+	}
+	return dirty
+}
+
+// pushedCommits reports how many commits prdozer's previous round added.
+//
+// Charged for every action that follows an agent run, expressed as the SHORT
+// list of actions that provably ran no agent — so an action added later is
+// charged by default. Enumerating the charged side instead is how this leaked
+// twice: first LastActionReworked (rework rebases and resolves conflicts,
+// pushing like any round), then LastActionFailed and its siblings — the polish
+// and rework runners keep the rounds that succeeded and THEN return the later
+// round's error, so an invocation that pushed three commits before dying was
+// recorded as a failure and billed nothing. Every one of those holes is a way
+// to ratchet for free, which is the failure direction this guard exists to close.
+//
+// Keyed off the head actually moving rather than off the round returning: a
+// round that only replied to comments has not grown the PR, and the scope brake
+// is about growth.
+//
+// The SIZE of the push comes from the commit count, not from the fact of the
+// push. A polish invocation commits once per round and force-pushes once at the
+// end, so charging one per push reads five rounds of growth as a single commit
+// — a cap of 12 would then sit ~60 commits deep, well past the 23 that made the
+// guard necessary.
+//
+// A human who pushes to the branch inside the same tick is billed to prdozer,
+// because commit authorship cannot tell the two apart: prdozer commits under
+// the operator's own git identity, so the author login is identical either way.
+// The bias is deliberate rather than merely tolerated — this is a brake, and
+// over-charging stops a run early where under-charging lets it ratchet, which
+// is the outcome that cost five days and $364.
+func pushedCommits(state *State, snap *Snapshot) int {
+	switch state.LastAction {
+	// No agent ran, so any movement on the branch came from somebody else:
+	// nothing polished or reworked, the tick only observed, merged, armed or
+	// handed the PR to a human.
+	case LastActionInit, LastActionIdle, LastActionMerged, LastActionClosed,
+		LastActionArmed, LastActionNeedsHuman, LastActionDryRun:
+		return 0
+	}
+	if state.LastSeenHeadSHA == "" || snap.PR.HeadRefOid == "" ||
+		state.LastSeenHeadSHA == snap.PR.HeadRefOid {
+		return 0
+	}
+	// Floor of one. The count is unusable when gh served neither an exact count
+	// nor a commit list, or when state predates the field, or when a rebase or
+	// squash left the branch no longer than it was — but the head moved, so a
+	// round's worth of growth did happen and charging zero would hand a
+	// squashing run an unlimited budget.
+	now := snap.PR.CommitCount()
+	if now == 0 || state.LastSeenCommitCount <= 0 || now <= state.LastSeenCommitCount {
+		return 1
+	}
+	return now - state.LastSeenCommitCount
 }
 
 // merge lands the PR according to the configured policy and then VERIFIES the
@@ -959,6 +1140,14 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 
 	if s.LastSeenHeadSHA != snap.PR.HeadRefOid {
 		s.LastSeenHeadSHA = snap.PR.HeadRefOid
+		dirty = true
+	}
+	// Only when gh actually served a count: zero means neither the GraphQL
+	// scalar nor the commit list came back, not that the PR lost its commits,
+	// and overwriting a real count with zero would charge the next push a floor
+	// of one instead of its true size.
+	if n := snap.PR.CommitCount(); n > 0 && s.LastSeenCommitCount != n {
+		s.LastSeenCommitCount = n
 		dirty = true
 	}
 	if snap.BaseSHA != "" && s.LastSeenBaseSHA != snap.BaseSHA {

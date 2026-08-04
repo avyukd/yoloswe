@@ -24,6 +24,7 @@ import (
 type fakeGH struct {
 	results  map[string]*wt.CmdResult
 	failures map[string]*wt.CmdResult
+	contains map[string]*wt.CmdResult
 	calls    [][]string
 	mu       sync.Mutex
 }
@@ -32,6 +33,7 @@ func newFakeGH() *fakeGH {
 	return &fakeGH{
 		results:  make(map[string]*wt.CmdResult),
 		failures: make(map[string]*wt.CmdResult),
+		contains: make(map[string]*wt.CmdResult),
 	}
 }
 
@@ -40,11 +42,28 @@ func (f *fakeGH) addPrefix(prefix, stdout string) {
 	f.results[prefix] = &wt.CmdResult{Stdout: stdout}
 }
 
+// addContains registers a stdout response for any call whose joined args
+// CONTAIN substr. Every GraphQL call shares the `api graphql -f query=` prefix
+// and differs only inside the query body, so prefix matching cannot tell the
+// commit-count query from the review-thread one.
+func (f *fakeGH) addContains(substr, stdout string) {
+	f.contains[substr] = &wt.CmdResult{Stdout: stdout}
+}
+
 // failPrefix registers a FAILING response (non-zero exit plus stderr) for any
 // call whose joined-args starts with prefix, so tests can exercise the paths
 // that only run when a gh command actually errors.
 func (f *fakeGH) failPrefix(prefix, stderr string) {
 	f.failures[prefix] = &wt.CmdResult{Stderr: stderr, ExitCode: 1}
+}
+
+// recoverPrefix drops a previously registered failure, so a test can make a gh
+// call fail on one tick and succeed on the next — the shape of a transient
+// outage, which is the only way to prove a blip does not corrupt saved state.
+func (f *fakeGH) recoverPrefix(prefix string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.failures, prefix)
 }
 
 func (f *fakeGH) Run(_ context.Context, args []string, _ string) (*wt.CmdResult, error) {
@@ -57,6 +76,14 @@ func (f *fakeGH) Run(_ context.Context, args []string, _ string) (*wt.CmdResult,
 	for prefix, res := range f.failures {
 		if strings.HasPrefix(joined, prefix) {
 			return res, fmt.Errorf("exit status %d", res.ExitCode)
+		}
+	}
+	// Substring matches are checked before prefixes: they exist to pick one
+	// GraphQL query out of several that share a prefix, so a broad prefix must
+	// not shadow them.
+	for substr, res := range f.contains {
+		if strings.Contains(joined, substr) {
+			return res, nil
 		}
 	}
 	for prefix, res := range f.results {
@@ -105,9 +132,14 @@ func (s *stubPolish) Run(_ context.Context, req PolishRequest) (PolishResult, er
 	return res, nil
 }
 
+// prViewPrefix is the args prefix of the snapshot's `gh pr view` call. Named so
+// a test can re-register it and REPLACE the response; a second, differently
+// spelled prefix that also matched would be resolved by map iteration order.
+const prViewPrefix = "pr view 42 --json number,url,headRefName,baseRefName,headRefOid,state,isDraft,reviewDecision,mergeable,statusCheckRollup"
+
 func setupGH(prJSON, runListJSON, baseSHA string) *fakeGH {
 	gh := newFakeGH()
-	gh.addPrefix("pr view 42 --json number,url,headRefName,baseRefName,headRefOid,state,isDraft,reviewDecision,mergeable,statusCheckRollup", prJSON)
+	gh.addPrefix(prViewPrefix, prJSON)
 	gh.addPrefix("run list --branch feature --status failure", runListJSON)
 	gh.addPrefix("api repos/{owner}/{repo}/git/refs/heads/main", baseSHA)
 	gh.addPrefix("api --paginate repos/o/r/pulls/42/comments", "[]")
@@ -2222,4 +2254,652 @@ func TestWatcher_Tick_CounterOnlyChange_IsPersisted(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 5, after.InvocationsSinceRound,
 		"a tick whose only change is the no-progress counter must still be saved")
+}
+
+// The scope brake must stop a run whose rounds all SUCCEED.
+//
+// This is the kernel#8374 shape and the reason it needs its own guard: every
+// liveness check reads that run as healthy. Rounds do not error, so
+// ConsecutiveFailures stays 0. Each round closes the findings the previous one
+// drew, so BestHealth keeps being beaten and RoundsSinceImprovement resets to 0
+// — it sat at zero across eight consecutive ticks. Rounds return, so
+// InvocationsSinceRound stays 0. Meanwhile the PR grew from 6 files/+407 to 13
+// files/+2509 over 23 commits and five days, and nothing stopped it.
+func TestWatcher_ScopeRatchet_StopsAHealthyButGrowingRun(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxPolishCommits = 3
+	statePath := StatePath("r", 42)
+
+	// Deliberately the picture of health by every OTHER guard: no failures, no
+	// stalls, and a fresh improvement streak. Only the commit count is high.
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		PolishCommits: 3, ConsecutiveFailures: 0, RoundsSinceImprovement: 0,
+		InvocationsSinceRound: 0,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionNeedsHuman, res.Action,
+		"a run that keeps succeeding while the PR keeps growing must still stop")
+}
+
+// Below the limit the guard must stay out of the way, or it becomes a round cap
+// wearing a different name.
+func TestWatcher_ScopeRatchet_SilentBelowTheLimit(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxPolishCommits = 12
+	statePath := StatePath("r", 42)
+
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		PolishCommits: 11,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.NotEqual(t, LastActionNeedsHuman, res.Action,
+		"one commit below the limit is still ordinary work")
+}
+
+// Zero disables the guard, so an operator can opt a repo out without patching.
+func TestWatcher_ScopeRatchet_ZeroDisables(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxPolishCommits = 0
+	statePath := StatePath("r", 42)
+
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		PolishCommits: 500,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.NotEqual(t, LastActionNeedsHuman, res.Action, "zero must disable the guard")
+}
+
+// At the limit, a tick that would only ORIGINATE a review must still run it.
+//
+// The brake counts commits, and a review-only tick produces none — there is
+// nothing for it to measure. On a self_review repo stopping here is the worse
+// of the two failures: prdozer is the only reviewer, so the run hands back a
+// green PR whose last commit nobody has read, and auto-merge is gated on
+// needsSelfReview so the PR cannot land either.
+func TestWatcher_ScopeRatchet_LetsTheOwedReviewRun(t *testing.T) {
+	prJSON := strings.Replace(okPRJSON, `"reviewDecision": "REVIEW_REQUIRED"`, `"reviewDecision": ""`, 1)
+	gh := setupGH(buildPRJSON(prJSON, "SUCCESS"), "[]", "base1")
+	gh.setThreads(0)
+	gh.addPrefix("api repos/o/r/pulls/42 --jq .merged", "false")
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Polish.SelfReview = true
+	w.cfg.Backoff.MaxPolishCommits = 3
+	statePath := StatePath("r", 42)
+
+	// At the limit, with nothing to polish: same head, same base, no failures.
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		PolishCommits: 3,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionPolished, res.Action,
+		"the scope brake counts commits; a review-only tick adds none and still owes a review")
+	assert.Len(t, polish.calls, 1, "the owed review must actually run")
+	assert.False(t, res.Ratcheted, "nothing was stopped, so nothing may report a scope stop")
+}
+
+// The allowance is bounded, and the bound is load-bearing.
+//
+// Every polish round pushes a commit, which moves the head, which makes
+// needsSelfReview true again — so an unconditional review exemption would mean
+// the brake can never fire on a self_review repo at all, restoring the
+// unbounded run it exists to prevent. Past 2*limit the commit count stands on
+// its own however the head looks.
+func TestWatcher_ScopeRatchet_ReviewAllowanceExpires(t *testing.T) {
+	prJSON := strings.Replace(okPRJSON, `"reviewDecision": "REVIEW_REQUIRED"`, `"reviewDecision": ""`, 1)
+	gh := setupGH(buildPRJSON(prJSON, "SUCCESS"), "[]", "base1")
+	gh.setThreads(0)
+	gh.addPrefix("api repos/o/r/pulls/42 --jq .merged", "false")
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Polish.SelfReview = true
+	w.cfg.Backoff.MaxPolishCommits = 3
+	statePath := StatePath("r", 42)
+
+	// Identical to the test above but at twice the limit: same unreviewed head,
+	// same clean PR, so only the count can be what decides.
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		PolishCommits: 6,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionNeedsHuman, res.Action,
+		"a second allowance is all a run gets; past 2*limit the count stands on its own")
+	assert.True(t, res.Ratcheted, "and the stop must still report itself as a scope stop")
+	assert.Empty(t, polish.calls, "the run is over — no round may start after the brake fires")
+}
+
+// The allowance covers the review, not the polishing. A tick with real work
+// queued is exactly what the brake exists to stop, unreviewed head or not.
+func TestWatcher_ScopeRatchet_StopsWorkOnAnUnreviewedHead(t *testing.T) {
+	// CI is failing, so NeedsPolish() is true: this tick would push commits.
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(0)
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Polish.SelfReview = true
+	w.cfg.Backoff.MaxPolishCommits = 3
+	statePath := StatePath("r", 42)
+
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		PolishCommits: 3,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionNeedsHuman, res.Action,
+		"an unreviewed head must not buy a commit-producing round past the limit")
+	assert.True(t, res.Ratcheted)
+	assert.Empty(t, polish.calls, "the brake fired, so no round may run")
+}
+
+// The scope guard is only as good as the pushes it manages to count, so the
+// counter has its own tests — the three above pre-seed PolishCommits and never
+// exercise the code that produces it.
+//
+// scopeSnapshot is a snapshot with the fields the counter reads, and nothing
+// else: head, commit list, diff size.
+func scopeSnapshot(head string, commits, additions int) *Snapshot {
+	rows := make([]commitRow, commits)
+	for i := range rows {
+		rows[i] = commitRow{OID: fmt.Sprintf("c%d", i)}
+	}
+	return &Snapshot{PR: PRDetails{HeadRefOid: head, Commits: rows, Additions: additions}}
+}
+
+// A push is charged for every commit it carried, not for the fact of the push.
+//
+// This is the difference between a cap that works and one that never fires: a
+// polish invocation commits once per round and force-pushes ONCE at the end, so
+// per-push counting reads a 5-round invocation as a single commit. A limit of
+// 12 would then sit around 60 commits deep — three times the 23 that made the
+// guard necessary in the first place.
+func TestRecordHealth_ChargesEveryCommitInAPush(t *testing.T) {
+	t.Parallel()
+	w := NewWatcher(DefaultConfig(), nil, nil, 42, ".", "r", nil)
+	state := &State{
+		LastAction: LastActionPolished, LastSeenHeadSHA: "head1",
+		LastSeenCommitCount: 4,
+	}
+
+	w.recordHealth(state, scopeSnapshot("head2", 9, 100))
+
+	assert.Equal(t, 5, state.PolishCommits,
+		"a push that added five commits costs five, not one")
+	assert.Equal(t, 1, state.PolishRounds)
+}
+
+// A tick whose health is unreadable must still charge the push.
+//
+// Health() reports !ok whenever the unresolved-thread lookup failed, and
+// recordSnapshot advances LastSeenHeadSHA and LastSeenCommitCount at the end of
+// the tick regardless — so a push charged behind the health gate is not merely
+// deferred, it is lost, and the run gets those commits for free.
+func TestRecordHealth_ChargesPushWhenHealthIsUnreadable(t *testing.T) {
+	t.Parallel()
+	w := NewWatcher(DefaultConfig(), nil, nil, 42, ".", "r", nil)
+	snap := scopeSnapshot("head2", 6, 100)
+	snap.UnresolvedThreads = -1 // the thread query failed
+	_, ok := snap.Health()
+	require.False(t, ok, "guarding the premise: this snapshot must be unreadable")
+
+	state := &State{
+		LastAction: LastActionPolished, LastSeenHeadSHA: "head1",
+		LastSeenCommitCount: 2,
+	}
+
+	dirty := w.recordHealth(state, snap)
+
+	assert.Equal(t, 4, state.PolishCommits,
+		"a failed side query does not un-happen the round that pushed")
+	assert.True(t, dirty, "the new count must be persisted, or the next tick reloads without it")
+}
+
+// A round that only replied to comments has not grown the PR, and the scope
+// brake is about growth.
+func TestRecordHealth_UnmovedHeadCostsNothing(t *testing.T) {
+	t.Parallel()
+	w := NewWatcher(DefaultConfig(), nil, nil, 42, ".", "r", nil)
+	state := &State{
+		LastAction: LastActionPolished, LastSeenHeadSHA: "head1",
+		LastSeenCommitCount: 4,
+	}
+
+	w.recordHealth(state, scopeSnapshot("head1", 4, 100))
+
+	assert.Zero(t, state.PolishCommits, "no push, no growth, no charge")
+	assert.Equal(t, 1, state.PolishRounds, "the round still ran")
+}
+
+// A rebase or squash can leave the branch no longer than it was. The head moved,
+// so a round's worth of growth happened; charging zero would hand a squashing
+// run an unlimited budget. Same floor covers a gh payload with no commit list
+// and state written before the field existed.
+func TestRecordHealth_ShrinkingPushStillCostsOne(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name          string
+		commits, seen int
+	}{
+		{"squashed", 2, 7},
+		{"no commit list from gh", 0, 7},
+		{"state predates the field", 9, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			w := NewWatcher(DefaultConfig(), nil, nil, 42, ".", "r", nil)
+			state := &State{
+				LastAction: LastActionPolished, LastSeenHeadSHA: "head1",
+				LastSeenCommitCount: tc.seen,
+			}
+			w.recordHealth(state, scopeSnapshot("head2", tc.commits, 100))
+			assert.Equal(t, 1, state.PolishCommits,
+				"an uncountable push still costs the floor of one")
+		})
+	}
+}
+
+// Only prdozer's own rounds are charged: a human pushing to the branch between
+// ticks must not spend the budget prdozer is being held to.
+func TestRecordHealth_OnlyPolishedTicksAreCharged(t *testing.T) {
+	t.Parallel()
+	w := NewWatcher(DefaultConfig(), nil, nil, 42, ".", "r", nil)
+	state := &State{
+		LastAction: LastActionIdle, LastSeenHeadSHA: "head1",
+		LastSeenCommitCount: 4,
+	}
+
+	w.recordHealth(state, scopeSnapshot("head2", 9, 100))
+
+	assert.Zero(t, state.PolishCommits, "prdozer did not push this")
+	assert.Zero(t, state.PolishRounds)
+}
+
+// The counter must survive a full tick: recordHealth charges the push, and
+// recordSnapshot then advances the baselines it charged against, so the next
+// tick starts from the new head and count rather than double-charging.
+func TestWatcher_Tick_ScopeCounterAdvancesAcrossTicks(t *testing.T) {
+	pushed := buildPRJSON(`{
+  "number": 42,
+  "url": "https://github.com/o/r/pull/42",
+  "headRefName": "feature",
+  "baseRefName": "main",
+  "headRefOid": "head2",
+  "state": "OPEN",
+  "isDraft": false,
+  "reviewDecision": "REVIEW_REQUIRED",
+  "mergeable": "MERGEABLE",
+  "additions": 900,
+  "commits": [{"oid":"c1"},{"oid":"c2"},{"oid":"c3"},{"oid":"c4"},{"oid":"c5"}]
+}`, "FAILURE")
+	gh := setupGH(pushed, "[]", "base1")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	statePath := StatePath("r", 42)
+
+	// The previous tick polished and the round pushed three commits onto the
+	// two the PR already had.
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		LastSeenCommitCount: 2, LastAction: LastActionPolished,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	_, err := w.Tick(context.Background())
+	require.NoError(t, err)
+
+	after, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 3, after.PolishCommits, "three commits arrived on that push")
+	assert.Equal(t, 5, after.LastSeenCommitCount, "the baseline moves to what was just seen")
+	assert.Equal(t, "head2", after.LastSeenHeadSHA)
+
+	// A second tick with nothing new must not re-charge the same push.
+	_, err = w.Tick(context.Background())
+	require.NoError(t, err)
+	after, err = LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 3, after.PolishCommits, "the same push must not be charged twice")
+}
+
+// `gh pr view --json commits` runs an unpaginated `commits(first:100)`, so on a
+// PR already 100 commits deep the list length is a cap, not a count. Left
+// unfixed, that pins LastSeenCommitCount at 100 forever: every later push looks
+// like zero growth and is charged the floor of one, so a limit of 12 tolerates
+// an unbounded number of agent commits — the brake under-counting, the one
+// direction it is explicitly built not to fail in.
+func TestCommitCount_ExactCountBeatsTheTruncatedList(t *testing.T) {
+	t.Parallel()
+	saturated := make([]commitRow, 100)
+
+	assert.Equal(t, 137, PRDetails{Commits: saturated, TotalCommits: 137}.CommitCount(),
+		"the GraphQL scalar is the real count; the list is capped at 100")
+	assert.Zero(t, PRDetails{Commits: saturated}.CommitCount(),
+		"a saturated list is unknown, not 100 — reporting the cap as a count "+
+			"poisons the baseline and fakes growth on the next tick")
+	assert.Equal(t, 99, PRDetails{Commits: saturated[:99]}.CommitCount(),
+		"under the cap the list is exact, so it is still the fallback")
+	assert.Zero(t, PRDetails{}.CommitCount(),
+		"no list and no count is unknown, and the caller floors it")
+}
+
+// The end-to-end version of the above: a real tick on a 100-commit PR must
+// charge the push its true delta, which means the count has to come from
+// GraphQL and survive all the way into PolishCommits.
+func TestWatcher_ChargesRealDeltaOnAPRPastTheCommitListCap(t *testing.T) {
+	// The list gh serves is truncated at 100 whatever the PR really carries.
+	rows := make([]string, 100)
+	for i := range rows {
+		rows[i] = fmt.Sprintf(`{"oid":"c%d"}`, i)
+	}
+	pushed := buildPRJSON(fmt.Sprintf(`{
+  "number": 42,
+  "url": "https://github.com/o/r/pull/42",
+  "headRefName": "feature",
+  "baseRefName": "main",
+  "headRefOid": "head2",
+  "state": "OPEN",
+  "isDraft": false,
+  "reviewDecision": "REVIEW_REQUIRED",
+  "mergeable": "MERGEABLE",
+  "additions": 900,
+  "commits": [%s]
+}`, strings.Join(rows, ",")), "FAILURE")
+	gh := setupGH(pushed, "[]", "base1")
+	// GraphQL reports the count as a scalar, so it is immune to the cap.
+	gh.addContains("commits{ totalCount }", "137\n")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	statePath := StatePath("r", 42)
+
+	// Last tick polished and saw 130 commits; the round pushed seven more.
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		LastSeenCommitCount: 130, LastAction: LastActionPolished,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	_, err := w.Tick(context.Background())
+	require.NoError(t, err)
+
+	after, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 7, after.PolishCommits,
+		"seven commits arrived; the truncated list would have charged the floor of one")
+	assert.Equal(t, 137, after.LastSeenCommitCount,
+		"the baseline is the exact count, not the 100-entry cap")
+}
+
+// When the exact query fails there is nothing better than the truncated list,
+// and falling back to it must keep the pre-existing behaviour rather than
+// charging zero — a snapshot that reads as "no commits" would hand a growing PR
+// a free tick.
+func TestWatcher_FallsBackToTheCommitListWhenTheExactCountFails(t *testing.T) {
+	pushed := buildPRJSON(`{
+  "number": 42,
+  "url": "https://github.com/o/r/pull/42",
+  "headRefName": "feature",
+  "baseRefName": "main",
+  "headRefOid": "head2",
+  "state": "OPEN",
+  "isDraft": false,
+  "reviewDecision": "REVIEW_REQUIRED",
+  "mergeable": "MERGEABLE",
+  "additions": 900,
+  "commits": [{"oid":"c1"},{"oid":"c2"},{"oid":"c3"},{"oid":"c4"},{"oid":"c5"}]
+}`, "FAILURE")
+	gh := setupGH(pushed, "[]", "base1")
+	gh.failPrefix("api graphql -f query=query($owner:String!,$repo:String!,$pr:Int!){", "gone")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	statePath := StatePath("r", 42)
+
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		LastSeenCommitCount: 2, LastAction: LastActionPolished,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	_, err := w.Tick(context.Background())
+	require.NoError(t, err)
+
+	after, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 3, after.PolishCommits, "the list still counts when the scalar is unavailable")
+	assert.Equal(t, 5, after.LastSeenCommitCount)
+}
+
+// A transient GraphQL failure on a PR past the cap must not poison the
+// baseline. If the truncated 100 were persisted over a real 137, the next
+// successful tick would read 37 commits of growth that never happened and slam
+// a limit of 12 shut on a run that pushed two commits.
+func TestWatcher_TransientCountFailureDoesNotPoisonTheBaseline(t *testing.T) {
+	rows := make([]string, 100)
+	for i := range rows {
+		rows[i] = fmt.Sprintf(`{"oid":"c%d"}`, i)
+	}
+	prJSON := func(head string) string {
+		return buildPRJSON(fmt.Sprintf(`{
+  "number": 42,
+  "url": "https://github.com/o/r/pull/42",
+  "headRefName": "feature",
+  "baseRefName": "main",
+  "headRefOid": %q,
+  "state": "OPEN",
+  "isDraft": false,
+  "reviewDecision": "REVIEW_REQUIRED",
+  "mergeable": "MERGEABLE",
+  "additions": 900,
+  "commits": [%s]
+}`, head, strings.Join(rows, ",")), "FAILURE")
+	}
+	const countQuery = "api graphql -f query=query($owner:String!,$repo:String!,$pr:Int!){"
+
+	gh := setupGH(prJSON("head2"), "[]", "base1")
+	gh.failPrefix(countQuery, "gone")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	statePath := StatePath("r", 42)
+
+	// The PR really carries 137 commits and the last tick knew it.
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		LastSeenCommitCount: 137, LastAction: LastActionPolished,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	// Tick one: a push landed, but the exact count is unavailable.
+	_, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	after, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 1, after.PolishCommits, "an unknown count charges the floor of one")
+	assert.Equal(t, 137, after.LastSeenCommitCount,
+		"the truncated 100 must not overwrite the last authoritative count")
+
+	// Tick two: GraphQL recovers and another two commits have landed.
+	gh.recoverPrefix(countQuery)
+	gh.addContains("commits{ totalCount }", "139\n")
+	// Same key setupGH registered, so this REPLACES the response rather than
+	// racing it: two prefixes both matching would resolve by map order.
+	gh.addPrefix(prViewPrefix, prJSON("head3"))
+
+	_, err = w.Tick(context.Background())
+	require.NoError(t, err)
+	after, err = LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 3, after.PolishCommits,
+		"one floored tick plus the two commits actually pushed — not 39")
+	assert.Equal(t, 139, after.LastSeenCommitCount)
+}
+
+// The stop must reach the operator as a SCOPE stop. The guard sets w.ratcheted
+// precisely because "needs a human" otherwise reads as "waiting on an approval",
+// and a flag nothing carries out of the tick cannot do that.
+func TestWatcher_ScopeRatchet_ReportsItselfOnTheResult(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxPolishCommits = 3
+	statePath := StatePath("r", 42)
+
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		PolishCommits: 4,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, LastActionNeedsHuman, res.Action)
+	assert.True(t, res.Ratcheted,
+		"without this the terminal report calls a scope stop an approval block")
+	assert.Equal(t, 4, res.PolishCommits)
+	assert.Equal(t, 3, res.PolishCommitLimit)
+	assert.False(t, res.Diverged, "the scope guard fired, not the divergence guard")
+}
+
+// The scope guard must not block a PR that is already DONE.
+//
+// It sits below the mergeable branches in decideAndAct, which reads like a
+// bypass and was flagged as one. It is deliberate: the guard exists to stop
+// FURTHER polishing, and a mergeable PR is APPROVED with checks green — a human
+// has already looked at the scope and said yes. Hoisting the guard above the
+// merge would strand exactly the PRs that grew large and then got reviewed
+// anyway, leaving them needing a human for a decision a human just made.
+func TestWatcher_ScopeRatchet_DoesNotBlockAnApprovedGreenPR(t *testing.T) {
+	gh := approvedGreenGH("true")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicySquash
+	w.cfg.Backoff.MaxPolishCommits = 3
+	statePath := StatePath("r", 42)
+
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		PolishCommits: 99, // far past the cap
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionMerged, res.Action,
+		"an approved, green PR is finished; the scope brake stops polishing, not merging")
+	assert.False(t, res.Ratcheted)
+}
+
+// Merge rework grows the PR too, and is the easier one to forget.
+//
+// It runs an agent against the branch to rebase or resolve conflicts against a
+// failed merge, pushing commits exactly like a polish round does. Charging only
+// LastActionPolished lets a run that keeps failing its merge ratchet for free —
+// the same unbounded growth the guard exists to stop, reached by the other door.
+func TestRecordHealth_ChargesMergeReworkPushes(t *testing.T) {
+	t.Parallel()
+	w := NewWatcher(DefaultConfig(), nil, nil, 42, ".", "r", nil)
+	state := &State{
+		LastAction: LastActionReworked, LastSeenHeadSHA: "head1",
+		LastSeenCommitCount: 4,
+	}
+
+	w.recordHealth(state, scopeSnapshot("head2", 6, 100))
+
+	assert.Equal(t, 2, state.PolishCommits, "a rework that pushed twice costs two")
+	assert.Zero(t, state.PolishRounds, "a rework is not a polish round")
+}
+
+// An invocation that pushes and THEN fails must still be billed.
+//
+// Both runners preserve the rounds that succeeded and return the later round's
+// error, so a spec that pushed three commits before dying lands in state as
+// LastActionFailed — or Stalled, or Transient. Charging only the clean-exit
+// actions hands those pushes to the run for free, and a run that fails its last
+// round every time would ratchet without ever tripping the cap.
+func TestRecordHealth_ChargesPushesThatEndedInFailure(t *testing.T) {
+	t.Parallel()
+	for _, action := range []LastAction{LastActionFailed, LastActionStalled, LastActionTransient} {
+		t.Run(string(action), func(t *testing.T) {
+			t.Parallel()
+			w := NewWatcher(DefaultConfig(), nil, nil, 42, ".", "r", nil)
+			state := &State{
+				LastAction: action, LastSeenHeadSHA: "head1", LastSeenCommitCount: 4,
+			}
+
+			w.recordHealth(state, scopeSnapshot("head2", 7, 100))
+
+			assert.Equal(t, 3, state.PolishCommits,
+				"the rounds that landed before the error still grew the PR")
+		})
+	}
+}
+
+// The failure itself is never what gets billed — the push is.
+//
+// Read twice now as "provider outages are charged as prdozer scope growth",
+// because Transient sits on the billable side of pushedCommits' switch. It is
+// only reachable there when the head MOVED, which for a died-on-529 invocation
+// means it pushed before it died. An outage that pushed nothing leaves the head
+// where it was and costs zero — asserted here so the answer lives in the suite
+// rather than in a review thread.
+func TestRecordHealth_AnOutageThatPushedNothingCostsNothing(t *testing.T) {
+	t.Parallel()
+	for _, action := range []LastAction{LastActionFailed, LastActionStalled, LastActionTransient} {
+		t.Run(string(action), func(t *testing.T) {
+			t.Parallel()
+			w := NewWatcher(DefaultConfig(), nil, nil, 42, ".", "r", nil)
+			state := &State{
+				LastAction: action, LastSeenHeadSHA: "head1", LastSeenCommitCount: 4,
+			}
+
+			w.recordHealth(state, scopeSnapshot("head1", 4, 100))
+
+			assert.Zero(t, state.PolishCommits,
+				"the round died without pushing; there is no growth to charge")
+		})
+	}
+}
+
+// The other side of the same rule: ticks where no agent ran are never charged,
+// so a human pushing to an idle PR does not spend prdozer's budget.
+func TestRecordHealth_TicksWithoutAnAgentAreNeverCharged(t *testing.T) {
+	t.Parallel()
+	for _, action := range []LastAction{
+		LastActionInit, LastActionIdle, LastActionMerged, LastActionClosed,
+		LastActionArmed, LastActionNeedsHuman, LastActionDryRun,
+	} {
+		name := string(action)
+		if name == "" {
+			name = "init"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			w := NewWatcher(DefaultConfig(), nil, nil, 42, ".", "r", nil)
+			state := &State{
+				LastAction: action, LastSeenHeadSHA: "head1", LastSeenCommitCount: 4,
+			}
+
+			w.recordHealth(state, scopeSnapshot("head2", 9, 100))
+
+			assert.Zero(t, state.PolishCommits, "prdozer ran nothing; this push is not its growth")
+		})
+	}
 }

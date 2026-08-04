@@ -19,6 +19,10 @@ func TestDefaultConfig_Sane(t *testing.T) {
 	assert.Equal(t, 30*time.Minute, c.PollInterval)
 	assert.Equal(t, 3, c.Source.MaxConcurrent)
 	assert.False(t, c.Polish.AutoMerge)
+	// The scope brake is only a brake if it ships on by default: every scope
+	// test sets MaxPolishCommits itself, so a production default that silently
+	// went to zero — which DISABLES the guard — would pass the whole suite.
+	assert.Equal(t, 12, c.Backoff.MaxPolishCommits)
 }
 
 func TestDefaultConfig_RunsValidateForBudgetInheritance(t *testing.T) {

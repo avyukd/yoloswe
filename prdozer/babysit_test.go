@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -546,4 +547,89 @@ func TestEndsTheRun_MatchesTerminalFor(t *testing.T) {
 				"endsTheRun must agree with terminalFor for %q", action)
 		})
 	}
+}
+
+// selfLoginGH answers the login lookup and nothing else.
+type selfLoginGH struct {
+	mu sync.Mutex
+}
+
+func (g *selfLoginGH) Run(_ context.Context, args []string, _ string) (*wt.CmdResult, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if strings.Contains(strings.Join(args, " "), "api user") {
+		return &wt.CmdResult{Stdout: "mzhaom\n"}, nil
+	}
+	// Anything else: an empty-but-valid payload keeps the caller moving.
+	return &wt.CmdResult{Stdout: "{}"}, nil
+}
+
+// A scope stop is the fourth kind of LastActionNeedsHuman, and the one the
+// generic message inverts outright: every round SUCCEEDED. "Blocked on a review
+// approval" sends the operator to find a reviewer, when what the PR needs is
+// someone to decide what to cut — the same misdiagnosis Diverged and Stalled
+// were added to prevent.
+func TestTerminalFor_RatchetedSaysWhy(t *testing.T) {
+	t.Parallel()
+	pr := DiscoveredPR{Number: 42}
+
+	state, msg, done := terminalFor(TickResult{
+		Action: LastActionNeedsHuman, Ratcheted: true,
+		PolishCommits: 23, PolishCommitLimit: 12, PolishRounds: 7,
+	}, pr)
+	require.True(t, done)
+	assert.Equal(t, TerminalNeedsHuman, state)
+	assert.Contains(t, msg, "scope cap")
+	assert.Contains(t, msg, "23 commits", "the operator needs the number that tripped the guard")
+	assert.Contains(t, msg, "limit 12")
+	assert.NotContains(t, msg, "review approval",
+		"nothing here is waiting on a reviewer")
+
+	_, plain, done := terminalFor(TickResult{Action: LastActionNeedsHuman}, pr)
+	require.True(t, done)
+	assert.NotContains(t, plain, "scope cap",
+		"a PR blocked on an approval must not be reported as over-scoped")
+}
+
+// The watcher babysit builds must carry the self login.
+//
+// Without it w.self is "", so Snapshot never marks a comment IsSelf, and
+// NewComments — an unconditional polish trigger — fires on prdozer's own
+// replies. The run then polishes in response to itself: kernel#7040 read
+// UNRES=0 / SUCCESS / APPROVED on every tick and still ran six rounds, with the
+// comment count climbing in lockstep with the rounds producing it. The
+// orchestrator path has always passed WithSelfLogin; only babysit did not.
+//
+// Asserted on the constructed watcher rather than through a running loop, and
+// that is the whole point of splitting newWatcher out. The bug was an option
+// never passed, which is invisible from outside a loop: a loop-level test can
+// only see that `gh api user` was called, and that still passes with
+// WithSelfLogin deleted. newWatcher is also the loop's only watcher
+// construction path (babysit.go), so this covers the loop too.
+//
+// The other half of the chain — w.self reaching the trigger — is
+// TestComputeChangeset_NewComments_IgnoresSelf.
+func TestBabysitNewWatcher_CarriesSelfLoginIntoTheWatcher(t *testing.T) {
+	t.Parallel()
+	gh := &selfLoginGH{}
+	b := NewBabysitter(gh, nil, nil, nil, BabysitOptions{OwnerRepo: "o/r", PRNumber: 42})
+
+	w := b.newWatcher(context.Background(), &RunContext{WorktreePath: t.TempDir()}, nil)
+
+	assert.Equal(t, "mzhaom", w.self,
+		"without the login every self-reply reads as a new comment and starts another round")
+}
+
+// A login lookup that fails must disable the filter, not the run: the same
+// best-effort behaviour the orchestrator path already has.
+func TestBabysitNewWatcher_LoginFailureLeavesTheRunAlive(t *testing.T) {
+	t.Parallel()
+	gh := newFakeGH()
+	gh.failPrefix("api user", "gh: not authenticated")
+	b := NewBabysitter(gh, nil, nil, nil, BabysitOptions{OwnerRepo: "o/r", PRNumber: 42})
+
+	w := b.newWatcher(context.Background(), &RunContext{WorktreePath: t.TempDir()}, nil)
+
+	require.NotNil(t, w, "a failed lookup must not take the run down with it")
+	assert.Empty(t, w.self)
 }
