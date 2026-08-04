@@ -208,13 +208,27 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 	// Counted, not compared by identity: decideAndAct adds keys to the SAME map
 	// when one already exists, so a pointer comparison would see no change.
 	priorOnceDone := len(state.OnceRoundsDone)
+	priorInvocations := state.InvocationsSinceRound
 	action := w.decideAndAct(ctx, snap, cs, state)
 	mergeStateDirty := state.MergeAttempts != priorAttempts ||
 		state.LastMergeError != priorMergeErr ||
 		state.SelfReviewedSHA != priorSelfReviewed ||
 		// Load-bearing: without this a newly completed once round is never saved,
 		// so the next tick reloads without it and runs it again.
-		len(state.OnceRoundsDone) != priorOnceDone
+		len(state.OnceRoundsDone) != priorOnceDone ||
+		// Same hazard as OnceRoundsDone above: decideAndAct owns this counter, and
+		// recordSnapshot only writes when something marks the state dirty, so a
+		// tick whose ONLY change is this counter would drop it.
+		//
+		// Defensive rather than demonstrated. Five attempts to build a failing
+		// test all passed unfixed, because on every reachable path something else
+		// (healthDirty, a LastAction transition, a new comment or run ID) already
+		// marked the state dirty. The omission is real and the invariant — every
+		// decideAndAct-owned field participates in the dirty check — is worth
+		// holding regardless; it just is not currently load-bearing. If you are
+		// here because a stall streak failed to climb, this is the first place to
+		// look, and that case would be the missing reproducer.
+		state.InvocationsSinceRound != priorInvocations
 
 	res := TickResult{Snapshot: snap, Changeset: cs, Action: action,
 		Diverged: w.diverged, PolishRounds: state.PolishRounds,
@@ -417,6 +431,15 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		}
 
 		if classified {
+			// Recorded on the STALL path too, not just the needs_human one above.
+			// cooldownCause reads this for LastActionStalled, and a stall reaches
+			// the cooldown through here — the guard above only fires at twice the
+			// brake limit. Setting it only there left that branch unreachable, so
+			// every stall-armed cooldown persisted the generic fallback instead of
+			// the grace-period error the plain-failure path records.
+			if action == LastActionStalled {
+				w.lastStallError = safe
+			}
 			return action
 		}
 		w.lastFailureError = safe

@@ -2135,3 +2135,35 @@ func TestWatcher_Tick_CompletedRound_ResetsNoProgressCounter(t *testing.T) {
 	assert.Equal(t, 0, s.InvocationsSinceRound,
 		"a returned round ends the no-progress streak")
 }
+
+// A stall that arms the cooldown must name the grace-period error.
+//
+// cooldownCause reads lastStallError for LastActionStalled, but that field was
+// only set by the no-progress guard, which fires at TWICE the brake limit. A
+// stall reaches the cooldown well before that, through classifyAgentFailure, so
+// the branch was unreachable on the path that actually arms it and every
+// stall-armed cooldown persisted the generic fallback.
+func TestWatcher_StallArmedCooldown_NamesTheGraceError(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	polish := &stubPolish{err: fmt.Errorf("polish round 1/2: agent execution: " +
+		"transient CLI error: stream idle: turn forced complete after grace period " +
+		"gated on background tool_use")}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	pre := &State{LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1"}
+	require.NoError(t, pre.Save(statePath))
+
+	// Enough stalls to arm the ordinary cooldown, but below the no-progress
+	// guard's 2x threshold — the window where the unreachable branch mattered.
+	for range 3 {
+		_, err := w.Tick(context.Background())
+		require.NoError(t, err)
+	}
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	require.False(t, s.CooldownUntil.IsZero(), "premise: repeated stalls must arm the cooldown")
+	assert.Contains(t, s.LastCooldownCause, "grace period",
+		"a stall-armed cooldown must name the grace-period error, not the generic fallback")
+}
