@@ -151,7 +151,20 @@ func (c GHPRChecker) Merged(ctx context.Context, prURL string) (bool, error) {
 }
 
 // prURLRE matches the PR URLs recorded in a run-log.
-var prURLRE = regexp.MustCompile(`github\.com/([^/]+)/([^/]+)/pull/(\d+)`)
+//
+// Anchored at the host on purpose. The substring "github.com/o/r/pull/1" also
+// occurs in "https://notgithub.com/o/r/pull/1", so an unanchored pattern would
+// answer that URL with github.com's o/r — the wrong repository, on the one path
+// that authorises deleting a worktree. A URL this does not match fails loudly in
+// parsePRURL instead, which keeps the worktree.
+//
+// github.com only, matching repoSlugFromURL in prdozer: nothing here plumbs a
+// host through to `gh`, so an enterprise URL has no correct answer to give and
+// is rejected rather than silently rewritten to github.com.
+//
+// The trailing boundary keeps "/pull/12x" from reading as PR 12, while still
+// allowing the "/files" and "#discussion_r…" tails gh and browsers append.
+var prURLRE = regexp.MustCompile(`^(?:https?://)?github\.com/([^/?#]+)/([^/?#]+)/pull/(\d+)(?:[/?#]|$)`)
 
 // parsePRURL pulls owner/repo/number out of a PR URL.
 func parsePRURL(prURL string) (owner, repo string, number int, err error) {

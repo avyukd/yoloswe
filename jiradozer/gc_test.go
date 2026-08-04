@@ -712,3 +712,44 @@ func TestParsePRURL(t *testing.T) {
 	_, _, _, err = parsePRURL("not a url")
 	require.Error(t, err)
 }
+
+// The parse is what picks the repository the merged check asks about, and its
+// answer authorises deleting a worktree. A URL it should not claim has to fail
+// loudly — answering with the wrong repo's .merged is how a worktree whose work
+// never landed gets swept.
+func TestParsePRURLRejectsURLsItDoesNotOwn(t *testing.T) {
+	for _, bad := range []string{
+		// A lookalike host contains "github.com/o/r/pull/1" as a substring; an
+		// unanchored pattern would answer it with github.com's o/r.
+		"https://notgithub.com/o/r/pull/1",
+		"https://evil.example/github.com/o/r/pull/1",
+		// Enterprise hosts have no correct answer here — nothing plumbs a host
+		// through to `gh` — so they are rejected, not rewritten to github.com.
+		"https://ghe.example.com/o/r/pull/1",
+		// Not a PR number.
+		"https://github.com/o/r/pull/12x",
+		"https://github.com/o/r/pull/",
+		// Not a PR.
+		"https://github.com/o/r/issues/1",
+	} {
+		_, _, _, err := parsePRURL(bad)
+		require.Error(t, err, "parsePRURL(%q) must not claim this URL", bad)
+	}
+}
+
+// The tails gh and the browser append are still the same PR.
+func TestParsePRURLAcceptsTrailingPath(t *testing.T) {
+	for _, u := range []string{
+		"https://github.com/bazelment/yoloswe/pull/302",
+		"https://github.com/bazelment/yoloswe/pull/302/files",
+		"https://github.com/bazelment/yoloswe/pull/302#discussion_r1",
+		"http://github.com/bazelment/yoloswe/pull/302",
+		"github.com/bazelment/yoloswe/pull/302",
+	} {
+		o, r, n, err := parsePRURL(u)
+		require.NoError(t, err, u)
+		require.Equal(t, "bazelment", o, u)
+		require.Equal(t, "yoloswe", r, u)
+		require.Equal(t, 302, n, u)
+	}
+}
