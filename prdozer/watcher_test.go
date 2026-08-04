@@ -2533,3 +2533,54 @@ func TestRecordHealth_ChargesMergeReworkPushes(t *testing.T) {
 	assert.Equal(t, 2, state.PolishCommits, "a rework that pushed twice costs two")
 	assert.Zero(t, state.PolishRounds, "a rework is not a polish round")
 }
+
+// An invocation that pushes and THEN fails must still be billed.
+//
+// Both runners preserve the rounds that succeeded and return the later round's
+// error, so a spec that pushed three commits before dying lands in state as
+// LastActionFailed — or Stalled, or Transient. Charging only the clean-exit
+// actions hands those pushes to the run for free, and a run that fails its last
+// round every time would ratchet without ever tripping the cap.
+func TestRecordHealth_ChargesPushesThatEndedInFailure(t *testing.T) {
+	t.Parallel()
+	for _, action := range []LastAction{LastActionFailed, LastActionStalled, LastActionTransient} {
+		t.Run(string(action), func(t *testing.T) {
+			t.Parallel()
+			w := NewWatcher(DefaultConfig(), nil, nil, 42, ".", "r", nil)
+			state := &State{
+				LastAction: action, LastSeenHeadSHA: "head1", LastSeenCommitCount: 4,
+			}
+
+			w.recordHealth(state, scopeSnapshot("head2", 7, 100))
+
+			assert.Equal(t, 3, state.PolishCommits,
+				"the rounds that landed before the error still grew the PR")
+		})
+	}
+}
+
+// The other side of the same rule: ticks where no agent ran are never charged,
+// so a human pushing to an idle PR does not spend prdozer's budget.
+func TestRecordHealth_TicksWithoutAnAgentAreNeverCharged(t *testing.T) {
+	t.Parallel()
+	for _, action := range []LastAction{
+		LastActionInit, LastActionIdle, LastActionMerged, LastActionClosed,
+		LastActionArmed, LastActionNeedsHuman, LastActionDryRun,
+	} {
+		name := string(action)
+		if name == "" {
+			name = "init"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			w := NewWatcher(DefaultConfig(), nil, nil, 42, ".", "r", nil)
+			state := &State{
+				LastAction: action, LastSeenHeadSHA: "head1", LastSeenCommitCount: 4,
+			}
+
+			w.recordHealth(state, scopeSnapshot("head2", 9, 100))
+
+			assert.Zero(t, state.PolishCommits, "prdozer ran nothing; this push is not its growth")
+		})
+	}
+}

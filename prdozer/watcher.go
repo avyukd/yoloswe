@@ -975,11 +975,15 @@ func (w *Watcher) recordPolishWork(state *State, snap *Snapshot, polished bool) 
 
 // pushedCommits reports how many commits prdozer's previous round added.
 //
-// Charged for BOTH agent actions that touch the branch. Polish is the obvious
-// one; merge rework is the one that gets missed — it rebases and resolves
-// conflicts against a failed merge, pushing commits exactly like a polish round
-// — and a run that keeps failing its merge would otherwise grow for free, which
-// is the failure direction this whole guard exists to close.
+// Charged for every action that follows an agent run, expressed as the SHORT
+// list of actions that provably ran no agent — so an action added later is
+// charged by default. Enumerating the charged side instead is how this leaked
+// twice: first LastActionReworked (rework rebases and resolves conflicts,
+// pushing like any round), then LastActionFailed and its siblings — the polish
+// and rework runners keep the rounds that succeeded and THEN return the later
+// round's error, so an invocation that pushed three commits before dying was
+// recorded as a failure and billed nothing. Every one of those holes is a way
+// to ratchet for free, which is the failure direction this guard exists to close.
 //
 // Keyed off the head actually moving rather than off the round returning: a
 // round that only replied to comments has not grown the PR, and the scope brake
@@ -999,8 +1003,11 @@ func (w *Watcher) recordPolishWork(state *State, snap *Snapshot, polished bool) 
 // is the outcome that cost five days and $364.
 func pushedCommits(state *State, snap *Snapshot) int {
 	switch state.LastAction {
-	case LastActionPolished, LastActionReworked:
-	default:
+	// No agent ran, so any movement on the branch came from somebody else:
+	// nothing polished or reworked, the tick only observed, merged, armed or
+	// handed the PR to a human.
+	case LastActionInit, LastActionIdle, LastActionMerged, LastActionClosed,
+		LastActionArmed, LastActionNeedsHuman, LastActionDryRun:
 		return 0
 	}
 	if state.LastSeenHeadSHA == "" || snap.PR.HeadRefOid == "" ||
