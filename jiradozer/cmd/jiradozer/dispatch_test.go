@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/bazelment/yoloswe/fleet"
+	"github.com/bazelment/yoloswe/jiradozer"
 )
 
 func TestDispatchArgsCarryTheTaskToTheRemoteExec(t *testing.T) {
@@ -134,6 +135,32 @@ func TestFindLeaseHolderBlocksADuplicateDispatch(t *testing.T) {
 
 	_, busy = fleet.FindLeaseHolder(scores, "INF-2")
 	assert.False(t, busy)
+}
+
+// The guard above only holds if the name dispatch probes for is the name the
+// worker's lease file actually has. Hand-writing "INF-1" on both sides tests
+// fleet's matcher and nothing else — it would keep passing if either end
+// stopped canonicalizing, or if sanitizeForRunDir and fleet.SanitizeSlug
+// drifted apart. So derive both ends the way production does, and spell the
+// issue differently on each, which is the case the guard exists for.
+func TestDispatchProbesForTheLeaseNameTheWorkerWillHold(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	// exec's side: the lease a worker handed the URL form would hold, as a
+	// probe of that box would report it.
+	workerLease := jiradozer.LeasePath(leaseTarget(execArgs{issueID: "https://github.com/acme/app/issues/42"}))
+	scores := []fleet.HostHealth{
+		{Host: "b"},
+		{Host: "a", HeldLeases: []string{filepath.Base(workerLease)}},
+	}
+
+	// dispatch's side: the same issue, shorthand.
+	holder, busy := fleet.FindLeaseHolder(scores, leaseTarget(execArgs{issueID: "acme/app#42"}))
+	require.True(t, busy, "the same issue spelled another way must still find the holder")
+	assert.Equal(t, "a", holder.Host)
+
+	_, busy = fleet.FindLeaseHolder(scores, leaseTarget(execArgs{issueID: "acme/app#43"}))
+	assert.False(t, busy, "and a different issue must not collide with it")
 }
 
 // The remote worker starts with cwd $HOME, so the default relative
