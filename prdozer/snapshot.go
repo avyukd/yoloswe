@@ -258,6 +258,14 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 // and reports its length. That difference is the whole point of this call: the
 // scope guard charges pushes by commit delta, and a length pinned at 100
 // charges a growing PR its floor of one per tick forever.
+//
+// The missing `first:`/`last:` is deliberate, not an oversight: GitHub only
+// demands a page size when the selection reaches into the connection's
+// `nodes`/`edges`. A selection of nothing but the `totalCount` scalar is served
+// as-is — verified against this very PR, which answers `{"totalCount":9}`. No
+// unit test can pin that, since the schema lives on GitHub's side; adding a
+// page size would be harmless but would also re-import the 100-cap thinking
+// this call exists to escape.
 func fetchCommitCount(ctx context.Context, gh wt.GHRunner, dir, owner, repo string, prNumber int) (int, error) {
 	const query = `query($owner:String!,$repo:String!,$pr:Int!){
   repository(owner:$owner,name:$repo){
