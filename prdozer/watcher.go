@@ -1024,10 +1024,17 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 	if w.mergeBrakeTripped(s) {
 		s.CooldownUntil = time.Now().Add(w.cfg.Backoff.Cooldown)
 		s.CooldownFromAttempt = s.MergeAttempts
-		// Unconditionally a merge cause, whatever this tick's action was: the
-		// brake counts merge attempts, so LastMergeError IS its reason. Set after
-		// the switch above so a merge brake tripping on the same tick as a stall
-		// reports the brake — it is the condition that actually armed the window.
+		// Unconditionally a merge cause, whatever this tick's action was:
+		// reaching here means the brake is what armed the window, and the brake
+		// counts merge attempts, so LastMergeError IS its reason.
+		//
+		// This cannot steal the window from the failure-streak arm above, even
+		// though it writes the same field afterwards: that arm opens the
+		// cooldown on this very tick, and mergeBrakeTripped declines to fire
+		// into an already-open window. So a tick where the streak arms never
+		// reaches here, and the stall/rework cause it wrote survives —
+		// TestWatcher_ReworkStallArmedCooldown_NamesTheGraceError pins exactly
+		// that collision.
 		s.LastCooldownCause = mergeBrakeCause(s)
 		dirty = true
 		w.logger.Warn("entering cooldown after repeated merge attempts",

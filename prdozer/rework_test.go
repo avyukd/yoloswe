@@ -708,6 +708,16 @@ func TestWatcher_ReworkStallArmedCooldown_NamesTheGraceError(t *testing.T) {
 	s, err := LoadState(statePath)
 	require.NoError(t, err)
 	require.False(t, s.CooldownUntil.IsZero(), "premise: repeated stalls must arm the cooldown")
+	// The merge brake is the only other writer of LastCooldownCause, and it
+	// overwrites unconditionally — so pin that it is not what the assertions
+	// below are reading. Its threshold is reached on this very tick (two
+	// rejected merges against MaxConsecutiveFailures=2, no prior watermark);
+	// it stays silent only because mergeBrakeTripped declines to fire into the
+	// window the stall just opened. A zero watermark is that silence.
+	require.Equal(t, 2, s.MergeAttempts,
+		"premise: the merge brake's threshold is reached on the same tick, so this is a real collision")
+	require.Zero(t, s.CooldownFromAttempt,
+		"the merge brake must not have armed this window, or the cause below is the brake's")
 	assert.Contains(t, s.LastCooldownCause, "grace period",
 		"a stall-armed cooldown must name the grace-period error, not the generic fallback")
 	assert.Contains(t, s.LastCooldownCause, "merge rework round stalled",
