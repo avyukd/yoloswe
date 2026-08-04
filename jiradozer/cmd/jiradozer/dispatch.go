@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"os"
@@ -68,22 +69,29 @@ func newDispatchCmd(x *execArgs) *cobra.Command {
 
 			// --here skips host SELECTION. It must not skip the two things below,
 			// and it used to skip both by returning here.
-			//
-			// A dry run must never execute, whatever the dispatch shape: the
-			// moment `--dry-run --here` does the work, --dry-run has stopped
-			// meaning dry-run and there is no safe way to preview anything.
-			if here && dryRun {
-				fmt.Fprintf(cmd.OutOrStdout(), "would run IN-PROCESS on this box (--here)\n")
-				return nil
-			}
 			if here {
 				// The duplicate guard is a safety property, not part of host
 				// selection. For a --description run the fleet lease is the ONLY
 				// cross-host exclusion there is — no tracker label backs it up —
 				// so bypassing it let a second local run start while another box
 				// was already working the task.
+				//
+				// It runs BEFORE the dry-run return so a preview answers the
+				// question a preview is for: would this run. Printing "would run"
+				// without checking makes --dry-run --here disagree with the real
+				// --here run it is previewing, and the plain dry-run path in this
+				// same command already guards first (narrowToPin, below) — a
+				// preview that skips the check is how you find out about a held
+				// lease only after committing.
 				if err := guardDuplicateRun(ctx, *x, minDiskGB, app.Logger); err != nil {
 					return err
+				}
+				// A dry run must never execute, whatever the dispatch shape: the
+				// moment `--dry-run --here` does the work, --dry-run has stopped
+				// meaning dry-run and there is no safe way to preview anything.
+				if dryRun {
+					fmt.Fprintf(cmd.OutOrStdout(), "would run IN-PROCESS on this box (--here)\n")
+					return nil
 				}
 				return runExec(ctx, app, *x)
 			}
@@ -270,22 +278,38 @@ func filterHosts(hosts []fleet.Host, name string) []fleet.Host {
 // the ordering inside there (check every box, THEN narrow) is the whole point,
 // and a second copy of the check is how the two paths drift apart.
 //
-// A box with no fleet inventory has no cross-host concern, so an unreadable
-// registry is not fatal — but it is logged. Silently skipping a safety check is
-// exactly how this gap arrived.
+// A box with no fleet inventory at all has no cross-host concern, so an ABSENT
+// registry degrades to a no-op — but only that one case. Any other load failure
+// (malformed entry, permission denied) means the fleet view is WRONG rather than
+// empty, and fleet.Load is explicit that a partial view must not be treated as a
+// complete one. Downgrading those to a warning is the same fail-open shape this
+// function exists to remove: a guard that answers "nobody is running it" because
+// it could not look is indistinguishable from one that checked.
+// The fleet dir and ssh runner are indirected so a test can drive the REAL
+// `--here` branch. The guard's whole value is that it runs on that path, and a
+// probe hardcoded to DefaultSSHRunner can only be exercised by reaching a live
+// fleet — which means the one ordering that matters would go untested.
+var (
+	guardFleetDir = fleet.DefaultFleetDir
+	guardSSH      = fleet.SSHRunner(fleet.DefaultSSHRunner{})
+)
+
 func guardDuplicateRun(ctx context.Context, x execArgs, minDiskGB int, logger *slog.Logger) error {
 	target := leaseTarget(x)
 	if target == "" {
 		return nil
 	}
-	hosts, err := fleet.Load(fleet.DefaultFleetDir)
-	if err != nil {
-		logger.Warn("no fleet inventory readable; cross-host duplicate guard skipped",
+	hosts, err := fleet.Load(guardFleetDir)
+	if errors.Is(err, fs.ErrNotExist) {
+		logger.Warn("no fleet inventory on this box; cross-host duplicate guard skipped",
 			"target", target, "error", err)
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("cannot rule out a second run of %s: %w", target, err)
+	}
 	selfHostname, _ := os.Hostname()
-	scores := fleet.Probe(ctx, fleet.DefaultSSHRunner{}, jiradozerTool, hosts, fleet.ProbeOptions{
+	scores := fleet.Probe(ctx, guardSSH, jiradozerTool, hosts, fleet.ProbeOptions{
 		SelfDNS:      fleet.SelfPublicDNS(fleet.DevboxConfigPath),
 		SelfHostname: selfHostname,
 		MinDiskGB:    minDiskGB,
