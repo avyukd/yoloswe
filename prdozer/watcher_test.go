@@ -2324,6 +2324,99 @@ func TestWatcher_ScopeRatchet_ZeroDisables(t *testing.T) {
 	assert.NotEqual(t, LastActionNeedsHuman, res.Action, "zero must disable the guard")
 }
 
+// At the limit, a tick that would only ORIGINATE a review must still run it.
+//
+// The brake counts commits, and a review-only tick produces none — there is
+// nothing for it to measure. On a self_review repo stopping here is the worse
+// of the two failures: prdozer is the only reviewer, so the run hands back a
+// green PR whose last commit nobody has read, and auto-merge is gated on
+// needsSelfReview so the PR cannot land either.
+func TestWatcher_ScopeRatchet_LetsTheOwedReviewRun(t *testing.T) {
+	prJSON := strings.Replace(okPRJSON, `"reviewDecision": "REVIEW_REQUIRED"`, `"reviewDecision": ""`, 1)
+	gh := setupGH(buildPRJSON(prJSON, "SUCCESS"), "[]", "base1")
+	gh.setThreads(0)
+	gh.addPrefix("api repos/o/r/pulls/42 --jq .merged", "false")
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Polish.SelfReview = true
+	w.cfg.Backoff.MaxPolishCommits = 3
+	statePath := StatePath("r", 42)
+
+	// At the limit, with nothing to polish: same head, same base, no failures.
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		PolishCommits: 3,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionPolished, res.Action,
+		"the scope brake counts commits; a review-only tick adds none and still owes a review")
+	assert.Len(t, polish.calls, 1, "the owed review must actually run")
+	assert.False(t, res.Ratcheted, "nothing was stopped, so nothing may report a scope stop")
+}
+
+// The allowance is bounded, and the bound is load-bearing.
+//
+// Every polish round pushes a commit, which moves the head, which makes
+// needsSelfReview true again — so an unconditional review exemption would mean
+// the brake can never fire on a self_review repo at all, restoring the
+// unbounded run it exists to prevent. Past 2*limit the commit count stands on
+// its own however the head looks.
+func TestWatcher_ScopeRatchet_ReviewAllowanceExpires(t *testing.T) {
+	prJSON := strings.Replace(okPRJSON, `"reviewDecision": "REVIEW_REQUIRED"`, `"reviewDecision": ""`, 1)
+	gh := setupGH(buildPRJSON(prJSON, "SUCCESS"), "[]", "base1")
+	gh.setThreads(0)
+	gh.addPrefix("api repos/o/r/pulls/42 --jq .merged", "false")
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Polish.SelfReview = true
+	w.cfg.Backoff.MaxPolishCommits = 3
+	statePath := StatePath("r", 42)
+
+	// Identical to the test above but at twice the limit: same unreviewed head,
+	// same clean PR, so only the count can be what decides.
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		PolishCommits: 6,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionNeedsHuman, res.Action,
+		"a second allowance is all a run gets; past 2*limit the count stands on its own")
+	assert.True(t, res.Ratcheted, "and the stop must still report itself as a scope stop")
+	assert.Empty(t, polish.calls, "the run is over — no round may start after the brake fires")
+}
+
+// The allowance covers the review, not the polishing. A tick with real work
+// queued is exactly what the brake exists to stop, unreviewed head or not.
+func TestWatcher_ScopeRatchet_StopsWorkOnAnUnreviewedHead(t *testing.T) {
+	// CI is failing, so NeedsPolish() is true: this tick would push commits.
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(0)
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Polish.SelfReview = true
+	w.cfg.Backoff.MaxPolishCommits = 3
+	statePath := StatePath("r", 42)
+
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		PolishCommits: 3,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionNeedsHuman, res.Action,
+		"an unreviewed head must not buy a commit-producing round past the limit")
+	assert.True(t, res.Ratcheted)
+	assert.Empty(t, polish.calls, "the brake fired, so no round may run")
+}
+
 // The scope guard is only as good as the pushes it manages to count, so the
 // counter has its own tests — the three above pre-seed PolishCommits and never
 // exercise the code that produces it.

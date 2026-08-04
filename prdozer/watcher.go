@@ -334,7 +334,7 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 	case !cs.NeedsPolish() && !w.needsSelfReview(snap, state):
 		w.status("PR #%d unchanged — idle", w.pr)
 		return LastActionIdle
-	case w.ratcheting(snap, state):
+	case w.ratcheting(snap, cs, state):
 		// The PR has grown past what polishing should produce. Ordered BEFORE
 		// the divergence guard because the two answer different questions and
 		// this one is the only guard that can fire on a run whose every round
@@ -780,12 +780,6 @@ func (w *Watcher) expireStaleDivergence(state *State, snap *Snapshot) bool {
 	return true
 }
 
-// diverging reports whether polishing has stopped making the PR better.
-//
-// It is deliberately evaluated BEFORE the polish call and AFTER this tick's
-// recordHealth, so the decision uses the outcome of work already done rather
-// than predicting the next round — and so a snapshot that finally improves is
-// scored before it can be used to stop the run.
 // ratcheting reports whether prdozer's own rounds have grown this PR past the
 // point where more polishing is the right answer.
 //
@@ -803,9 +797,33 @@ func (w *Watcher) expireStaleDivergence(state *State, snap *Snapshot) bool {
 // a size threshold tuned to catch #8374 would have aborted it. The commit count
 // is the sharper signal because it measures how many times prdozer decided the
 // PR was not done yet.
-func (w *Watcher) ratcheting(snap *Snapshot, state *State) bool {
+func (w *Watcher) ratcheting(snap *Snapshot, cs Changeset, state *State) bool {
 	limit := w.cfg.Backoff.MaxPolishCommits
 	if limit <= 0 || state.PolishCommits < limit {
+		return false
+	}
+	// A tick with nothing to polish and an unreviewed head is about to produce a
+	// REVIEW, not a commit — the one thing this guard does not measure. Stopping
+	// it charges the scope brake for work that cannot grow the scope, and on a
+	// self_review repo it is the worse failure of the two: prdozer IS the
+	// reviewer there, so a green PR whose last commit nobody has read gets
+	// handed back with the review still owed, and auto-merge is gated on
+	// needsSelfReview so the PR cannot land either.
+	//
+	// Same bounded shape as diverging's allowance, and bounded for the same
+	// reason: if that review round does push commits, the head moves,
+	// needsSelfReview re-arms, and an unconditional exemption would mean the
+	// brake can never fire on a self_review repo at all — restoring the
+	// unbounded run it exists to prevent. Past 2*limit the count stands on its
+	// own however the head looks. The other exit is quieter and more common: a
+	// review that pushes nothing marks the SHA seen, needsSelfReview goes false,
+	// and the next tick idles or merges without ever consulting this guard.
+	if state.PolishCommits < 2*limit && !cs.NeedsPolish() && w.needsSelfReview(snap, state) {
+		w.logger.Info("scope limit reached on an unreviewed head; extending once so the review can run",
+			"polish_commits", state.PolishCommits,
+			"limit", limit,
+			"hard_limit", 2*limit,
+			"head", snap.PR.HeadRefOid)
 		return false
 	}
 	grew := ""
@@ -813,6 +831,11 @@ func (w *Watcher) ratcheting(snap *Snapshot, state *State) bool {
 		grew = fmt.Sprintf(" diff +%d->+%d additions across %d files",
 			state.BaselineAdditions, snap.PR.Additions, snap.PR.ChangedFiles)
 	}
+	// Reported for the same reason divergence reports it: on a self_review repo
+	// "prdozer added N commits" and "nobody has read the last one" are different
+	// things to walk into, and only the second tells the human to start by
+	// reading rather than by cutting.
+	unreviewed := w.needsSelfReview(snap, state)
 	w.ratcheted = true
 	w.logger.Warn("stopping: polish has added enough commits that the PR needs a human look",
 		"polish_commits", state.PolishCommits,
@@ -820,12 +843,19 @@ func (w *Watcher) ratcheting(snap *Snapshot, state *State) bool {
 		"polish_rounds", state.PolishRounds,
 		"additions", snap.PR.Additions,
 		"baseline_additions", state.BaselineAdditions,
-		"changed_files", snap.PR.ChangedFiles)
-	w.status("PR #%d stopped: prdozer has added %d commits (limit %d).%s",
-		w.pr, state.PolishCommits, limit, grew)
+		"changed_files", snap.PR.ChangedFiles,
+		"head_unreviewed", unreviewed)
+	w.status("PR #%d stopped: prdozer has added %d commits (limit %d, head_reviewed=%t).%s",
+		w.pr, state.PolishCommits, limit, !unreviewed, grew)
 	return true
 }
 
+// diverging reports whether polishing has stopped making the PR better.
+//
+// It is deliberately evaluated BEFORE the polish call and AFTER this tick's
+// recordHealth, so the decision uses the outcome of work already done rather
+// than predicting the next round — and so a snapshot that finally improves is
+// scored before it can be used to stop the run.
 func (w *Watcher) diverging(snap *Snapshot, state *State) bool {
 	limit := w.cfg.Backoff.MaxRoundsWithoutImprovement
 	if limit <= 0 || state.BestHealth == nil {
