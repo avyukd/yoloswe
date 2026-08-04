@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "bootstrap.go",
         "exec.go",
+        "gc.go",
         "main.go",
         "models.go",
         "run.go",

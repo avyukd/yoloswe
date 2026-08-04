@@ -24,8 +24,8 @@ func main() {
 	}))
 }
 
-// newRootCommand builds the cobra tree: a root with six subcommands
-// (run, exec, bootstrap, validate-config, models, runs). The root's RunE delegates to run's
+// newRootCommand builds the cobra tree: a root with seven subcommands
+// (run, exec, bootstrap, validate-config, models, runs, gc). The root's RunE delegates to run's
 // handler so plain `jiradozer` (with no subcommand) keeps working for
 // existing invocations and shell scripts; for that to be useful, the same
 // run-only flags (--issue, --filter, --description, etc.) are also bound
@@ -57,7 +57,7 @@ func newRootCommand(opts *cliapp.Options) *cobra.Command {
 	execCmd := newExecCmd(&xargs)
 	execCmd.PreRun = func(*cobra.Command, []string) { xargs.configPath = rargs.configPath }
 
-	rootCmd.AddCommand(runCmd, bootstrapCmd, validateConfigCmd, modelsCmd, newRunsCmd(), execCmd)
+	rootCmd.AddCommand(runCmd, bootstrapCmd, validateConfigCmd, modelsCmd, newRunsCmd(), execCmd, newGCCmd())
 
 	// Back-compat: bare `jiradozer --issue X --description Y` (no
 	// subcommand) behaves like `jiradozer run --issue X --description Y`.
