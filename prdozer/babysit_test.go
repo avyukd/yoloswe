@@ -284,6 +284,35 @@ func TestTerminalFor_DivergedSaysWhy(t *testing.T) {
 		"a PR blocked on an approval must not be reported as diverging")
 }
 
+// A stall, a divergence and an approval block are all LastActionNeedsHuman and
+// all call for different responses — so, like divergence, a stall must say so.
+//
+// The generic message is actively misleading here: it sends an operator looking
+// for a reviewer or a merge policy when the actual fault is the agent backend
+// never returning a round (kernel#8374).
+func TestTerminalFor_StalledSaysWhy(t *testing.T) {
+	t.Parallel()
+	pr := DiscoveredPR{Number: 42}
+
+	state, msg, done := terminalFor(TickResult{
+		Action: LastActionNeedsHuman, Stalled: true,
+		InvocationsSinceRound: 6, StallError: "turn forced complete after grace period",
+	}, pr)
+	require.True(t, done)
+	assert.Equal(t, TerminalNeedsHuman, state)
+	assert.Contains(t, msg, "stalled")
+	assert.Contains(t, msg, "6 polish invocations produced no completed round")
+	assert.Contains(t, msg, "turn forced complete after grace period",
+		"must name the cause; a polish stall has no LastMergeError to fall back on")
+	assert.NotContains(t, msg, "stopped improving",
+		"a stall is not a divergence: no round ever returned to be scored")
+
+	_, plain, done := terminalFor(TickResult{Action: LastActionNeedsHuman}, pr)
+	require.True(t, done)
+	assert.NotContains(t, plain, "stalled",
+		"a PR blocked on an approval must not be reported as a stall")
+}
+
 func TestTerminalFor_ArmedIsNotTerminal(t *testing.T) {
 	t.Parallel()
 	// --auto only ARMS the merge queue; the PR has not landed. Treating this

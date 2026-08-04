@@ -185,8 +185,12 @@ func (b *Babysitter) loop(ctx context.Context, rc *RunContext, runLog *RunLog, p
 		if state, serr := LoadState(StatePath(o.OwnerRepo, o.PRNumber)); serr == nil &&
 			!state.CooldownUntil.IsZero() && state.CooldownUntil.After(cooldownReported) {
 			cooldownReported = state.CooldownUntil
-			b.event(runLog, "cooldown", state.LastMergeError, map[string]any{"until": state.CooldownUntil})
-			Report(ctx, b.logger, notifier, CooldownWarning(runLog.Meta(), state.CooldownUntil, state.LastMergeError))
+			// LastCooldownCause, not LastMergeError: the cooldown trips on a
+			// failure streak that stalls and reworks feed too, so the merge field
+			// would misattribute every non-merge cause. Written and cleared with
+			// the window itself, so it always describes THIS cooldown.
+			b.event(runLog, "cooldown", state.LastCooldownCause, map[string]any{"until": state.CooldownUntil})
+			Report(ctx, b.logger, notifier, CooldownWarning(runLog.Meta(), state.CooldownUntil, state.LastCooldownCause))
 		}
 
 		if o.Once {
@@ -269,6 +273,16 @@ func terminalFor(res TickResult, pr DiscoveredPR) (TerminalState, string, bool) 
 		// Say WHICH kind of stuck. "Needs a human" alone does not distinguish a
 		// PR waiting on an approval from one the babysitter was actively making
 		// worse — and those call for opposite responses.
+		//
+		// A stall is the third kind, and the one where the generic message is
+		// most misleading: nothing is blocked on a reviewer and nothing about the
+		// PR got worse — the rounds never returned. Reported first because a
+		// stalled run never completes a round, so it cannot also have diverged.
+		if res.Stalled {
+			return TerminalNeedsHuman, fmt.Sprintf(
+				"PR #%d stalled: %d polish invocations produced no completed round, so the run was halted rather than burning further attempts. Nothing is wrong with the PR itself — check the agent backend. Last error: %s",
+				pr.Number, res.InvocationsSinceRound, res.StallError), true
+		}
 		if res.Diverged {
 			// Report the streak the guard tripped on, NOT the run's cumulative
 			// PolishRounds: a run that improved several times before stalling

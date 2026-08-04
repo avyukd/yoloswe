@@ -10,28 +10,46 @@ import (
 	"time"
 
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude/render"
+	transientmeta "github.com/bazelment/yoloswe/agent-cli-wrapper/transient"
 	"github.com/bazelment/yoloswe/multiagent/agent"
 	"github.com/bazelment/yoloswe/wt"
 )
 
 // Watcher polls a single PR and reacts to changes by invoking the polish agent.
 type Watcher struct {
-	gh         wt.GHRunner
-	polish     PolishRunner
-	rework     ReworkRunner
-	cfg        *Config
-	renderer   *render.Renderer
-	logger     *slog.Logger
-	repo       string
-	workDir    string
-	self       string
-	reworkSpec StepSpec
-	polishSpec StepSpec
-	pr         int
-	dryRun     bool
+	gh       wt.GHRunner
+	polish   PolishRunner
+	rework   ReworkRunner
+	cfg      *Config
+	renderer *render.Renderer
+	logger   *slog.Logger
+	repo     string
+	workDir  string
+	self     string
+	// lastStallError is the scrubbed error from the invocation that tripped the
+	// no-progress guard. Carried alongside stalled because the stall path has no
+	// LastMergeError to quote — that field is only written by the merge path, so
+	// a polish-only stall would otherwise report an empty cause.
+	lastStallError string
+	// lastFailureError is the scrubbed error from the agent failure that made
+	// this tick return LastActionFailed. Same reason as lastStallError: the
+	// cooldown reports the cause of the failure that armed it, and a polish or
+	// rework failure has no LastMergeError of its own. Falling back to that
+	// field would quote whatever merge failed earlier in the run — it is
+	// cleared only on a successful merge, so a stale one outlives its tick.
+	lastFailureError string
+	reworkSpec       StepSpec
+	polishSpec       StepSpec
+	pr               int
+	dryRun           bool
 	// diverged is set by the divergence guard within a tick so Tick can
 	// report WHY it stopped. Reset at the top of every tick.
 	diverged bool
+	// stalled is set by the no-progress guard within a tick, for the same
+	// reason as diverged: both stop the run with LastActionNeedsHuman, and
+	// without a distinct signal the terminal report cannot tell "waiting on an
+	// approval" from "the rounds never came back". Reset every tick.
+	stalled bool
 }
 
 // WithPolishSpec attaches configured polish rounds, replacing the default
@@ -91,13 +109,14 @@ func NewWatcher(cfg *Config, gh wt.GHRunner, polish PolishRunner, prNumber int, 
 
 // TickResult summarizes what happened in one polling cycle.
 type TickResult struct {
-	Snapshot  *Snapshot
-	Action    LastAction
-	Changeset Changeset
-	// Diverged reports that NeedsHuman was reached because the PR stopped
-	// improving, rather than because it is waiting on an approval. The two need
-	// opposite responses, so the notification must tell them apart.
-	Diverged bool
+	Snapshot *Snapshot
+	Action   LastAction
+	// StallError is the scrubbed error from the invocation that tripped the
+	// no-progress guard, reported alongside Stalled. The merge path's
+	// LastMergeError is empty on a polish-only stall, so without this the report
+	// names no cause.
+	StallError string
+	Changeset  Changeset
 	// PolishRounds is the run's cumulative polish count, reported alongside
 	// Diverged.
 	PolishRounds int
@@ -107,6 +126,20 @@ type TickResult struct {
 	// rounds flat, and saying "17 rounds produced no better result" would be a
 	// lie.
 	RoundsSinceImprovement int
+	// InvocationsSinceRound is the no-progress streak the stall guard trips on,
+	// reported for the same reason RoundsSinceImprovement is: the operator needs
+	// the number that actually caused the stop.
+	InvocationsSinceRound int
+	// Diverged reports that NeedsHuman was reached because the PR stopped
+	// improving, rather than because it is waiting on an approval. The two need
+	// opposite responses, so the notification must tell them apart.
+	Diverged bool
+	// Stalled reports that NeedsHuman was reached because polish invocations
+	// stopped producing rounds at all, rather than because the PR is waiting on
+	// an approval or has stopped improving. A third distinct cause needing a
+	// third distinct response: nothing about the PR is wrong, the agent never
+	// came back.
+	Stalled bool
 }
 
 func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
@@ -168,6 +201,8 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 	)
 
 	w.diverged = false
+	w.stalled, w.lastStallError = false, ""
+	w.lastFailureError = ""
 	priorAttempts, priorMergeErr := state.MergeAttempts, state.LastMergeError
 	priorSelfReviewed := state.SelfReviewedSHA
 	// Counted, not compared by identity: decideAndAct adds keys to the SAME map
@@ -183,7 +218,9 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 
 	res := TickResult{Snapshot: snap, Changeset: cs, Action: action,
 		Diverged: w.diverged, PolishRounds: state.PolishRounds,
-		RoundsSinceImprovement: state.RoundsSinceImprovement}
+		RoundsSinceImprovement: state.RoundsSinceImprovement,
+		Stalled:                w.stalled, StallError: w.lastStallError,
+		InvocationsSinceRound: state.InvocationsSinceRound}
 	if w.recordSnapshot(state, snap, action, mergeStateDirty || healthDirty) {
 		if err := state.Save(statePath); err != nil {
 			// State save failure is serious: the action already ran (maybe merged
@@ -323,13 +360,75 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		// embed the endpoint config (API key / key-bearing env var), and these
 		// messages are persisted and Slacked.
 		safe := safeErrString(err)
-		if action, ok := w.classifyAgentFailure("polish", err, safe); ok {
+		action, classified := w.classifyAgentFailure("polish", err, safe)
+
+		// This invocation produced no round result, so every round-keyed counter
+		// (PolishRounds, RoundsSinceImprovement, BestHealth) stays exactly where
+		// it was. Counted here, at the one place that knows the round did not
+		// return, so no failure mode can burn invocations invisibly.
+		//
+		// A provider outage is excluded, and that exclusion is the whole reason
+		// this is not simply "count every failed invocation": a downed provider
+		// recovers on its own, and stopping the run for it would re-introduce
+		// exactly the kernel#8031 behaviour LastActionTransient exists to
+		// prevent. A stall is NOT excluded — it recurs on retry, which is what
+		// makes it worth bounding.
+		//
+		// An invocation that COMPLETED work is excluded too, and for a stricter
+		// reason: it is not a no-progress invocation at all, so counting it is
+		// simply wrong. Rounds execute in order and stop at the first error, so a
+		// multi-round spec can finish round 1 and fail round 2.
+		//
+		// Keyed on CompletedRounds rather than RanOnceRounds: the latter records
+		// only `once: true` rounds, so a spec of ordinary repeatable rounds whose
+		// first succeeds and second fails every tick would leave it empty and the
+		// run would still be halted while doing real work each time.
+		if polishRes.CompletedRounds > 0 {
+			// RESET, not merely skip: a round finished, which is the very thing
+			// this counter exists to detect the absence of. Same rule as the
+			// success path below — the streak is "consecutive invocations that
+			// produced nothing", and this invocation produced something.
+			state.InvocationsSinceRound = 0
+		} else if action != LastActionTransient {
+			state.InvocationsSinceRound++
+			// Deliberately WIDER than MaxConsecutiveFailures. The ordinary brake
+			// should get to work first: it pauses for a cooldown and lets the run
+			// recover, where this stops it for a human. Sharing one threshold
+			// makes whichever is checked first the only one that ever fires — at
+			// parity this guard preempted the cooldown entirely, and because
+			// needs_human is a terminal arm it also reset ConsecutiveFailures on
+			// its way out, so the stall brake became dead code.
+			if limit := 2 * w.cfg.Backoff.MaxConsecutiveFailures; limit > 0 && state.InvocationsSinceRound >= limit {
+				// Flagged so the terminal report can say WHICH kind of stuck. The
+				// action alone is LastActionNeedsHuman, which terminalFor otherwise
+				// reads as "blocked on an approval or a merge policy" — the opposite
+				// diagnosis from "the polish rounds never returned", and the one an
+				// operator debugging a kernel#8374 loop would be misled by.
+				w.stalled = true
+				w.lastStallError = safe
+				w.logger.Warn("stopping: polish invocations are not producing rounds",
+					"invocations_since_round", state.InvocationsSinceRound,
+					"polish_rounds", state.PolishRounds,
+					"error", safe)
+				w.status("PR #%d stopped: %d polish invocations produced no completed round (last: %s)",
+					w.pr, state.InvocationsSinceRound, safe)
+				return LastActionNeedsHuman
+			}
+		}
+
+		if classified {
 			return action
 		}
+		w.lastFailureError = safe
 		w.logger.Error("polish failed", "error", safe)
 		w.status("PR #%d polish failed: %s", w.pr, safe)
 		return LastActionFailed
 	}
+	// The round returned, so the round-keyed counters can move again and the
+	// no-progress streak is over. Reset on RESULT rather than on success: a
+	// round that returned a result did the work this counter exists to detect
+	// the absence of, whatever that result says about the PR.
+	state.InvocationsSinceRound = 0
 	w.status("PR #%d polish completed", w.pr)
 
 	// Mark this commit as self-reviewed. Recorded on SUCCESS only: a failed
@@ -398,14 +497,25 @@ func (w *Watcher) rerequestReviews(ctx context.Context, snap *Snapshot) {
 	}
 }
 
-// classifyAgentFailure reports whether an agent-round error was a provider-side
-// outage rather than a fact about this PR, and if so returns the action that
-// keeps it off the failure brake.
+// classifyAgentFailure maps an agent-round error to the action that decides
+// whether it counts toward the failure brake.
 //
-// A provider outage is not a fact about this PR. Counting it toward the failure
-// brake spends the budget meant for "this PR is not converging" on "Anthropic
-// returned 529", and three of those bought kernel#8031 a two-hour cooldown while
-// nothing was wrong with the branch.
+// Three outcomes, because "transient" turned out to cover two unlike things:
+//
+//   - A PROVIDER outage (http_5xx, rate limit) is not a fact about this PR.
+//     Counting it spends the budget meant for "this PR is not converging" on
+//     "Anthropic returned 529", and three of those bought kernel#8031 a two-hour
+//     cooldown while nothing was wrong with the branch. -> LastActionTransient,
+//     exempt.
+//   - A STALL (grace_forced) is our own deadline firing against a local
+//     condition that is still there next time. Retrying re-runs the round from
+//     scratch and hits the same wall; kernel#8374 did exactly that three times
+//     for 62 minutes and zero completed rounds. -> LastActionStalled, counts.
+//   - Anything else is a real failure. -> not handled here, counts.
+//
+// The distinction is whether the next attempt has a materially different chance
+// of succeeding. A downed provider recovers on its own; our own expired deadline
+// does not.
 //
 // Verified against the real strings: an API 529 classifies http_5xx and a
 // force-completed turn classifies grace_forced, while a bare "exit status 1"
@@ -430,6 +540,17 @@ func (w *Watcher) classifyAgentFailure(stage string, err error, safe string) (La
 	transient, reason := agent.ClassifyTransient(err)
 	if !transient {
 		return "", false
+	}
+	// Classified transient by the shared classifier, which answers "is a retry
+	// worth attempting" — correct for its callers, and deliberately left alone
+	// here: it lives in multiagent/agent and is used well beyond prdozer. What
+	// prdozer needs on top is whether the retry should be FREE, and for a stall
+	// it must not be.
+	if reason == transientmeta.ReasonGraceForced {
+		w.logger.Warn(stage+" was cut off mid-round by the turn grace period; counting it toward the failure brake",
+			"error", safe, "reason", reason)
+		w.status("PR #%d %s stalled mid-round (%s) — counts toward the brake", w.pr, stage, reason)
+		return LastActionStalled, true
 	}
 	w.logger.Warn(stage+" hit a transient provider error; not counting it toward the failure brake",
 		"error", safe, "reason", reason)
@@ -483,6 +604,7 @@ func (w *Watcher) reworkAfterFailedMerge(ctx context.Context, snap *Snapshot, st
 		if action, ok := w.classifyAgentFailure("merge rework", err, safe); ok {
 			return action
 		}
+		w.lastFailureError = safe
 		w.logger.Error("merge rework failed", "error", safe, "attempt", state.MergeAttempts)
 		w.status("PR #%d merge rework failed: %s", w.pr, safe)
 		return LastActionFailed
@@ -525,15 +647,25 @@ func (w *Watcher) needsSelfReview(snap *Snapshot, state *State) bool {
 	return state.SelfReviewedSHA != snap.PR.HeadRefOid
 }
 
-// expireStaleDivergence clears a divergence verdict inherited from a previous
+// expireStaleDivergence clears a no-progress verdict inherited from a previous
 // run whose subject no longer exists. Reports whether it changed anything.
 //
+// Covers BOTH streaks that can end a run at needs_human, because they go stale
+// for the identical reason and on the identical trigger:
+//
+//   - RoundsSinceImprovement / BestHealth — "the last N rounds did not make THIS
+//     head better".
+//   - InvocationsSinceRound — "the last N invocations produced no round". Just
+//     as head-specific: a stall streak is a fact about a particular attempt at
+//     particular code, and a run resumed on a new head that inherits a saturated
+//     one halts on its first non-transient failure, exactly the hand-edit-the-
+//     state-file trap the divergence retirement exists to close.
+//
 // State outlives the run that wrote it, by design — that is what lets a resumed
-// babysit keep its once-round record and its merge-attempt count. But
-// RoundsSinceImprovement is a judgment about SPECIFIC CODE: "the last N polish
-// rounds did not make THIS head better". When a run ends at needs_human and the
-// branch is then rebased or pushed to, the next run loads a streak that scored
-// commits that are gone, and stops on tick one having done nothing.
+// babysit keep its once-round record and its merge-attempt count. But these
+// counters are judgments about SPECIFIC CODE. When a run ends at needs_human and
+// the branch is then rebased or pushed to, the next run loads a streak that
+// scored commits that are gone, and stops on tick one having done nothing.
 //
 // Seen three times in one day (yoloswe#290, yoloswe#291, kernel#8297), each
 // needing the state file hand-edited to let the PR proceed. #8297 is the case
@@ -551,7 +683,11 @@ func (w *Watcher) needsSelfReview(snap *Snapshot, state *State) bool {
 //   - the head moved since that ending. A resumed run looking at the SAME
 //     commits inherits a verdict that still applies, and must keep it.
 func (w *Watcher) expireStaleDivergence(state *State, snap *Snapshot) bool {
-	if state.RoundsSinceImprovement == 0 && state.BestHealth == nil {
+	// Nothing inherited to retire. InvocationsSinceRound is part of the test
+	// because a run can stop on the stall guard alone, with the divergence
+	// counters never having moved.
+	if state.RoundsSinceImprovement == 0 && state.BestHealth == nil &&
+		state.InvocationsSinceRound == 0 {
 		return false
 	}
 	if state.LastAction != LastActionNeedsHuman {
@@ -562,12 +698,14 @@ func (w *Watcher) expireStaleDivergence(state *State, snap *Snapshot) bool {
 		state.LastSeenHeadSHA == snap.PR.HeadRefOid {
 		return false
 	}
-	w.logger.Info("retiring a divergence verdict that judged a previous head",
+	w.logger.Info("retiring a no-progress verdict that judged a previous head",
 		"scored_head", state.LastSeenHeadSHA,
 		"current_head", snap.PR.HeadRefOid,
-		"rounds_since_improvement", state.RoundsSinceImprovement)
+		"rounds_since_improvement", state.RoundsSinceImprovement,
+		"invocations_since_round", state.InvocationsSinceRound)
 	state.RoundsSinceImprovement = 0
 	state.BestHealth = nil
+	state.InvocationsSinceRound = 0
 	return true
 }
 
@@ -810,14 +948,18 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 		// outage in the rework does not un-reject them. See
 		// TestWatcher_RepeatedTransientRework_StillTripsMergeBrake.
 	// LastActionReworked shares the failure arm so a straight run of reworks
-	// still trips the ordinary backoff.
-	case LastActionFailed, LastActionReworked:
+	// still trips the ordinary backoff. LastActionStalled shares it for the same
+	// reason: our own expired deadline recurs on retry, so an unbroken run of
+	// stalls has to reach the cooldown rather than loop for free (kernel#8374).
+	case LastActionFailed, LastActionReworked, LastActionStalled:
 		s.ConsecutiveFailures++
 		dirty = true
 		if w.cfg.Backoff.MaxConsecutiveFailures > 0 && s.ConsecutiveFailures >= w.cfg.Backoff.MaxConsecutiveFailures && w.cfg.Backoff.Cooldown > 0 {
 			s.CooldownUntil = time.Now().Add(w.cfg.Backoff.Cooldown)
+			s.LastCooldownCause = w.cooldownCause(s, action)
 			w.logger.Warn("entering cooldown after repeated failures",
 				"failures", s.ConsecutiveFailures,
+				"cause", s.LastCooldownCause,
 				"until", s.CooldownUntil,
 			)
 		}
@@ -829,6 +971,9 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 		}
 		s.ConsecutiveFailures = 0
 		s.CooldownUntil = time.Time{}
+		// Cleared with the window it describes: a cause outliving its cooldown
+		// is exactly the stale-attribution bug this field exists to prevent.
+		s.LastCooldownCause = ""
 	}
 
 	// The merge-attempt brake. ConsecutiveFailures alone CANNOT bound merge
@@ -847,9 +992,15 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 	if w.mergeBrakeTripped(s) {
 		s.CooldownUntil = time.Now().Add(w.cfg.Backoff.Cooldown)
 		s.CooldownFromAttempt = s.MergeAttempts
+		// Unconditionally a merge cause, whatever this tick's action was: the
+		// brake counts merge attempts, so LastMergeError IS its reason. Set after
+		// the switch above so a merge brake tripping on the same tick as a stall
+		// reports the brake — it is the condition that actually armed the window.
+		s.LastCooldownCause = mergeBrakeCause(s)
 		dirty = true
 		w.logger.Warn("entering cooldown after repeated merge attempts",
 			"merge_attempts", s.MergeAttempts,
+			"cause", s.LastCooldownCause,
 			"until", s.CooldownUntil,
 		)
 	}
@@ -857,6 +1008,54 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 		s.LastCheckAt = snap.TakenAt
 	}
 	return dirty
+}
+
+// cooldownCause describes why the failure-streak cooldown just armed, in terms
+// of the action that armed it.
+//
+// The streak counts stalls, reworks, agent failures and merge failures alike,
+// so the cause has to be selected by action rather than read off any single
+// field: quoting LastMergeError on a stall names an unrelated earlier merge,
+// and on a polish-only run names nothing at all. LastMergeError survives until
+// the next SUCCESSFUL merge, so "it is set" is not evidence that the merge is
+// what armed this cooldown.
+func (w *Watcher) cooldownCause(s *State, action LastAction) string {
+	switch action {
+	case LastActionStalled:
+		if w.lastStallError != "" {
+			return fmt.Sprintf("polish round stalled: %s", w.lastStallError)
+		}
+		return "polish rounds stalled without returning a result"
+	case LastActionReworked:
+		if s.LastMergeError != "" {
+			return fmt.Sprintf("reworking after a failed merge: %s", s.LastMergeError)
+		}
+		return "repeated rework rounds"
+	default:
+		// LastActionFailed. Prefer the failure from THIS tick: the agent paths
+		// (polish, merge rework) record it, and it is the thing that armed the
+		// streak.
+		if w.lastFailureError != "" {
+			return w.lastFailureError
+		}
+		// No agent error recorded, so the only remaining producer of
+		// LastActionFailed is "merge failed and no merge_rework is configured" —
+		// a genuinely merge-caused failure, which is exactly what LastMergeError
+		// describes.
+		if s.LastMergeError != "" {
+			return s.LastMergeError
+		}
+		return ""
+	}
+}
+
+// mergeBrakeCause describes why the merge-attempt brake armed the cooldown.
+func mergeBrakeCause(s *State) string {
+	if s.LastMergeError != "" {
+		return fmt.Sprintf("%d merge attempts without landing; last error: %s",
+			s.MergeAttempts, s.LastMergeError)
+	}
+	return fmt.Sprintf("%d merge attempts without landing", s.MergeAttempts)
 }
 
 // mergeBrakeTripped reports whether enough merge attempts have accumulated

@@ -30,8 +30,7 @@ const (
 	LastActionFailed   LastAction = "failed"
 	LastActionDryRun   LastAction = "dry_run"
 	// LastActionTransient means the polish round died on a provider-side
-	// failure — an API 5xx, a rate limit, a force-completed turn — rather than
-	// on anything about this PR.
+	// failure — an API 5xx, a rate limit — rather than on anything about this PR.
 	//
 	// It deliberately neither increments nor resets ConsecutiveFailures. Not
 	// increment, because the failure brake exists to stop a run that is not
@@ -39,7 +38,33 @@ const (
 	// kernel#8031's entire brake budget and imposed a 2h cooldown while the
 	// branch was fine. Not reset, because a provider blip in the middle of a
 	// genuine failure streak must not launder that streak back to zero.
+	//
+	// A force-completed turn is NOT one of these; see LastActionStalled.
 	LastActionTransient LastAction = "transient"
+	// LastActionStalled means the round was cut off because OUR grace period
+	// expired while the agent still had work in flight (reason grace_forced).
+	//
+	// Split out of LastActionTransient, which it used to share. The two look
+	// alike — both arrive as a "transient CLI error" and neither is a verdict on
+	// the code — but they differ in the one way the brake cares about:
+	//
+	//   http_5xx     the PROVIDER was down. Nothing local changed, the next
+	//                attempt is genuinely likely to succeed, and retrying costs
+	//                one round. Exempting it is right (kernel#8031).
+	//   grace_forced OUR deadline fired against a local condition that is still
+	//                there on the next attempt. Retrying re-runs the round from
+	//                scratch and hits the same wall.
+	//
+	// Measured on kernel#8374: three invocations at 22:15, 22:45 and 23:17 each
+	// armed a /pr-polish reviewer background join, each was force-completed ten
+	// minutes later, and each was exempted from the brake. 62 minutes and three
+	// full bootstraps produced zero completed rounds, and because the exemption
+	// also kept PolishRounds at zero, no other guard could see it either.
+	//
+	// So this counts toward ConsecutiveFailures, which makes the existing
+	// max_consecutive_failures/cooldown brake apply. It is not terminal: the
+	// cooldown is the brake, and a stall that clears on its own still recovers.
+	LastActionStalled LastAction = "stalled"
 	// LastActionArmed means auto-merge was armed on a merge-queue repo. The
 	// PR has NOT landed yet — the queue lands it asynchronously — so this is a
 	// non-terminal state that keeps the watcher polling until `.merged` is true.
@@ -76,10 +101,21 @@ type State struct {
 	// PolishRounds, which counts only rounds whose result a later tick actually
 	// OBSERVED — a failed round, or a snapshot with no thread count, leaves it at
 	// zero and would re-run every once round on the next tick.
-	OnceRoundsDone  map[string]bool `json:"once_rounds_done,omitempty"`
-	LastCheckAt     time.Time       `json:"last_check_at,omitempty"`
-	CooldownUntil   time.Time       `json:"cooldown_until,omitempty"`
-	LastSeenHeadSHA string          `json:"last_seen_head_sha,omitempty"`
+	OnceRoundsDone map[string]bool `json:"once_rounds_done,omitempty"`
+	LastCheckAt    time.Time       `json:"last_check_at,omitempty"`
+	CooldownUntil  time.Time       `json:"cooldown_until,omitempty"`
+	// LastCooldownCause is the scrubbed reason the CURRENT cooldown window was
+	// armed, written at the moment CooldownUntil is set and cleared with it.
+	//
+	// The reporting path can only reload persisted state, and LastMergeError is
+	// not that reason: the cooldown trips on ConsecutiveFailures, which a stall
+	// or a rework increments just as a rejected merge does. Quoting
+	// LastMergeError there names a stale merge error from earlier in the run, or
+	// on a polish-only stall names nothing at all. Kept separate from
+	// LastMergeError rather than overloading it because that field is fed
+	// verbatim into the rework prompt, where a stall message does not belong.
+	LastCooldownCause string `json:"last_cooldown_cause,omitempty"`
+	LastSeenHeadSHA   string `json:"last_seen_head_sha,omitempty"`
 	// SelfReviewedSHA is the head SHA prdozer last originated a review for on a
 	// self_review repo. Keyed by SHA so the review happens once per commit: an
 	// unconditional trigger would re-review an idle PR on every tick forever.
@@ -119,6 +155,23 @@ type State struct {
 	// RoundsSinceImprovement counts consecutive polish rounds that failed to
 	// beat BestHealth. Reset to zero whenever a new best is reached.
 	RoundsSinceImprovement int `json:"rounds_since_improvement,omitempty"`
+	// InvocationsSinceRound counts polish invocations that ended WITHOUT the
+	// round returning a result. Reset to zero whenever one completes.
+	//
+	// This is the backstop for a blind spot the other guards share by
+	// construction: PolishRounds, RoundsSinceImprovement and BestHealth all
+	// advance only when a round returns, so a run whose rounds are eaten before
+	// they return is invisible to every one of them. kernel#8374 burned three
+	// invocations and 62 minutes with all three reading zero — the divergence
+	// guard could not fire because, as far as it could tell, nothing had
+	// happened yet.
+	//
+	// LastActionStalled fixes the grace_forced instance of that; this counter
+	// catches the CLASS, so the next failure mode that eats a round before it
+	// returns does not reopen the same hole. It counts INVOCATIONS rather than
+	// elapsed time because the cost being bounded is per-attempt: each one
+	// re-runs bootstrap from scratch.
+	InvocationsSinceRound int `json:"invocations_since_round,omitempty"`
 }
 
 // PRHealth is the cheap, externally-observable measure of whether a PR is

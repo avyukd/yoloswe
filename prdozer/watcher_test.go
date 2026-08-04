@@ -76,19 +76,27 @@ type stubPolish struct {
 	// path too: a real runner reports the once-only rounds it completed even when
 	// a LATER round failed.
 	ranOnce []string
-	mu      sync.Mutex
+	// completedRounds is how many rounds finished before the error, of any kind.
+	// Separate from ranOnce because the real runner counts every round here but
+	// keys only `once: true` ones in RanOnceRounds — the whole distinction the
+	// no-progress reset depends on.
+	completedRounds int
+	mu              sync.Mutex
 }
 
 func (s *stubPolish) Run(_ context.Context, req PolishRequest) (PolishResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, req)
-	res := PolishResult{}
+	res := PolishResult{CompletedRounds: s.completedRounds}
 	for _, key := range s.ranOnce {
 		if res.RanOnceRounds == nil {
 			res.RanOnceRounds = make(map[string]bool)
 		}
 		res.RanOnceRounds[key] = true
+		// A once round that finished is a round that finished. Mirrors the real
+		// runner, which increments CompletedRounds for every round kind.
+		res.CompletedRounds++
 	}
 	if s.err != nil {
 		return res, s.err
@@ -1675,4 +1683,455 @@ func TestWatcher_StaleDivergenceVerdict_KeptWhenHeadUnchanged(t *testing.T) {
 	assert.Equal(t, LastActionNeedsHuman, res.Action,
 		"same code, same verdict — re-dispatching must not launder a real stop")
 	assert.True(t, res.Diverged)
+}
+
+// The stall streak must be retired on resume for the same reason the divergence
+// streak is: it is a judgment about a specific head.
+//
+// Without this, InvocationsSinceRound is the one no-progress counter that
+// survives a push. A run stopped at needs_human leaves it at the limit; the next
+// run resumes on a NEW head, and the first non-transient failure — one tick,
+// wholly unrelated to whatever stalled before — re-crosses the threshold and
+// halts again, forcing the state-file hand-edit the divergence retirement was
+// added to eliminate.
+func TestWatcher_StaleStallStreak_RetiredWhenHeadMoved(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(9)
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	// A previous run that ended on the stall guard alone: the divergence
+	// counters never moved, because no round ever returned to score.
+	stale := &State{
+		LastCheckAt:           time.Now(),
+		LastSeenHeadSHA:       "an-older-head",
+		LastSeenBaseSHA:       "base1",
+		LastAction:            LastActionNeedsHuman,
+		InvocationsSinceRound: 2 * w.cfg.Backoff.MaxConsecutiveFailures,
+	}
+	require.NoError(t, stale.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.False(t, res.Stalled,
+		"a stall streak about commits that are gone must not stop the resumed run")
+	assert.NotEmpty(t, polish.calls, "the run must actually get to work")
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 0, s.InvocationsSinceRound,
+		"the retirement must reach disk, or the next tick reloads the same wall")
+}
+
+// The mirror case: the same inherited streak on the SAME head is a verdict that
+// still applies. Retiring it there would make the guard unresumable-past, i.e.
+// no guard at all across restarts.
+func TestWatcher_StaleStallStreak_KeptWhenHeadUnchanged(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(9)
+	polish := &stubPolish{err: fmt.Errorf("boom: round died before returning")}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	same := &State{
+		LastCheckAt:           time.Now(),
+		LastSeenHeadSHA:       "head1", // what the fake gh serves
+		LastSeenBaseSHA:       "base1",
+		LastAction:            LastActionNeedsHuman,
+		InvocationsSinceRound: 2*w.cfg.Backoff.MaxConsecutiveFailures - 1,
+	}
+	require.NoError(t, same.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionNeedsHuman, res.Action,
+		"same head, same streak — one more fruitless invocation must still stop it")
+	assert.True(t, res.Stalled, "and it must be reported as a stall, not an approval block")
+}
+
+// A stall is our own deadline firing, not the provider going down, so it must
+// reach the brake.
+//
+// The real kernel#8374 string. Three invocations (22:15, 22:45, 23:17) each
+// armed a /pr-polish reviewer background join, each was force-completed ten
+// minutes later, and each was exempted as a provider outage. 62 minutes and
+// three full bootstraps produced zero completed rounds and no brake ever fired.
+func TestClassifyAgentFailure_GraceForcedCountsTowardBrake(t *testing.T) {
+	t.Parallel()
+	w := &Watcher{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	err := errors.New("polish round 1/2: agent execution: transient CLI error: " +
+		"stream idle: turn forced complete after grace period gated on background tool_use")
+	action, ok := w.classifyAgentFailure("polish", err, err.Error())
+	assert.True(t, ok, "a stall is still classified, just not exempted")
+	assert.Equal(t, LastActionStalled, action,
+		"grace_forced must not share the provider-outage exemption")
+}
+
+// The other arm, asserted in the same shape. Without this a wholesale deletion
+// of the exemption would still pass the grace_forced test above, and kernel#8031
+// would regress silently.
+func TestClassifyAgentFailure_ProviderOutageStillExempt(t *testing.T) {
+	t.Parallel()
+	w := &Watcher{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	for _, text := range []string{
+		"polish round 1/3: agent execution: API Error: 529 Overloaded",
+		"polish round 1/3: agent execution: API Error: 503 Service Unavailable",
+	} {
+		action, ok := w.classifyAgentFailure("polish", errors.New(text), text)
+		assert.True(t, ok, "%s", text)
+		assert.Equal(t, LastActionTransient, action,
+			"a provider outage must stay exempt from the brake: %s", text)
+	}
+}
+
+// End to end: a run that keeps stalling has to stop, where before it looped.
+//
+// Asserts the full mechanism rather than the classification alone — the action
+// has to reach recordSnapshot's failure arm for the cooldown to exist.
+func TestWatcher_Tick_RepeatedStalls_TripTheBrake(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	polish := &stubPolish{err: fmt.Errorf("polish round 1/2: agent execution: " +
+		"transient CLI error: stream idle: turn forced complete after grace period " +
+		"gated on background tool_use")}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	pre := &State{LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1"}
+	require.NoError(t, pre.Save(statePath))
+
+	for range 3 {
+		_, err := w.Tick(context.Background())
+		require.NoError(t, err)
+	}
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	// Assert the brake actually ENGAGED, not merely that some counter moved.
+	// `> 0` would also pass if stalls were misclassified as LastActionFailed, or
+	// if only one of the three ticks counted — both regressions this test exists
+	// to catch. The cooldown is the observable consequence, so pin that too.
+	assert.GreaterOrEqual(t, s.ConsecutiveFailures, w.cfg.Backoff.MaxConsecutiveFailures,
+		"a stall recurs on retry, so every one must count toward the brake")
+	assert.Equal(t, LastActionStalled, s.LastAction,
+		"the stall must be recorded as such, not laundered into a plain failure")
+	assert.False(t, s.CooldownUntil.IsZero(),
+		"reaching MaxConsecutiveFailures with a cooldown configured must arm it")
+}
+
+// The cooldown alert must name the cause that actually armed the window.
+//
+// The regression this pins: the reporting path can only reload persisted state,
+// and it used to quote LastMergeError. That field is written by the merge path
+// alone and is never cleared by a stall, so a run that failed a merge early and
+// later stalled its way into a cooldown told the operator to go look at a merge
+// error that had nothing to do with why it backed off. Seeded with exactly that
+// stale error so a regression reports it rather than the stall.
+func TestWatcher_StallCooldown_ReportsStallNotStaleMergeError(t *testing.T) {
+	const staleMergeErr = "Pull request is in an unmergeable state"
+
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	polish := &stubPolish{err: fmt.Errorf("polish round 1/2: agent execution: " +
+		"transient CLI error: stream idle: turn forced complete after grace period " +
+		"gated on background tool_use")}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		LastMergeError: staleMergeErr,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	for range 3 {
+		_, err := w.Tick(context.Background())
+		require.NoError(t, err)
+	}
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	require.False(t, s.CooldownUntil.IsZero(), "the stalls must have armed a cooldown")
+	assert.Equal(t, staleMergeErr, s.LastMergeError,
+		"the merge field is deliberately left alone — it feeds the rework prompt")
+	assert.NotEmpty(t, s.LastCooldownCause, "an armed cooldown must record its cause")
+	assert.NotContains(t, s.LastCooldownCause, staleMergeErr,
+		"a stall-armed cooldown must not be attributed to an unrelated older merge failure")
+	assert.Contains(t, s.LastCooldownCause, "stall",
+		"the cause must name the stall that actually armed the window")
+
+	// The cause reaches the operator-facing alert, not just the state file.
+	report := CooldownWarning(sampleMeta(), s.CooldownUntil, s.LastCooldownCause)
+	assert.Contains(t, report.Detail, "stall")
+	assert.NotContains(t, report.Detail, staleMergeErr)
+}
+
+// Same regression as the stall case above, on the other arm that reaches the
+// cooldown: a PLAIN polish failure. classifyAgentFailure declines to classify a
+// non-transient error, so the tick returns LastActionFailed rather than
+// LastActionStalled — a different path into the same backoff, and the one that
+// still read LastMergeError. A run that failed a merge early and later backed
+// off on repeated polish failures blamed that stale merge error.
+func TestWatcher_PlainFailureCooldown_ReportsFailureNotStaleMergeError(t *testing.T) {
+	const staleMergeErr = "Pull request is in an unmergeable state"
+	const polishErr = "polish round 1/2: agent execution: exit status 1"
+
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	// Deliberately NOT a transient-looking error: it must fall through
+	// classifyAgentFailure to the LastActionFailed arm, which is the arm under
+	// test. A transient or grace-forced error would take a different branch.
+	polish := &stubPolish{err: errors.New(polishErr)}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		LastMergeError: staleMergeErr,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	// MaxConsecutiveFailures is 2, so two failures arm the cooldown — comfortably
+	// inside the no-progress guard's 2x limit, so this exercises the failure
+	// brake and not the stall stop.
+	for range 2 {
+		res, err := w.Tick(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, LastActionFailed, res.Action,
+			"the seeded error must reach the plain-failure arm under test")
+	}
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	require.False(t, s.CooldownUntil.IsZero(), "the failures must have armed a cooldown")
+	assert.Equal(t, staleMergeErr, s.LastMergeError,
+		"the merge field is deliberately left alone — it feeds the rework prompt")
+	assert.NotEmpty(t, s.LastCooldownCause, "an armed cooldown must record its cause")
+	assert.NotContains(t, s.LastCooldownCause, staleMergeErr,
+		"a polish-armed cooldown must not be attributed to an unrelated older merge failure")
+	assert.Contains(t, s.LastCooldownCause, polishErr,
+		"the cause must name the polish failure that actually armed the window")
+
+	// The cause reaches the operator-facing alert, not just the state file.
+	report := CooldownWarning(sampleMeta(), s.CooldownUntil, s.LastCooldownCause)
+	assert.Contains(t, report.Detail, polishErr)
+	assert.NotContains(t, report.Detail, staleMergeErr)
+}
+
+// A cooldown cleared by a successful tick must not leave its cause behind for
+// the next one to misreport.
+func TestWatcher_SuccessfulTick_ClearsCooldownCause(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "SUCCESS"), "[]", "new-base")
+	// Built before the state is seeded: newWatcherForTest repoints HOME at a
+	// temp dir, and StatePath is under HOME — seeding first writes the file
+	// where the tick will never look for it.
+	w := newWatcherForTest(t, gh, &stubPolish{})
+
+	statePath := StatePath("r", 42)
+	pre := &State{
+		PRNumber: 42, Repo: "r",
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "old-base",
+		ConsecutiveFailures: 2,
+		CooldownUntil:       time.Now().Add(-time.Hour), // expired: does not short-circuit the tick
+		LastCooldownCause:   "polish round stalled: stream idle",
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	// Any non-failing action reaches recordSnapshot's clearing arm; assert on
+	// the arm rather than pinning one specific action, so a fixture change that
+	// yields idle instead of polished doesn't fail this test for the wrong
+	// reason. The cleared cooldown below is the real precondition.
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	require.NotContains(t, []LastAction{LastActionFailed, LastActionReworked, LastActionStalled},
+		res.Action, "the tick must not have failed, or it would arm a cooldown rather than clear one")
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	require.True(t, s.CooldownUntil.IsZero(), "a successful tick clears the cooldown")
+	assert.Empty(t, s.LastCooldownCause,
+		"the cause must be cleared with the window it describes, or the next cooldown inherits it")
+}
+
+// The merge brake arms its own cooldown after the failure switch, so its cause
+// must describe the brake rather than whatever this tick's action was.
+func TestWatcher_MergeBrakeCause_NamesMergeAttempts(t *testing.T) {
+	s := &State{MergeAttempts: 4, LastMergeError: "required status check is failing"}
+	got := mergeBrakeCause(s)
+	assert.Contains(t, got, "4 merge attempts")
+	assert.Contains(t, got, "required status check is failing")
+
+	// No recorded error still has to name the brake, not go blank.
+	assert.Contains(t, mergeBrakeCause(&State{MergeAttempts: 3}), "3 merge attempts")
+}
+
+// The no-progress guard: invocations that never yield a round must stop the run,
+// whatever ate them.
+//
+// This is the backstop for the CLASS that grace_forced is one instance of. Every
+// other guard keys off round COMPLETION, so a run whose rounds die before
+// returning shows PolishRounds=0 and RoundsSinceImprovement=0 forever and the
+// divergence guard cannot fire. kernel#8374 burned three invocations that way.
+//
+// Uses the stall error, because that is the class the guard is FOR: a plain
+// failure already trips the ordinary cooldown after two ticks and never reaches
+// here. Only an error that keeps the run alive tick after tick can burn
+// invocations indefinitely, which is exactly what kernel#8374 did.
+func TestWatcher_Tick_InvocationsWithoutRounds_StopTheRun(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	polish := &stubPolish{err: fmt.Errorf("polish round 1/2: agent execution: " +
+		"transient CLI error: stream idle: turn forced complete after grace period " +
+		"gated on background tool_use")}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	pre := &State{LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1"}
+	require.NoError(t, pre.Save(statePath))
+
+	// Cooldown disabled so this test isolates the no-progress guard: otherwise the
+	// run pauses on the stall brake and never reaches enough invocations.
+	w.cfg.Backoff.Cooldown = 0
+
+	var last LastAction
+	for range 6 {
+		res, err := w.Tick(context.Background())
+		require.NoError(t, err)
+		last = res.Action
+	}
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, LastActionNeedsHuman, last,
+		"invocations that never produce a round must stop the run")
+	assert.Equal(t, 0, s.PolishRounds,
+		"premise: no round ever completed, so the round-keyed guards saw nothing")
+}
+
+// A provider outage must NOT trip the no-progress guard, or D2 quietly
+// re-introduces the kernel#8031 over-braking that the transient exemption
+// exists to prevent. This is the pairing assertion for the counter.
+func TestWatcher_Tick_ProviderOutage_DoesNotTripNoProgressGuard(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	polish := &stubPolish{err: fmt.Errorf(
+		"polish round 1/3: agent execution: API Error: 529 Overloaded")}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	pre := &State{LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1"}
+	require.NoError(t, pre.Save(statePath))
+
+	for range 4 {
+		_, err := w.Tick(context.Background())
+		require.NoError(t, err)
+	}
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 0, s.InvocationsSinceRound,
+		"a downed provider recovers on its own; it must not count as no-progress")
+	assert.Equal(t, LastActionTransient, s.LastAction)
+	assert.Len(t, polish.calls, 4, "nothing should be braking a pure outage")
+}
+
+// An invocation that COMPLETED rounds is not a no-progress invocation, even
+// though it returned an error.
+//
+// Rounds execute in order and stop at the first error, so a multi-round spec can
+// finish round 1 and fail round 2 — which is why PolishResult.RanOnceRounds
+// exists and why decideAndAct banks it before the error check. Keying the brake
+// on `err != nil` alone counts those productive invocations as barren, and a run
+// doing real work on every single tick gets halted for making no progress.
+func TestWatcher_Tick_PartiallyCompletedRounds_DoNotCountAsNoProgress(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	// A later round failed, but an earlier once-round finished first.
+	polish := &stubPolish{
+		err:     fmt.Errorf("polish round 2/2: agent execution: exit status 1"),
+		ranOnce: []string{"simplify-branch"},
+	}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	pre := &State{LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1"}
+	require.NoError(t, pre.Save(statePath))
+
+	// Well past the limit, had every one of these counted.
+	for range 2*w.cfg.Backoff.MaxConsecutiveFailures + 2 {
+		res, err := w.Tick(context.Background())
+		require.NoError(t, err)
+		require.False(t, res.Stalled,
+			"an invocation that finished a round is progress, whatever the error says")
+	}
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 0, s.InvocationsSinceRound,
+		"completed work resets the streak, exactly as a fully returned round does")
+	assert.True(t, s.OnceRoundsDone["simplify-branch"],
+		"premise: the round really did complete and was banked")
+}
+
+// The same rule for REPEATABLE rounds, which is the larger case: most specs have
+// no `once: true` rounds at all.
+//
+// RanOnceRounds cannot answer "did this invocation accomplish anything" — it
+// records only once rounds, so an ordinary two-round spec whose first round
+// succeeds and second fails leaves it empty while real work was done. Keying the
+// reset on it would still false-stop exactly the runs this brake is least
+// entitled to touch. CompletedRounds counts every kind, which is why the reset
+// uses it.
+func TestWatcher_Tick_CompletedRepeatableRounds_DoNotCountAsNoProgress(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	// Round 1 of 2 finished; round 2 failed. No once rounds anywhere in the spec,
+	// so RanOnceRounds is empty and only CompletedRounds carries the progress.
+	polish := &stubPolish{
+		err:             fmt.Errorf("polish round 2/2: agent execution: exit status 1"),
+		completedRounds: 1,
+	}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	pre := &State{LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1"}
+	require.NoError(t, pre.Save(statePath))
+
+	for range 2*w.cfg.Backoff.MaxConsecutiveFailures + 2 {
+		res, err := w.Tick(context.Background())
+		require.NoError(t, err)
+		require.False(t, res.Stalled,
+			"a finished repeatable round is progress just as a once round is")
+	}
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 0, s.InvocationsSinceRound,
+		"completed work resets the streak whatever the round's kind")
+	assert.Empty(t, s.OnceRoundsDone,
+		"premise: no once rounds ran, so RanOnceRounds could not have carried this")
+}
+
+// The counter must RESET when a round returns, or it climbs monotonically across
+// a long healthy run and eventually stops a PR that is working fine.
+func TestWatcher_Tick_CompletedRound_ResetsNoProgressCounter(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	polish := &stubPolish{err: fmt.Errorf("boom: round died before returning")}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	pre := &State{LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1"}
+	require.NoError(t, pre.Save(statePath))
+
+	_, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	require.Equal(t, 1, s.InvocationsSinceRound, "premise: the streak started")
+
+	// Now let the round return.
+	polish.err = nil
+	_, err = w.Tick(context.Background())
+	require.NoError(t, err)
+
+	s, err = LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 0, s.InvocationsSinceRound,
+		"a returned round ends the no-progress streak")
 }

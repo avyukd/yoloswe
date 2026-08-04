@@ -164,17 +164,34 @@ func Report(ctx context.Context, logger *slog.Logger, n notify.Notifier, report 
 }
 
 // CooldownWarning builds the non-terminal alert emitted each time repeated
-// merge rework trips the backoff cooldown.
+// failures trip the backoff cooldown.
 //
 // Unbounded retry is only an acceptable design if it stays VISIBLE: the loop
 // will keep trying, so it must keep telling you.
-func CooldownWarning(meta RunMeta, until time.Time, lastErr string) RunReport {
+//
+// Deliberately NOT merge-specific. The cooldown is driven by
+// ConsecutiveFailures, which a stalled polish round increments just as a
+// rejected merge does — so wording this as "repeated merge failures" and
+// quoting LastMergeError misreports every non-merge cause, and on a polish-only
+// stall LastMergeError is empty, naming no cause at all.
+//
+// cause must therefore be State.LastCooldownCause — recorded when the window
+// armed and cleared with it — not LastMergeError, which survives past the
+// merge that produced it and would name a stale error on a later stall.
+func CooldownWarning(meta RunMeta, until time.Time, cooldownCause string) RunReport {
+	cause := cooldownCause
+	if cause == "" {
+		// Deliberately makes no claim about WHICH kind of failure this was: the
+		// cause is recorded for every arming path now, so a blank one means it
+		// went unrecorded, not that a merge was ruled out.
+		cause = "not recorded; see the run log for the failing step"
+	}
 	return RunReport{
 		Meta:    meta,
 		State:   TerminalRunning,
 		Warning: true,
 		Detail: fmt.Sprintf(
-			"Repeated merge failures tripped the backoff cooldown; retrying after %s.\nLast merge error: %s",
-			until.Format(time.RFC3339), lastErr),
+			"Repeated failures tripped the backoff cooldown; retrying after %s.\nLast error: %s",
+			until.Format(time.RFC3339), cause),
 	}
 }
