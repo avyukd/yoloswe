@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 
@@ -24,9 +25,8 @@ var jiradozerTool = fleet.Tool{Name: "jiradozer", LeaseDir: jiradozer.LeaseDir}
 // to dispatch, how many at once, and when to retry stay with the caller — a
 // skill or a human — because those are judgment calls that change per batch,
 // while host selection has a right answer that belongs in code.
-func newDispatchCmd() *cobra.Command {
+func newDispatchCmd(x *execArgs) *cobra.Command {
 	var (
-		x         execArgs
 		host      string
 		here      bool
 		dryRun    bool
@@ -63,7 +63,7 @@ func newDispatchCmd() *cobra.Command {
 			}
 
 			if here {
-				return runExec(ctx, app, x)
+				return runExec(ctx, app, *x)
 			}
 
 			hosts, err := fleet.Load(fleet.DefaultFleetDir)
@@ -111,7 +111,7 @@ func newDispatchCmd() *cobra.Command {
 			req := fleet.Request{
 				Host:        chosen,
 				SessionName: tmuxSessionName(target, x.repo),
-				Args:        dispatchArgs(x, tmuxSessionName(target, x.repo)),
+				Args:        dispatchArgs(*x, tmuxSessionName(target, x.repo)),
 			}
 
 			if dryRun {
@@ -127,7 +127,7 @@ func newDispatchCmd() *cobra.Command {
 
 			if chosen.IsSelf {
 				app.Logger.Info("chosen host is this box; running in-process", "host", chosen.Host)
-				return runExec(ctx, app, x)
+				return runExec(ctx, app, *x)
 			}
 			if err := fleet.Dispatch(ctx, ssh, jiradozerTool, req, app.Logger); err != nil {
 				return err
@@ -160,6 +160,19 @@ func newDispatchCmd() *cobra.Command {
 // passed raw; the fleet dispatcher quotes them.
 func dispatchArgs(x execArgs, session string) []string {
 	args := []string{"exec", "--repo", x.repo}
+	// --config MUST be forwarded. The remote worker starts with cwd $HOME, so
+	// the default relative "jiradozer.yaml" resolves to nothing there and the
+	// run dies before doing any work.
+	//
+	// It is forwarded HOME-RELATIVE whenever it lives under this user's home.
+	// The homes differ per box — the Azure devbox runs as "ming", the AWS boxes
+	// as "ubuntu" — while ~/magent is synced fleet-wide, so a local absolute
+	// path names a file that exists on no other machine. This matters even when
+	// the caller typed a tilde, because their shell expanded it before jiradozer
+	// ever saw the value.
+	if x.configPath != "" {
+		args = append(args, "--config", portableConfigPath(x.configPath))
+	}
 	if x.issueID != "" {
 		args = append(args, "--issue", x.issueID)
 	}
@@ -190,6 +203,26 @@ func dispatchArgs(x execArgs, session string) []string {
 	// this the run knows nothing about how it was started.
 	args = append(args, "--tmux-session", session)
 	return args
+}
+
+// portableConfigPath rewrites a path so it resolves on the target box: paths
+// under this user's home become ~-relative for the worker to expand against
+// its own home, and anything else is made absolute since a relative path means
+// nothing from $HOME.
+func portableConfigPath(p string) string {
+	if strings.HasPrefix(p, "~") {
+		return p
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return p
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if rel, err := filepath.Rel(home, abs); err == nil && !strings.HasPrefix(rel, "..") {
+			return filepath.Join("~", rel)
+		}
+	}
+	return abs
 }
 
 // tmuxSessionName follows the fleet convention so the window is recognisable

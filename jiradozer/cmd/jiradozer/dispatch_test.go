@@ -135,3 +135,33 @@ func TestFindLeaseHolderBlocksADuplicateDispatch(t *testing.T) {
 	_, busy = fleet.FindLeaseHolder(scores, "INF-2")
 	assert.False(t, busy)
 }
+
+// The remote worker starts with cwd $HOME, so the default relative
+// "jiradozer.yaml" resolves to nothing there and the run dies before doing any
+// work. The config path must be forwarded, in a form the target can resolve.
+func TestDispatchArgsForwardAConfigPathTheTargetCanResolve(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// The common case, and the subtle one: the caller's SHELL expands ~ before
+	// jiradozer ever sees the value, so what arrives is a local absolute path.
+	// Homes differ per box — this user is "ming", the AWS boxes run as "ubuntu"
+	// — while ~/magent is synced fleet-wide, so it must go over home-relative
+	// or it names a file that exists on no other machine.
+	local := filepath.Join(home, "magent", "jdozer", "jiradozer_kernel.yaml")
+	joined := strings.Join(dispatchArgs(execArgs{
+		issueID: "INF-1", repo: "kernel", configPath: local}, "s"), " ")
+	assert.Contains(t, joined, "--config ~/magent/jdozer/jiradozer_kernel.yaml")
+	assert.NotContains(t, joined, home, "a local home path resolves on no other box")
+
+	// An explicit tilde is already portable and passes through untouched.
+	joined = strings.Join(dispatchArgs(execArgs{
+		issueID: "INF-1", repo: "kernel", configPath: "~/magent/x.yaml"}, "s"), " ")
+	assert.Contains(t, joined, "--config ~/magent/x.yaml")
+
+	// A path outside home cannot be made portable, so it goes absolute — a
+	// relative path would mean nothing from $HOME.
+	joined = strings.Join(dispatchArgs(execArgs{
+		issueID: "INF-1", repo: "kernel", configPath: "/etc/jd.yaml"}, "s"), " ")
+	assert.Contains(t, joined, "--config /etc/jd.yaml")
+}
