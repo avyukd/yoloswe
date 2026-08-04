@@ -185,8 +185,12 @@ func (b *Babysitter) loop(ctx context.Context, rc *RunContext, runLog *RunLog, p
 		if state, serr := LoadState(StatePath(o.OwnerRepo, o.PRNumber)); serr == nil &&
 			!state.CooldownUntil.IsZero() && state.CooldownUntil.After(cooldownReported) {
 			cooldownReported = state.CooldownUntil
-			b.event(runLog, "cooldown", state.LastMergeError, map[string]any{"until": state.CooldownUntil})
-			Report(ctx, b.logger, notifier, CooldownWarning(runLog.Meta(), state.CooldownUntil, state.LastMergeError))
+			// LastCooldownCause, not LastMergeError: the cooldown trips on a
+			// failure streak that stalls and reworks feed too, so the merge field
+			// would misattribute every non-merge cause. Written and cleared with
+			// the window itself, so it always describes THIS cooldown.
+			b.event(runLog, "cooldown", state.LastCooldownCause, map[string]any{"until": state.CooldownUntil})
+			Report(ctx, b.logger, notifier, CooldownWarning(runLog.Meta(), state.CooldownUntil, state.LastCooldownCause))
 		}
 
 		if o.Once {

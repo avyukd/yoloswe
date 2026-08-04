@@ -1821,6 +1821,99 @@ func TestWatcher_Tick_RepeatedStalls_TripTheBrake(t *testing.T) {
 		"reaching MaxConsecutiveFailures with a cooldown configured must arm it")
 }
 
+// The cooldown alert must name the cause that actually armed the window.
+//
+// The regression this pins: the reporting path can only reload persisted state,
+// and it used to quote LastMergeError. That field is written by the merge path
+// alone and is never cleared by a stall, so a run that failed a merge early and
+// later stalled its way into a cooldown told the operator to go look at a merge
+// error that had nothing to do with why it backed off. Seeded with exactly that
+// stale error so a regression reports it rather than the stall.
+func TestWatcher_StallCooldown_ReportsStallNotStaleMergeError(t *testing.T) {
+	const staleMergeErr = "Pull request is in an unmergeable state"
+
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	polish := &stubPolish{err: fmt.Errorf("polish round 1/2: agent execution: " +
+		"transient CLI error: stream idle: turn forced complete after grace period " +
+		"gated on background tool_use")}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		LastMergeError: staleMergeErr,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	for range 3 {
+		_, err := w.Tick(context.Background())
+		require.NoError(t, err)
+	}
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	require.False(t, s.CooldownUntil.IsZero(), "the stalls must have armed a cooldown")
+	assert.Equal(t, staleMergeErr, s.LastMergeError,
+		"the merge field is deliberately left alone — it feeds the rework prompt")
+	assert.NotEmpty(t, s.LastCooldownCause, "an armed cooldown must record its cause")
+	assert.NotContains(t, s.LastCooldownCause, staleMergeErr,
+		"a stall-armed cooldown must not be attributed to an unrelated older merge failure")
+	assert.Contains(t, s.LastCooldownCause, "stall",
+		"the cause must name the stall that actually armed the window")
+
+	// The cause reaches the operator-facing alert, not just the state file.
+	report := CooldownWarning(sampleMeta(), s.CooldownUntil, s.LastCooldownCause)
+	assert.Contains(t, report.Detail, "stall")
+	assert.NotContains(t, report.Detail, staleMergeErr)
+}
+
+// A cooldown cleared by a successful tick must not leave its cause behind for
+// the next one to misreport.
+func TestWatcher_SuccessfulTick_ClearsCooldownCause(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "SUCCESS"), "[]", "new-base")
+	// Built before the state is seeded: newWatcherForTest repoints HOME at a
+	// temp dir, and StatePath is under HOME — seeding first writes the file
+	// where the tick will never look for it.
+	w := newWatcherForTest(t, gh, &stubPolish{})
+
+	statePath := StatePath("r", 42)
+	pre := &State{
+		PRNumber: 42, Repo: "r",
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "old-base",
+		ConsecutiveFailures: 2,
+		CooldownUntil:       time.Now().Add(-time.Hour), // expired: does not short-circuit the tick
+		LastCooldownCause:   "polish round stalled: stream idle",
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	// Any non-failing action reaches recordSnapshot's clearing arm; assert on
+	// the arm rather than pinning one specific action, so a fixture change that
+	// yields idle instead of polished doesn't fail this test for the wrong
+	// reason. The cleared cooldown below is the real precondition.
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	require.NotContains(t, []LastAction{LastActionFailed, LastActionReworked, LastActionStalled},
+		res.Action, "the tick must not have failed, or it would arm a cooldown rather than clear one")
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	require.True(t, s.CooldownUntil.IsZero(), "a successful tick clears the cooldown")
+	assert.Empty(t, s.LastCooldownCause,
+		"the cause must be cleared with the window it describes, or the next cooldown inherits it")
+}
+
+// The merge brake arms its own cooldown after the failure switch, so its cause
+// must describe the brake rather than whatever this tick's action was.
+func TestWatcher_MergeBrakeCause_NamesMergeAttempts(t *testing.T) {
+	s := &State{MergeAttempts: 4, LastMergeError: "required status check is failing"}
+	got := mergeBrakeCause(s)
+	assert.Contains(t, got, "4 merge attempts")
+	assert.Contains(t, got, "required status check is failing")
+
+	// No recorded error still has to name the brake, not go blank.
+	assert.Contains(t, mergeBrakeCause(&State{MergeAttempts: 3}), "3 merge attempts")
+}
+
 // The no-progress guard: invocations that never yield a round must stop the run,
 // whatever ate them.
 //

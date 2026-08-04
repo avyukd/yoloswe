@@ -946,8 +946,10 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 		dirty = true
 		if w.cfg.Backoff.MaxConsecutiveFailures > 0 && s.ConsecutiveFailures >= w.cfg.Backoff.MaxConsecutiveFailures && w.cfg.Backoff.Cooldown > 0 {
 			s.CooldownUntil = time.Now().Add(w.cfg.Backoff.Cooldown)
+			s.LastCooldownCause = w.cooldownCause(s, action)
 			w.logger.Warn("entering cooldown after repeated failures",
 				"failures", s.ConsecutiveFailures,
+				"cause", s.LastCooldownCause,
 				"until", s.CooldownUntil,
 			)
 		}
@@ -959,6 +961,9 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 		}
 		s.ConsecutiveFailures = 0
 		s.CooldownUntil = time.Time{}
+		// Cleared with the window it describes: a cause outliving its cooldown
+		// is exactly the stale-attribution bug this field exists to prevent.
+		s.LastCooldownCause = ""
 	}
 
 	// The merge-attempt brake. ConsecutiveFailures alone CANNOT bound merge
@@ -977,9 +982,15 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 	if w.mergeBrakeTripped(s) {
 		s.CooldownUntil = time.Now().Add(w.cfg.Backoff.Cooldown)
 		s.CooldownFromAttempt = s.MergeAttempts
+		// Unconditionally a merge cause, whatever this tick's action was: the
+		// brake counts merge attempts, so LastMergeError IS its reason. Set after
+		// the switch above so a merge brake tripping on the same tick as a stall
+		// reports the brake — it is the condition that actually armed the window.
+		s.LastCooldownCause = mergeBrakeCause(s)
 		dirty = true
 		w.logger.Warn("entering cooldown after repeated merge attempts",
 			"merge_attempts", s.MergeAttempts,
+			"cause", s.LastCooldownCause,
 			"until", s.CooldownUntil,
 		)
 	}
@@ -987,6 +998,42 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 		s.LastCheckAt = snap.TakenAt
 	}
 	return dirty
+}
+
+// cooldownCause describes why the failure-streak cooldown just armed, in terms
+// of the action that armed it.
+//
+// The streak counts stalls, reworks and merge failures alike, so the cause has
+// to be selected by action rather than read off any single field: quoting
+// LastMergeError on a stall names an unrelated earlier merge, and on a
+// polish-only run names nothing at all.
+func (w *Watcher) cooldownCause(s *State, action LastAction) string {
+	switch action {
+	case LastActionStalled:
+		if w.lastStallError != "" {
+			return fmt.Sprintf("polish round stalled: %s", w.lastStallError)
+		}
+		return "polish rounds stalled without returning a result"
+	case LastActionReworked:
+		if s.LastMergeError != "" {
+			return fmt.Sprintf("reworking after a failed merge: %s", s.LastMergeError)
+		}
+		return "repeated rework rounds"
+	default:
+		if s.LastMergeError != "" {
+			return s.LastMergeError
+		}
+		return ""
+	}
+}
+
+// mergeBrakeCause describes why the merge-attempt brake armed the cooldown.
+func mergeBrakeCause(s *State) string {
+	if s.LastMergeError != "" {
+		return fmt.Sprintf("%d merge attempts without landing; last error: %s",
+			s.MergeAttempts, s.LastMergeError)
+	}
+	return fmt.Sprintf("%d merge attempts without landing", s.MergeAttempts)
 }
 
 // mergeBrakeTripped reports whether enough merge attempts have accumulated

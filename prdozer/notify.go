@@ -174,10 +174,17 @@ func Report(ctx context.Context, logger *slog.Logger, n notify.Notifier, report 
 // rejected merge does — so wording this as "repeated merge failures" and
 // quoting LastMergeError misreports every non-merge cause, and on a polish-only
 // stall LastMergeError is empty, naming no cause at all.
-func CooldownWarning(meta RunMeta, until time.Time, lastErr string) RunReport {
-	cause := lastErr
+//
+// cause must therefore be State.LastCooldownCause — recorded when the window
+// armed and cleared with it — not LastMergeError, which survives past the
+// merge that produced it and would name a stale error on a later stall.
+func CooldownWarning(meta RunMeta, until time.Time, cooldownCause string) RunReport {
+	cause := cooldownCause
 	if cause == "" {
-		cause = "not recorded (the cooldown was not tripped by a merge attempt; see the run log for the failing step)"
+		// Deliberately makes no claim about WHICH kind of failure this was: the
+		// cause is recorded for every arming path now, so a blank one means it
+		// went unrecorded, not that a merge was ruled out.
+		cause = "not recorded; see the run log for the failing step"
 	}
 	return RunReport{
 		Meta:    meta,

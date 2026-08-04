@@ -101,10 +101,21 @@ type State struct {
 	// PolishRounds, which counts only rounds whose result a later tick actually
 	// OBSERVED — a failed round, or a snapshot with no thread count, leaves it at
 	// zero and would re-run every once round on the next tick.
-	OnceRoundsDone  map[string]bool `json:"once_rounds_done,omitempty"`
-	LastCheckAt     time.Time       `json:"last_check_at,omitempty"`
-	CooldownUntil   time.Time       `json:"cooldown_until,omitempty"`
-	LastSeenHeadSHA string          `json:"last_seen_head_sha,omitempty"`
+	OnceRoundsDone map[string]bool `json:"once_rounds_done,omitempty"`
+	LastCheckAt    time.Time       `json:"last_check_at,omitempty"`
+	CooldownUntil  time.Time       `json:"cooldown_until,omitempty"`
+	// LastCooldownCause is the scrubbed reason the CURRENT cooldown window was
+	// armed, written at the moment CooldownUntil is set and cleared with it.
+	//
+	// The reporting path can only reload persisted state, and LastMergeError is
+	// not that reason: the cooldown trips on ConsecutiveFailures, which a stall
+	// or a rework increments just as a rejected merge does. Quoting
+	// LastMergeError there names a stale merge error from earlier in the run, or
+	// on a polish-only stall names nothing at all. Kept separate from
+	// LastMergeError rather than overloading it because that field is fed
+	// verbatim into the rework prompt, where a stall message does not belong.
+	LastCooldownCause string `json:"last_cooldown_cause,omitempty"`
+	LastSeenHeadSHA   string `json:"last_seen_head_sha,omitempty"`
 	// SelfReviewedSHA is the head SHA prdozer last originated a review for on a
 	// self_review repo. Keyed by SHA so the review happens once per commit: an
 	// unconditional trigger would re-review an idle PR on every tick forever.
