@@ -245,6 +245,14 @@ func TestTerminalFor(t *testing.T) {
 		{LastActionArmed, "", false},
 		{LastActionIdle, "", false},
 		{LastActionFailed, "", false},
+		// Stalled is non-terminal BY DESIGN, and is the entry most likely to be
+		// "fixed" into a terminal one: it shares a name with TickResult.Stalled,
+		// which is terminal. They mean opposite things — this action says one
+		// invocation was cut off mid-round and the cooldown brake should handle
+		// it, while the flag says a whole streak produced no round and the run is
+		// over. Ending the run here would hand a human every PR the brake would
+		// have recovered on its own.
+		{LastActionStalled, "", false},
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.action), func(t *testing.T) {

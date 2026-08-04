@@ -54,6 +54,18 @@ type Watcher struct {
 	// reason as diverged: both stop the run with LastActionNeedsHuman, and
 	// without a distinct signal the terminal report cannot tell "waiting on an
 	// approval" from "the rounds never came back". Reset every tick.
+	//
+	// NOT the same thing as LastActionStalled, despite the name — and the two
+	// must not be wired to each other. LastActionStalled says ONE invocation was
+	// cut off mid-round and is deliberately non-terminal, so the cooldown brake
+	// gets to work and a stall that clears still recovers (see state.go). This
+	// flag says the run is OVER: a whole streak of invocations produced no round
+	// at all, so terminalFor reports it instead of the generic needs-human text.
+	// Setting it from classifyAgentFailure — which returns LastActionStalled for
+	// both stages — would end a run on the first grace-forced round and hand a
+	// human a PR the brake would have recovered on its own. That is also why the
+	// guard, and this flag, stay polish-only: only the polish path feeds
+	// InvocationsSinceRound, which is the streak the terminal report quotes.
 	stalled bool
 }
 
