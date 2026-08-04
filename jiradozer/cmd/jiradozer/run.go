@@ -257,9 +257,18 @@ func run(ctx context.Context, app *cliapp.App, args runArgs) (runErr error) {
 // nil error or a bare context cancellation (Ctrl-C / shutdown / deadline) is an
 // expected stop, not a failure. A real step error reports even if the context
 // was also cancelled during or right after it — fail loudly is the whole point.
+// An idle-timeout kill is checked FIRST and always reports. A wedged agent is
+// the single most important thing to alert on, and it is exactly the case that
+// looks like a clean shutdown from the outside: the watchdog cancels the step,
+// so any layer that joins or re-wraps the cause alongside context.Canceled
+// would otherwise silence it. Team mode has the same problem and solves it with
+// the orchestrator's `hung` flag; in-process the reason rides on the error.
 func shouldReportFailure(runErr error) bool {
 	if runErr == nil {
 		return false
+	}
+	if errors.Is(runErr, jiradozer.ErrIdleTimeout) {
+		return true
 	}
 	return !errors.Is(runErr, context.Canceled) && !errors.Is(runErr, context.DeadlineExceeded)
 }

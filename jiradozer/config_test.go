@@ -677,6 +677,7 @@ func TestResolveRound_InheritsFromStep(t *testing.T) {
 		TransientRetries:      4,
 		MaxToolErrorRetries:   3,
 		StreamTurnGracePeriod: 12 * time.Minute,
+		IdleTimeout:           20 * time.Minute,
 	}
 
 	// Round with no overrides — inherits everything.
@@ -695,6 +696,10 @@ func TestResolveRound_InheritsFromStep(t *testing.T) {
 	// inherits the parent's value verbatim (the wiring cursor flagged as
 	// untested in PR #259).
 	assert.Equal(t, 12*time.Minute, resolved.StreamTurnGracePeriod)
+	// IdleTimeout likewise has no per-round override. Dropping it here disabled
+	// the stall watchdog for every rounds-based step — build/validate/ship in
+	// the bootstrap shape, i.e. the long ones it exists to protect.
+	assert.Equal(t, 20*time.Minute, resolved.IdleTimeout)
 	// FallbackModels has no per-round override field either; a round must
 	// inherit the parent's list verbatim so out-of-credits failover still
 	// triggers inside multi-round steps.

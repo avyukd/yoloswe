@@ -35,6 +35,7 @@ go_library(
 go_test(
     name = "jiradozer_test",
     srcs = [
+        "agent_idle_test.go",
         "agent_retry_test.go",
         "agent_test.go",
         "config_test.go",

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"text/template"
 	"time"
 
@@ -155,15 +156,41 @@ type logEventHandler struct {
 	planFilePath string
 	lastWriteMD  string
 	textBuf      strings.Builder
+	// lastEventAt is the UnixNano timestamp of the most recent event of any
+	// kind, and is the liveness signal the idle watchdog reads. It is atomic
+	// because the watchdog goroutine samples it while the provider's stream
+	// goroutine writes it.
+	//
+	// This is the same measurement the team-mode parent reconstructs by
+	// regex-parsing the child's log file (orchestrator_logtail.go), taken at
+	// the source instead: no file I/O, no reopen/seek, and it works in a
+	// process that has no parent watching it.
+	lastEventAt atomic.Int64
 }
 
 func newLogEventHandler(logger *slog.Logger, step, provider string) *logEventHandler {
-	return &logEventHandler{
+	h := &logEventHandler{
 		logger:     logger,
 		step:       step,
 		provider:   provider,
 		toolStarts: make(map[string]time.Time),
 	}
+	h.touch()
+	return h
+}
+
+// touch records that the agent just emitted an event.
+func (h *logEventHandler) touch() {
+	h.lastEventAt.Store(time.Now().UnixNano())
+}
+
+// idleFor reports how long it has been since the last agent event.
+func (h *logEventHandler) idleFor(now time.Time) time.Duration {
+	last := h.lastEventAt.Load()
+	if last == 0 {
+		return 0
+	}
+	return now.Sub(time.Unix(0, last))
 }
 
 // providerReportsCost reports whether a provider's turn/result events carry a
@@ -200,6 +227,9 @@ func usageLogAttr(reported bool, key string, value any) []any {
 // timestamps belong to a single agent run; carrying them across attempts can
 // surface a stale plan file via resolveOutput when a retry doesn't write one.
 func (h *logEventHandler) resetPerAttempt() {
+	// A new attempt is itself activity: the idle clock must not carry the
+	// previous attempt's stall (or the retry backoff) into this one.
+	h.touch()
 	h.planFilePath = ""
 	h.lastWriteMD = ""
 	h.toolStarts = make(map[string]time.Time)
@@ -207,6 +237,7 @@ func (h *logEventHandler) resetPerAttempt() {
 }
 
 func (h *logEventHandler) OnSessionInit(sessionID string) {
+	h.touch()
 	h.logger.Info("agent session init", "step", h.step, "session_id", sessionID)
 }
 
@@ -219,6 +250,7 @@ func (h *logEventHandler) flushText() {
 }
 
 func (h *logEventHandler) OnText(text string) {
+	h.touch()
 	h.textBuf.WriteString(text)
 	if strings.Contains(text, "\n") || h.textBuf.Len() > 200 {
 		h.flushText()
@@ -226,16 +258,19 @@ func (h *logEventHandler) OnText(text string) {
 }
 
 func (h *logEventHandler) OnThinking(thinking string) {
+	h.touch()
 	h.flushText()
 	h.logger.Debug("agent thinking", "step", h.step, "thinking", Truncate(thinking, 200))
 }
 
 func (h *logEventHandler) OnToolStart(name, id string, input map[string]interface{}) {
+	h.touch()
 	h.flushText()
 	h.toolStarts[id] = time.Now()
 }
 
 func (h *logEventHandler) OnToolComplete(name, id string, input map[string]interface{}, result interface{}, isError bool) {
+	h.touch()
 	attrs := []any{"step", h.step, "tool", name}
 	if inputSummary := render.FormatToolInput(name, input); inputSummary != "" {
 		attrs = append(attrs, "input", inputSummary)
@@ -264,6 +299,7 @@ func (h *logEventHandler) OnToolComplete(name, id string, input map[string]inter
 }
 
 func (h *logEventHandler) OnTurnComplete(turnNumber int, success bool, durationMs int64, costUSD float64) {
+	h.touch()
 	h.flushText()
 	attrs := []any{
 		"step", h.step,
@@ -277,12 +313,14 @@ func (h *logEventHandler) OnTurnComplete(turnNumber int, success bool, durationM
 }
 
 func (h *logEventHandler) OnError(err error, context string) {
+	h.touch()
 	h.flushText()
 	clear(h.toolStarts)
 	h.logger.Debug("agent error", "step", h.step, "error", err, "context", context)
 }
 
 func (h *logEventHandler) OnRetry(attempt, max int, tool, excerpt string) {
+	h.touch()
 	h.flushText()
 	h.logger.Info("retry on tool error",
 		"step", h.step,
@@ -301,6 +339,7 @@ func (h *logEventHandler) OnRetry(attempt, max int, tool, excerpt string) {
 }
 
 func (h *logEventHandler) OnRetryAbort(reason, tool, excerpt string) {
+	h.touch()
 	h.flushText()
 	h.logger.Info("retry loop aborted",
 		"step", h.step,
@@ -486,6 +525,11 @@ func (r agentRunner) runAgent(ctx context.Context, stepName, prompt string, cfg 
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return res, err
 		}
+		// A stall is likewise not a model-capacity problem, so falling back
+		// would just spend another full idle_timeout finding that out.
+		if errors.Is(err, ErrIdleTimeout) {
+			return res, err
+		}
 		lastErr, lastResult = err, res
 		if outOfCredits && mi < len(models)-1 {
 			next := models[mi+1]
@@ -539,6 +583,92 @@ func (r agentRunner) claudeNearLimit(ctx context.Context, cfg StepConfig, stepNa
 	return pct >= sessionLimitSkipPct
 }
 
+// ErrIdleTimeout reports that a step was cancelled because the agent stopped
+// emitting stream events for longer than the step's configured idle_timeout.
+//
+// It is deliberately distinct from context.Canceled: shouldReportFailure treats
+// a bare cancellation as an expected stop (Ctrl-C / shutdown) and stays silent,
+// which would make a wedged agent look like a clean exit. The team-mode parent
+// solves the same problem with its `hung` flag (orchestrator.go); in-process we
+// carry the reason on the error instead.
+var ErrIdleTimeout = errors.New("agent idle timeout")
+
+// idleWatchdogMaxTick bounds how coarsely the watchdog samples. A stall is
+// detected up to one tick late, which is fine against timeouts measured in
+// minutes and keeps a long run from waking constantly.
+const idleWatchdogMaxTick = 30 * time.Second
+
+// idleWatchdogMinTick keeps the sampling loop from spinning when a caller
+// configures a very short timeout (tests do).
+const idleWatchdogMinTick = 10 * time.Millisecond
+
+// executeWithIdleWatchdog runs provider.Execute, cancelling it when the agent
+// emits no events for timeout. A timeout of 0 disables the watchdog entirely —
+// that is the documented meaning of idle_timeout: 0 and the zero value, so a
+// config that never opted in never gains a kill switch by surprise.
+//
+// The clock measures the GAP BETWEEN EVENTS, not wall-clock since start, so a
+// slow-but-progressing agent is never interrupted. Scope is one Execute call:
+// the transient-retry backoff between attempts happens outside this function,
+// so a sleeping retry can never be mistaken for a stalled agent.
+func executeWithIdleWatchdog(
+	ctx context.Context,
+	provider agent.Provider,
+	prompt string,
+	opts []agent.ExecuteOption,
+	h *logEventHandler,
+	timeout time.Duration,
+	stepName string,
+	logger *slog.Logger,
+) (*agent.AgentResult, error) {
+	if timeout <= 0 {
+		return provider.Execute(ctx, prompt, nil, opts...)
+	}
+
+	execCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	h.touch()
+	done := make(chan struct{})
+	defer close(done)
+
+	tick := min(max(timeout/4, idleWatchdogMinTick), idleWatchdogMaxTick)
+	go func() {
+		ticker := time.NewTicker(tick)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-execCtx.Done():
+				return
+			case <-ticker.C:
+				idle := h.idleFor(time.Now())
+				if idle < timeout {
+					continue
+				}
+				logger.Error("agent idle timeout",
+					"step", stepName,
+					"idle", idle.Truncate(time.Second),
+					"idle_timeout", timeout,
+				)
+				cancel(fmt.Errorf("%w: %s produced no output for %s (idle_timeout=%s)",
+					ErrIdleTimeout, stepName, idle.Truncate(time.Second), timeout))
+				return
+			}
+		}
+	}()
+
+	result, err := provider.Execute(execCtx, prompt, nil, opts...)
+	// Report the stall as the cause only when the parent context is still
+	// healthy. If the caller cancelled too, that is the real reason the run is
+	// ending and reporting an idle timeout would send a misleading alert.
+	if cause := context.Cause(execCtx); errors.Is(cause, ErrIdleTimeout) && ctx.Err() == nil {
+		return result, cause
+	}
+	return result, err
+}
+
 // runAgentForModel runs the transient-retry loop for a single model. It returns
 // the step result, whether the terminal error was a workspace out-of-credits
 // failure (so the caller can decide to fall back to a different model), and a
@@ -587,7 +717,18 @@ func (r agentRunner) runAgentForModel(ctx context.Context, stepName, prompt stri
 		if err != nil {
 			return StepAgentResult{}, false, err
 		}
-		result, err = provider.Execute(ctx, prompt, nil, opts...)
+		result, err = executeWithIdleWatchdog(ctx, provider, prompt, opts, logHandler, cfg.IdleTimeout, stepName, logger)
+		// An idle kill is terminal, matching what the team-mode parent watchdog
+		// does (it cancels the whole subprocess). Returning here also keeps it
+		// away from ClassifyTransient, which must never see a stall as
+		// retryable — retrying a wedged agent just burns another idle_timeout.
+		if errors.Is(err, ErrIdleTimeout) {
+			logHandler.flushText()
+			if result != nil && result.SessionID != "" {
+				currentResume = result.SessionID
+			}
+			return StepAgentResult{SessionID: currentResume}, false, err
+		}
 		if err == nil {
 			if result == nil || result.Success || result.Error == nil {
 				break
