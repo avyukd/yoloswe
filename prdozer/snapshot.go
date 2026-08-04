@@ -80,8 +80,16 @@ type PRDetails struct {
 	// under-counts badly: a polish invocation commits once per round and
 	// force-pushes ONCE at the end, so a 5-round invocation reads as a single
 	// commit and a cap of 12 would sit ~60 commits deep before firing.
+	//
+	// Read it through CommitCount, never directly: gh caps this list at 100
+	// entries with no pagination, so on a large PR its length is a truncation
+	// artifact rather than a count.
 	Commits []commitRow `json:"commits"`
-	Number  int         `json:"number"`
+	// TotalCommits is the exact commit count from GraphQL, which reports it as
+	// a scalar and so is immune to the 100-entry cap on Commits. Zero when the
+	// query failed; CommitCount falls back to the list length in that case.
+	TotalCommits int `json:"-"`
+	Number       int `json:"number"`
 	// Additions/Deletions/ChangedFiles size the PR's diff. Fetched in the same
 	// gh call as everything else, so the scope guard costs no extra round trip.
 	Additions    int  `json:"additions"`
@@ -92,9 +100,31 @@ type PRDetails struct {
 
 // commitRow is one entry in gh's commits list. Only the count is ever read —
 // the guard needs to know how many commits arrived, not what is in them — but
-// gh exposes no count-only field, so the list is decoded and measured.
+// `gh pr view --json` exposes no count-only field, so the list is decoded and
+// measured.
 type commitRow struct {
 	OID string `json:"oid"`
+}
+
+// CommitCount reports how many commits the PR carries, or 0 when that is
+// unknown.
+//
+// The exact GraphQL count wins over the list length because `gh pr view --json
+// commits` issues an unpaginated `commits(first:100)` and silently truncates
+// there. On a PR already 100 commits deep the list length is pinned at 100, so
+// every subsequent push measures as zero growth and pushedCommits charges its
+// floor of one instead of the true delta — the scope brake under-counting,
+// which is the one direction it must not be wrong in.
+//
+// The list length survives as the fallback rather than being dropped: when the
+// GraphQL call fails it is still exact for the PRs small enough to fit under
+// the cap, which is nearly all of them, and a saturated 100 recorded as the
+// baseline still beats recording nothing at all.
+func (p PRDetails) CommitCount() int {
+	if p.TotalCommits > 0 {
+		return p.TotalCommits
+	}
+	return len(p.Commits)
 }
 
 // reviewRow is one entry in gh's latestReviews: the most recent review per
@@ -150,9 +180,17 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 		comments               []CommentRef
 		baseSHA                string
 		unresolved             int
+		totalCommits           int
 		failedErr, commentsErr error
 	)
-	wg.Add(4)
+	wg.Add(5)
+	go func() {
+		defer wg.Done()
+		// Best-effort: an unreadable count leaves PRDetails.TotalCommits at
+		// zero and CommitCount falls back to the (possibly truncated) list,
+		// which is what the scope guard read before this query existed.
+		totalCommits, _ = fetchCommitCount(ctx, gh, dir, owner, repo, prNumber)
+	}()
 	go func() {
 		defer wg.Done()
 		// Best-effort, like base detection: an unreadable thread count only
@@ -185,6 +223,7 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 	if commentsErr != nil {
 		return nil, fmt.Errorf("comments for #%d: %w", prNumber, commentsErr)
 	}
+	pr.TotalCommits = totalCommits
 	return &Snapshot{
 		TakenAt:            time.Now().UTC(),
 		PR:                 *pr,
@@ -196,6 +235,45 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 		IsBotReviewer:      botReviewers(pr.LatestReviews),
 		UnresolvedThreads:  unresolved,
 	}, nil
+}
+
+// fetchCommitCount reads the PR's exact commit count.
+//
+// GraphQL exposes it as a scalar `totalCount`, so one unpaginated query is
+// enough — unlike `gh pr view --json commits`, which fetches a `first:100` page
+// and reports its length. That difference is the whole point of this call: the
+// scope guard charges pushes by commit delta, and a length pinned at 100
+// charges a growing PR its floor of one per tick forever.
+func fetchCommitCount(ctx context.Context, gh wt.GHRunner, dir, owner, repo string, prNumber int) (int, error) {
+	const query = `query($owner:String!,$repo:String!,$pr:Int!){
+  repository(owner:$owner,name:$repo){
+    pullRequest(number:$pr){
+      commits{ totalCount }
+    }
+  }
+}`
+	res, err := gh.Run(ctx, []string{
+		"api", "graphql",
+		"-f", "query=" + query,
+		"-F", "owner=" + owner,
+		"-F", "repo=" + repo,
+		"-F", fmt.Sprintf("pr=%d", prNumber),
+		"--jq", `.data.repository.pullRequest.commits.totalCount`,
+	}, dir)
+	if err != nil {
+		return 0, ghError(err, res)
+	}
+	out := strings.TrimSpace(res.Stdout)
+	if out == "" {
+		// Unknown, not zero: zero would read as a PR with no commits and hand
+		// the next push the floor charge instead of its real delta.
+		return 0, fmt.Errorf("empty commit count")
+	}
+	n, err := strconv.Atoi(out)
+	if err != nil {
+		return 0, fmt.Errorf("parse commit count %q: %w", out, err)
+	}
+	return n, nil
 }
 
 // fetchUnresolvedThreads counts review threads that are neither resolved nor

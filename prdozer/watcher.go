@@ -1014,11 +1014,12 @@ func pushedCommits(state *State, snap *Snapshot) int {
 		state.LastSeenHeadSHA == snap.PR.HeadRefOid {
 		return 0
 	}
-	// Floor of one. The count is unusable when gh served no commit list, or when
-	// state predates the field, or when a rebase or squash left the branch no
-	// longer than it was — but the head moved, so a round's worth of growth did
-	// happen and charging zero would hand a squashing run an unlimited budget.
-	now := len(snap.PR.Commits)
+	// Floor of one. The count is unusable when gh served neither an exact count
+	// nor a commit list, or when state predates the field, or when a rebase or
+	// squash left the branch no longer than it was — but the head moved, so a
+	// round's worth of growth did happen and charging zero would hand a
+	// squashing run an unlimited budget.
+	now := snap.PR.CommitCount()
 	if now == 0 || state.LastSeenCommitCount <= 0 || now <= state.LastSeenCommitCount {
 		return 1
 	}
@@ -1111,11 +1112,11 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 		s.LastSeenHeadSHA = snap.PR.HeadRefOid
 		dirty = true
 	}
-	// Only when gh actually served a commit list: an empty one means the field
-	// was missing, not that the PR lost its commits, and overwriting a real
-	// count with zero would charge the next push a floor of one instead of its
-	// true size.
-	if n := len(snap.PR.Commits); n > 0 && s.LastSeenCommitCount != n {
+	// Only when gh actually served a count: zero means neither the GraphQL
+	// scalar nor the commit list came back, not that the PR lost its commits,
+	// and overwriting a real count with zero would charge the next push a floor
+	// of one instead of its true size.
+	if n := snap.PR.CommitCount(); n > 0 && s.LastSeenCommitCount != n {
 		s.LastSeenCommitCount = n
 		dirty = true
 	}

@@ -24,6 +24,7 @@ import (
 type fakeGH struct {
 	results  map[string]*wt.CmdResult
 	failures map[string]*wt.CmdResult
+	contains map[string]*wt.CmdResult
 	calls    [][]string
 	mu       sync.Mutex
 }
@@ -32,12 +33,21 @@ func newFakeGH() *fakeGH {
 	return &fakeGH{
 		results:  make(map[string]*wt.CmdResult),
 		failures: make(map[string]*wt.CmdResult),
+		contains: make(map[string]*wt.CmdResult),
 	}
 }
 
 // addPrefix registers a stdout response for any call whose joined-args starts with prefix.
 func (f *fakeGH) addPrefix(prefix, stdout string) {
 	f.results[prefix] = &wt.CmdResult{Stdout: stdout}
+}
+
+// addContains registers a stdout response for any call whose joined args
+// CONTAIN substr. Every GraphQL call shares the `api graphql -f query=` prefix
+// and differs only inside the query body, so prefix matching cannot tell the
+// commit-count query from the review-thread one.
+func (f *fakeGH) addContains(substr, stdout string) {
+	f.contains[substr] = &wt.CmdResult{Stdout: stdout}
 }
 
 // failPrefix registers a FAILING response (non-zero exit plus stderr) for any
@@ -57,6 +67,14 @@ func (f *fakeGH) Run(_ context.Context, args []string, _ string) (*wt.CmdResult,
 	for prefix, res := range f.failures {
 		if strings.HasPrefix(joined, prefix) {
 			return res, fmt.Errorf("exit status %d", res.ExitCode)
+		}
+	}
+	// Substring matches are checked before prefixes: they exist to pick one
+	// GraphQL query out of several that share a prefix, so a broad prefix must
+	// not shadow them.
+	for substr, res := range f.contains {
+		if strings.Contains(joined, substr) {
+			return res, nil
 		}
 	}
 	for prefix, res := range f.results {
@@ -2458,6 +2476,108 @@ func TestWatcher_Tick_ScopeCounterAdvancesAcrossTicks(t *testing.T) {
 	after, err = LoadState(statePath)
 	require.NoError(t, err)
 	assert.Equal(t, 3, after.PolishCommits, "the same push must not be charged twice")
+}
+
+// `gh pr view --json commits` runs an unpaginated `commits(first:100)`, so on a
+// PR already 100 commits deep the list length is a cap, not a count. Left
+// unfixed, that pins LastSeenCommitCount at 100 forever: every later push looks
+// like zero growth and is charged the floor of one, so a limit of 12 tolerates
+// an unbounded number of agent commits — the brake under-counting, the one
+// direction it is explicitly built not to fail in.
+func TestCommitCount_ExactCountBeatsTheTruncatedList(t *testing.T) {
+	t.Parallel()
+	saturated := make([]commitRow, 100)
+
+	assert.Equal(t, 137, PRDetails{Commits: saturated, TotalCommits: 137}.CommitCount(),
+		"the GraphQL scalar is the real count; the list is capped at 100")
+	assert.Equal(t, 100, PRDetails{Commits: saturated}.CommitCount(),
+		"without an exact count the list length is the best available answer")
+	assert.Zero(t, PRDetails{}.CommitCount(),
+		"no list and no count is unknown, and the caller floors it")
+}
+
+// The end-to-end version of the above: a real tick on a 100-commit PR must
+// charge the push its true delta, which means the count has to come from
+// GraphQL and survive all the way into PolishCommits.
+func TestWatcher_ChargesRealDeltaOnAPRPastTheCommitListCap(t *testing.T) {
+	// The list gh serves is truncated at 100 whatever the PR really carries.
+	rows := make([]string, 100)
+	for i := range rows {
+		rows[i] = fmt.Sprintf(`{"oid":"c%d"}`, i)
+	}
+	pushed := buildPRJSON(fmt.Sprintf(`{
+  "number": 42,
+  "url": "https://github.com/o/r/pull/42",
+  "headRefName": "feature",
+  "baseRefName": "main",
+  "headRefOid": "head2",
+  "state": "OPEN",
+  "isDraft": false,
+  "reviewDecision": "REVIEW_REQUIRED",
+  "mergeable": "MERGEABLE",
+  "additions": 900,
+  "commits": [%s]
+}`, strings.Join(rows, ",")), "FAILURE")
+	gh := setupGH(pushed, "[]", "base1")
+	// GraphQL reports the count as a scalar, so it is immune to the cap.
+	gh.addContains("commits{ totalCount }", "137\n")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	statePath := StatePath("r", 42)
+
+	// Last tick polished and saw 130 commits; the round pushed seven more.
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		LastSeenCommitCount: 130, LastAction: LastActionPolished,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	_, err := w.Tick(context.Background())
+	require.NoError(t, err)
+
+	after, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 7, after.PolishCommits,
+		"seven commits arrived; the truncated list would have charged the floor of one")
+	assert.Equal(t, 137, after.LastSeenCommitCount,
+		"the baseline is the exact count, not the 100-entry cap")
+}
+
+// When the exact query fails there is nothing better than the truncated list,
+// and falling back to it must keep the pre-existing behaviour rather than
+// charging zero — a snapshot that reads as "no commits" would hand a growing PR
+// a free tick.
+func TestWatcher_FallsBackToTheCommitListWhenTheExactCountFails(t *testing.T) {
+	pushed := buildPRJSON(`{
+  "number": 42,
+  "url": "https://github.com/o/r/pull/42",
+  "headRefName": "feature",
+  "baseRefName": "main",
+  "headRefOid": "head2",
+  "state": "OPEN",
+  "isDraft": false,
+  "reviewDecision": "REVIEW_REQUIRED",
+  "mergeable": "MERGEABLE",
+  "additions": 900,
+  "commits": [{"oid":"c1"},{"oid":"c2"},{"oid":"c3"},{"oid":"c4"},{"oid":"c5"}]
+}`, "FAILURE")
+	gh := setupGH(pushed, "[]", "base1")
+	gh.failPrefix("api graphql -f query=query($owner:String!,$repo:String!,$pr:Int!){", "gone")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	statePath := StatePath("r", 42)
+
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		LastSeenCommitCount: 2, LastAction: LastActionPolished,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	_, err := w.Tick(context.Background())
+	require.NoError(t, err)
+
+	after, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 3, after.PolishCommits, "the list still counts when the scalar is unavailable")
+	assert.Equal(t, 5, after.LastSeenCommitCount)
 }
 
 // The stop must reach the operator as a SCOPE stop. The guard sets w.ratcheted
