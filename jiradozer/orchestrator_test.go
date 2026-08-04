@@ -22,7 +22,11 @@ type mockWTManager struct {
 	baseDir string            // temp dir for creating real directories
 	created map[string]string // branch -> worktreePath
 	removed []string          // branches removed
-	mu      sync.Mutex
+	// forced records the force flag of each removal. Without it a silent
+	// revert to an unforced removal would pass every test here while leaking
+	// the worktrees those removals exist to reclaim.
+	forced []bool
+	mu     sync.Mutex
 }
 
 func newMockWTManager() *mockWTManager {
@@ -54,11 +58,24 @@ func (m *mockWTManager) NewWorktree(_ context.Context, branch, _, _ string) (str
 	return path, nil
 }
 
-func (m *mockWTManager) RemoveWorktree(_ context.Context, nameOrBranch string, _, _ bool) error {
+func (m *mockWTManager) RemoveWorktree(_ context.Context, nameOrBranch string, _, force bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.removed = append(m.removed, nameOrBranch)
+	m.forced = append(m.forced, force)
 	return nil
+}
+
+func (m *mockWTManager) getRemoved() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.removed...)
+}
+
+func (m *mockWTManager) getForced() []bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]bool(nil), m.forced...)
 }
 
 func (m *mockWTManager) getCreated() map[string]string {
@@ -518,6 +535,41 @@ func TestOrchestrator_CancelPreservesWorktree(t *testing.T) {
 	require.Contains(t, preserved[0].Branch, "ENG-1")
 }
 
+// A worktree created for a run that never started must always come back down.
+// Nothing has run in it, so the only thing in it is post-create hook output —
+// and an unforced `git worktree remove` refuses on exactly that. A refusal here
+// protects no work; it strands a checkout no run-log will ever claim, which is
+// the one kind gc cannot find.
+func TestOrchestrator_RollbackForcesRemovalOfAWorktreeThatNeverRan(t *testing.T) {
+	t.Run("subprocess fails to start", func(t *testing.T) {
+		orch, wtm := setupSubprocessOrch(t, testOrchestratorConfig(),
+			filepath.Join(t.TempDir(), "not-a-real-binary"))
+
+		err := orch.Start(context.Background(), &tracker.Issue{ID: "1", Identifier: "ENG-1", Title: "Test"})
+		require.Error(t, err, "a missing child binary must surface, not be swallowed")
+
+		require.Len(t, wtm.getRemoved(), 1, "the worktree must not outlive the failed start")
+		require.Equal(t, []bool{true}, wtm.getForced())
+	})
+
+	t.Run("log file cannot be opened", func(t *testing.T) {
+		// A regular file where the log directory should be: OpenFile under it
+		// fails with ENOTDIR, which is the rollback this exercises.
+		notADir := filepath.Join(t.TempDir(), "logdir")
+		require.NoError(t, os.WriteFile(notADir, nil, 0o600))
+
+		wtm := newMockWTManagerWithDir(t)
+		orch := NewOrchestrator(&mockDiscoveryTracker{}, testOrchestratorConfig(), wtm, "", testLogger(t))
+		orch.SetSubprocessMode(writeTestScript(t, "exit 0"), nil, notADir)
+
+		err := orch.Start(context.Background(), &tracker.Issue{ID: "1", Identifier: "ENG-1", Title: "Test"})
+		require.ErrorContains(t, err, "open log file")
+
+		require.Len(t, wtm.getRemoved(), 1, "the worktree must not outlive the failed log open")
+		require.Equal(t, []bool{true}, wtm.getForced())
+	})
+}
+
 func TestOrchestrator_CancelWithForceCleanup(t *testing.T) {
 	cfg := testOrchestratorConfig()
 
@@ -554,6 +606,13 @@ func TestOrchestrator_CancelWithForceCleanup(t *testing.T) {
 	removed := wtm.removed
 	wtm.mu.Unlock()
 	require.Len(t, removed, 1, "cancelled worktree should be removed with --force-cleanup")
+
+	// And the removal has to be forced. --force-cleanup exists to delete
+	// worktrees that hold work; an unforced `git worktree remove` refuses on
+	// exactly the modified files it was asked to discard, so entering this
+	// branch without the flag is a wipe that never happens.
+	require.Equal(t, []bool{true}, wtm.getForced(),
+		"--force-cleanup must reach the removal, not just the decision to remove")
 
 	// No preserved worktrees.
 	require.Empty(t, orch.PreservedWorktrees())

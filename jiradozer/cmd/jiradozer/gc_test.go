@@ -40,16 +40,27 @@ func TestRemoversUseTheRootARunWasActuallyCreatedUnder(t *testing.T) {
 	removers, err := removersForRuns(runs)
 	require.NoError(t, err)
 
-	// r1 and r3 share a RemoverKey (both have an empty WTRoot), and r1 is seen
-	// first, so the derived root is what both resolve through.
-	legacy := removers[runs[0].RemoverKey()]
-	require.NotNil(t, legacy)
-	require.Equal(t, "/roots/old", removerRoot(t, legacy),
-		"a record with no wt_root must be reclaimed under the root its path names, not the ambient one")
+	// Every run gets its own bucket. r1 and r3 both have an empty wt_root, so a
+	// key built from that raw field would collapse them together and hand
+	// whichever was seen first its manager to the other — the same wrong-tree
+	// lookup, arriving from the other direction.
+	require.Len(t, removers, 3, "three distinct roots, three managers")
 
-	pinned := removers[runs[1].RemoverKey()]
-	require.NotNil(t, pinned)
-	require.Equal(t, "/roots/pinned", removerRoot(t, pinned))
+	for _, tc := range []struct {
+		name string
+		run  jiradozer.RunMeta
+		want string
+	}{
+		{"root read back off the recorded path", runs[0], "/roots/old"},
+		{"root recorded outright", runs[1], "/roots/pinned"},
+		{"no root to be had; ambient is the last resort", runs[2], "/roots/new"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := removers[tc.run.RemoverKey()]
+			require.NotNil(t, r, "the lookup key must match the key it was built under")
+			require.Equal(t, tc.want, removerRoot(t, r))
+		})
+	}
 }
 
 // With nothing to derive from, the current root is the only answer available —

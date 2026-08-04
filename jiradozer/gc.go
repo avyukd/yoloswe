@@ -276,7 +276,9 @@ func gcWorktree(ctx context.Context, deps GCDeps, opts GCOptions, m RunMeta, log
 	remover := deps.Removers[m.RemoverKey()]
 	if remover == nil {
 		c.Eligible = false
-		c.Reason = fmt.Sprintf("no worktree manager for repo %q under %q", m.Repo, m.WTRoot)
+		// The effective root, not the raw field: that is the root the lookup
+		// keyed on, so it is the one a human needs in order to explain the miss.
+		c.Reason = fmt.Sprintf("no worktree manager for repo %q under %q", m.Repo, m.EffectiveWTRoot())
 		return c
 	}
 	// Remove through the manager (git worktree remove + prune), never rm -rf,

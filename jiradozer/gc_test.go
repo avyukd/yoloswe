@@ -50,9 +50,15 @@ func (g fakeGit) Run(_ context.Context, _ []string, dir string) (*wt.CmdResult, 
 }
 
 // gcFixture seeds one run with a real directory standing in for its worktree.
+// A caller that needs the path to have a particular shape — the <root>/<repo>/
+// <branch> layout a pre-wt_root record's root is read back off — sets
+// WorktreePath itself and gets that directory created instead.
 func gcFixture(t *testing.T, m RunMeta) (RunMeta, string) {
 	t.Helper()
-	wtPath := filepath.Join(t.TempDir(), "worktree")
+	wtPath := m.WorktreePath
+	if wtPath == "" {
+		wtPath = filepath.Join(t.TempDir(), "worktree")
+	}
 	require.NoError(t, os.MkdirAll(wtPath, 0o755))
 	m.WorktreePath = wtPath
 	rl, err := NewRunLog(m)
@@ -443,6 +449,49 @@ func TestGCPicksTheRemoverForTheRootTheRunWasCreatedUnder(t *testing.T) {
 	require.Equal(t, []string{"feature/INF-1"}, right.removed)
 	require.Empty(t, wrong.removed, "a manager on the wrong root must never be handed the run")
 	require.Equal(t, 1, res.Removed)
+}
+
+// The case above, for the records that have no wt_root to key on — the ones
+// EffectiveWTRoot exists for. Their root is readable off their worktree path,
+// so they must NOT share a bucket with records that genuinely cannot say and
+// fall back to the ambient root. Keying on the raw field collapsed both into
+// one, and whichever was seen first handed its manager to the other.
+func TestGCRoutesAPreWTRootRecordToTheRootItsPathNames(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	oldRoot := filepath.Join(t.TempDir(), "roots", "old")
+
+	// Recorded before wt_root existed, but its path still names the old root.
+	derivable, _ := gcFixture(t, RunMeta{
+		RunID: "r1", IssueIdentifier: "INF-1", Repo: "kernel", Branch: "feature/INF-1",
+		WorktreePath: filepath.Join(oldRoot, "kernel", "feature/INF-1"),
+		State:        RunStateDone, PRURL: "https://github.com/o/r/pull/1",
+	})
+	// Also pre-wt_root, but its path is not in the layout, so nothing can be
+	// read back off it: the ambient root is all this one has.
+	ambient, _ := gcFixture(t, RunMeta{
+		RunID: "r2", IssueIdentifier: "INF-2", Repo: "kernel", Branch: "feature/INF-2",
+		State: RunStateDone, PRURL: "https://github.com/o/r/pull/2",
+	})
+	require.Equal(t, oldRoot, derivable.EffectiveWTRoot())
+	require.Empty(t, ambient.EffectiveWTRoot())
+
+	atOldRoot, atAmbientRoot := &fakeRemover{}, &fakeRemover{}
+	deps := gcDeps(fakePRChecker{merged: map[string]bool{
+		"https://github.com/o/r/pull/1": true,
+		"https://github.com/o/r/pull/2": true,
+	}}, atAmbientRoot, nil)
+	deps.Removers = map[string]WorktreeRemover{
+		derivable.RemoverKey(): atOldRoot,
+		ambient.RemoverKey():   atAmbientRoot,
+	}
+	require.NotEqual(t, derivable.RemoverKey(), ambient.RemoverKey(),
+		"a derivable root and an unknowable one must not share a bucket")
+
+	res, err := RunGC(context.Background(), deps, GCOptions{Apply: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, 2, res.Removed)
+	require.Equal(t, []string{"feature/INF-1"}, atOldRoot.removed)
+	require.Equal(t, []string{"feature/INF-2"}, atAmbientRoot.removed)
 }
 
 // A run whose root has no manager must be reported, not silently counted as

@@ -130,12 +130,20 @@ func (m RunMeta) Target() string {
 
 // RemoverKey identifies the worktree manager that owns this run's checkout.
 //
-// Repo alone is not enough: WTRoot is recorded per run precisely because it can
-// differ between runs (WT_ROOT changes, or historical runs made under another
-// root), and a manager built on the wrong root looks in a directory the
-// worktree was never in — so gc would silently never reclaim it.
+// Repo alone is not enough: the root can differ between runs (WT_ROOT changes,
+// or historical runs made under another root), and a manager built on the wrong
+// root looks in a directory the worktree was never in — so gc would silently
+// never reclaim it.
+//
+// It keys on EffectiveWTRoot, not the raw WTRoot field, because that is the
+// root the manager is actually built on. Keying on the raw field would collapse
+// every pre-wt_root record for a repo into one bucket regardless of the
+// different historical roots their paths name, and the first one seen would
+// hand its manager to all the rest — reintroducing the wrong-tree lookup from
+// the other direction. Records that can name no root share the empty key, which
+// is correct: they all resolve through the same ambient fallback.
 func (m RunMeta) RemoverKey() string {
-	return m.WTRoot + "\x00" + m.Repo
+	return m.EffectiveWTRoot() + "\x00" + m.Repo
 }
 
 // EffectiveWTRoot returns the worktree root this run's checkout actually lives

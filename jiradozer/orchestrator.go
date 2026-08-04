@@ -993,9 +993,13 @@ func (o *Orchestrator) cleanup(ctx context.Context, mw *managedWorkflow, step Wo
 		})
 		o.mu.Unlock()
 	} else {
-		// No force: a finished run's checkout can hold work that exists nowhere
-		// else, and a refusal here is the signal a human should look.
-		if err := o.wtManager.RemoveWorktree(ctx, mw.branch, true, false); err != nil {
+		// forceCleanup, not false: reaching here on a failed or cancelled run
+		// means the operator passed --force-cleanup, whose whole point is to
+		// delete worktrees that hold work. An unforced removal would refuse on
+		// exactly the modified files that flag exists to discard, so the wipe
+		// would silently not happen. Without the flag the removal stays
+		// unforced, and a refusal is the signal a human should look.
+		if err := o.wtManager.RemoveWorktree(ctx, mw.branch, true, forceCleanup); err != nil {
 			o.logger.Warn("failed to remove worktree", "branch", mw.branch, "error", err)
 		}
 	}
