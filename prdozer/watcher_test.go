@@ -1677,6 +1677,71 @@ func TestWatcher_StaleDivergenceVerdict_KeptWhenHeadUnchanged(t *testing.T) {
 	assert.True(t, res.Diverged)
 }
 
+// The stall streak must be retired on resume for the same reason the divergence
+// streak is: it is a judgment about a specific head.
+//
+// Without this, InvocationsSinceRound is the one no-progress counter that
+// survives a push. A run stopped at needs_human leaves it at the limit; the next
+// run resumes on a NEW head, and the first non-transient failure — one tick,
+// wholly unrelated to whatever stalled before — re-crosses the threshold and
+// halts again, forcing the state-file hand-edit the divergence retirement was
+// added to eliminate.
+func TestWatcher_StaleStallStreak_RetiredWhenHeadMoved(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(9)
+	polish := &stubPolish{}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	// A previous run that ended on the stall guard alone: the divergence
+	// counters never moved, because no round ever returned to score.
+	stale := &State{
+		LastCheckAt:           time.Now(),
+		LastSeenHeadSHA:       "an-older-head",
+		LastSeenBaseSHA:       "base1",
+		LastAction:            LastActionNeedsHuman,
+		InvocationsSinceRound: 2 * w.cfg.Backoff.MaxConsecutiveFailures,
+	}
+	require.NoError(t, stale.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.False(t, res.Stalled,
+		"a stall streak about commits that are gone must not stop the resumed run")
+	assert.NotEmpty(t, polish.calls, "the run must actually get to work")
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 0, s.InvocationsSinceRound,
+		"the retirement must reach disk, or the next tick reloads the same wall")
+}
+
+// The mirror case: the same inherited streak on the SAME head is a verdict that
+// still applies. Retiring it there would make the guard unresumable-past, i.e.
+// no guard at all across restarts.
+func TestWatcher_StaleStallStreak_KeptWhenHeadUnchanged(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	gh.setThreads(9)
+	polish := &stubPolish{err: fmt.Errorf("boom: round died before returning")}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	same := &State{
+		LastCheckAt:           time.Now(),
+		LastSeenHeadSHA:       "head1", // what the fake gh serves
+		LastSeenBaseSHA:       "base1",
+		LastAction:            LastActionNeedsHuman,
+		InvocationsSinceRound: 2*w.cfg.Backoff.MaxConsecutiveFailures - 1,
+	}
+	require.NoError(t, same.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionNeedsHuman, res.Action,
+		"same head, same streak — one more fruitless invocation must still stop it")
+	assert.True(t, res.Stalled, "and it must be reported as a stall, not an approval block")
+}
+
 // A stall is our own deadline firing, not the provider going down, so it must
 // reach the brake.
 //
@@ -1736,8 +1801,16 @@ func TestWatcher_Tick_RepeatedStalls_TripTheBrake(t *testing.T) {
 
 	s, err := LoadState(statePath)
 	require.NoError(t, err)
-	assert.Positive(t, s.ConsecutiveFailures,
-		"a stall recurs on retry, so it must count toward the brake")
+	// Assert the brake actually ENGAGED, not merely that some counter moved.
+	// `> 0` would also pass if stalls were misclassified as LastActionFailed, or
+	// if only one of the three ticks counted — both regressions this test exists
+	// to catch. The cooldown is the observable consequence, so pin that too.
+	assert.GreaterOrEqual(t, s.ConsecutiveFailures, w.cfg.Backoff.MaxConsecutiveFailures,
+		"a stall recurs on retry, so every one must count toward the brake")
+	assert.Equal(t, LastActionStalled, s.LastAction,
+		"the stall must be recorded as such, not laundered into a plain failure")
+	assert.False(t, s.CooldownUntil.IsZero(),
+		"reaching MaxConsecutiveFailures with a cooldown configured must arm it")
 }
 
 // The no-progress guard: invocations that never yield a round must stop the run,

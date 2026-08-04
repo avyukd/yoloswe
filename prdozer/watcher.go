@@ -17,22 +17,32 @@ import (
 
 // Watcher polls a single PR and reacts to changes by invoking the polish agent.
 type Watcher struct {
-	gh         wt.GHRunner
-	polish     PolishRunner
-	rework     ReworkRunner
-	cfg        *Config
-	renderer   *render.Renderer
-	logger     *slog.Logger
-	repo       string
-	workDir    string
-	self       string
-	reworkSpec StepSpec
-	polishSpec StepSpec
-	pr         int
-	dryRun     bool
+	gh       wt.GHRunner
+	polish   PolishRunner
+	rework   ReworkRunner
+	cfg      *Config
+	renderer *render.Renderer
+	logger   *slog.Logger
+	repo     string
+	workDir  string
+	self     string
+	// lastStallError is the scrubbed error from the invocation that tripped the
+	// no-progress guard. Carried alongside stalled because the stall path has no
+	// LastMergeError to quote — that field is only written by the merge path, so
+	// a polish-only stall would otherwise report an empty cause.
+	lastStallError string
+	reworkSpec     StepSpec
+	polishSpec     StepSpec
+	pr             int
+	dryRun         bool
 	// diverged is set by the divergence guard within a tick so Tick can
 	// report WHY it stopped. Reset at the top of every tick.
 	diverged bool
+	// stalled is set by the no-progress guard within a tick, for the same
+	// reason as diverged: both stop the run with LastActionNeedsHuman, and
+	// without a distinct signal the terminal report cannot tell "waiting on an
+	// approval" from "the rounds never came back". Reset every tick.
+	stalled bool
 }
 
 // WithPolishSpec attaches configured polish rounds, replacing the default
@@ -92,13 +102,14 @@ func NewWatcher(cfg *Config, gh wt.GHRunner, polish PolishRunner, prNumber int, 
 
 // TickResult summarizes what happened in one polling cycle.
 type TickResult struct {
-	Snapshot  *Snapshot
-	Action    LastAction
-	Changeset Changeset
-	// Diverged reports that NeedsHuman was reached because the PR stopped
-	// improving, rather than because it is waiting on an approval. The two need
-	// opposite responses, so the notification must tell them apart.
-	Diverged bool
+	Snapshot *Snapshot
+	Action   LastAction
+	// StallError is the scrubbed error from the invocation that tripped the
+	// no-progress guard, reported alongside Stalled. The merge path's
+	// LastMergeError is empty on a polish-only stall, so without this the report
+	// names no cause.
+	StallError string
+	Changeset  Changeset
 	// PolishRounds is the run's cumulative polish count, reported alongside
 	// Diverged.
 	PolishRounds int
@@ -108,6 +119,20 @@ type TickResult struct {
 	// rounds flat, and saying "17 rounds produced no better result" would be a
 	// lie.
 	RoundsSinceImprovement int
+	// InvocationsSinceRound is the no-progress streak the stall guard trips on,
+	// reported for the same reason RoundsSinceImprovement is: the operator needs
+	// the number that actually caused the stop.
+	InvocationsSinceRound int
+	// Diverged reports that NeedsHuman was reached because the PR stopped
+	// improving, rather than because it is waiting on an approval. The two need
+	// opposite responses, so the notification must tell them apart.
+	Diverged bool
+	// Stalled reports that NeedsHuman was reached because polish invocations
+	// stopped producing rounds at all, rather than because the PR is waiting on
+	// an approval or has stopped improving. A third distinct cause needing a
+	// third distinct response: nothing about the PR is wrong, the agent never
+	// came back.
+	Stalled bool
 }
 
 func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
@@ -169,6 +194,7 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 	)
 
 	w.diverged = false
+	w.stalled, w.lastStallError = false, ""
 	priorAttempts, priorMergeErr := state.MergeAttempts, state.LastMergeError
 	priorSelfReviewed := state.SelfReviewedSHA
 	// Counted, not compared by identity: decideAndAct adds keys to the SAME map
@@ -184,7 +210,9 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 
 	res := TickResult{Snapshot: snap, Changeset: cs, Action: action,
 		Diverged: w.diverged, PolishRounds: state.PolishRounds,
-		RoundsSinceImprovement: state.RoundsSinceImprovement}
+		RoundsSinceImprovement: state.RoundsSinceImprovement,
+		Stalled:                w.stalled, StallError: w.lastStallError,
+		InvocationsSinceRound: state.InvocationsSinceRound}
 	if w.recordSnapshot(state, snap, action, mergeStateDirty || healthDirty) {
 		if err := state.Save(statePath); err != nil {
 			// State save failure is serious: the action already ran (maybe merged
@@ -347,6 +375,13 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 			// needs_human is a terminal arm it also reset ConsecutiveFailures on
 			// its way out, so the stall brake became dead code.
 			if limit := 2 * w.cfg.Backoff.MaxConsecutiveFailures; limit > 0 && state.InvocationsSinceRound >= limit {
+				// Flagged so the terminal report can say WHICH kind of stuck. The
+				// action alone is LastActionNeedsHuman, which terminalFor otherwise
+				// reads as "blocked on an approval or a merge policy" — the opposite
+				// diagnosis from "the polish rounds never returned", and the one an
+				// operator debugging a kernel#8374 loop would be misled by.
+				w.stalled = true
+				w.lastStallError = safe
 				w.logger.Warn("stopping: polish invocations are not producing rounds",
 					"invocations_since_round", state.InvocationsSinceRound,
 					"polish_rounds", state.PolishRounds,
@@ -586,15 +621,25 @@ func (w *Watcher) needsSelfReview(snap *Snapshot, state *State) bool {
 	return state.SelfReviewedSHA != snap.PR.HeadRefOid
 }
 
-// expireStaleDivergence clears a divergence verdict inherited from a previous
+// expireStaleDivergence clears a no-progress verdict inherited from a previous
 // run whose subject no longer exists. Reports whether it changed anything.
 //
+// Covers BOTH streaks that can end a run at needs_human, because they go stale
+// for the identical reason and on the identical trigger:
+//
+//   - RoundsSinceImprovement / BestHealth — "the last N rounds did not make THIS
+//     head better".
+//   - InvocationsSinceRound — "the last N invocations produced no round". Just
+//     as head-specific: a stall streak is a fact about a particular attempt at
+//     particular code, and a run resumed on a new head that inherits a saturated
+//     one halts on its first non-transient failure, exactly the hand-edit-the-
+//     state-file trap the divergence retirement exists to close.
+//
 // State outlives the run that wrote it, by design — that is what lets a resumed
-// babysit keep its once-round record and its merge-attempt count. But
-// RoundsSinceImprovement is a judgment about SPECIFIC CODE: "the last N polish
-// rounds did not make THIS head better". When a run ends at needs_human and the
-// branch is then rebased or pushed to, the next run loads a streak that scored
-// commits that are gone, and stops on tick one having done nothing.
+// babysit keep its once-round record and its merge-attempt count. But these
+// counters are judgments about SPECIFIC CODE. When a run ends at needs_human and
+// the branch is then rebased or pushed to, the next run loads a streak that
+// scored commits that are gone, and stops on tick one having done nothing.
 //
 // Seen three times in one day (yoloswe#290, yoloswe#291, kernel#8297), each
 // needing the state file hand-edited to let the PR proceed. #8297 is the case
@@ -612,7 +657,11 @@ func (w *Watcher) needsSelfReview(snap *Snapshot, state *State) bool {
 //   - the head moved since that ending. A resumed run looking at the SAME
 //     commits inherits a verdict that still applies, and must keep it.
 func (w *Watcher) expireStaleDivergence(state *State, snap *Snapshot) bool {
-	if state.RoundsSinceImprovement == 0 && state.BestHealth == nil {
+	// Nothing inherited to retire. InvocationsSinceRound is part of the test
+	// because a run can stop on the stall guard alone, with the divergence
+	// counters never having moved.
+	if state.RoundsSinceImprovement == 0 && state.BestHealth == nil &&
+		state.InvocationsSinceRound == 0 {
 		return false
 	}
 	if state.LastAction != LastActionNeedsHuman {
@@ -623,12 +672,14 @@ func (w *Watcher) expireStaleDivergence(state *State, snap *Snapshot) bool {
 		state.LastSeenHeadSHA == snap.PR.HeadRefOid {
 		return false
 	}
-	w.logger.Info("retiring a divergence verdict that judged a previous head",
+	w.logger.Info("retiring a no-progress verdict that judged a previous head",
 		"scored_head", state.LastSeenHeadSHA,
 		"current_head", snap.PR.HeadRefOid,
-		"rounds_since_improvement", state.RoundsSinceImprovement)
+		"rounds_since_improvement", state.RoundsSinceImprovement,
+		"invocations_since_round", state.InvocationsSinceRound)
 	state.RoundsSinceImprovement = 0
 	state.BestHealth = nil
+	state.InvocationsSinceRound = 0
 	return true
 }
 

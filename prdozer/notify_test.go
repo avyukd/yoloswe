@@ -104,6 +104,21 @@ func TestCooldownWarning_IsVisibleAndNonTerminal(t *testing.T) {
 	assert.Contains(t, got, "Merge attempts: 2", "say how many attempts have happened")
 }
 
+// The cooldown is tripped by ConsecutiveFailures, which a stalled polish round
+// increments just as a rejected merge does — but only the merge path writes
+// LastMergeError. Reporting that empty string verbatim gave the operator a
+// warning that named no cause at all.
+func TestCooldownWarning_NonMergeCauseIsStillNamed(t *testing.T) {
+	t.Parallel()
+	got := CooldownWarning(sampleMeta(), time.Date(2026, 7, 29, 3, 0, 0, 0, time.UTC), "").
+		Message().Render()
+	assert.NotContains(t, got, "Repeated merge failures",
+		"a polish stall is not a merge failure; the wording must not assert one")
+	assert.Contains(t, got, "not recorded",
+		"an empty cause must say so rather than render as a blank line")
+	assert.Contains(t, got, "run log", "and point at where the cause can be found")
+}
+
 func TestNotifyConfig_EmptyWebhookDisablesNotification(t *testing.T) {
 	// An unconfigured deployment is a normal state, not an error.
 	t.Setenv("PRDOZER_SLACK_WEBHOOK", "")
