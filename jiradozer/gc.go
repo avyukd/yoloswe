@@ -126,6 +126,11 @@ type GHPRChecker struct {
 //
 // `gh pr view` does expose mergedAt, which is nearly equivalent, but .merged via
 // the REST API is the authoritative answer and the one worth depending on here.
+//
+// The two spellings are easy to conflate, so to be concrete: `merged` is absent
+// from `gh pr view`'s field set but present as a boolean in the response of REST
+// GET /repos/{owner}/{repo}/pulls/{number}, which is the endpoint below. It
+// prints bare `true`/`false` under `--jq .merged`.
 func (c GHPRChecker) Merged(ctx context.Context, prURL string) (bool, error) {
 	owner, repo, number, err := parsePRURL(prURL)
 	if err != nil {
