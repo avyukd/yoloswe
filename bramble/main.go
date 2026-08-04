@@ -239,15 +239,35 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	registry := session.NewSessionRegistry()
 	registry.Register(sessionManager)
 	sharedManagerConfig.Registry = registry
+
+	// Publish both socket paths to the manager BEFORE either server starts
+	// listening. The IPC server accepts RequestNewSession the moment it starts,
+	// and that handler runs all the way to newTmuxRunner, which snapshots
+	// m.config.ControlSockPath into the window's environment for the session's
+	// lifetime. Setting the control path only after startControlServer returned
+	// left a window in which such a session was launched with an empty
+	// BRAMBLE_CONTROL_SOCK and could never drive its peers. Both paths derive
+	// from the pid, so they are knowable before the listeners exist.
+	//
+	// This is also what makes the unsynchronized writes below safe: they happen
+	// on this goroutine before any session goroutine can observe m.config.
+	sessionManager.SetIPCSockPath(ipcSocketPath())
+	sharedManagerConfig.IPCSockPath = ipcSocketPath()
+	sessionManager.SetControlSockPath(controlSocketPath())
+	sharedManagerConfig.ControlSockPath = controlSocketPath()
+
+	// Start IPC server so child processes can request new sessions.
+	// The registry aggregates all repo managers so IPC handlers can find
+	// sessions from any repo, including those opened later via Alt-R.
 	ipcServer, ipcSockPath := startIPCServer(registry, wtRoot, repoName)
 	if ipcServer != nil {
 		defer ipcServer.Close()
 		os.Setenv(ipc.SockEnvVar, ipcSockPath)
-		// Propagate the socket path to the session manager (and the shared
-		// config template used when opening additional repos) so that tmux
-		// windows receive BRAMBLE_SOCK without relying on os.Getenv.
-		sessionManager.SetIPCSockPath(ipcSockPath)
-		sharedManagerConfig.IPCSockPath = ipcSockPath
+	} else {
+		// The server never bound, so nothing is reachable at that path. Clear it
+		// rather than exporting a dead socket into every tmux window.
+		sessionManager.SetIPCSockPath("")
+		sharedManagerConfig.IPCSockPath = ""
 	}
 
 	// Start the control server (read+write tmux control plane) on its own Unix
@@ -257,11 +277,9 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	if controlServer != nil {
 		defer controlServer.Close()
 		os.Setenv(control.SockEnvVar, controlServer.SocketPath())
-		// Mirror the IPCSockPath plumbing: propagate through the manager (and
-		// the shared config template used by openRepo) so tmux windows get
-		// BRAMBLE_CONTROL_SOCK without relying on os.Getenv.
-		sessionManager.SetControlSockPath(controlServer.SocketPath())
-		sharedManagerConfig.ControlSockPath = controlServer.SocketPath()
+	} else {
+		sessionManager.SetControlSockPath("")
+		sharedManagerConfig.ControlSockPath = ""
 	}
 
 	// If a hub is configured, dial out to it so the user can reach this
@@ -376,15 +394,31 @@ func detectRepoFromPath(cwd, wtRoot string) (string, error) {
 
 // --- IPC server setup --------------------------------------------------------
 
-func startIPCServer(registry *session.SessionRegistry, wtRoot, repoName string) (*ipc.Server, string) {
-	// Prefer $XDG_RUNTIME_DIR (user-private, tmpfs) over /tmp to avoid
-	// symlink/TOCTOU risks in world-writable directories.
-	runDir := os.Getenv("XDG_RUNTIME_DIR")
-	if runDir == "" {
-		runDir = os.TempDir()
+// socketDir is where this process's Unix domain sockets live. It prefers
+// $XDG_RUNTIME_DIR (user-private, tmpfs) over /tmp to avoid symlink/TOCTOU
+// risks in world-writable directories.
+func socketDir() string {
+	if runDir := os.Getenv("XDG_RUNTIME_DIR"); runDir != "" {
+		return runDir
 	}
-	sockPath := filepath.Join(runDir, fmt.Sprintf("bramble-%d.sock", os.Getpid()))
-	srv := ipc.NewServer(sockPath)
+	return os.TempDir()
+}
+
+// ipcSocketPath and controlSocketPath derive each server's socket path from the
+// pid alone, so both are known before either server starts listening. runTUI
+// relies on that: it publishes both paths to the manager up front, because an
+// IPC-spawned session created between the two Start() calls would otherwise
+// snapshot an empty control socket for its whole lifetime.
+func ipcSocketPath() string {
+	return filepath.Join(socketDir(), fmt.Sprintf("bramble-%d.sock", os.Getpid()))
+}
+
+func controlSocketPath() string {
+	return filepath.Join(socketDir(), fmt.Sprintf("bramble-control-%d.sock", os.Getpid()))
+}
+
+func startIPCServer(registry *session.SessionRegistry, wtRoot, repoName string) (*ipc.Server, string) {
+	srv := ipc.NewServer(ipcSocketPath())
 
 	srv.Handle(ipc.RequestPing, func(_ context.Context, _ *ipc.Request) (any, error) {
 		return "pong", nil
@@ -467,13 +501,8 @@ func startIPCServer(registry *session.SessionRegistry, wtRoot, repoName string) 
 // session registry and a real tmux controller. Returns nil if it fails to
 // start (non-fatal — the TUI still runs, only remote/CLI control is absent).
 func startControlServer(registry *session.SessionRegistry) *control.UnixServer {
-	runDir := os.Getenv("XDG_RUNTIME_DIR")
-	if runDir == "" {
-		runDir = os.TempDir()
-	}
-	sockPath := filepath.Join(runDir, fmt.Sprintf("bramble-control-%d.sock", os.Getpid()))
 	disp := control.NewDispatcher(registry, tmuxctl.New())
-	srv := control.NewUnixServer(sockPath, disp)
+	srv := control.NewUnixServer(controlSocketPath(), disp)
 	if err := srv.Start(); err != nil {
 		slog.Warn("control server failed to start", "err", err)
 		return nil

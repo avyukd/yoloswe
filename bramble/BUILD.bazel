@@ -39,6 +39,7 @@ go_test(
         "main_test.go",
         "notify_cmd_test.go",
         "notify_session_id_test.go",
+        "socket_path_test.go",
     ],
     embed = [":bramble_lib"],
     deps = [

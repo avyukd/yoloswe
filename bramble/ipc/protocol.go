@@ -2,6 +2,8 @@
 // for communication between the bramble TUI server and CLI clients.
 package ipc
 
+import "github.com/bazelment/yoloswe/bramble/session"
+
 // RequestType identifies the kind of IPC request.
 type RequestType string
 
@@ -79,4 +81,7 @@ type CapturePaneResult struct {
 }
 
 // SockEnvVar is the environment variable name used to discover the socket path.
-const SockEnvVar = "BRAMBLE_SOCK"
+// The literal lives in package session, which injects it into tmux windows;
+// aliasing it here keeps this consumer and that producer from drifting apart
+// under a rename. Mirrors control.SockEnvVar.
+const SockEnvVar = session.IPCSockEnvVar

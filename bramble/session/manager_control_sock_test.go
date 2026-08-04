@@ -65,7 +65,7 @@ func TestManagerNewTmuxRunnerCarriesSocketsAndIdentity(t *testing.T) {
 	// ...and survive all the way into the tmux window's environment.
 	args := runner.envArgs()
 	for _, kv := range []string{
-		ipcSockEnvVar + "=" + ipcSock,
+		IPCSockEnvVar + "=" + ipcSock,
 		SessionIDEnvVar + "=" + string(sess.ID),
 		ControlSockEnvVar + "=" + controlSock,
 	} {
