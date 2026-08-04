@@ -26,11 +26,16 @@ type Watcher struct {
 	repo     string
 	workDir  string
 	self     string
-	// lastStallError is the scrubbed error from the invocation that tripped the
-	// no-progress guard. Carried alongside stalled because the stall path has no
-	// LastMergeError to quote — that field is only written by the merge path, so
-	// a polish-only stall would otherwise report an empty cause.
+	// lastStallError is the scrubbed error from the invocation that stalled.
+	// Carried alongside stalled because the stall path has no LastMergeError to
+	// quote — that field is only written by the merge path, so a polish-only
+	// stall would otherwise report an empty cause.
 	lastStallError string
+	// lastStallStage names the round that produced lastStallError ("polish" or
+	// "merge rework"). Recorded because classifyAgentFailure serves both, so the
+	// cooldown cause cannot assume the polish one: a stalled merge rework
+	// reported as a stalled polish round sends an operator to the wrong round.
+	lastStallStage string
 	// lastFailureError is the scrubbed error from the agent failure that made
 	// this tick return LastActionFailed. Same reason as lastStallError: the
 	// cooldown reports the cause of the failure that armed it, and a polish or
@@ -201,7 +206,7 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 	)
 
 	w.diverged = false
-	w.stalled, w.lastStallError = false, ""
+	w.stalled, w.lastStallError, w.lastStallStage = false, "", ""
 	w.lastFailureError = ""
 	priorAttempts, priorMergeErr := state.MergeAttempts, state.LastMergeError
 	priorSelfReviewed := state.SelfReviewedSHA
@@ -419,7 +424,11 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 				// diagnosis from "the polish rounds never returned", and the one an
 				// operator debugging a kernel#8374 loop would be misled by.
 				w.stalled = true
-				w.lastStallError = safe
+				// Set unconditionally, not only when classifyAgentFailure already
+				// did: this guard also fires for a PLAIN polish failure, which is
+				// never classified and so records nothing above. The stage is
+				// fixed because only the polish path counts toward this guard.
+				w.lastStallError, w.lastStallStage = safe, "polish"
 				w.logger.Warn("stopping: polish invocations are not producing rounds",
 					"invocations_since_round", state.InvocationsSinceRound,
 					"polish_rounds", state.PolishRounds,
@@ -431,15 +440,6 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		}
 
 		if classified {
-			// Recorded on the STALL path too, not just the needs_human one above.
-			// cooldownCause reads this for LastActionStalled, and a stall reaches
-			// the cooldown through here — the guard above only fires at twice the
-			// brake limit. Setting it only there left that branch unreachable, so
-			// every stall-armed cooldown persisted the generic fallback instead of
-			// the grace-period error the plain-failure path records.
-			if action == LastActionStalled {
-				w.lastStallError = safe
-			}
 			return action
 		}
 		w.lastFailureError = safe
@@ -570,6 +570,15 @@ func (w *Watcher) classifyAgentFailure(stage string, err error, safe string) (La
 	// prdozer needs on top is whether the retry should be FREE, and for a stall
 	// it must not be.
 	if reason == transientmeta.ReasonGraceForced {
+		// Recorded HERE rather than at the callers, because this is the one place
+		// that turns a round error into LastActionStalled — and cooldownCause
+		// reads the field for exactly that action. Set at a caller instead, it
+		// covers only that caller: the polish path recorded it and merge rework
+		// did not, so a stall-armed merge-rework cooldown persisted the generic
+		// fallback rather than the grace-period error that armed it. Producing it
+		// alongside the action it belongs to is what keeps the two stages from
+		// drifting apart again.
+		w.lastStallError, w.lastStallStage = safe, stage
 		w.logger.Warn(stage+" was cut off mid-round by the turn grace period; counting it toward the failure brake",
 			"error", safe, "reason", reason)
 		w.status("PR #%d %s stalled mid-round (%s) — counts toward the brake", w.pr, stage, reason)
@@ -1046,9 +1055,13 @@ func (w *Watcher) cooldownCause(s *State, action LastAction) string {
 	switch action {
 	case LastActionStalled:
 		if w.lastStallError != "" {
-			return fmt.Sprintf("polish round stalled: %s", w.lastStallError)
+			// Named by the stage that actually stalled. Both the polish and the
+			// merge-rework rounds reach this arm, and they are debugged in
+			// different places, so a fixed "polish" label would send an operator
+			// after the wrong round for half the stalls that arm this cooldown.
+			return fmt.Sprintf("%s round stalled: %s", w.lastStallStage, w.lastStallError)
 		}
-		return "polish rounds stalled without returning a result"
+		return "agent rounds stalled without returning a result"
 	case LastActionReworked:
 		if s.LastMergeError != "" {
 			return fmt.Sprintf("reworking after a failed merge: %s", s.LastMergeError)

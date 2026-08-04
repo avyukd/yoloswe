@@ -2143,6 +2143,9 @@ func TestWatcher_Tick_CompletedRound_ResetsNoProgressCounter(t *testing.T) {
 // stall reaches the cooldown well before that, through classifyAgentFailure, so
 // the branch was unreachable on the path that actually arms it and every
 // stall-armed cooldown persisted the generic fallback.
+//
+// The merge-rework half of the same invariant is covered by
+// TestWatcher_ReworkStallArmedCooldown_NamesTheGraceError.
 func TestWatcher_StallArmedCooldown_NamesTheGraceError(t *testing.T) {
 	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
 	polish := &stubPolish{err: fmt.Errorf("polish round 1/2: agent execution: " +

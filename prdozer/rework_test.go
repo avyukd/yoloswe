@@ -675,3 +675,41 @@ func TestWatcher_FailedMerge_RealReworkErrorStillCountsTowardBrake(t *testing.T)
 	require.NoError(t, err)
 	assert.Equal(t, 1, s.ConsecutiveFailures, "a real rework failure still spends the brake")
 }
+
+// A merge-rework stall that arms the cooldown must name the grace-period error,
+// and must say it was the REWORK round that stalled.
+//
+// The stall error is produced by classifyAgentFailure, which serves the polish
+// and merge-rework rounds alike. Recorded at the polish caller instead, this
+// path recorded nothing, and cooldownCause fell back to the generic "stalled
+// without returning a result" — the same defect the polish path was fixed for.
+// The stage is asserted alongside it because a merge-rework stall reported as a
+// polish one sends an operator to the wrong round.
+func TestWatcher_ReworkStallArmedCooldown_NamesTheGraceError(t *testing.T) {
+	gh := failingMergeGH(t)
+	rework := &stubRework{err: fmt.Errorf("merge rework: agent execution: " +
+		"transient CLI error: stream idle: turn forced complete after grace period " +
+		"gated on background tool_use")}
+	w := newWatcherForTest(t, gh, &stubPolish{}, WithRework(rework, oneRoundSpec()))
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicySquash
+	statePath := StatePath("r", 42)
+
+	// newWatcherForTest sets MaxConsecutiveFailures=2, so two stalls arm the
+	// cooldown — well below the polish guard's 2x no-progress threshold, which
+	// this path never reaches anyway.
+	for range 2 {
+		res, err := w.Tick(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, LastActionStalled, res.Action,
+			"premise: a grace-forced rework must classify as a stall")
+	}
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	require.False(t, s.CooldownUntil.IsZero(), "premise: repeated stalls must arm the cooldown")
+	assert.Contains(t, s.LastCooldownCause, "grace period",
+		"a stall-armed cooldown must name the grace-period error, not the generic fallback")
+	assert.Contains(t, s.LastCooldownCause, "merge rework round stalled",
+		"the cause must name the round that actually stalled")
+}
