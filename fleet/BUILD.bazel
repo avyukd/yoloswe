@@ -1,0 +1,28 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "fleet",
+    srcs = [
+        "dispatch.go",
+        "fleet.go",
+        "probe.go",
+        "quota.go",
+        "runs.go",
+    ],
+    importpath = "github.com/bazelment/yoloswe/fleet",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "fleet_test",
+    srcs = [
+        "dispatch_test.go",
+        "probe_test.go",
+        "runs_test.go",
+    ],
+    embed = [":fleet"],
+    deps = [
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+    ],
+)

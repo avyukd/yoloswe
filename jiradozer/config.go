@@ -169,7 +169,11 @@ type StatesConfig struct {
 
 // LoadConfig reads and parses a jiradozer YAML config file.
 func LoadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	// Resolve ~ HERE, on the machine that opens the file. A dispatcher on one
+	// box hands this path to a worker on another whose home differs (the Azure
+	// devbox runs as "ming", the AWS boxes as "ubuntu"), so expanding it at the
+	// sending end would produce a path that does not exist at the receiving one.
+	data, err := os.ReadFile(ExpandHome(path))
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
@@ -662,6 +666,12 @@ func ResolveRound(round RoundConfig, parent StepConfig) StepConfig {
 		FallbackModels:        parent.FallbackModels,
 		TransientRetries:      parent.TransientRetries,
 		StreamTurnGracePeriod: parent.StreamTurnGracePeriod,
+		// IdleTimeout is not overridable per round: a round is just a segment of
+		// the parent step, and the watchdog it arms measures the same thing in
+		// both. Omitting it here silently disabled stall protection for every
+		// rounds-based step — which is all of build/validate/ship in the
+		// bootstrap shape, i.e. exactly the long-running ones it exists for.
+		IdleTimeout:           parent.IdleTimeout,
 		LLMEndpoint:           parent.LLMEndpoint,
 		DisableLimitPreflight: parent.DisableLimitPreflight,
 	}

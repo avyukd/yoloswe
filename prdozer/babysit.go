@@ -385,6 +385,14 @@ func PlanDispatch(ctx context.Context, ssh SSHRunner, opts DispatchOptions, logg
 		opts.Probe.SelfHostname, _ = os.Hostname()
 	}
 
+	// Narrowing before the probe is safe HERE, and only here: prdozer has no
+	// fleet-wide duplicate-run guard for a pin to hide from. Its lease is a
+	// flock taken inside the worker, so it excludes a second babysitter on ONE
+	// box; nothing asks the rest of the fleet whether this PR is already being
+	// babysat. jiradozer's dispatch does ask, which is why the equivalent pin
+	// there is applied to the probe RESULTS instead — see narrowToPin in
+	// jiradozer/cmd/jiradozer/dispatch.go. If prdozer ever grows the same
+	// preflight, this filter has to move below the probe with it.
 	if opts.Host != "" {
 		hosts = filterHosts(hosts, opts.Host)
 		if len(hosts) == 0 {

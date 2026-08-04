@@ -1,8 +1,7 @@
-package prdozer
+package fleet
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os/exec"
 	"sort"
@@ -12,44 +11,110 @@ import (
 	"time"
 )
 
+// Tool describes the binary being dispatched. Everything the probe and the
+// dispatcher need to know that differs between prdozer and jiradozer lives
+// here, so neither has to restate the mechanism.
+type Tool struct {
+	// Name is the binary name as it appears on PATH ("prdozer", "jiradozer").
+	Name string
+	// LeaseDir is where that tool keeps its per-task flock files, e.g.
+	// "~/.prdozer/leases". The probe counts HELD locks there.
+	LeaseDir string
+	// MaxLeasesPerHost caps concurrent runs on one box. 0 means the default.
+	MaxLeasesPerHost int
+}
+
 // probeScript gathers every signal in ONE ssh round trip. Each command is
 // sub-100ms and needs no sudo. Sections are delimited so the parser never has
 // to guess which output it is looking at — `df` in particular omits or
 // collapses rows depending on the filesystem, so position-based parsing is
 // unreliable.
-const probeScript = `echo "__NPROC__"; nproc
+//
+// The lease section emits both a COUNT and the held lock NAMES. The names are
+// what let a caller answer "which host is running INF-1234", which a count
+// cannot; the dispatcher needs the count and the reaper needs the names.
+func (t Tool) probeScript() string {
+	leaseDir := t.LeaseDir
+	if leaseDir == "" {
+		leaseDir = "~/." + t.Name + "/leases"
+	}
+	// Held locks are tested with `flock -n`, never counted as files. Release
+	// deliberately leaves the file behind — removing it races a process that
+	// just opened it and is about to flock — so a file count is a count of
+	// tasks the box has EVER run. Observed 2026-07-30: with a cap of 2, two of
+	// three boxes reported "already holds 2 leases" with zero live workers,
+	// leaving only the most overloaded host eligible.
+	return `echo "__NPROC__"; nproc
 echo "__LOAD__"; cat /proc/loadavg
 echo "__DF__"; df -P "$HOME"; df -P /mnt/nvme 2>/dev/null
 echo "__TMUX__"; tmux list-windows -a 2>/dev/null | wc -l
-echo "__LEASES__"; { cd ~/.prdozer/leases 2>/dev/null && held=0; for f in *.lock; do [ -e "$f" ] || continue; flock -n "$f" true 2>/dev/null || held=$((held+1)); done; echo "${held:-0}"; } || echo 0
-echo "__PRDOZER__"; command -v prdozer || ([ -x "$HOME/bin/prdozer" ] && echo "$HOME/bin/prdozer") || echo MISSING
+echo "__LEASES__"; { cd ` + leaseDir + ` 2>/dev/null && for f in *.lock; do [ -e "$f" ] || continue; flock -n "$f" true 2>/dev/null || echo "$f"; done; } 2>/dev/null || true
+echo "__BIN__"; ` + t.resolveBinExpr() + `
 echo "__END__"`
+}
+
+// binMissing is what resolveBinExpr prints when the tool is nowhere to be
+// found. It is a sentinel rather than an empty line so a truncated section and
+// an absent binary stay distinguishable.
+const binMissing = "MISSING"
+
+// resolveBinExpr renders the shell expression that prints the tool's absolute
+// path on a target box, or binMissing.
+//
+// EVERY remote command that names the tool must resolve it through this one
+// expression. A non-interactive SSH shell's PATH contains neither ~/bin nor
+// ~/.local/bin, and both install shapes are in use: a symlink at ~/bin on boxes
+// that build the binary, and a copied artifact at ~/.local/bin on boxes
+// carrying no worktree. When two call sites resolve differently the fleet goes
+// split-brain — the probe reports a box as healthy and eligible for dispatch
+// while a gather on the same box reports "command not found", which reads as
+// "nothing is running there".
+func (t Tool) resolveBinExpr() string {
+	n := t.Name
+	return `command -v ` + n +
+		` || ([ -x "$HOME/bin/` + n + `" ] && echo "$HOME/bin/` + n + `")` +
+		` || ([ -x "$HOME/.local/bin/` + n + `" ] && echo "$HOME/.local/bin/` + n + `")` +
+		` || echo ` + binMissing
+}
 
 // HostHealth is one probed box.
+//
+//nolint:govet // fieldalignment: grouped by concern for readability.
 type HostHealth struct {
-	Err         error
-	Host        string
-	SSHUser     string
-	PublicDNS   string
-	PrdozerPath string
+	Err       error
+	Host      string
+	SSHUser   string
+	PublicDNS string
+	// BinaryPath is the absolute path the probe resolved for the tool. The
+	// dispatcher must use it verbatim: a non-interactive SSH shell does not
+	// include ~/bin, so a bare name produces a tmux session that dies instantly
+	// with "command not found" — indistinguishable from a silent no-op.
+	BinaryPath string
+	// HeldLeases names the lock files actually held on this host. The count is
+	// what gates eligibility; the names are what map a task back to its box.
+	HeldLeases  []string
 	DiskFreeGB  int
 	Load1       float64
 	NVMeFreeGB  int
 	TmuxWindows int
-	// Leases counts babysit leases actually HELD on this host, tested with
-	// flock -n rather than by counting files in the lease directory.
-	//
-	// Release() deliberately leaves the lock file behind — removing it races a
-	// process that just opened it and is about to flock. So a file count is a
-	// count of babysits this box has EVER run, and with MaxLeasesPerHost=2
-	// every host permanently excluded itself after two runs. Observed
-	// 2026-07-30: two of three boxes reported "already holds 2 babysit leases"
-	// with zero live workers, leaving only the most overloaded host eligible.
-	Leases     int
-	Cores      int
-	HasPrdozer bool
-	Reachable  bool
-	IsSelf     bool
+	Cores       int
+	HasBinary   bool
+	Reachable   bool
+	IsSelf      bool
+}
+
+// Leases counts the leases actually HELD on this host.
+func (h HostHealth) Leases() int { return len(h.HeldLeases) }
+
+// HoldsLeaseFor reports whether this host holds a live lease for target.
+func (h HostHealth) HoldsLeaseFor(target string) bool {
+	want := SanitizeSlug(target) + ".lock"
+	for _, l := range h.HeldLeases {
+		if l == want {
+			return true
+		}
+	}
+	return false
 }
 
 // Target returns the ssh destination for this host.
@@ -105,8 +170,7 @@ type SSHRunner interface {
 	Run(ctx context.Context, target string, script string) (string, error)
 }
 
-// DefaultSSHRunner shells out to ssh with the same options the existing fleet
-// scripts use.
+// DefaultSSHRunner shells out to ssh with the same options the fleet scripts use.
 type DefaultSSHRunner struct {
 	Timeout time.Duration
 }
@@ -143,9 +207,9 @@ func asExitError(err error, target **exec.ExitError) bool {
 	return false
 }
 
-// ProbeFleet probes every host concurrently and returns their health, ordered
+// Probe probes every host concurrently and returns their health, ordered
 // best-first by ScoreHosts.
-func ProbeFleet(ctx context.Context, ssh SSHRunner, hosts []FleetHost, opts ProbeOptions) []HostHealth {
+func Probe(ctx context.Context, ssh SSHRunner, tool Tool, hosts []Host, opts ProbeOptions) []HostHealth {
 	opts.applyDefaults()
 	out := make([]HostHealth, len(hosts))
 	var wg sync.WaitGroup
@@ -153,7 +217,7 @@ func ProbeFleet(ctx context.Context, ssh SSHRunner, hosts []FleetHost, opts Prob
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			out[i] = probeOne(ctx, ssh, hosts[i], opts)
+			out[i] = probeOne(ctx, ssh, tool, hosts[i], opts)
 		}(i)
 	}
 	wg.Wait()
@@ -161,14 +225,14 @@ func ProbeFleet(ctx context.Context, ssh SSHRunner, hosts []FleetHost, opts Prob
 	return out
 }
 
-func probeOne(ctx context.Context, ssh SSHRunner, h FleetHost, opts ProbeOptions) HostHealth {
+func probeOne(ctx context.Context, ssh SSHRunner, tool Tool, h Host, opts ProbeOptions) HostHealth {
 	hh := HostHealth{
 		Host:      h.Hostname,
 		SSHUser:   h.SSHUser,
 		PublicDNS: h.PublicDNS,
 		IsSelf:    h.IsSelf(opts.SelfDNS, opts.SelfHostname),
 	}
-	raw, err := ssh.Run(ctx, h.Target(), probeScript)
+	raw, err := ssh.Run(ctx, h.Target(), tool.probeScript())
 	if err != nil {
 		hh.Err = err
 		return hh
@@ -210,18 +274,16 @@ func parseProbe(raw string, hh *HostHealth) error {
 	// Parse df BY MOUNT POINT, never by row position: df collapses or omits
 	// rows, and the optional /mnt/nvme block means the row count varies
 	// between hosts.
-	mounts := parseDF(sections["DF"])
-	for mount, freeKB := range mounts {
-		switch {
-		case mount == "/mnt/nvme":
+	for mount, freeKB := range parseDF(sections["DF"]) {
+		if mount == "/mnt/nvme" {
 			hh.NVMeFreeGB = int(freeKB / 1024 / 1024)
-		default:
-			// The home filesystem is whatever df reported for $HOME; on these
-			// boxes that is "/". Take the largest non-nvme mount so an
-			// unusual layout still yields a sane figure.
-			if gb := int(freeKB / 1024 / 1024); gb > hh.DiskFreeGB {
-				hh.DiskFreeGB = gb
-			}
+			continue
+		}
+		// The home filesystem is whatever df reported for $HOME; on these boxes
+		// that is "/". Take the largest non-nvme mount so an unusual layout
+		// still yields a sane figure.
+		if gb := int(freeKB / 1024 / 1024); gb > hh.DiskFreeGB {
+			hh.DiskFreeGB = gb
 		}
 	}
 
@@ -232,14 +294,14 @@ func parseProbe(raw string, hh *HostHealth) error {
 			hh.TmuxWindows = n
 		}
 	}
-	if v := firstLine(sections["LEASES"]); v != "" {
-		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
-			hh.Leases = n
+	for _, line := range strings.Split(sections["LEASES"], "\n") {
+		if t := strings.TrimSpace(line); t != "" {
+			hh.HeldLeases = append(hh.HeldLeases, t)
 		}
 	}
-	if v := firstLine(sections["PRDOZER"]); v != "" && v != "MISSING" {
-		hh.HasPrdozer = true
-		hh.PrdozerPath = v
+	if v := firstLine(sections["BIN"]); v != "" && v != binMissing {
+		hh.HasBinary = true
+		hh.BinaryPath = v
 	}
 	return nil
 }
@@ -284,10 +346,7 @@ func parseDF(s string) map[string]int64 {
 	out := make(map[string]int64)
 	for _, line := range strings.Split(s, "\n") {
 		fields := strings.Fields(line)
-		if len(fields) < 6 {
-			continue
-		}
-		if fields[0] == "Filesystem" {
+		if len(fields) < 6 || fields[0] == "Filesystem" {
 			continue
 		}
 		avail, err := strconv.ParseInt(fields[3], 10, 64)
@@ -299,21 +358,25 @@ func parseDF(s string) map[string]int64 {
 	return out
 }
 
-// Eligible reports whether this host can accept a new babysit run.
-func (h HostHealth) Eligible(opts ProbeOptions) (bool, string) {
+// Eligible reports whether this host can accept a new run.
+func (h HostHealth) Eligible(tool Tool, opts ProbeOptions) (bool, string) {
 	opts.applyDefaults()
+	maxLeases := opts.MaxLeasesPerHost
+	if tool.MaxLeasesPerHost > 0 {
+		maxLeases = tool.MaxLeasesPerHost
+	}
 	switch {
 	case !h.Reachable:
 		if h.Err != nil {
 			return false, "unreachable: " + h.Err.Error()
 		}
 		return false, "unreachable"
-	case !h.HasPrdozer:
-		return false, "prdozer not on PATH"
+	case !h.HasBinary:
+		return false, tool.Name + " not on PATH"
 	case h.UsableDiskGB() < opts.MinDiskGB:
 		return false, fmt.Sprintf("only %dGB free (need %dGB)", h.UsableDiskGB(), opts.MinDiskGB)
-	case h.Leases >= opts.MaxLeasesPerHost:
-		return false, fmt.Sprintf("already holds %d babysit leases", h.Leases)
+	case h.Leases() >= maxLeases:
+		return false, fmt.Sprintf("already holds %d %s leases", h.Leases(), tool.Name)
 	}
 	return true, ""
 }
@@ -342,13 +405,13 @@ func ScoreHosts(hosts []HostHealth) {
 }
 
 // PickHost returns the best eligible host, or an error explaining why every
-// candidate was rejected — a dispatch that silently finds nothing is
-// impossible to debug.
-func PickHost(hosts []HostHealth, opts ProbeOptions) (HostHealth, error) {
+// candidate was rejected — a dispatch that silently finds nothing is impossible
+// to debug.
+func PickHost(hosts []HostHealth, tool Tool, opts ProbeOptions) (HostHealth, error) {
 	ScoreHosts(hosts)
 	var reasons []string
 	for i := range hosts {
-		ok, why := hosts[i].Eligible(opts)
+		ok, why := hosts[i].Eligible(tool, opts)
 		if ok {
 			return hosts[i], nil
 		}
@@ -357,61 +420,14 @@ func PickHost(hosts []HostHealth, opts ProbeOptions) (HostHealth, error) {
 	return HostHealth{}, fmt.Errorf("no eligible host (%s)", strings.Join(reasons, "; "))
 }
 
-// ClaudeUsage is the slice of claude_limits.py output prdozer cares about.
-type ClaudeUsage struct {
-	FiveHourUtilization float64
-	SevenDayUtilization float64
-}
-
-type claudeLimitsDoc struct {
-	Default struct {
-		Error *string `json:"error"`
-		Usage struct {
-			FiveHour struct {
-				Utilization float64 `json:"utilization"`
-			} `json:"five_hour"`
-			SevenDay struct {
-				Utilization float64 `json:"utilization"`
-			} `json:"seven_day"`
-		} `json:"usage"`
-	} `json:"default"`
-}
-
-// ClaudeLimitsScript is the fleet-wide quota reporter.
-const ClaudeLimitsScript = "~/magent/scripts/claude_limits.py"
-
-// CheckClaudeQuota reads the shared Claude quota.
-//
-// This is a fleet-GLOBAL gate, never a per-host ranking signal: the OAuth
-// session is shared across every box, which is exactly why magent.cron tags
-// the limits job "primary" rather than "all". Query it once on the control box
-// and refuse to dispatch if exhausted, rather than burning a run that dies
-// mid-polish.
-func CheckClaudeQuota(ctx context.Context) (ClaudeUsage, error) {
-	cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(cctx, "python3", ExpandHome(ClaudeLimitsScript), "--json").Output()
-	if err != nil {
-		return ClaudeUsage{}, fmt.Errorf("run claude_limits.py: %w", err)
+// FindLeaseHolder returns the host holding a live lease for target, if any.
+// This is what maps a task back to the box actually running it — impossible
+// with only a lease count.
+func FindLeaseHolder(hosts []HostHealth, target string) (HostHealth, bool) {
+	for i := range hosts {
+		if hosts[i].HoldsLeaseFor(target) {
+			return hosts[i], true
+		}
 	}
-	var doc claudeLimitsDoc
-	if err := json.Unmarshal(out, &doc); err != nil {
-		return ClaudeUsage{}, fmt.Errorf("parse claude_limits output: %w", err)
-	}
-	if doc.Default.Error != nil && *doc.Default.Error != "" {
-		return ClaudeUsage{}, fmt.Errorf("claude_limits reported: %s", *doc.Default.Error)
-	}
-	return ClaudeUsage{
-		FiveHourUtilization: doc.Default.Usage.FiveHour.Utilization,
-		SevenDayUtilization: doc.Default.Usage.SevenDay.Utilization,
-	}, nil
-}
-
-// QuotaExhaustedThreshold is the five-hour utilization above which prdozer
-// refuses to start a new run.
-const QuotaExhaustedThreshold = 90.0
-
-// Exhausted reports whether quota is too tight to start a run.
-func (u ClaudeUsage) Exhausted() bool {
-	return u.FiveHourUtilization > QuotaExhaustedThreshold
+	return HostHealth{}, false
 }

@@ -1,7 +1,6 @@
 package prdozer
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -63,125 +62,15 @@ func TestTmuxSessionName(t *testing.T) {
 	assert.Equal(t, "babysit/yoloswe#7", TmuxSessionName("bazelment/yoloswe", 7))
 }
 
-func TestDispatchRequest_RemoteCommand(t *testing.T) {
-	t.Parallel()
-	req := DispatchRequest{
-		Host:         HostHealth{Host: "box", PublicDNS: "box.example", SSHUser: "ubuntu", HasPrdozer: true},
-		OwnerRepo:    "sycamore-labs/kernel",
-		PRNumber:     8123,
-		RegistryPath: "~/magent/prdozer/registry.yaml",
-	}
-	cmd := req.RemoteCommand()
-	assert.Contains(t, cmd, "tmux new-session -d")
-	assert.Contains(t, cmd, "babysit/kernel#8123", "the session must be attachable by a recognisable name")
-	assert.Contains(t, cmd, "babysit-local")
-	assert.Contains(t, cmd, "--pr 8123")
-	assert.Contains(t, cmd, "sycamore-labs/kernel")
-
-	// flock(1) must NOT appear: it looks like mutual exclusion but drops the
-	// lock the moment tmux daemonizes. The worker takes the lease itself.
-	assert.NotContains(t, cmd, "flock",
-		"flock(1) around tmux does not hold the lock; the worker must acquire it internally")
-}
-
-func TestDispatchRequest_SSHCommandIsPrintableForDryRun(t *testing.T) {
-	t.Parallel()
-	// --dry-run prints this verbatim; it is the primary debugging surface for
-	// dispatch, so it must be a command a human can paste and run.
-	req := DispatchRequest{
-		Host:      HostHealth{Host: "box", PublicDNS: "box.example", SSHUser: "ming", HasPrdozer: true},
-		OwnerRepo: "bazelment/yoloswe",
-		PRNumber:  42,
-	}
-	got := req.SSHCommand()
-	assert.Contains(t, got, "ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new")
-	assert.Contains(t, got, "ming@box.example")
-	assert.Contains(t, got, "babysit-local")
-}
-
-func TestDispatchRequest_UsesResolvedBinaryPath(t *testing.T) {
-	t.Parallel()
-	// A non-interactive SSH shell's PATH omits ~/bin (verified against the
-	// real fleet), so a bare "prdozer" produces a tmux session that dies with
-	// "command not found" — indistinguishable from a silent no-op.
-	req := DispatchRequest{
-		Host: HostHealth{
-			PublicDNS:   "b.example",
-			HasPrdozer:  true,
-			PrdozerPath: "/home/ming/bin/prdozer",
-		},
-		OwnerRepo: "o/r",
-		PRNumber:  1,
-	}
-	assert.Contains(t, req.RemoteCommand(), "/home/ming/bin/prdozer babysit-local")
-
-	// With no resolved path, fall back to the bare name rather than emitting
-	// an empty command.
-	bare := DispatchRequest{
-		Host:      HostHealth{PublicDNS: "b.example", HasPrdozer: true},
-		OwnerRepo: "o/r",
-		PRNumber:  1,
-	}
-	assert.Contains(t, bare.RemoteCommand(), "prdozer babysit-local")
-}
-
 func TestDispatchRequest_KeepWorktreeFlagPropagates(t *testing.T) {
 	t.Parallel()
 	req := DispatchRequest{
-		Host:         HostHealth{PublicDNS: "b.example", HasPrdozer: true},
+		Host:         HostHealth{PublicDNS: "b.example", HasBinary: true},
 		OwnerRepo:    "o/r",
 		PRNumber:     1,
 		KeepWorktree: true,
 	}
 	assert.Contains(t, req.RemoteCommand(), "--keep-worktree")
-}
-
-func TestShellQuote_EscapesSingleQuotes(t *testing.T) {
-	t.Parallel()
-	// A branch or repo name containing a quote must not break out of the
-	// remote command.
-	got := shellQuote(`it's`)
-	assert.Equal(t, `'it'\''s'`, got)
-}
-
-func TestDispatch_RefusesHostWithoutPrdozer(t *testing.T) {
-	t.Parallel()
-	// Dispatching to a box lacking the binary creates a tmux session that dies
-	// instantly — indistinguishable from a silent no-op.
-	ssh := &fakeSSH{out: map[string]string{}}
-	err := Dispatch(context.Background(), ssh, DispatchRequest{
-		Host:      HostHealth{Host: "bare", PublicDNS: "bare.example", HasPrdozer: false},
-		OwnerRepo: "o/r",
-		PRNumber:  1,
-	}, nil)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "PATH")
-	assert.Empty(t, ssh.seen, "nothing should have been dispatched")
-}
-
-func TestDispatch_SendsCommandToChosenHost(t *testing.T) {
-	t.Parallel()
-	ssh := &fakeSSH{out: map[string]string{"ming@box.example": ""}}
-	err := Dispatch(context.Background(), ssh, DispatchRequest{
-		Host:      HostHealth{Host: "box", PublicDNS: "box.example", SSHUser: "ming", HasPrdozer: true},
-		OwnerRepo: "o/r",
-		PRNumber:  5,
-	}, nil)
-	require.NoError(t, err)
-	require.Len(t, ssh.seen, 1)
-	assert.Equal(t, "ming@box.example", ssh.seen[0])
-}
-
-func TestDispatch_SurfacesRemoteFailure(t *testing.T) {
-	t.Parallel()
-	ssh := &fakeSSH{errs: map[string]error{"ubuntu@box.example": fmt.Errorf("permission denied")}}
-	err := Dispatch(context.Background(), ssh, DispatchRequest{
-		Host:      HostHealth{Host: "box", PublicDNS: "box.example", SSHUser: "ubuntu", HasPrdozer: true},
-		OwnerRepo: "o/r",
-		PRNumber:  5,
-	}, nil)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "permission denied")
 }
 
 func TestAcquireLease_SurvivesProcessScopedUse(t *testing.T) {
@@ -205,42 +94,3 @@ func TestAcquireLease_SurvivesProcessScopedUse(t *testing.T) {
 // so without an explicit PATH the worker starts, detects work correctly, then
 // every polish round dies with `exec: "claude": executable file not found`.
 // Observed on kernel#8227.
-func TestDispatchRequest_RemoteCommandPutsUserBinOnPath(t *testing.T) {
-	t.Parallel()
-	req := DispatchRequest{
-		Host:      HostHealth{Host: "box", PublicDNS: "box.example", SSHUser: "ming", HasPrdozer: true},
-		OwnerRepo: "sycamore-labs/kernel",
-		PRNumber:  8227,
-	}
-	req.Host.PrdozerPath = "/home/ming/bin/prdozer"
-	cmd := req.RemoteCommand()
-	// NOT tmux -e: tmux treats PATH specially and silently ignores an -e
-	// override, so the session keeps the tmux server's PATH. (-e FOO=bar does
-	// work, which makes this easy to misdiagnose.) Only a shell wrapper takes
-	// effect.
-	assert.NotContains(t, cmd, "-e 'PATH=",
-		"tmux -e cannot override PATH; it is silently ignored")
-	assert.Contains(t, cmd, "export PATH=")
-	assert.Contains(t, cmd, "/home/ming/.local/bin",
-		"the agent CLI lives in ~/.local/bin and is resolved from PATH")
-	assert.Contains(t, cmd, "/home/ming/bin")
-	assert.Contains(t, cmd, "/usr/bin",
-		"tmux -e replaces PATH wholesale, so the base entries must be carried")
-	assert.NotContains(t, cmd, "$HOME",
-		"tmux -e does no shell expansion; the value must be literal")
-}
-
-func TestDispatchRequest_RemotePathEnvUnresolvableIsOmitted(t *testing.T) {
-	t.Parallel()
-	// A bare "prdozer" (probe could not resolve an absolute path) gives no
-	// basis for deriving the home root. Leave PATH untouched rather than
-	// setting a wrong one.
-	req := DispatchRequest{
-		Host:      HostHealth{Host: "box", PublicDNS: "box.example", SSHUser: "ming"},
-		OwnerRepo: "o/r",
-		PRNumber:  1,
-	}
-	assert.Empty(t, req.remotePathEnv())
-	assert.NotContains(t, req.RemoteCommand(), "export PATH=",
-		"no PATH export when it cannot be derived")
-}

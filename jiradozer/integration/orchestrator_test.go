@@ -90,7 +90,7 @@ func (m *mockWTManager) NewWorktree(_ context.Context, branch, _, _ string) (str
 	return dir, nil
 }
 
-func (m *mockWTManager) RemoveWorktree(_ context.Context, nameOrBranch string, _ bool) error {
+func (m *mockWTManager) RemoveWorktree(_ context.Context, nameOrBranch string, _, _ bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.removed = append(m.removed, nameOrBranch)

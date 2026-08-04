@@ -1,4 +1,4 @@
-package prdozer
+package fleet
 
 import (
 	"context"
@@ -11,8 +11,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testTool stands in for a real tool; the probe is tool-agnostic apart from
+// the binary name and lease directory it interpolates.
+var testTool = Tool{Name: "prdozer", LeaseDir: "~/.prdozer/leases"}
+
+func PickHostT(hosts []HostHealth, opts ProbeOptions) (HostHealth, error) {
+	return PickHost(hosts, testTool, opts)
+}
+
+func (h HostHealth) EligibleT(opts ProbeOptions) (bool, string) {
+	return h.Eligible(testTool, opts)
+}
+
 // The blobs below are REAL probe output captured from the live fleet, not
 // hand-written fixtures. They carry the exact quirks the parser must handle.
+//
+// The __LEASES__ section is now a list of HELD lock names rather than a count,
+// so a box holding nothing emits an empty section. The captured blobs said "0";
+// left unchanged they parsed as one lease named "0", which is what caught the
+// protocol change here rather than in production.
 
 // awsProbeBlob: this box (ming.devbox, aws). Single df row, no /mnt/nvme.
 const awsProbeBlob = `__NPROC__
@@ -25,8 +42,7 @@ Filesystem     1024-blocks      Used Available Capacity Mounted on
 __TMUX__
 31
 __LEASES__
-0
-__PRDOZER__
+__BIN__
 /home/ubuntu/bin/prdozer
 __END__
 `
@@ -47,8 +63,7 @@ Filesystem     1024-blocks     Used Available Capacity Mounted on
 __TMUX__
 15
 __LEASES__
-0
-__PRDOZER__
+__BIN__
 /home/ming/bin/prdozer
 __END__
 `
@@ -64,8 +79,7 @@ Filesystem     1024-blocks      Used Available Capacity Mounted on
 __TMUX__
 38
 __LEASES__
-0
-__PRDOZER__
+__BIN__
 MISSING
 __END__
 `
@@ -79,8 +93,8 @@ func TestParseProbe_RealAWSBlob(t *testing.T) {
 	assert.Equal(t, 153, hh.DiskFreeGB, "161357176 KB is ~153 GB")
 	assert.Zero(t, hh.NVMeFreeGB, "an AWS box has no /mnt/nvme")
 	assert.Equal(t, 31, hh.TmuxWindows)
-	assert.Equal(t, 0, hh.Leases)
-	assert.True(t, hh.HasPrdozer)
+	assert.Equal(t, 0, hh.Leases())
+	assert.True(t, hh.HasBinary)
 }
 
 func TestParseProbe_RealAzureBlob_UsesNVMe(t *testing.T) {
@@ -101,7 +115,7 @@ func TestParseProbe_RealAzureBlob_UsesNVMe(t *testing.T) {
 	// Reachable is set by probeOne, not parseProbe; set it to exercise
 	// eligibility on this parsed data.
 	hh.Reachable = true
-	ok, why := hh.Eligible(ProbeOptions{MinDiskGB: 40})
+	ok, why := hh.EligibleT(ProbeOptions{MinDiskGB: 40})
 	assert.True(t, ok, "the azure box must be eligible via nvme, got: %s", why)
 }
 
@@ -109,9 +123,9 @@ func TestParseProbe_MissingPrdozerIsDetected(t *testing.T) {
 	t.Parallel()
 	var hh HostHealth
 	require.NoError(t, parseProbe(clawProbeBlob, &hh))
-	assert.False(t, hh.HasPrdozer)
+	assert.False(t, hh.HasBinary)
 	hh.Reachable = true
-	ok, why := hh.Eligible(ProbeOptions{})
+	ok, why := hh.EligibleT(ProbeOptions{})
 	assert.False(t, ok, "a box without prdozer must not be dispatched to")
 	assert.Contains(t, why, "PATH")
 }
@@ -141,8 +155,7 @@ Filesystem     1024-blocks     Used Available Capacity Mounted on
 __TMUX__
 0
 __LEASES__
-0
-__PRDOZER__
+__BIN__
 /usr/bin/prdozer
 __END__
 `
@@ -195,11 +208,11 @@ func TestPickHost_ExcludesAndExplains(t *testing.T) {
 	t.Parallel()
 	opts := ProbeOptions{MinDiskGB: 40, MaxLeasesPerHost: 1}
 	hosts := []HostHealth{
-		{Host: "full", Reachable: true, HasPrdozer: true, Cores: 8, Load1: 0.1, DiskFreeGB: 5},
-		{Host: "leased", Reachable: true, HasPrdozer: true, Cores: 8, Load1: 0.2, DiskFreeGB: 500, Leases: 1},
+		{Host: "full", Reachable: true, HasBinary: true, Cores: 8, Load1: 0.1, DiskFreeGB: 5},
+		{Host: "leased", Reachable: true, HasBinary: true, Cores: 8, Load1: 0.2, DiskFreeGB: 500, HeldLeases: []string{"o-r-1.lock"}},
 		{Host: "down", Reachable: false, Err: fmt.Errorf("connection refused")},
 	}
-	_, err := PickHost(hosts, opts)
+	_, err := PickHostT(hosts, opts)
 	require.Error(t, err, "no host is eligible")
 	// A dispatch that finds nothing must say why for EVERY candidate.
 	assert.Contains(t, err.Error(), "full")
@@ -208,8 +221,8 @@ func TestPickHost_ExcludesAndExplains(t *testing.T) {
 	assert.Contains(t, err.Error(), "leases")
 	assert.Contains(t, err.Error(), "down")
 
-	good := HostHealth{Host: "good", Reachable: true, HasPrdozer: true, Cores: 8, Load1: 0.3, DiskFreeGB: 500}
-	picked, err := PickHost(append(hosts, good), opts)
+	good := HostHealth{Host: "good", Reachable: true, HasBinary: true, Cores: 8, Load1: 0.3, DiskFreeGB: 500}
+	picked, err := PickHostT(append(hosts, good), opts)
 	require.NoError(t, err)
 	assert.Equal(t, "good", picked.Host)
 }
@@ -232,7 +245,7 @@ func (f *fakeSSH) Run(_ context.Context, target, _ string) (string, error) {
 func TestProbeFleet_MarksUnreachableWithoutFailing(t *testing.T) {
 	t.Parallel()
 	// One dead box must not prevent the rest of the fleet from being used.
-	hosts := []FleetHost{
+	hosts := []Host{
 		{Hostname: "aws-box", PublicDNS: "aws.example", SSHUser: "ubuntu", Cloud: "aws"},
 		{Hostname: "azure-box", PublicDNS: "azure.example", SSHUser: "ming", Cloud: "azure"},
 		{Hostname: "dead-box", PublicDNS: "dead.example", SSHUser: "ubuntu", Cloud: "aws"},
@@ -244,7 +257,7 @@ func TestProbeFleet_MarksUnreachableWithoutFailing(t *testing.T) {
 		},
 		errs: map[string]error{"ubuntu@dead.example": fmt.Errorf("connection timed out")},
 	}
-	got := ProbeFleet(context.Background(), ssh, hosts, ProbeOptions{})
+	got := Probe(context.Background(), ssh, testTool, hosts, ProbeOptions{})
 	require.Len(t, got, 3)
 
 	byName := map[string]HostHealth{}
@@ -261,18 +274,11 @@ func TestProbeFleet_MarksUnreachableWithoutFailing(t *testing.T) {
 
 func TestProbeFleet_DetectsSelf(t *testing.T) {
 	t.Parallel()
-	hosts := []FleetHost{{Hostname: "me", PublicDNS: "me.example", SSHUser: "ubuntu"}}
+	hosts := []Host{{Hostname: "me", PublicDNS: "me.example", SSHUser: "ubuntu"}}
 	ssh := &fakeSSH{out: map[string]string{"ubuntu@me.example": awsProbeBlob}}
-	got := ProbeFleet(context.Background(), ssh, hosts, ProbeOptions{SelfDNS: "me.example"})
+	got := Probe(context.Background(), ssh, testTool, hosts, ProbeOptions{SelfDNS: "me.example"})
 	require.Len(t, got, 1)
 	assert.True(t, got[0].IsSelf, "the dispatcher must recognise its own box and not SSH to itself")
-}
-
-func TestClaudeUsage_Exhausted(t *testing.T) {
-	t.Parallel()
-	assert.False(t, ClaudeUsage{FiveHourUtilization: 26}.Exhausted(), "the real observed value should pass")
-	assert.False(t, ClaudeUsage{FiveHourUtilization: 90}.Exhausted(), "the threshold itself is not over")
-	assert.True(t, ClaudeUsage{FiveHourUtilization: 91}.Exhausted())
 }
 
 func TestLoadFleet_RealSchema(t *testing.T) {
@@ -294,7 +300,7 @@ func TestLoadFleet_RealSchema(t *testing.T) {
 }`)
 	write("notes.txt", "ignored")
 
-	hosts, err := LoadFleet(dir)
+	hosts, err := Load(dir)
 	require.NoError(t, err)
 	require.Len(t, hosts, 2, "non-JSON files are ignored")
 	// Sorted by hostname for determinism.
@@ -310,7 +316,7 @@ func TestLoadFleet_MalformedEntryFailsLoudly(t *testing.T) {
 	// fleet while looking healthy.
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "bad.json"), []byte("{not json"), 0o600))
-	_, err := LoadFleet(dir)
+	_, err := Load(dir)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "parse")
 }
@@ -326,7 +332,7 @@ func TestSelfPublicDNS(t *testing.T) {
 
 func TestFleetHost_IsSelf(t *testing.T) {
 	t.Parallel()
-	h := FleetHost{Hostname: "ip-172-31-23-21", PublicDNS: "ming.devbox.sycloud.ai"}
+	h := Host{Hostname: "ip-172-31-23-21", PublicDNS: "ming.devbox.sycloud.ai"}
 	assert.True(t, h.IsSelf("ming.devbox.sycloud.ai", ""), "matched by public DNS")
 	assert.True(t, h.IsSelf("", "ip-172-31-23-21"), "falls back to hostname")
 	assert.False(t, h.IsSelf("other.example", "other-host"))
@@ -339,9 +345,9 @@ func TestFleetHost_IsSelf(t *testing.T) {
 // boxes reported "already holds 2 babysit leases" with zero live workers.
 func TestProbeCommand_CountsHeldLeasesNotFiles(t *testing.T) {
 	t.Parallel()
-	assert.Contains(t, probeScript, "flock -n",
+	assert.Contains(t, testTool.probeScript(), "flock -n",
 		"lease occupancy must be tested with flock, not by counting files")
-	assert.NotContains(t, probeScript, "ls ~/.prdozer/leases/ 2>/dev/null | wc -l",
+	assert.NotContains(t, testTool.probeScript(), "ls ~/.prdozer/leases/ 2>/dev/null | wc -l",
 		"the file-count form is what caused the fleet to exclude every host")
 }
 
@@ -349,10 +355,69 @@ func TestProbeCommand_CountsHeldLeasesNotFiles(t *testing.T) {
 func TestEligible_StaleLeaseFilesDoNotExcludeAHost(t *testing.T) {
 	t.Parallel()
 	h := HostHealth{
-		Host: "box", Reachable: true, HasPrdozer: true,
+		Host: "box", Reachable: true, HasBinary: true,
 		Cores: 8, Load1: 1.0, DiskFreeGB: 100,
-		Leases: 0, // files may exist on disk; none are held
+		// Files may exist on disk; none are HELD, so none count.
+		HeldLeases: nil,
 	}
-	ok, reason := h.Eligible(ProbeOptions{MaxLeasesPerHost: 2, MinDiskGB: 40})
+	ok, reason := h.EligibleT(ProbeOptions{MaxLeasesPerHost: 2, MinDiskGB: 40})
 	assert.True(t, ok, "a host with no HELD leases is eligible: %s", reason)
+}
+
+// The probe emits held lock NAMES, not just a count. A count answers "can this
+// box take more work"; only the names answer "which box is running INF-1234",
+// which is what a reaper and a gather loop both need.
+func TestParseProbe_ReportsHeldLeaseNames(t *testing.T) {
+	t.Parallel()
+	blob := `__NPROC__
+8
+__LOAD__
+0.5 0.4 0.3 1/100 1
+__DF__
+Filesystem     1024-blocks      Used Available Capacity Mounted on
+/dev/root        506771172 345397612 161357176      69% /
+__TMUX__
+3
+__LEASES__
+INF-1234.lock
+acme-app-42.lock
+__BIN__
+/home/ubuntu/bin/jiradozer
+__END__
+`
+	var hh HostHealth
+	require.NoError(t, parseProbe(blob, &hh))
+	assert.Equal(t, 2, hh.Leases())
+	assert.True(t, hh.HoldsLeaseFor("INF-1234"))
+	// A GitHub identifier is sanitized into the lock name the same way the
+	// worker sanitizes it, or the lookup silently never matches.
+	assert.True(t, hh.HoldsLeaseFor("acme/app#42"))
+	assert.False(t, hh.HoldsLeaseFor("INF-9999"))
+}
+
+func TestFindLeaseHolder_MapsATaskBackToItsBox(t *testing.T) {
+	t.Parallel()
+	hosts := []HostHealth{
+		{Host: "a", HeldLeases: []string{"INF-1.lock"}},
+		{Host: "b", HeldLeases: []string{"INF-2.lock", "INF-3.lock"}},
+	}
+	h, ok := FindLeaseHolder(hosts, "INF-3")
+	require.True(t, ok)
+	assert.Equal(t, "b", h.Host)
+
+	_, ok = FindLeaseHolder(hosts, "INF-404")
+	assert.False(t, ok, "an unheld task must not resolve to a host")
+}
+
+// The lease section must be produced with `flock -n`, never by listing files:
+// Release leaves the lock file behind on purpose, so a file listing counts
+// every task the box has ever run.
+func TestProbeScript_TestsLocksRatherThanListingFiles(t *testing.T) {
+	t.Parallel()
+	script := testTool.probeScript()
+	assert.Contains(t, script, "flock -n")
+	assert.Contains(t, script, "~/.prdozer/leases")
+	assert.Contains(t, script, "command -v prdozer")
+	assert.Contains(t, script, `$HOME/bin/prdozer`,
+		"~/bin is not on a non-interactive ssh PATH, so the fallback must be explicit")
 }

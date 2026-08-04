@@ -4,6 +4,7 @@ use (
 	./agent-cli-wrapper
 	./bramble
 	./cliapp
+	./fleet
 	./jiradozer
 	./logging
 	./medivac
