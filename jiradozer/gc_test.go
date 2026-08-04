@@ -3,6 +3,7 @@ package jiradozer
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -265,6 +266,69 @@ func TestGCExpiresARunLogOnceItsWorktreeIsGone(t *testing.T) {
 	require.NoError(t, err)
 	require.NoDirExists(t, m.LogDir)
 	require.GreaterOrEqual(t, res.Removed, 1)
+}
+
+// unverifiableFixture seeds a run whose recorded worktree path os.Stat cannot
+// answer for: its parent is a regular file, so the kernel returns ENOTDIR.
+//
+// That stands in for the EACCES/EIO a real sweep hits on a bad mount, and
+// unlike a chmod-0 trick it behaves identically when the tests run as root.
+// The path is taken literally — no directory is created — which is why this
+// cannot go through gcFixture.
+func unverifiableFixture(t *testing.T, m RunMeta) RunMeta {
+	t.Helper()
+	notADir := filepath.Join(t.TempDir(), "not-a-dir")
+	require.NoError(t, os.WriteFile(notADir, []byte("x"), 0o600))
+	m.WorktreePath = filepath.Join(notADir, "worktree")
+
+	_, err := os.Stat(m.WorktreePath)
+	require.Error(t, err, "the fixture must make stat fail")
+	require.False(t, errors.Is(err, fs.ErrNotExist),
+		"and fail with something other than ENOENT, or it proves nothing")
+
+	rl, err := NewRunLog(m)
+	require.NoError(t, err)
+	if m.State.IsTerminal() {
+		require.NoError(t, rl.Finish(m.State, "", nil))
+	}
+	return rl.Meta()
+}
+
+// A stat that failed is not a stat that said "gone". gc must not walk into the
+// reclaim path on a directory it has not established is there.
+func TestGCWillNotReclaimAWorktreeItCannotSee(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	unverifiableFixture(t, RunMeta{
+		RunID: "r1", IssueIdentifier: "INF-1", Repo: "kernel", Branch: "feature/INF-1",
+		State: RunStateDone, PRURL: "https://github.com/o/r/pull/1",
+	})
+
+	rm := &fakeRemover{}
+	res, err := RunGC(context.Background(),
+		gcDeps(fakePRChecker{merged: map[string]bool{"https://github.com/o/r/pull/1": true}}, rm, nil),
+		GCOptions{Apply: true}, nil)
+	require.NoError(t, err)
+	require.Empty(t, rm.removed, "an unverifiable path must not reach the remover")
+	require.Zero(t, res.Removed)
+	requireReason(t, res, "worktree", "could not verify the worktree path")
+}
+
+// The run-log is the worktree's only ownership record, so expiring it on an
+// inconclusive stat orphans the directory permanently — no later sweep can
+// rediscover it. Keep the record until the filesystem gives a real answer.
+func TestGCKeepsARunLogItCannotProveIsOrphaned(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	m := unverifiableFixture(t, RunMeta{
+		RunID: "r1", IssueIdentifier: "INF-1", Repo: "kernel", Branch: "feature/INF-1",
+		State: RunStateDone,
+	})
+	require.NotEmpty(t, m.LogDir)
+
+	res, err := RunGC(context.Background(), gcDeps(fakePRChecker{}, &fakeRemover{}, nil),
+		GCOptions{Apply: true, RunLogTTL: time.Nanosecond}, nil)
+	require.NoError(t, err)
+	require.DirExists(t, m.LogDir, "a run-log must outlive a stat it could not complete")
+	requireReason(t, res, "runlog", "could not verify the worktree path")
 }
 
 // A worktree with no run-log is somebody's, not jiradozer's.

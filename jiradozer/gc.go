@@ -3,7 +3,9 @@ package jiradozer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"strings"
@@ -204,6 +206,24 @@ func (r *GCResult) add(c GCCandidate) {
 	}
 }
 
+// worktreeExists reports whether a recorded worktree is still on disk.
+//
+// The error return is a third answer, not a variant of "no": a stat that fails
+// for any reason other than "not there" — EACCES on a parent, EIO on a flaky
+// mount, a dead NFS server — has established nothing about the path. Both
+// callers fail closed on it, because both of the actions it gates are
+// irreversible (removing a checkout, expiring the record that owns one) while
+// the check itself is free to retry on the next sweep.
+func worktreeExists(path string) (bool, error) {
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 func gcWorktree(ctx context.Context, deps GCDeps, opts GCOptions, m RunMeta, logger *slog.Logger) GCCandidate {
 	c := GCCandidate{
 		Kind:   "worktree",
@@ -213,7 +233,15 @@ func gcWorktree(ctx context.Context, deps GCDeps, opts GCOptions, m RunMeta, log
 		Age:    time.Since(m.StartedAt),
 	}
 
-	if _, err := os.Stat(m.WorktreePath); os.IsNotExist(err) {
+	exists, err := worktreeExists(m.WorktreePath)
+	if err != nil {
+		// An unanswered question is not permission to reclaim. Everything below
+		// this point reasons about a directory gc has not established is there,
+		// and the sweep runs again in an hour — waiting costs nothing.
+		c.Reason = fmt.Sprintf("could not verify the worktree path: %v", err)
+		return c
+	}
+	if !exists {
 		c.Reason = "worktree already gone"
 		return c
 	}
@@ -334,7 +362,15 @@ func gcRunLog(opts GCOptions, m RunMeta, now time.Time) (GCCandidate, bool) {
 	// only thing that marks that directory as jiradozer's, so dropping it first
 	// would orphan the worktree permanently.
 	if m.WorktreePath != "" {
-		if _, err := os.Stat(m.WorktreePath); err == nil {
+		switch exists, err := worktreeExists(m.WorktreePath); {
+		case err != nil:
+			// "I could not tell" is not "it is gone". Dropping the record on a
+			// transient stat failure orphans the directory for good: nothing
+			// else marks it as jiradozer's, so no later sweep can find it.
+			c.Eligible = false
+			c.Reason = fmt.Sprintf("could not verify the worktree path: %v", err)
+			return c, true
+		case exists:
 			c.Eligible = false
 			c.Reason = "worktree still present; the run-log is its only ownership record"
 			return c, true
