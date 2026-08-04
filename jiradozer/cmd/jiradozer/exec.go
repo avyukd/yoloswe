@@ -36,7 +36,6 @@ type execArgs struct {
 	tmuxSession  string
 	maxBudget    float64
 	force        bool
-	keepWorktree bool
 }
 
 // newExecCmd builds the worker that a dispatcher places on a box.
@@ -70,7 +69,11 @@ func newExecCmd(args *execArgs) *cobra.Command {
 	f.StringVar(&args.tmuxSession, "tmux-session", "", "Record the tmux session this run was dispatched into")
 	f.Float64Var(&args.maxBudget, "max-budget", 0, "Override max_budget_usd")
 	f.BoolVar(&args.force, "force", false, "Proceed even when the issue is already claimed by another host")
-	f.BoolVar(&args.keepWorktree, "keep-worktree", false, "Never reclaim the worktree (default already keeps it)")
+	// There is deliberately no --keep-worktree here. exec ALWAYS keeps its
+	// worktree — its terminal state is "a PR is open", which authorises nothing
+	// — and only `jiradozer gc` ever reclaims one, by asking whether the PR
+	// landed. A flag that cannot change either answer would only promise a
+	// control that does not exist.
 	return cmd
 }
 
@@ -215,9 +218,14 @@ type execRun struct {
 	// teardown path only runs when something else already failed, so it needs a
 	// test that does not depend on a real repository.
 	removeWorktree func(ctx context.Context, branch string) error
-	runID          string
-	branch         string
-	args           execArgs
+	// newTracker builds the issue tracker client. Injected so the claim
+	// ORDERING — label attached before the worktree, released again when the
+	// worktree never comes up — can be driven through run() itself rather than
+	// asserted on the pieces, which is the only way the ordering stays enforced.
+	newTracker func(cfg *jiradozer.Config, issueID string) (tracker.IssueTracker, error)
+	runID      string
+	branch     string
+	args       execArgs
 }
 
 // defaultPRLookup asks gh which PR exists for a branch, from inside the
@@ -248,7 +256,11 @@ func (x *execRun) run(ctx context.Context) (runErr error) {
 	// is rooted inside the run directory, which does not exist yet, so it is
 	// built later. The two orders are why exec cannot reuse run()'s flow.
 	if x.args.issueID != "" {
-		t, err := createTracker(x.cfg, x.args.issueID)
+		newTracker := x.newTracker
+		if newTracker == nil {
+			newTracker = createTracker
+		}
+		t, err := newTracker(x.cfg, x.args.issueID)
 		if err != nil {
 			return err
 		}
@@ -262,9 +274,23 @@ func (x *execRun) run(ctx context.Context) (runErr error) {
 		if err := x.checkNotClaimed(issue); err != nil {
 			return err
 		}
+		// Claim HERE, not after the worktree exists. The label is the only
+		// claim another box can see — the flock lease is per-host — and every
+		// instant between the check above and the label being attached is a
+		// window in which a second dispatch reads an unclaimed issue and starts
+		// a duplicate run. Claiming after createWorktree stretched that window
+		// across a full checkout (clone, hooks, minutes); claiming here narrows
+		// it to the round trip below.
+		//
+		// It does not close it: no tracker offers a compare-and-set, so two
+		// workers can still both read "unclaimed" and both label. Narrowing is
+		// what is available without shared fleet state, and it removes the part
+		// of the window that was long enough to hit in practice.
+		x.claim(ctx)
 	}
 
 	if err := x.createWorktree(ctx); err != nil {
+		x.abandonClaim(ctx)
 		return err
 	}
 
@@ -275,6 +301,7 @@ func (x *execRun) run(ctx context.Context) (runErr error) {
 		// a failed startRunLog is orphaned PERMANENTLY. Nothing has run in it
 		// yet, so tearing it down here loses nothing.
 		x.discardUnclaimedWorktree(ctx)
+		x.abandonClaim(ctx)
 		return err
 	}
 
@@ -296,9 +323,14 @@ func (x *execRun) run(ctx context.Context) (runErr error) {
 		if err := x.createLocalIssue(); err != nil {
 			return err
 		}
+		// The local tracker lives inside this run's directory, so its issue
+		// cannot exist any earlier and its label is a per-run record rather
+		// than a cross-host claim. For a --description run the fleet-wide
+		// exclusion is `dispatch`'s lease probe on the derived adhoc- target
+		// and nothing else.
+		x.claim(ctx)
 	}
 
-	x.claim(ctx)
 	x.postStartComment(ctx)
 
 	wf := jiradozer.NewWorkflow(x.tracker, x.issue, x.cfg, x.logger)
@@ -475,6 +507,34 @@ func (x *execRun) claim(ctx context.Context) {
 		return
 	}
 	x.logger.Info("claimed issue", "issue", x.issue.Identifier, "label", jiradozer.LockLabel)
+}
+
+// abandonClaim drops the lock label for a run that died before the run-log
+// existed, which is the window in which finish() is not yet deferred and so
+// nothing else will release it.
+//
+// Without this, moving the claim ahead of the worktree would trade a race for a
+// worse failure: a checkout that fails — no disk, a bad base branch — would
+// leave the issue labelled with no run anywhere to explain it, and every later
+// dispatch would refuse it until a human passed --force.
+//
+// A fresh context for the same reason finish() uses one: the run context is
+// usually already cancelled by the time an abort unwinds, and this write is the
+// one that must still land.
+func (x *execRun) abandonClaim(ctx context.Context) {
+	if x.tracker == nil || x.issue == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if err := x.tracker.RemoveLabel(ctx, x.issue.ID, jiradozer.LockLabel); err != nil {
+		// Loud: a claim left on an issue nobody is working blocks the fleet
+		// from ever picking it up again, and only the log says why.
+		x.logger.Error("could not release the lock label of a run that never started; the issue stays claimed until this label is removed or --force is passed",
+			"issue", x.issue.Identifier, "label", jiradozer.LockLabel, "error", err)
+		return
+	}
+	x.logger.Info("released the claim of a run that never started", "issue", x.issue.Identifier)
 }
 
 // postStartComment records where this run is happening.

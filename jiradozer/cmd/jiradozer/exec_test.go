@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -80,6 +81,165 @@ func TestCheckNotClaimedBlocksAForeignClaim(t *testing.T) {
 	unclaimed := &execRun{}
 	require.NoError(t, unclaimed.checkNotClaimed(&tracker.Issue{
 		Identifier: "INF-2", Labels: []string{"ming-work"}}))
+}
+
+// claimRecordingTracker records label mutations in the order they happen, so a
+// test can assert WHEN the claim was taken relative to the worktree — the
+// ordering is the whole point, and a tracker that only remembers the final set
+// of labels cannot see it.
+type claimRecordingTracker struct {
+	issue      *tracker.Issue
+	fetchErr   error
+	addLabelEr error
+	calls      []string
+}
+
+func (c *claimRecordingTracker) FetchIssue(context.Context, string) (*tracker.Issue, error) {
+	if c.fetchErr != nil {
+		return nil, c.fetchErr
+	}
+	c.calls = append(c.calls, "fetch")
+	return c.issue, nil
+}
+
+func (c *claimRecordingTracker) ListIssues(context.Context, tracker.IssueFilter) ([]*tracker.Issue, error) {
+	return nil, nil
+}
+
+func (c *claimRecordingTracker) FetchComments(context.Context, string, time.Time) ([]tracker.Comment, error) {
+	return nil, nil
+}
+
+func (c *claimRecordingTracker) FetchWorkflowStates(context.Context, string) ([]tracker.WorkflowState, error) {
+	return nil, nil
+}
+
+func (c *claimRecordingTracker) PostComment(context.Context, string, string) (tracker.Comment, error) {
+	return tracker.Comment{}, nil
+}
+
+func (c *claimRecordingTracker) UpdateIssueState(context.Context, string, string) error { return nil }
+
+func (c *claimRecordingTracker) AddLabel(_ context.Context, _ string, label string) error {
+	if c.addLabelEr != nil {
+		return c.addLabelEr
+	}
+	c.calls = append(c.calls, "add:"+label)
+	return nil
+}
+
+func (c *claimRecordingTracker) RemoveLabel(_ context.Context, _ string, label string) error {
+	c.calls = append(c.calls, "remove:"+label)
+	return nil
+}
+
+// execRunForClaimOrdering wires run() so it reaches createWorktree and fails
+// there. The manager is built on an empty root, so wt refuses before running a
+// single git command — deterministic, and it needs no repository.
+func execRunForClaimOrdering(t *testing.T, trk *claimRecordingTracker) *execRun {
+	t.Helper()
+	return &execRun{
+		app:    execTestApp(t),
+		logger: testMainLogger(t),
+		cfg:    &jiradozer.Config{BaseBranch: "main"},
+		wtMgr:  wt.NewManager(t.TempDir(), "kernel"),
+		args:   execArgs{issueID: "INF-1", repo: "kernel"},
+		runID:  "r1",
+		newTracker: func(*jiradozer.Config, string) (tracker.IssueTracker, error) {
+			return trk, nil
+		},
+	}
+}
+
+// The lock label is the only claim another box can see. Taking it AFTER the
+// worktree left a window as long as a full checkout in which a second dispatch
+// read an unclaimed issue and started a duplicate run; it must be taken between
+// the claim check and the checkout instead.
+func TestTheIssueIsClaimedBeforeTheWorktreeIsCreated(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	trk := &claimRecordingTracker{issue: &tracker.Issue{ID: "id-1", Identifier: "INF-1"}}
+	x := execRunForClaimOrdering(t, trk)
+
+	err := x.run(context.Background())
+
+	require.Error(t, err, "the checkout must fail so the test observes only the pre-worktree path")
+	require.NotContains(t, err.Error(), "already claimed")
+	require.Equal(t, []string{"fetch", "add:" + jiradozer.LockLabel, "remove:" + jiradozer.LockLabel}, trk.calls,
+		"the claim must land between reading the issue and creating the worktree")
+}
+
+// Moving the claim earlier must not trade a race for a stuck issue: finish() is
+// only deferred once the run-log exists, so a failure before that has nothing
+// else to release the label — and a label nobody is working blocks every later
+// dispatch until a human passes --force.
+func TestAClaimIsReleasedWhenTheWorktreeNeverComesUp(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	trk := &claimRecordingTracker{issue: &tracker.Issue{ID: "id-1", Identifier: "INF-1"}}
+	x := execRunForClaimOrdering(t, trk)
+
+	require.Error(t, x.run(context.Background()))
+
+	require.Equal(t, "remove:"+jiradozer.LockLabel, trk.calls[len(trk.calls)-1],
+		"an aborted run must leave the issue unclaimed")
+}
+
+// The release has to survive the context that carried the failure: by the time
+// an abort unwinds, the run context is usually already cancelled, and this is
+// the one write that must still land.
+func TestAClaimIsReleasedEvenOnACancelledContext(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	trk := &claimRecordingTracker{issue: &tracker.Issue{ID: "id-1", Identifier: "INF-1"}}
+	x := &execRun{
+		logger:  testMainLogger(t),
+		tracker: trk,
+		issue:   trk.issue,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	x.abandonClaim(ctx)
+
+	assert.Equal(t, []string{"remove:" + jiradozer.LockLabel}, trk.calls)
+}
+
+// A claim left on an issue nobody is working is invisible except in the log, so
+// a failed release must be loud rather than a warning nobody reads.
+func TestAFailedClaimReleaseIsReportedNotSwallowed(t *testing.T) {
+	var logged bytes.Buffer
+	trk := &failingRemoveLabelTracker{}
+	x := &execRun{
+		logger:  slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelError})),
+		tracker: trk,
+		issue:   &tracker.Issue{ID: "id-1", Identifier: "INF-1"},
+	}
+
+	x.abandonClaim(context.Background())
+
+	out := logged.String()
+	assert.Contains(t, out, "INF-1", "a human needs to know which issue stays claimed")
+	assert.Contains(t, out, jiradozer.LockLabel)
+	assert.Contains(t, out, "tracker unavailable")
+}
+
+type failingRemoveLabelTracker struct{ claimRecordingTracker }
+
+func (failingRemoveLabelTracker) RemoveLabel(context.Context, string, string) error {
+	return errors.New("tracker unavailable")
+}
+
+// Nothing to release must be a no-op: abandonClaim runs on the failure path,
+// which is reachable before a tracker or issue exists at all.
+func TestAbandonClaimIsANoOpWithNothingClaimed(t *testing.T) {
+	x := &execRun{logger: testMainLogger(t)}
+	x.abandonClaim(context.Background()) // no tracker, no issue
+
+	trk := &claimRecordingTracker{}
+	x.tracker = trk
+	x.abandonClaim(context.Background()) // tracker, but no issue yet
+	assert.Empty(t, trk.calls)
 }
 
 // A lease is held INSIDE the worker for its whole lifetime, so a second worker
