@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -281,4 +283,65 @@ func TestStartRunLogRecordsTheLeaseItHolds(t *testing.T) {
 	onDisk, err := jiradozer.LoadRunMeta(x.rl.Dir())
 	require.NoError(t, err)
 	assert.Equal(t, want, onDisk.LeaseTarget, "gc reads meta.json, not this process's memory")
+}
+
+// The run-log IS gc's ownership namespace: these are ordinary wt worktrees
+// sitting beside human-owned ones, so a worktree no run-log claims is never a
+// candidate. A worktree that outlives a failed startRunLog is therefore
+// orphaned permanently — and nothing has run in it yet, so tearing it down
+// loses nothing.
+func TestAWorktreeIsNotLeftBehindWhenTheRunLogCannotBeCreated(t *testing.T) {
+	var removed []string
+	x := &execRun{
+		logger: testMainLogger(t),
+		cfg:    &jiradozer.Config{WorkDir: t.TempDir()},
+		branch: "jiradozer/INF-1",
+		removeWorktree: func(_ context.Context, branch string) error {
+			removed = append(removed, branch)
+			return nil
+		},
+	}
+
+	x.discardUnclaimedWorktree(context.Background())
+
+	assert.Equal(t, []string{"jiradozer/INF-1"}, removed,
+		"the checkout must be removed by branch, through the worktree manager")
+}
+
+// If the teardown itself fails the directory is now invisible to gc and only a
+// human can find it, so the path must survive into the log rather than be
+// swallowed.
+func TestAFailedTeardownIsReportedNotSwallowed(t *testing.T) {
+	var logged bytes.Buffer
+	x := &execRun{
+		logger: slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelError})),
+		cfg:    &jiradozer.Config{WorkDir: "/roots/kernel/jiradozer-INF-1"},
+		branch: "jiradozer/INF-1",
+		removeWorktree: func(context.Context, string) error {
+			return errors.New("worktree is locked")
+		},
+	}
+
+	x.discardUnclaimedWorktree(context.Background())
+
+	out := logged.String()
+	assert.Contains(t, out, "/roots/kernel/jiradozer-INF-1", "a human needs the path to find it")
+	assert.Contains(t, out, "worktree is locked")
+}
+
+// Nothing to discard must be a no-op, not a removal against an empty branch
+// name — wt would resolve that to some other worktree.
+func TestDiscardUnclaimedWorktreeIsANoOpBeforeAWorktreeExists(t *testing.T) {
+	called := false
+	x := &execRun{
+		logger:         testMainLogger(t),
+		cfg:            &jiradozer.Config{},
+		removeWorktree: func(context.Context, string) error { called = true; return nil },
+	}
+
+	x.discardUnclaimedWorktree(context.Background())
+	x.branch = "jiradozer/INF-1" // branch known, but no worktree created yet
+	x.discardUnclaimedWorktree(context.Background())
+
+	assert.False(t, called, "nothing may be removed before a worktree exists")
 }

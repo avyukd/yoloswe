@@ -58,9 +58,11 @@ func gcFixture(t *testing.T, m RunMeta) (RunMeta, string) {
 
 func gcDeps(pr PRChecker, rm *fakeRemover, dirty map[string]bool) GCDeps {
 	return GCDeps{
-		Git:       fakeGit{dirty: dirty},
-		PR:        pr,
-		Removers:  map[string]WorktreeRemover{"kernel": rm},
+		Git: fakeGit{dirty: dirty},
+		PR:  pr,
+		// Keyed the way gc looks it up: worktree root AND repo. The fixtures
+		// leave WTRoot empty, which is what a pre-WTRoot record looks like.
+		Removers:  map[string]WorktreeRemover{RunMeta{Repo: "kernel"}.RemoverKey(): rm},
 		LeaseHeld: func(string) bool { return false },
 	}
 }
@@ -389,4 +391,49 @@ func TestMatchesAcceptsEveryNameARunIsKnownBy(t *testing.T) {
 	require.True(t, m.Matches("adhoc-abc"))
 	require.False(t, m.Matches("INF-999"))
 	require.False(t, m.Matches(""), "an empty filter must not match everything by accident")
+}
+
+// Each run records the worktree root it was created under, and those can differ
+// — WT_ROOT changes, or older runs were made elsewhere. Keying a remover by
+// repo alone hands a run to a manager pointed at a directory its worktree never
+// occupied, so gc quietly reclaims nothing.
+func TestGCPicksTheRemoverForTheRootTheRunWasCreatedUnder(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	gcFixture(t, RunMeta{
+		RunID: "r1", IssueIdentifier: "INF-1", Repo: "kernel", Branch: "feature/INF-1",
+		WTRoot: "/roots/old", State: RunStateDone, PRURL: "https://github.com/o/r/pull/1",
+	})
+
+	right, wrong := &fakeRemover{}, &fakeRemover{}
+	deps := gcDeps(fakePRChecker{merged: map[string]bool{"https://github.com/o/r/pull/1": true}}, wrong, nil)
+	deps.Removers = map[string]WorktreeRemover{
+		RunMeta{Repo: "kernel", WTRoot: "/roots/old"}.RemoverKey(): right,
+		RunMeta{Repo: "kernel", WTRoot: "/roots/new"}.RemoverKey(): wrong,
+	}
+
+	res, err := RunGC(context.Background(), deps, GCOptions{Apply: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, []string{"feature/INF-1"}, right.removed)
+	require.Empty(t, wrong.removed, "a manager on the wrong root must never be handed the run")
+	require.Equal(t, 1, res.Removed)
+}
+
+// A run whose root has no manager must be reported, not silently counted as
+// swept — the reason is the only thing that explains why a mergeable worktree
+// is still on disk.
+func TestGCSaysWhichRootHasNoRemover(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	gcFixture(t, RunMeta{
+		RunID: "r1", IssueIdentifier: "INF-1", Repo: "kernel", Branch: "feature/INF-1",
+		WTRoot: "/roots/gone", State: RunStateDone, PRURL: "https://github.com/o/r/pull/1",
+	})
+
+	rm := &fakeRemover{}
+	deps := gcDeps(fakePRChecker{merged: map[string]bool{"https://github.com/o/r/pull/1": true}}, rm, nil)
+
+	res, err := RunGC(context.Background(), deps, GCOptions{Apply: true}, nil)
+	require.NoError(t, err)
+	require.Empty(t, rm.removed)
+	require.Zero(t, res.Removed)
+	requireReason(t, res, "worktree", "/roots/gone")
 }

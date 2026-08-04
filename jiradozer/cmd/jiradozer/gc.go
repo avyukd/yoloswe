@@ -91,7 +91,15 @@ func newGCCmd() *cobra.Command {
 	return cmd
 }
 
-// removersForRuns builds one wt.Manager per repo mentioned by a run-log.
+// removersForRuns builds one wt.Manager per (worktree root, repo) a run-log
+// mentions.
+//
+// Keyed by root as well as repo because each run records the root it was
+// created under, and those can differ — WT_ROOT changes, or older runs were
+// made elsewhere. A manager built on this process's root would look for those
+// worktrees in a directory they never occupied and quietly reclaim nothing.
+// Records predating WTRoot have it empty and fall back to the current root,
+// which is what they were created under.
 func removersForRuns(runs []jiradozer.RunMeta) (map[string]jiradozer.WorktreeRemover, error) {
 	root, err := resolveWTRoot()
 	if err != nil {
@@ -99,11 +107,15 @@ func removersForRuns(runs []jiradozer.RunMeta) (map[string]jiradozer.WorktreeRem
 	}
 	out := map[string]jiradozer.WorktreeRemover{}
 	for i := range runs {
-		repo := runs[i].Repo
-		if repo == "" || out[repo] != nil {
+		m := &runs[i]
+		if m.Repo == "" || out[m.RemoverKey()] != nil {
 			continue
 		}
-		out[repo] = &wtAdapter{mgr: wt.NewManager(root, repo)}
+		runRoot := m.WTRoot
+		if runRoot == "" {
+			runRoot = root
+		}
+		out[m.RemoverKey()] = &wtAdapter{mgr: wt.NewManager(runRoot, m.Repo)}
 	}
 	return out, nil
 }

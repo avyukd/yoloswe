@@ -170,6 +170,12 @@ func runExec(ctx context.Context, app *cliapp.App, args execArgs) (runErr error)
 		wtMgr:    wtMgr,
 		runID:    runID,
 		lookupPR: defaultPRLookup,
+		// force=false deliberately: this only ever runs against a fresh
+		// checkout, so a refusal means something unexpected is in there and a
+		// human should look rather than have it deleted.
+		removeWorktree: func(ctx context.Context, branch string) error {
+			return wtMgr.Remove(ctx, branch, true, false)
+		},
 	}
 
 	// exec owns its own failure reporting, for the same reason it refuses to run
@@ -210,9 +216,13 @@ type execRun struct {
 	// lookupPR resolves the PR opened for a branch. Injected so the recording
 	// path can be tested without a GitHub round trip.
 	lookupPR func(ctx context.Context, branch, dir string) (*wt.PRInfo, error)
-	runID    string
-	branch   string
-	args     execArgs
+	// removeWorktree tears a checkout down. Injected for the same reason: the
+	// teardown path only runs when something else already failed, so it needs a
+	// test that does not depend on a real repository.
+	removeWorktree func(ctx context.Context, branch string) error
+	runID          string
+	branch         string
+	args           execArgs
 }
 
 // defaultPRLookup asks gh which PR exists for a branch, from inside the
@@ -264,6 +274,12 @@ func (x *execRun) run(ctx context.Context) (runErr error) {
 	}
 
 	if err := x.startRunLog(); err != nil {
+		// The run-log IS gc's ownership namespace — a worktree no run-log claims
+		// is never a candidate, because these sit beside human-owned ones with
+		// nothing else marking them as jiradozer's. So a worktree that outlives
+		// a failed startRunLog is orphaned PERMANENTLY. Nothing has run in it
+		// yet, so tearing it down here loses nothing.
+		x.discardUnclaimedWorktree(ctx)
 		return err
 	}
 
@@ -353,6 +369,25 @@ func (x *execRun) createWorktree(ctx context.Context) error {
 	x.cfg.WorkDir = path
 	x.logger.Info("worktree created", "branch", x.branch, "path", path)
 	return nil
+}
+
+// discardUnclaimedWorktree removes a worktree that no run-log will ever claim.
+//
+// Only ever called between createWorktree and a FAILED startRunLog: at that
+// point the checkout is a fresh branch off base with nothing in it, so this can
+// destroy no work. It is best-effort and loud — if the removal itself fails the
+// path is logged, because that directory is now invisible to `jiradozer gc` and
+// only a human can find it.
+func (x *execRun) discardUnclaimedWorktree(ctx context.Context) {
+	if x.cfg.WorkDir == "" || x.branch == "" || x.removeWorktree == nil {
+		return
+	}
+	if err := x.removeWorktree(ctx, x.branch); err != nil {
+		x.logger.Error("could not remove the worktree of a run that never started; it is not tracked by any run-log and gc will never see it",
+			"path", x.cfg.WorkDir, "branch", x.branch, "error", err)
+		return
+	}
+	x.logger.Info("removed the worktree of a run that never started", "branch", x.branch)
 }
 
 // startRunLog records the run BEFORE any tracker mutation, so a crash from here

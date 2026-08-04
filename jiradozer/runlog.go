@@ -128,6 +128,16 @@ func (m RunMeta) Target() string {
 	return m.RunID
 }
 
+// RemoverKey identifies the worktree manager that owns this run's checkout.
+//
+// Repo alone is not enough: WTRoot is recorded per run precisely because it can
+// differ between runs (WT_ROOT changes, or historical runs made under another
+// root), and a manager built on the wrong root looks in a directory the
+// worktree was never in — so gc would silently never reclaim it.
+func (m RunMeta) RemoverKey() string {
+	return m.WTRoot + "\x00" + m.Repo
+}
+
 // LeaseKey names the lock this run holds, for a liveness check.
 //
 // It falls back to Target() only for records written before LeaseTarget

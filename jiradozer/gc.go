@@ -142,7 +142,10 @@ type GCDeps struct {
 	// PRByBranch recovers a PR URL the run itself failed to record. Optional:
 	// nil simply means a run with no recorded PR is never reclaimed.
 	PRByBranch PRResolver
-	Removers   map[string]WorktreeRemover // keyed by repo name
+	// Removers is keyed by RunMeta.RemoverKey() — worktree root AND repo, since
+	// a manager built on the wrong root looks in a directory the worktree never
+	// occupied.
+	Removers map[string]WorktreeRemover
 	// LeaseHeld reports whether a live worker still owns this target on this
 	// box. The lease is the authoritative liveness signal — it is held inside
 	// the worker, so the kernel drops it on any death.
@@ -269,10 +272,10 @@ func gcWorktree(ctx context.Context, deps GCDeps, opts GCOptions, m RunMeta, log
 		return c
 	}
 
-	remover := deps.Removers[m.Repo]
+	remover := deps.Removers[m.RemoverKey()]
 	if remover == nil {
 		c.Eligible = false
-		c.Reason = fmt.Sprintf("no worktree manager for repo %q", m.Repo)
+		c.Reason = fmt.Sprintf("no worktree manager for repo %q under %q", m.Repo, m.WTRoot)
 		return c
 	}
 	// Remove through the manager (git worktree remove + prune), never rm -rf,
