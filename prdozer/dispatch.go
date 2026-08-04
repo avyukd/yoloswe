@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/bazelment/yoloswe/fleet"
 )
 
 // LeaseDir holds one lock file per babysat PR, on the box actually running it.
@@ -92,8 +94,7 @@ func (l *Lease) Release() error {
 func (l *Lease) Path() string { return l.path }
 
 // TmuxSessionName is the attachable session the worker runs under. It follows
-// the observed fleet convention so the window is recognisable in a session
-// list.
+// the observed fleet convention so the window is recognisable in a session list.
 func TmuxSessionName(ownerRepo string, prNumber int) string {
 	repo := ownerRepo
 	if _, after, ok := strings.Cut(ownerRepo, "/"); ok {
@@ -111,114 +112,31 @@ type DispatchRequest struct {
 	KeepWorktree bool
 }
 
-// RemoteCommand builds the command run on the target box.
-//
-// flock(1) is deliberately ABSENT here. Wrapping the tmux invocation in
-// `flock -n` looks like mutual exclusion but is not: tmux daemonizes, flock(1)
-// exits, and the lock drops while the worker keeps running (verified). The
-// worker instead takes the lease itself at startup via AcquireLease, holding it
-// for its real lifetime.
-func (r DispatchRequest) RemoteCommand() string {
-	// Use the path the probe actually resolved. A non-interactive SSH shell
-	// does not include ~/bin on PATH (verified), so a bare "prdozer" here
-	// would produce a tmux session that dies instantly with "command not
-	// found" — indistinguishable from a silent no-op.
-	bin := r.Host.PrdozerPath
-	if bin == "" {
-		bin = "prdozer"
-	}
-	inner := []string{
-		bin, "babysit-local",
-		"--repo", shellQuote(r.OwnerRepo),
-		"--pr", fmt.Sprintf("%d", r.PRNumber),
-	}
+// toFleet renders prdozer's babysit-local invocation for the shared dispatcher.
+// The quoting, PATH wrapper and deliberate absence of flock(1) all live there —
+// see fleet.Request.RemoteCommand for why each is the way it is.
+func (r DispatchRequest) toFleet() fleet.Request {
+	args := []string{"babysit-local", "--repo", r.OwnerRepo, "--pr", fmt.Sprintf("%d", r.PRNumber)}
 	if r.RegistryPath != "" {
-		inner = append(inner, "--registry", shellQuote(r.RegistryPath))
+		args = append(args, "--registry", r.RegistryPath)
 	}
 	if r.KeepWorktree {
-		inner = append(inner, "--keep-worktree")
+		args = append(args, "--keep-worktree")
 	}
-	// Set PATH by wrapping the command in a shell.
-	//
-	// This matters because an absolute path fixes prdozer itself but not the
-	// agent: prdozer SPAWNS the CLI as a child and resolves it from PATH, and
-	// `claude` lives in ~/.local/bin, which a non-interactive SSH shell omits.
-	// Without it the worker starts, detects work correctly, then every polish
-	// round dies with `exec: "claude": executable file not found in $PATH` —
-	// a failure with nothing to do with the PR.
-	//
-	// `tmux -e PATH=...` does NOT work here and was tried first: tmux treats
-	// PATH specially and silently ignores the override, so the session still
-	// runs with the tmux server's PATH. (`-e FOO=bar` DOES work, which makes
-	// the failure easy to misdiagnose — verify with PATH itself, not a proxy
-	// variable.) The shell wrapper costs an extra quoting level but actually
-	// takes effect.
-	cmd := strings.Join(inner, " ")
-	if pathEnv := r.remotePathEnv(); pathEnv != "" {
-		cmd = "export PATH=" + shellQuote(pathEnv) + "; exec " + cmd
+	return fleet.Request{
+		Host:        r.Host,
+		SessionName: TmuxSessionName(r.OwnerRepo, r.PRNumber),
+		Args:        args,
 	}
-	return fmt.Sprintf("tmux new-session -d -s %s %s",
-		shellQuote(TmuxSessionName(r.OwnerRepo, r.PRNumber)),
-		shellQuote("sh -c "+shellQuote(cmd)),
-	)
 }
 
-// remotePathEnv builds the PATH the worker needs on the target box.
-//
-// The home directory differs per box (the Azure devbox runs as "ming", the AWS
-// boxes as "ubuntu"), and tmux -e takes a literal value with no shell
-// expansion — so $HOME cannot be used. The probe already resolved prdozer to an
-// absolute path, and its parent IS the home bin dir, so the home root is
-// derivable without another round trip. Returns "" when it cannot be derived,
-// leaving PATH untouched rather than setting a wrong one.
-func (r DispatchRequest) remotePathEnv() string {
-	bin := r.Host.PrdozerPath
-	if !strings.HasPrefix(bin, "/") {
-		return ""
-	}
-	binDir := filepath.Dir(bin)  // /home/ming/bin
-	home := filepath.Dir(binDir) // /home/ming
-	if home == "/" || home == "." {
-		return ""
-	}
-	return filepath.Join(home, ".local", "bin") + ":" + binDir + ":" + remoteBasePath
-}
-
-// remoteBasePath is the PATH a non-interactive SSH shell provides (verified on
-// both the Azure and AWS boxes). tmux -e replaces PATH wholesale rather than
-// prepending, so the base entries have to be carried explicitly.
-const remoteBasePath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+// RemoteCommand builds the command run on the target box.
+func (r DispatchRequest) RemoteCommand() string { return r.toFleet().RemoteCommand() }
 
 // SSHCommand renders the full ssh invocation, which is what --dry-run prints.
-func (r DispatchRequest) SSHCommand() string {
-	return fmt.Sprintf("ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new %s %s",
-		r.Host.Target(), shellQuote(r.RemoteCommand()))
-}
+func (r DispatchRequest) SSHCommand() string { return r.toFleet().SSHCommand() }
 
-// shellQuote single-quotes a value for safe use in a remote shell command.
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
-// Dispatch hands the run off to the target box under tmux, so the session is
-// attachable and survives the SSH connection closing.
+// Dispatch hands the run off to the target box under tmux.
 func Dispatch(ctx context.Context, ssh SSHRunner, req DispatchRequest, logger *slog.Logger) error {
-	if logger == nil {
-		logger = slog.Default()
-	}
-	// Fail loudly rather than half-dispatching into a session that dies
-	// instantly and looks like a silent no-op.
-	if !req.Host.HasPrdozer {
-		return fmt.Errorf("prdozer is not on %s's PATH", req.Host.Host)
-	}
-	cmd := req.RemoteCommand()
-	logger.Info("dispatching babysit run",
-		"host", req.Host.Host, "repo", req.OwnerRepo, "pr", req.PRNumber,
-		"tmux_session", TmuxSessionName(req.OwnerRepo, req.PRNumber))
-
-	out, err := ssh.Run(ctx, req.Host.Target(), cmd)
-	if err != nil {
-		return fmt.Errorf("dispatch to %s: %w (output: %s)", req.Host.Host, err, strings.TrimSpace(out))
-	}
-	return nil
+	return fleet.Dispatch(ctx, ssh, Tool, req.toFleet(), logger)
 }

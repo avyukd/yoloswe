@@ -6,7 +6,9 @@ require (
 	github.com/bazelment/yoloswe/agent-cli-wrapper v0.0.0
 	github.com/bazelment/yoloswe/cliapp v0.0.0
 	github.com/bazelment/yoloswe/multiagent v0.0.0
+	github.com/bazelment/yoloswe/notify v0.0.0-00010101000000-000000000000
 	github.com/bazelment/yoloswe/wt v0.0.0
+	github.com/bazelment/yoloswe/yoloswe v0.0.0-20260803224826-2d10110b7f1a
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
 	gopkg.in/yaml.v3 v3.0.1
@@ -31,6 +33,7 @@ require (
 replace (
 	github.com/bazelment/yoloswe/agent-cli-wrapper => ../agent-cli-wrapper
 	github.com/bazelment/yoloswe/cliapp => ../cliapp
+	github.com/bazelment/yoloswe/fleet => ../fleet
 	github.com/bazelment/yoloswe/logging => ../logging
 	github.com/bazelment/yoloswe/multiagent => ../multiagent
 	github.com/bazelment/yoloswe/notify => ../notify

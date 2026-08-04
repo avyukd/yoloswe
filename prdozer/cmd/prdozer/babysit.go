@@ -219,12 +219,12 @@ func printScores(w interface{ Write([]byte) (int, error) }, scores []prdozer.Hos
 	for i := range scores {
 		h := &scores[i]
 		status := "ok"
-		if ok, why := h.Eligible(prdozer.ProbeOptions{}); !ok {
+		if ok, why := prdozer.Eligible(*h, prdozer.ProbeOptions{}); !ok {
 			status = why
 		}
 		fmt.Fprintf(tw, "%s\t%d\t%.2f\t%.2f\t%d\t%d\t%d\t%t\t%t\t%s\n",
 			h.Host, h.Cores, h.Load1, h.LoadPerCore(), h.UsableDiskGB(),
-			h.TmuxWindows, h.Leases, h.HasPrdozer, h.IsSelf, status)
+			h.TmuxWindows, h.Leases(), h.HasBinary, h.IsSelf, status)
 	}
 	_ = tw.Flush()
 }

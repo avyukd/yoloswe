@@ -26,8 +26,7 @@ Filesystem     1024-blocks      Used Available Capacity Mounted on
 __TMUX__
 90
 __LEASES__
-0
-__PRDOZER__
+__BIN__
 /usr/bin/prdozer
 __END__
 `
@@ -43,8 +42,7 @@ Filesystem     1024-blocks      Used Available Capacity Mounted on
 __TMUX__
 1
 __LEASES__
-0
-__PRDOZER__
+__BIN__
 MISSING
 __END__
 `
