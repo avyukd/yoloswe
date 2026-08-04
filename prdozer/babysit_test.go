@@ -549,71 +549,19 @@ func TestEndsTheRun_MatchesTerminalFor(t *testing.T) {
 	}
 }
 
-// selfLoginGH records whether the loop asked who it is authenticated as, and
-// serves a login when it does.
+// selfLoginGH answers the login lookup and nothing else.
 type selfLoginGH struct {
-	ticked chan struct{}
-	mu     sync.Mutex
-	once   sync.Once
-	asked  bool
+	mu sync.Mutex
 }
 
 func (g *selfLoginGH) Run(_ context.Context, args []string, _ string) (*wt.CmdResult, error) {
 	g.mu.Lock()
-	joined := strings.Join(args, " ")
-	if strings.Contains(joined, "api user") {
-		g.asked = true
-		g.mu.Unlock()
+	defer g.mu.Unlock()
+	if strings.Contains(strings.Join(args, " "), "api user") {
 		return &wt.CmdResult{Stdout: "mzhaom\n"}, nil
 	}
-	g.mu.Unlock()
-	g.once.Do(func() { close(g.ticked) })
-	// Anything else: an empty-but-valid payload keeps the tick moving.
+	// Anything else: an empty-but-valid payload keeps the caller moving.
 	return &wt.CmdResult{Stdout: "{}"}, nil
-}
-
-func (g *selfLoginGH) askedForLogin() bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.asked
-}
-
-// The babysit loop must resolve its own GitHub login and hand it to the watcher.
-//
-// Without it w.self is "", so Snapshot never marks a comment IsSelf, and
-// NewComments — an unconditional polish trigger — fires on prdozer's own
-// replies. The run then polishes in response to itself: kernel#7040 read
-// UNRES=0 / SUCCESS / APPROVED on every tick and still ran six rounds, with the
-// comment count climbing in lockstep with the rounds producing it.
-//
-// The orchestrator path has always passed WithSelfLogin; only babysit did not.
-func TestBabysitLoop_ResolvesSelfLoginForCommentFiltering(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	gh := &selfLoginGH{ticked: make(chan struct{})}
-
-	runLog, err := NewRunLog(RunMeta{Repo: "o/r", PRNumber: 42, RunID: "self-login-test"})
-	require.NoError(t, err)
-
-	b := NewBabysitter(gh, nil, nil, nil, BabysitOptions{
-		OwnerRepo:    "o/r",
-		PRNumber:     42,
-		PollInterval: time.Hour,
-	})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go b.loop(ctx, &RunContext{WorktreePath: t.TempDir()}, runLog, DiscoveredPR{Number: 42})
-
-	select {
-	case <-gh.ticked:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the loop never ran a tick")
-	}
-	cancel()
-
-	assert.True(t, gh.askedForLogin(),
-		"the loop must resolve its own login, or every self-reply reads as a new comment "+
-			"and triggers another polish round")
 }
 
 // A scope stop is the fourth kind of LastActionNeedsHuman, and the one the
@@ -645,15 +593,25 @@ func TestTerminalFor_RatchetedSaysWhy(t *testing.T) {
 
 // The watcher babysit builds must carry the self login.
 //
-// Asserted on the constructed watcher rather than through a running loop
-// because the bug was an option that was simply never passed: w.self stayed "",
-// no comment was ever marked IsSelf, and NewComments — an unconditional polish
-// trigger — fired on prdozer's own replies. A test that only checks the `gh api
-// user` call still passes with WithSelfLogin deleted, which is the exact
-// regression it is meant to catch.
+// Without it w.self is "", so Snapshot never marks a comment IsSelf, and
+// NewComments — an unconditional polish trigger — fires on prdozer's own
+// replies. The run then polishes in response to itself: kernel#7040 read
+// UNRES=0 / SUCCESS / APPROVED on every tick and still ran six rounds, with the
+// comment count climbing in lockstep with the rounds producing it. The
+// orchestrator path has always passed WithSelfLogin; only babysit did not.
+//
+// Asserted on the constructed watcher rather than through a running loop, and
+// that is the whole point of splitting newWatcher out. The bug was an option
+// never passed, which is invisible from outside a loop: a loop-level test can
+// only see that `gh api user` was called, and that still passes with
+// WithSelfLogin deleted. newWatcher is also the loop's only watcher
+// construction path (babysit.go), so this covers the loop too.
+//
+// The other half of the chain — w.self reaching the trigger — is
+// TestComputeChangeset_NewComments_IgnoresSelf.
 func TestBabysitNewWatcher_CarriesSelfLoginIntoTheWatcher(t *testing.T) {
 	t.Parallel()
-	gh := &selfLoginGH{ticked: make(chan struct{})}
+	gh := &selfLoginGH{}
 	b := NewBabysitter(gh, nil, nil, nil, BabysitOptions{OwnerRepo: "o/r", PRNumber: 42})
 
 	w := b.newWatcher(context.Background(), &RunContext{WorktreePath: t.TempDir()}, nil)
