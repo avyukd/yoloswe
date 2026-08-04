@@ -6,17 +6,18 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/bazelment/yoloswe/bramble/session"
 )
 
-// runTUI publishes both socket paths to the session manager before either
-// server starts listening, because the IPC server serves RequestNewSession the
-// moment it binds and that handler runs all the way to newTmuxRunner, which
-// snapshots the control socket into the window environment for the session's
-// lifetime. That ordering is only possible because both paths derive from the
-// pid alone. These cases pin that property: if either helper grew a dependency
-// on a started server, the paths would stop being knowable up front and the
-// startup window would silently reopen.
-func TestSocketPathsAreKnowableBeforeListening(t *testing.T) {
+// Covers path derivation only — NOT the startup ordering that depends on it.
+// See TestPublishSockPaths* for the publication behavior and
+// TestStartIPCServerBindsThePublishedPath for the publish/bind equality.
+//
+// The ordering fix in runTUI is only possible because a path is knowable before
+// its server exists: if either helper grew a dependency on a started server, the
+// startup window would silently reopen. That is the property pinned here.
+func TestSocketPathDerivation(t *testing.T) {
 	ipc := ipcSocketPath()
 	control := controlSocketPath()
 
@@ -76,5 +77,84 @@ func TestSocketPathsFallBackToTempDir(t *testing.T) {
 		if filepath.Dir(got) != os.TempDir() {
 			t.Errorf("%s socket %q did not fall back to %q", name, got, os.TempDir())
 		}
+	}
+}
+
+// publishSockPaths must write BOTH destinations: the live manager (whose
+// sessions read it via newTmuxRunner) and the shared config template that
+// openRepo copies for repos opened later with Alt-R. Updating only one is how a
+// secondary repo's sessions silently lose a socket.
+func TestPublishSockPathsWritesManagerAndSharedConfig(t *testing.T) {
+	t.Parallel()
+
+	m := session.NewManager()
+	shared := session.ManagerConfig{}
+
+	const (
+		ipcPath     = "/run/user/1000/bramble-42.sock"
+		controlPath = "/run/user/1000/bramble-control-42.sock"
+	)
+	publishSockPaths(m, &shared, ipcPath, controlPath)
+
+	if got := m.IPCSockPath(); got != ipcPath {
+		t.Errorf("manager IPC path = %q, want %q", got, ipcPath)
+	}
+	if got := m.ControlSockPath(); got != controlPath {
+		t.Errorf("manager control path = %q, want %q", got, controlPath)
+	}
+	if shared.IPCSockPath != ipcPath {
+		t.Errorf("shared config IPC path = %q, want %q — sessions in repos opened via Alt-R would lose it", shared.IPCSockPath, ipcPath)
+	}
+	if shared.ControlSockPath != controlPath {
+		t.Errorf("shared config control path = %q, want %q — sessions in repos opened via Alt-R would lose it", shared.ControlSockPath, controlPath)
+	}
+}
+
+// When the control server fails to bind, runTUI publishes an empty control path
+// rather than the path nothing is listening on. Clearing must reach the shared
+// config too, or Alt-R sessions would export a dead socket.
+func TestPublishSockPathsClearsBothOnEmpty(t *testing.T) {
+	t.Parallel()
+
+	m := session.NewManager()
+	shared := session.ManagerConfig{}
+
+	publishSockPaths(m, &shared, "/run/bramble.sock", "/run/bramble-control.sock")
+	publishSockPaths(m, &shared, "/run/bramble.sock", "")
+
+	if got := m.ControlSockPath(); got != "" {
+		t.Errorf("manager control path = %q, want empty after a failed control bind", got)
+	}
+	if shared.ControlSockPath != "" {
+		t.Errorf("shared config control path = %q, want empty after a failed control bind", shared.ControlSockPath)
+	}
+	// Clearing one socket must not disturb the other.
+	if got := m.IPCSockPath(); got != "/run/bramble.sock" {
+		t.Errorf("IPC path = %q, want it untouched by a control-socket clear", got)
+	}
+}
+
+// The whole ordering fix rests on the manager advertising the path the IPC
+// server actually binds. startIPCServer takes that path as a parameter rather
+// than recomputing it; this pins that it binds what it was given, so the value
+// published to the manager beforehand cannot be stale.
+func TestStartIPCServerBindsThePublishedPath(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+
+	published := ipcSocketPath()
+	registry := session.NewSessionRegistry()
+
+	srv := startIPCServer(registry, published, dir, "repo")
+	if srv == nil {
+		t.Fatal("startIPCServer returned nil; expected a bound server")
+	}
+	defer srv.Close()
+
+	if got := srv.SocketPath(); got != published {
+		t.Errorf("server bound %q but the manager was told %q — sessions would hold a dead socket", got, published)
+	}
+	if _, err := os.Stat(published); err != nil {
+		t.Errorf("nothing listening at the published path %q: %v", published, err)
 	}
 }

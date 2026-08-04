@@ -240,46 +240,50 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	registry.Register(sessionManager)
 	sharedManagerConfig.Registry = registry
 
-	// Publish both socket paths to the manager BEFORE either server starts
-	// listening. The IPC server accepts RequestNewSession the moment it starts,
-	// and that handler runs all the way to newTmuxRunner, which snapshots
-	// m.config.ControlSockPath into the window's environment for the session's
-	// lifetime. Setting the control path only after startControlServer returned
-	// left a window in which such a session was launched with an empty
-	// BRAMBLE_CONTROL_SOCK and could never drive its peers. Both paths derive
-	// from the pid, so they are knowable before the listeners exist.
+	// Ordering here is load-bearing, in three steps: start the control server,
+	// publish both socket paths, and only then let the IPC server listen.
 	//
-	// This is also what makes the unsynchronized writes below safe: they happen
-	// on this goroutine before any session goroutine can observe m.config.
-	sessionManager.SetIPCSockPath(ipcSocketPath())
-	sharedManagerConfig.IPCSockPath = ipcSocketPath()
-	sessionManager.SetControlSockPath(controlSocketPath())
-	sharedManagerConfig.ControlSockPath = controlSocketPath()
-
-	// Start IPC server so child processes can request new sessions.
-	// The registry aggregates all repo managers so IPC handlers can find
-	// sessions from any repo, including those opened later via Alt-R.
-	ipcServer, ipcSockPath := startIPCServer(registry, wtRoot, repoName)
-	if ipcServer != nil {
-		defer ipcServer.Close()
-		os.Setenv(ipc.SockEnvVar, ipcSockPath)
-	} else {
-		// The server never bound, so nothing is reachable at that path. Clear it
-		// rather than exporting a dead socket into every tmux window.
-		sessionManager.SetIPCSockPath("")
-		sharedManagerConfig.IPCSockPath = ""
-	}
+	// The IPC server serves RequestNewSession the moment it binds, and that
+	// handler runs all the way to newTmuxRunner, which snapshots both socket
+	// paths out of m.config into the window's environment for that session's
+	// whole lifetime. So every path the manager will ever advertise has to be
+	// final before IPC accepts its first connection. Starting control first is
+	// what makes the failure case honest: if control never binds we publish an
+	// empty path rather than a dead one, and no session can have read the dead
+	// value in the meantime.
+	//
+	// This same before-any-listener property is what makes the unsynchronized
+	// m.config writes safe: they all happen on this goroutine before any
+	// session goroutine exists to observe them.
 
 	// Start the control server (read+write tmux control plane) on its own Unix
 	// socket. Local CLI subcommands (send-input, send-key) and the remote hub
 	// agent client both drive the same control.Dispatcher.
 	controlServer := startControlServer(registry)
+	controlSockPath := ""
 	if controlServer != nil {
 		defer controlServer.Close()
-		os.Setenv(control.SockEnvVar, controlServer.SocketPath())
+		controlSockPath = controlServer.SocketPath()
+		os.Setenv(control.SockEnvVar, controlSockPath)
+	}
+
+	// The IPC server has not started yet, so its path is the one it is about to
+	// bind. Publish it up front; clear it below if the bind fails.
+	ipcSockPath := ipcSocketPath()
+	publishSockPaths(sessionManager, &sharedManagerConfig, ipcSockPath, controlSockPath)
+
+	// Start IPC server so child processes can request new sessions.
+	// The registry aggregates all repo managers so IPC handlers can find
+	// sessions from any repo, including those opened later via Alt-R.
+	ipcServer := startIPCServer(registry, ipcSockPath, wtRoot, repoName)
+	if ipcServer != nil {
+		defer ipcServer.Close()
+		os.Setenv(ipc.SockEnvVar, ipcSockPath)
 	} else {
-		sessionManager.SetControlSockPath("")
-		sharedManagerConfig.ControlSockPath = ""
+		// Nothing bound, so nothing is reachable at that path. Clear it rather
+		// than exporting a dead socket into every tmux window. Safe to do here:
+		// no listener ever accepted a request, so no session read the old value.
+		publishSockPaths(sessionManager, &sharedManagerConfig, "", controlSockPath)
 	}
 
 	// If a hub is configured, dial out to it so the user can reach this
@@ -405,10 +409,13 @@ func socketDir() string {
 }
 
 // ipcSocketPath and controlSocketPath derive each server's socket path from the
-// pid alone, so both are known before either server starts listening. runTUI
-// relies on that: it publishes both paths to the manager up front, because an
-// IPC-spawned session created between the two Start() calls would otherwise
-// snapshot an empty control socket for its whole lifetime.
+// pid alone, so a path is knowable before its server exists. runTUI depends on
+// that: it must publish the IPC path to the manager before the IPC server binds,
+// because that server starts serving session-creating requests immediately.
+//
+// Each is called exactly once per process, into a local that is then both
+// published and handed to the server, so the advertised path and the bound path
+// cannot diverge even though socketDir() re-reads the environment.
 func ipcSocketPath() string {
 	return filepath.Join(socketDir(), fmt.Sprintf("bramble-%d.sock", os.Getpid()))
 }
@@ -417,8 +424,28 @@ func controlSocketPath() string {
 	return filepath.Join(socketDir(), fmt.Sprintf("bramble-control-%d.sock", os.Getpid()))
 }
 
-func startIPCServer(registry *session.SessionRegistry, wtRoot, repoName string) (*ipc.Server, string) {
-	srv := ipc.NewServer(ipcSocketPath())
+// publishSockPaths makes both socket paths visible to every session the manager
+// will create: directly on the manager for the current repo, and on the shared
+// config template that openRepo copies for repos opened later via Alt-R. The two
+// destinations are written together because a session launched from either sees
+// the same tmux environment, and updating one without the other is how a
+// secondary repo's sessions silently lose a socket.
+//
+// Callers must invoke this before any listener that can create sessions starts
+// accepting: newTmuxRunner snapshots these values, so a session started earlier
+// keeps whatever was set at its creation for its entire lifetime.
+func publishSockPaths(m *session.Manager, shared *session.ManagerConfig, ipcSockPath, controlSockPath string) {
+	m.SetIPCSockPath(ipcSockPath)
+	m.SetControlSockPath(controlSockPath)
+	shared.IPCSockPath = ipcSockPath
+	shared.ControlSockPath = controlSockPath
+}
+
+// startIPCServer binds the IPC server to sockPath, which the caller has already
+// published to the session manager. Taking the path as a parameter rather than
+// recomputing it is what guarantees the two agree.
+func startIPCServer(registry *session.SessionRegistry, sockPath, wtRoot, repoName string) *ipc.Server {
+	srv := ipc.NewServer(sockPath)
 
 	srv.Handle(ipc.RequestPing, func(_ context.Context, _ *ipc.Request) (any, error) {
 		return "pong", nil
@@ -491,10 +518,9 @@ func startIPCServer(registry *session.SessionRegistry, wtRoot, repoName string) 
 
 	if err := srv.Start(); err != nil {
 		slog.Warn("IPC server failed to start", "err", err)
-		return nil, ""
+		return nil
 	}
-	socketPath := srv.SocketPath()
-	return srv, socketPath
+	return srv
 }
 
 // startControlServer starts the control-protocol Unix server backed by the
