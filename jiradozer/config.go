@@ -667,7 +667,7 @@ func ResolveRound(round RoundConfig, parent StepConfig) StepConfig {
 		// both. Omitting it here silently disabled stall protection for every
 		// rounds-based step — which is all of build/validate/ship in the
 		// bootstrap shape, i.e. exactly the long-running ones it exists for.
-		IdleTimeout: parent.IdleTimeout,
+		IdleTimeout:           parent.IdleTimeout,
 		LLMEndpoint:           parent.LLMEndpoint,
 		DisableLimitPreflight: parent.DisableLimitPreflight,
 	}

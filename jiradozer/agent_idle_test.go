@@ -18,13 +18,13 @@ import (
 // watchdog NOT firing (and the fake being released by test cleanup), never by
 // the fake returning early and making the assertion vacuous.
 type idleFakeProvider struct {
-	// emitEvery, when > 0, calls the handler's OnText on that interval,
-	// simulating a slow-but-progressing agent.
-	emitEvery time.Duration
 	// released is closed when Execute returns, so a test can prove the
 	// provider was actually cancelled rather than left running.
 	released chan struct{}
 	ctxErr   error
+	// emitEvery, when > 0, calls the handler's OnText on that interval,
+	// simulating a slow-but-progressing agent.
+	emitEvery time.Duration
 }
 
 func newIdleFakeProvider(emitEvery time.Duration) *idleFakeProvider {
