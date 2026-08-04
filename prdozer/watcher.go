@@ -223,16 +223,16 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 		len(state.OnceRoundsDone) != priorOnceDone ||
 		// Same hazard as OnceRoundsDone above: decideAndAct owns this counter, and
 		// recordSnapshot only writes when something marks the state dirty, so a
-		// tick whose ONLY change is this counter would drop it.
+		// tick whose ONLY change is this counter would drop it — the streak would
+		// reload flat every tick and the guard that stops a stuck run would never
+		// fire.
 		//
-		// Defensive rather than demonstrated. Five attempts to build a failing
-		// test all passed unfixed, because on every reachable path something else
-		// (healthDirty, a LastAction transition, a new comment or run ID) already
-		// marked the state dirty. The omission is real and the invariant — every
-		// decideAndAct-owned field participates in the dirty check — is worth
-		// holding regardless; it just is not currently load-bearing. If you are
-		// here because a stall streak failed to climb, this is the first place to
-		// look, and that case would be the missing reproducer.
+		// It takes a specific tick to reach that, which is why the reproducer is
+		// easy to miss: an ordinary failing tick also moves ConsecutiveFailures,
+		// and the guard's FIRST trip also transitions LastAction to needs_human.
+		// The second trip changes nothing else — same action, and needs_human
+		// already zeroed the failure counter on its way out. See
+		// TestWatcher_Tick_CounterOnlyChange_IsPersisted.
 		state.InvocationsSinceRound != priorInvocations
 
 	res := TickResult{Snapshot: snap, Changeset: cs, Action: action,

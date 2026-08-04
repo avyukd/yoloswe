@@ -2170,3 +2170,56 @@ func TestWatcher_StallArmedCooldown_NamesTheGraceError(t *testing.T) {
 	assert.Contains(t, s.LastCooldownCause, "grace period",
 		"a stall-armed cooldown must name the grace-period error, not the generic fallback")
 }
+
+// A tick whose ONLY change is InvocationsSinceRound must still persist it.
+//
+// recordSnapshot writes state only when something marked it dirty, so a counter
+// that decideAndAct owns but the dirty check does not consult is silently
+// dropped: the next tick reloads the old value and the no-progress streak never
+// climbs, so the guard that stops a stuck run never fires.
+//
+// Reaching a counter-only tick takes a specific shape, which is why the check
+// went in defensively. Ordinary failing ticks also move ConsecutiveFailures, and
+// the first guard trip also transitions LastAction to needs_human — both dirty
+// on their own. It is the SECOND guard trip that changes nothing else: the
+// action is already needs_human, and needs_human is a terminal arm that already
+// zeroed ConsecutiveFailures on its way out. The cooldown is disabled here
+// because at the default hour it would skip the ticks before the streak can
+// reach the guard's 2x threshold.
+func TestWatcher_Tick_CounterOnlyChange_IsPersisted(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	// A PLAIN failure: classifyAgentFailure declines it, so it counts toward the
+	// streak without taking the stall or transient arm.
+	polish := &stubPolish{err: errors.New("polish round 1/2: exit status 1")}
+	w := newWatcherForTest(t, gh, polish)
+	w.cfg.Backoff.Cooldown = 0
+	statePath := StatePath("r", 42)
+
+	pre := &State{LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1"}
+	require.NoError(t, pre.Save(statePath))
+
+	// newWatcherForTest sets MaxConsecutiveFailures=2, so the guard's threshold
+	// is 4. These four ticks all dirty something else and are only setup.
+	for range 4 {
+		_, err := w.Tick(context.Background())
+		require.NoError(t, err)
+	}
+	before, err := LoadState(statePath)
+	require.NoError(t, err)
+	require.Equal(t, LastActionNeedsHuman, before.LastAction,
+		"premise: the streak guard must have fired, so the next tick repeats its action")
+	require.Equal(t, 0, before.ConsecutiveFailures,
+		"premise: needs_human is a terminal arm, so the failure counter is already zeroed")
+	require.True(t, before.CooldownUntil.IsZero(), "premise: no cooldown to clear")
+	require.Equal(t, 4, before.InvocationsSinceRound)
+
+	// The counter-only tick: same action, same counters, same head/base, no new
+	// comments or runs. Nothing but InvocationsSinceRound moves.
+	_, err = w.Tick(context.Background())
+	require.NoError(t, err)
+
+	after, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 5, after.InvocationsSinceRound,
+		"a tick whose only change is the no-progress counter must still be saved")
+}
