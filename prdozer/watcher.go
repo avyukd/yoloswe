@@ -31,10 +31,17 @@ type Watcher struct {
 	// LastMergeError to quote — that field is only written by the merge path, so
 	// a polish-only stall would otherwise report an empty cause.
 	lastStallError string
-	reworkSpec     StepSpec
-	polishSpec     StepSpec
-	pr             int
-	dryRun         bool
+	// lastFailureError is the scrubbed error from the agent failure that made
+	// this tick return LastActionFailed. Same reason as lastStallError: the
+	// cooldown reports the cause of the failure that armed it, and a polish or
+	// rework failure has no LastMergeError of its own. Falling back to that
+	// field would quote whatever merge failed earlier in the run — it is
+	// cleared only on a successful merge, so a stale one outlives its tick.
+	lastFailureError string
+	reworkSpec       StepSpec
+	polishSpec       StepSpec
+	pr               int
+	dryRun           bool
 	// diverged is set by the divergence guard within a tick so Tick can
 	// report WHY it stopped. Reset at the top of every tick.
 	diverged bool
@@ -195,6 +202,7 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 
 	w.diverged = false
 	w.stalled, w.lastStallError = false, ""
+	w.lastFailureError = ""
 	priorAttempts, priorMergeErr := state.MergeAttempts, state.LastMergeError
 	priorSelfReviewed := state.SelfReviewedSHA
 	// Counted, not compared by identity: decideAndAct adds keys to the SAME map
@@ -411,6 +419,7 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 		if classified {
 			return action
 		}
+		w.lastFailureError = safe
 		w.logger.Error("polish failed", "error", safe)
 		w.status("PR #%d polish failed: %s", w.pr, safe)
 		return LastActionFailed
@@ -595,6 +604,7 @@ func (w *Watcher) reworkAfterFailedMerge(ctx context.Context, snap *Snapshot, st
 		if action, ok := w.classifyAgentFailure("merge rework", err, safe); ok {
 			return action
 		}
+		w.lastFailureError = safe
 		w.logger.Error("merge rework failed", "error", safe, "attempt", state.MergeAttempts)
 		w.status("PR #%d merge rework failed: %s", w.pr, safe)
 		return LastActionFailed
@@ -1003,10 +1013,12 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 // cooldownCause describes why the failure-streak cooldown just armed, in terms
 // of the action that armed it.
 //
-// The streak counts stalls, reworks and merge failures alike, so the cause has
-// to be selected by action rather than read off any single field: quoting
-// LastMergeError on a stall names an unrelated earlier merge, and on a
-// polish-only run names nothing at all.
+// The streak counts stalls, reworks, agent failures and merge failures alike,
+// so the cause has to be selected by action rather than read off any single
+// field: quoting LastMergeError on a stall names an unrelated earlier merge,
+// and on a polish-only run names nothing at all. LastMergeError survives until
+// the next SUCCESSFUL merge, so "it is set" is not evidence that the merge is
+// what armed this cooldown.
 func (w *Watcher) cooldownCause(s *State, action LastAction) string {
 	switch action {
 	case LastActionStalled:
@@ -1020,6 +1032,16 @@ func (w *Watcher) cooldownCause(s *State, action LastAction) string {
 		}
 		return "repeated rework rounds"
 	default:
+		// LastActionFailed. Prefer the failure from THIS tick: the agent paths
+		// (polish, merge rework) record it, and it is the thing that armed the
+		// streak.
+		if w.lastFailureError != "" {
+			return w.lastFailureError
+		}
+		// No agent error recorded, so the only remaining producer of
+		// LastActionFailed is "merge failed and no merge_rework is configured" —
+		// a genuinely merge-caused failure, which is exactly what LastMergeError
+		// describes.
 		if s.LastMergeError != "" {
 			return s.LastMergeError
 		}

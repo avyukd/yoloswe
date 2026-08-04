@@ -1867,6 +1867,57 @@ func TestWatcher_StallCooldown_ReportsStallNotStaleMergeError(t *testing.T) {
 	assert.NotContains(t, report.Detail, staleMergeErr)
 }
 
+// Same regression as the stall case above, on the other arm that reaches the
+// cooldown: a PLAIN polish failure. classifyAgentFailure declines to classify a
+// non-transient error, so the tick returns LastActionFailed rather than
+// LastActionStalled — a different path into the same backoff, and the one that
+// still read LastMergeError. A run that failed a merge early and later backed
+// off on repeated polish failures blamed that stale merge error.
+func TestWatcher_PlainFailureCooldown_ReportsFailureNotStaleMergeError(t *testing.T) {
+	const staleMergeErr = "Pull request is in an unmergeable state"
+	const polishErr = "polish round 1/2: agent execution: exit status 1"
+
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	// Deliberately NOT a transient-looking error: it must fall through
+	// classifyAgentFailure to the LastActionFailed arm, which is the arm under
+	// test. A transient or grace-forced error would take a different branch.
+	polish := &stubPolish{err: errors.New(polishErr)}
+	w := newWatcherForTest(t, gh, polish)
+	statePath := StatePath("r", 42)
+
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		LastMergeError: staleMergeErr,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	// MaxConsecutiveFailures is 2, so two failures arm the cooldown — comfortably
+	// inside the no-progress guard's 2x limit, so this exercises the failure
+	// brake and not the stall stop.
+	for range 2 {
+		res, err := w.Tick(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, LastActionFailed, res.Action,
+			"the seeded error must reach the plain-failure arm under test")
+	}
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	require.False(t, s.CooldownUntil.IsZero(), "the failures must have armed a cooldown")
+	assert.Equal(t, staleMergeErr, s.LastMergeError,
+		"the merge field is deliberately left alone — it feeds the rework prompt")
+	assert.NotEmpty(t, s.LastCooldownCause, "an armed cooldown must record its cause")
+	assert.NotContains(t, s.LastCooldownCause, staleMergeErr,
+		"a polish-armed cooldown must not be attributed to an unrelated older merge failure")
+	assert.Contains(t, s.LastCooldownCause, polishErr,
+		"the cause must name the polish failure that actually armed the window")
+
+	// The cause reaches the operator-facing alert, not just the state file.
+	report := CooldownWarning(sampleMeta(), s.CooldownUntil, s.LastCooldownCause)
+	assert.Contains(t, report.Detail, polishErr)
+	assert.NotContains(t, report.Detail, staleMergeErr)
+}
+
 // A cooldown cleared by a successful tick must not leave its cause behind for
 // the next one to misreport.
 func TestWatcher_SuccessfulTick_ClearsCooldownCause(t *testing.T) {
