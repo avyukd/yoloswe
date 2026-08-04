@@ -130,9 +130,10 @@ func (c GHPRChecker) Merged(ctx context.Context, prURL string) (bool, error) {
 	return out.Merged, nil
 }
 
-// WorktreeRemover removes a reclaimed worktree.
+// WorktreeRemover removes a reclaimed worktree. Same contract as
+// WorktreeManager.RemoveWorktree, narrowed to what the sweeper needs.
 type WorktreeRemover interface {
-	RemoveWorktree(ctx context.Context, nameOrBranch string, deleteBranch bool) error
+	RemoveWorktree(ctx context.Context, nameOrBranch string, deleteBranch, force bool) error
 }
 
 // GCDeps are the sweeper's injectable collaborators.
@@ -280,7 +281,11 @@ func gcWorktree(ctx context.Context, deps GCDeps, opts GCOptions, m RunMeta, log
 	}
 	// Remove through the manager (git worktree remove + prune), never rm -rf,
 	// so the bare repo's metadata stays consistent.
-	if err := remover.RemoveWorktree(ctx, m.Branch, true); err != nil {
+	//
+	// opts.Force is forwarded rather than hardcoded false: it is the flag that
+	// already waved the dirty-worktree check through above, and git would
+	// otherwise refuse the very removal the operator just authorised.
+	if err := remover.RemoveWorktree(ctx, m.Branch, true, opts.Force); err != nil {
 		c.Eligible = false
 		c.Reason = fmt.Sprintf("remove failed: %v", err)
 		logger.Warn("gc: worktree removal failed", "path", m.WorktreePath, "branch", m.Branch, "error", err)

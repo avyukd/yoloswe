@@ -5,7 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -327,6 +330,47 @@ func TestAFailedTeardownIsReportedNotSwallowed(t *testing.T) {
 	out := logged.String()
 	assert.Contains(t, out, "/roots/kernel/jiradozer-INF-1", "a human needs the path to find it")
 	assert.Contains(t, out, "worktree is locked")
+}
+
+// recordingGit captures the git command lines a wt.Manager issues, so a test
+// can assert on the flags that actually reach git rather than on a stand-in
+// remover that can never refuse.
+type recordingGit struct{ cmds [][]string }
+
+func (g *recordingGit) Run(_ context.Context, args []string, _ string) (*wt.CmdResult, error) {
+	g.cmds = append(g.cmds, args)
+	if len(args) > 1 && args[0] == "branch" && args[1] == "--show-current" {
+		return &wt.CmdResult{Stdout: "jiradozer/INF-1\n"}, nil
+	}
+	return &wt.CmdResult{}, nil
+}
+
+// The teardown must pass --force. wt.New runs post-create hooks in the fresh
+// checkout, and hooks routinely leave untracked build output; an unforced
+// `git worktree remove` refuses on exactly that. The refusal would strand a
+// worktree no run-log claims, which is the one thing gc can never find. A test
+// against an injected remover cannot see this — only the real flags can.
+func TestDiscardingAnUnclaimedWorktreeForcesPastHookOutput(t *testing.T) {
+	root := t.TempDir()
+	repo := "kernel"
+	branch := "jiradozer/INF-1"
+	require.NoError(t, os.MkdirAll(filepath.Join(root, repo, branch), 0o755))
+
+	git := &recordingGit{}
+	mgr := wt.NewManager(root, repo, wt.WithGitRunner(git), wt.WithOutput(wt.NewOutput(io.Discard, false)))
+
+	require.NoError(t, discardRemover(mgr)(context.Background(), branch))
+
+	var removeCmd []string
+	for _, c := range git.cmds {
+		if len(c) > 1 && c[0] == "worktree" && c[1] == "remove" {
+			removeCmd = c
+			break
+		}
+	}
+	require.NotNil(t, removeCmd, "the teardown must issue a worktree remove")
+	assert.Contains(t, removeCmd, "--force",
+		"an unforced removal refuses on post-create hook output and leaks the worktree")
 }
 
 // Nothing to discard must be a no-op, not a removal against an empty branch

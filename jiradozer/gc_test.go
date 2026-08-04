@@ -26,10 +26,17 @@ func (f fakePRChecker) Merged(_ context.Context, prURL string) (bool, error) {
 	return f.merged[prURL], nil
 }
 
-type fakeRemover struct{ removed []string }
+type fakeRemover struct {
+	removed []string
+	// forced records the force flag of each removal, so a test can assert the
+	// operator's --force actually reaches git rather than stopping at gc's own
+	// dirty-worktree check.
+	forced []bool
+}
 
-func (r *fakeRemover) RemoveWorktree(_ context.Context, nameOrBranch string, _ bool) error {
+func (r *fakeRemover) RemoveWorktree(_ context.Context, nameOrBranch string, _, force bool) error {
 	r.removed = append(r.removed, nameOrBranch)
+	r.forced = append(r.forced, force)
 	return nil
 }
 
@@ -182,10 +189,30 @@ func TestGCRefusesAWorktreeWithUncommittedWork(t *testing.T) {
 	require.Empty(t, rm.removed)
 	requireReason(t, res, "worktree", "uncommitted changes")
 
-	// --force is the deliberate override.
+	// --force is the deliberate override, and it has to reach git. Waving the
+	// dirty check through while still calling an unforced `git worktree remove`
+	// would leave --force advertising a reclaim it can never perform.
 	res, err = RunGC(context.Background(), deps, GCOptions{Apply: true, Force: true}, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, res.Removed)
+	require.Equal(t, []bool{true}, rm.forced, "--force must be forwarded to the removal itself")
+}
+
+// The unforced path must stay unforced: a clean reclaim that silently forced
+// would delete work the dirty check exists to protect.
+func TestGCDoesNotForceARoutineReclaim(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	gcFixture(t, RunMeta{
+		RunID: "r1", IssueIdentifier: "INF-1", Repo: "kernel", Branch: "feature/INF-1",
+		State: RunStateDone, PRURL: "https://github.com/o/r/pull/1",
+	})
+
+	rm := &fakeRemover{}
+	deps := gcDeps(fakePRChecker{merged: map[string]bool{"https://github.com/o/r/pull/1": true}}, rm, nil)
+
+	_, err := RunGC(context.Background(), deps, GCOptions{Apply: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, []bool{false}, rm.forced)
 }
 
 func TestGCWithoutARecordedPRWillNotGuess(t *testing.T) {

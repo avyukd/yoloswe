@@ -138,6 +138,35 @@ func (m RunMeta) RemoverKey() string {
 	return m.WTRoot + "\x00" + m.Repo
 }
 
+// EffectiveWTRoot returns the worktree root this run's checkout actually lives
+// under, or "" when the record does not pin one.
+//
+// WTRoot is authoritative when recorded. Records written before it existed have
+// it empty, and for those WorktreePath still answers the question: worktrees are
+// laid out as <root>/<repo>/<branch>, so trimming the repo and branch off the
+// recorded path recovers the root the run was created under. That matters
+// because the alternative — falling through to the sweeper's ambient WT_ROOT —
+// is only right when the root never moved. After a migration it points gc at a
+// tree those worktrees were never in, and they are never reclaimed.
+//
+// Returning "" means "this record cannot say"; the caller decides what to
+// assume, which is the one case where the ambient root is the best guess left.
+func (m RunMeta) EffectiveWTRoot() string {
+	if m.WTRoot != "" {
+		return m.WTRoot
+	}
+	if m.WorktreePath == "" || m.Repo == "" || m.Branch == "" {
+		return ""
+	}
+	// Join first so a branch containing slashes ("feature/x") is matched whole.
+	suffix := string(filepath.Separator) + filepath.Join(m.Repo, m.Branch)
+	root := strings.TrimSuffix(filepath.Clean(m.WorktreePath), suffix)
+	if root == filepath.Clean(m.WorktreePath) || root == "" {
+		return "" // not the layout we build; the path tells us nothing
+	}
+	return root
+}
+
 // LeaseKey names the lock this run holds, for a liveness check.
 //
 // It falls back to Target() only for records written before LeaseTarget

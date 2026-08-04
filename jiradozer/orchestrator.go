@@ -49,7 +49,13 @@ const tailLineMax = 2000
 // WorktreeManager is the interface for creating and removing git worktrees.
 type WorktreeManager interface {
 	NewWorktree(ctx context.Context, branch, baseBranch, goal string) (worktreePath string, err error)
-	RemoveWorktree(ctx context.Context, nameOrBranch string, deleteBranch bool) error
+	// RemoveWorktree tears a checkout down. force passes git's --force, which is
+	// what lets removal succeed on a tree that is merely untidy rather than
+	// unsaved — notably one where NewWorktree's post-create hooks left build
+	// output. Callers that would lose real work must pass false; callers tearing
+	// down a checkout nothing has run in yet must pass true, because refusing
+	// there strands a directory no sweeper can find.
+	RemoveWorktree(ctx context.Context, nameOrBranch string, deleteBranch, force bool) error
 }
 
 // IssueStatus represents the current state of a tracked issue's subprocess.
@@ -553,7 +559,9 @@ func (o *Orchestrator) Start(ctx context.Context, issue *tracker.Issue) error {
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		cancel()
-		if removeErr := o.wtManager.RemoveWorktree(context.Background(), branch, true); removeErr != nil {
+		// force: nothing has run in this checkout, so the only thing in it is
+		// post-create hook output — refusing on that would leak the worktree.
+		if removeErr := o.wtManager.RemoveWorktree(context.Background(), branch, true, true); removeErr != nil {
 			o.logger.Warn("failed to remove worktree after log open failure", "branch", branch, "error", removeErr)
 		}
 		// addLockLabel already attached LockLabel above. The state transition
@@ -571,7 +579,9 @@ func (o *Orchestrator) Start(ctx context.Context, issue *tracker.Issue) error {
 		logFile.Close()
 		cancel()
 		// Clean up the worktree that was already created before we failed.
-		if removeErr := o.wtManager.RemoveWorktree(context.Background(), branch, true); removeErr != nil {
+		// force for the same reason as the log-open rollback above: the
+		// subprocess never started, so hook output is all that can be in there.
+		if removeErr := o.wtManager.RemoveWorktree(context.Background(), branch, true, true); removeErr != nil {
 			o.logger.Warn("failed to remove worktree after start failure", "branch", branch, "error", removeErr)
 		}
 		// State transition has not yet happened — only the label needs
@@ -983,7 +993,9 @@ func (o *Orchestrator) cleanup(ctx context.Context, mw *managedWorkflow, step Wo
 		})
 		o.mu.Unlock()
 	} else {
-		if err := o.wtManager.RemoveWorktree(ctx, mw.branch, true); err != nil {
+		// No force: a finished run's checkout can hold work that exists nowhere
+		// else, and a refusal here is the signal a human should look.
+		if err := o.wtManager.RemoveWorktree(ctx, mw.branch, true, false); err != nil {
 			o.logger.Warn("failed to remove worktree", "branch", mw.branch, "error", err)
 		}
 	}

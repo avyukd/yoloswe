@@ -163,19 +163,14 @@ func runExec(ctx context.Context, app *cliapp.App, args execArgs) (runErr error)
 	}()
 
 	x := &execRun{
-		app:      app,
-		logger:   logger,
-		cfg:      cfg,
-		args:     args,
-		wtMgr:    wtMgr,
-		runID:    runID,
-		lookupPR: defaultPRLookup,
-		// force=false deliberately: this only ever runs against a fresh
-		// checkout, so a refusal means something unexpected is in there and a
-		// human should look rather than have it deleted.
-		removeWorktree: func(ctx context.Context, branch string) error {
-			return wtMgr.Remove(ctx, branch, true, false)
-		},
+		app:            app,
+		logger:         logger,
+		cfg:            cfg,
+		args:           args,
+		wtMgr:          wtMgr,
+		runID:          runID,
+		lookupPR:       defaultPRLookup,
+		removeWorktree: discardRemover(wtMgr),
 	}
 
 	// exec owns its own failure reporting, for the same reason it refuses to run
@@ -369,6 +364,19 @@ func (x *execRun) createWorktree(ctx context.Context) error {
 	x.cfg.WorkDir = path
 	x.logger.Info("worktree created", "branch", x.branch, "path", path)
 	return nil
+}
+
+// discardRemover builds the teardown used for a checkout no run-log claims.
+//
+// force=true deliberately. The only thing that can be in there is whatever
+// wt.New's post-create hooks wrote, and hooks routinely leave untracked build
+// output — exactly what an unforced `git worktree remove` refuses on. Refusing
+// protects no work here (none has run yet); it strands a directory gc can never
+// see. Named rather than inlined so the force decision has a test.
+func discardRemover(mgr *wt.Manager) func(context.Context, string) error {
+	return func(ctx context.Context, branch string) error {
+		return mgr.Remove(ctx, branch, true, true)
+	}
 }
 
 // discardUnclaimedWorktree removes a worktree that no run-log will ever claim.

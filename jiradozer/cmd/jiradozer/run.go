@@ -437,8 +437,8 @@ func (a *wtAdapter) NewWorktree(ctx context.Context, branch, baseBranch, goal st
 	return a.mgr.New(ctx, branch, baseBranch, goal)
 }
 
-func (a *wtAdapter) RemoveWorktree(ctx context.Context, nameOrBranch string, deleteBranch bool) error {
-	return a.mgr.Remove(ctx, nameOrBranch, deleteBranch, false)
+func (a *wtAdapter) RemoveWorktree(ctx context.Context, nameOrBranch string, deleteBranch, force bool) error {
+	return a.mgr.Remove(ctx, nameOrBranch, deleteBranch, force)
 }
 
 // validateDryRunMode enforces that --dry-run is only used with team mode.

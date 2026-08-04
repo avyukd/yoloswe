@@ -98,8 +98,9 @@ func newGCCmd() *cobra.Command {
 // created under, and those can differ — WT_ROOT changes, or older runs were
 // made elsewhere. A manager built on this process's root would look for those
 // worktrees in a directory they never occupied and quietly reclaim nothing.
-// Records predating WTRoot have it empty and fall back to the current root,
-// which is what they were created under.
+// Records predating WTRoot have it empty; EffectiveWTRoot recovers the root
+// from their recorded worktree path, so a root migration does not strand them.
+// Only a record that can name no root at all falls back to the current one.
 func removersForRuns(runs []jiradozer.RunMeta) (map[string]jiradozer.WorktreeRemover, error) {
 	root, err := resolveWTRoot()
 	if err != nil {
@@ -111,7 +112,7 @@ func removersForRuns(runs []jiradozer.RunMeta) (map[string]jiradozer.WorktreeRem
 		if m.Repo == "" || out[m.RemoverKey()] != nil {
 			continue
 		}
-		runRoot := m.WTRoot
+		runRoot := m.EffectiveWTRoot()
 		if runRoot == "" {
 			runRoot = root
 		}

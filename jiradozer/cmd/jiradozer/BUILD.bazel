@@ -49,6 +49,7 @@ go_test(
         "bootstrap_test.go",
         "dispatch_test.go",
         "exec_test.go",
+        "gc_test.go",
         "main_test.go",
         "runs_test.go",
     ],

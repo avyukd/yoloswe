@@ -114,7 +114,7 @@ func (restoreWTManager) NewWorktree(_ context.Context, _, _, _ string) (string, 
 	return "", nil
 }
 
-func (restoreWTManager) RemoveWorktree(_ context.Context, _ string, _ bool) error {
+func (restoreWTManager) RemoveWorktree(_ context.Context, _ string, _, _ bool) error {
 	return nil
 }
 

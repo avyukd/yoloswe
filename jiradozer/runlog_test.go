@@ -244,3 +244,36 @@ func TestRunMetaTargetFallsBackToTaskIDThenRunID(t *testing.T) {
 		"a --description run has no identifier; the task id is what correlates it")
 	require.Equal(t, "r", RunMeta{RunID: "r"}.Target())
 }
+
+// A record with no wt_root still knows where its checkout is. Reading the root
+// back off that path is what keeps pre-WTRoot runs reclaimable after WT_ROOT
+// moves — the ambient root would send gc looking in the new tree, where those
+// worktrees have never been.
+func TestEffectiveWTRootRecoversTheRootFromAPreWTRootRecord(t *testing.T) {
+	t.Run("recorded root wins", func(t *testing.T) {
+		m := RunMeta{
+			WTRoot: "/roots/recorded", Repo: "kernel", Branch: "feature/INF-1",
+			WorktreePath: "/roots/elsewhere/kernel/feature/INF-1",
+		}
+		require.Equal(t, "/roots/recorded", m.EffectiveWTRoot())
+	})
+
+	t.Run("derived from the worktree path", func(t *testing.T) {
+		m := RunMeta{
+			Repo: "kernel", Branch: "feature/INF-1",
+			WorktreePath: "/roots/old/kernel/feature/INF-1",
+		}
+		require.Equal(t, "/roots/old", m.EffectiveWTRoot(),
+			"a slash-bearing branch must be trimmed whole, not one segment at a time")
+	})
+
+	t.Run("unknowable stays empty", func(t *testing.T) {
+		require.Empty(t, RunMeta{Repo: "kernel", Branch: "b"}.EffectiveWTRoot(),
+			"no path to read")
+		require.Empty(t, RunMeta{WorktreePath: "/roots/old/kernel/b"}.EffectiveWTRoot(),
+			"no repo or branch to trim with")
+		require.Empty(t, RunMeta{
+			Repo: "kernel", Branch: "b", WorktreePath: "/somewhere/else/entirely",
+		}.EffectiveWTRoot(), "a path that is not our layout tells us nothing")
+	})
+}
