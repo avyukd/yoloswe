@@ -169,6 +169,41 @@ func TestTheIssueIsClaimedBeforeTheWorktreeIsCreated(t *testing.T) {
 		"the claim must land between reading the issue and creating the worktree")
 }
 
+// A claim that silently failed is WORSE than the old ordering: the run builds
+// its worktree looking claimed while no other box can see any claim at all. The
+// pre-worktree AddLabel is therefore the one tracker write in exec that is
+// fatal.
+func TestAFailedClaimStopsTheRunBeforeAnyWorktreeExists(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	trk := &claimRecordingTracker{
+		issue:      &tracker.Issue{ID: "id-1", Identifier: "INF-1"},
+		addLabelEr: errors.New("tracker unavailable"),
+	}
+	x := execRunForClaimOrdering(t, trk)
+
+	err := x.run(context.Background())
+
+	require.ErrorContains(t, err, "claim INF-1")
+	require.ErrorContains(t, err, "tracker unavailable")
+	assert.Empty(t, x.branch, "the run must stop before a worktree is even named")
+	assert.Equal(t, []string{"fetch"}, trk.calls,
+		"a label that never attached must not then be removed: that would strip another host's claim")
+}
+
+// A --description run's label sits on a per-run local tracker nothing else can
+// read, so it excludes nothing and must not be able to kill a live run.
+func TestALocalIssueLabelFailureDoesNotKillTheRun(t *testing.T) {
+	trk := &claimRecordingTracker{
+		issue:      &tracker.Issue{ID: "id-1", Identifier: "local-1"},
+		addLabelEr: errors.New("tracker unavailable"),
+	}
+	x := &execRun{logger: testMainLogger(t), tracker: trk, issue: trk.issue}
+
+	require.Error(t, x.claim(context.Background()),
+		"claim reports the failure; whether it is fatal is the caller's decision")
+}
+
 // Moving the claim earlier must not trade a race for a stuck issue: finish() is
 // only deferred once the run-log exists, so a failure before that has nothing
 // else to release the label — and a label nobody is working blocks every later
@@ -399,6 +434,35 @@ func TestLeaseTargetIsStableForADescriptionRun(t *testing.T) {
 	// It becomes a lock FILENAME, so free-form text must not survive verbatim.
 	assert.NotContains(t, leaseTarget(execArgs{description: "fix /etc/hosts\nand more"}), "/")
 	assert.NotContains(t, leaseTarget(execArgs{description: "fix /etc/hosts\nand more"}), "\n")
+}
+
+// A description is the only task identifier here that is free-form, so it is
+// the only one two unrelated tasks can collide on. Unscoped, "update the deps"
+// against two repos leased the same name and dispatch refused the second as
+// already-running somewhere.
+func TestADescriptionLeaseIsScopedToItsRepo(t *testing.T) {
+	kernel := leaseTarget(execArgs{description: "update the deps", repo: "kernel"})
+	web := leaseTarget(execArgs{description: "update the deps", repo: "web"})
+
+	assert.NotEqual(t, kernel, web, "the same words against two repos are two tasks")
+	assert.Equal(t, kernel, leaseTarget(execArgs{description: "update the deps", repo: "kernel"}),
+		"dispatch and exec must still derive the same name for the same task")
+
+	// The repo boundary must be unambiguous, or two different (repo,
+	// description) pairs whose concatenation matches would collide anyway.
+	assert.NotEqual(t,
+		leaseTarget(execArgs{repo: "ab", description: "cd"}),
+		leaseTarget(execArgs{repo: "a", description: "bcd"}))
+
+	// An issue or task id is already unique fleet-wide. Folding the repo in
+	// would WEAKEN it: the same issue dispatched at two repos would stop
+	// excluding itself, and an issue is claimed once.
+	assert.Equal(t,
+		leaseTarget(execArgs{issueID: "INF-1", repo: "kernel"}),
+		leaseTarget(execArgs{issueID: "INF-1", repo: "web"}))
+	assert.Equal(t,
+		leaseTarget(execArgs{taskID: "t-7", repo: "kernel"}),
+		leaseTarget(execArgs{taskID: "t-7", repo: "web"}))
 }
 
 // An alert with no target names nothing an on-call human can act on.

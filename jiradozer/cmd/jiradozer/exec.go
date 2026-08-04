@@ -286,7 +286,16 @@ func (x *execRun) run(ctx context.Context) (runErr error) {
 		// workers can still both read "unclaimed" and both label. Narrowing is
 		// what is available without shared fleet state, and it removes the part
 		// of the window that was long enough to hit in practice.
-		x.claim(ctx)
+		//
+		// FATAL, unlike every other tracker write in this file. Proceeding past
+		// a failed AddLabel would build the worktree with no fleet-visible claim
+		// at all, which is the exact state this ordering exists to prevent —
+		// worse than the old ordering, because it looks claimed and is not.
+		// Nothing is abandoned on this path: the label was never attached, and
+		// removing one on a failed add could strip a claim another host owns.
+		if err := x.claim(ctx); err != nil {
+			return fmt.Errorf("claim %s: %w", x.issue.Identifier, err)
+		}
 	}
 
 	if err := x.createWorktree(ctx); err != nil {
@@ -328,7 +337,13 @@ func (x *execRun) run(ctx context.Context) (runErr error) {
 		// than a cross-host claim. For a --description run the fleet-wide
 		// exclusion is `dispatch`'s lease probe on the derived adhoc- target
 		// and nothing else.
-		x.claim(ctx)
+		//
+		// Best-effort here precisely because it excludes nothing: the run-log
+		// and the worktree already exist, and killing a live run over a label
+		// that no other host can even read would cost more than it protects.
+		if err := x.claim(ctx); err != nil {
+			x.logger.Warn("failed to label the local issue", "issue", x.issue.Identifier, "error", err)
+		}
 	}
 
 	x.postStartComment(ctx)
@@ -499,14 +514,20 @@ func (x *execRun) createLocalIssue() error {
 	})
 }
 
-// claim attaches the lock label. Best-effort: a tracker hiccup must not abort a
-// run whose worktree already exists, and the flock lease still holds locally.
-func (x *execRun) claim(ctx context.Context) {
+// claim attaches the lock label and reports whether it landed.
+//
+// Whether a failure is fatal is the CALLER's decision, and the two callers
+// answer differently: for a tracker-backed issue the label is the fleet's only
+// cross-host claim, so failing to attach it must stop the run before a worktree
+// exists; for a --description run the label sits on a per-run local tracker
+// nothing else can read, so it is a record and losing it costs nothing. Which
+// is why this reports the error rather than swallowing it.
+func (x *execRun) claim(ctx context.Context) error {
 	if err := x.tracker.AddLabel(ctx, x.issue.ID, jiradozer.LockLabel); err != nil {
-		x.logger.Warn("failed to add lock label", "issue", x.issue.Identifier, "error", err)
-		return
+		return err
 	}
 	x.logger.Info("claimed issue", "issue", x.issue.Identifier, "label", jiradozer.LockLabel)
+	return nil
 }
 
 // abandonClaim drops the lock label for a run that died before the run-log
@@ -674,6 +695,14 @@ func (x *execRun) postEndComment(ctx context.Context, state jiradozer.RunState, 
 //
 // A description is hashed rather than used verbatim because it is free-form
 // multi-line text and this becomes a lock FILENAME.
+//
+// The description hash is scoped by --repo; an issue or task id is not. Those
+// two are already unique across the fleet, and folding the repo in would WEAKEN
+// them — the same issue dispatched at two repos would stop excluding itself,
+// which is wrong, because an issue is claimed once. A description is the only
+// identifier here that is free-form, so it is the only one where two unrelated
+// tasks ("update the deps") collide, and a collision makes dispatch refuse a
+// perfectly valid run as already-running elsewhere.
 func leaseTarget(x execArgs) string {
 	if x.issueID != "" {
 		return x.issueID
@@ -684,7 +713,9 @@ func leaseTarget(x execArgs) string {
 	if x.description == "" {
 		return ""
 	}
-	sum := sha256.Sum256([]byte(strings.TrimSpace(x.description)))
+	// The separator keeps the repo boundary unambiguous: without it "ab"+"cd"
+	// and "a"+"bcd" would hash alike, and a repo name can contain anything.
+	sum := sha256.Sum256([]byte(x.repo + "\x00" + strings.TrimSpace(x.description)))
 	return "adhoc-" + hex.EncodeToString(sum[:6])
 }
 
