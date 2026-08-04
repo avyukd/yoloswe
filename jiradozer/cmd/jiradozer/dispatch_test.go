@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -11,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/bazelment/yoloswe/cliapp"
 	"github.com/bazelment/yoloswe/fleet"
 	"github.com/bazelment/yoloswe/jiradozer"
 )
@@ -289,4 +292,66 @@ func TestDispatchArgsForwardAConfigPathTheTargetCanResolve(t *testing.T) {
 	joined = strings.Join(dispatchArgs(execArgs{
 		issueID: "INF-1", repo: "kernel", configPath: "/etc/jd.yaml"}, "s"), " ")
 	assert.Contains(t, joined, "--config /etc/jd.yaml")
+}
+
+// runDispatchCmd executes the real dispatch command so ORDERING is what is
+// under test. The bug this covers was purely an ordering mistake — `--here`
+// returned above both guards — which no unit test of a helper could have seen.
+func runDispatchCmd(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	var x execArgs
+	cmd := newDispatchCmd(&x)
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs(args)
+	cmd.SetContext(cliapp.WithApp(context.Background(), &cliapp.App{Logger: testMainLogger(t)}))
+	err := cmd.Execute()
+	return out.String(), err
+}
+
+// A dry run must never execute, whatever the dispatch shape. `--dry-run --here`
+// used to fall straight into runExec and do the work for real.
+//
+// The assertion is load-bearing in a specific way: --repo names a repo that does
+// not exist and no config is passed, so if the dry run ever executes, runExec
+// fails and this returns an error. Passing REQUIRES not having run.
+func TestDryRunHereNeverExecutes(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	out, err := runDispatchCmd(t, "--here", "--dry-run", "--skip-quota-check",
+		"--description", "should never run", "--repo", "no-such-repo-exists")
+
+	require.NoError(t, err, "a dry run reached execution and failed there: %s", out)
+	assert.Contains(t, out, "would run IN-PROCESS")
+	// Nothing may be claimed by a preview.
+	require.NoDirExists(t, filepath.Join(os.Getenv("HOME"), ".jiradozer", "runs"))
+	require.NoDirExists(t, filepath.Join(os.Getenv("HOME"), ".jiradozer", "leases"))
+}
+
+// --here skips host SELECTION, not the duplicate guard. With no fleet inventory
+// readable there is no cross-host concern, so the guard degrades to a no-op
+// rather than blocking the local escape hatch.
+func TestGuardDuplicateRunDegradesWithoutAFleet(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // no ~/magent/fleet here
+
+	err := guardDuplicateRun(context.Background(),
+		execArgs{description: "x", taskID: "t-1", repo: "yoloswe"}, 0, testMainLogger(t))
+	require.NoError(t, err, "an absent fleet must not block a local run")
+}
+
+// A --description run has no tracker-side claim, so its lease target is derived
+// from its CONTENT and is stable across invocations. That is what makes the
+// duplicate guard work for ad-hoc tasks at all — a per-run identifier would be
+// unique every time and could never collide with the run it needs to exclude.
+func TestAdHocLeaseTargetIsStableAcrossRuns(t *testing.T) {
+	a := execArgs{description: "tidy the helm chart", repo: "yoloswe"}
+	first, second := leaseTarget(a), leaseTarget(a)
+
+	require.NotEmpty(t, first)
+	require.Equal(t, first, second, "an ad-hoc target must be reproducible, or it can never collide")
+
+	// Different task, or same task in a different repo, must not collide.
+	require.NotEqual(t, first, leaseTarget(execArgs{description: "something else", repo: "yoloswe"}))
+	require.NotEqual(t, first, leaseTarget(execArgs{description: "tidy the helm chart", repo: "kernel"}))
 }

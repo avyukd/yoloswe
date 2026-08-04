@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -64,7 +66,25 @@ func newDispatchCmd(x *execArgs) *cobra.Command {
 				}
 			}
 
+			// --here skips host SELECTION. It must not skip the two things below,
+			// and it used to skip both by returning here.
+			//
+			// A dry run must never execute, whatever the dispatch shape: the
+			// moment `--dry-run --here` does the work, --dry-run has stopped
+			// meaning dry-run and there is no safe way to preview anything.
+			if here && dryRun {
+				fmt.Fprintf(cmd.OutOrStdout(), "would run IN-PROCESS on this box (--here)\n")
+				return nil
+			}
 			if here {
+				// The duplicate guard is a safety property, not part of host
+				// selection. For a --description run the fleet lease is the ONLY
+				// cross-host exclusion there is — no tracker label backs it up —
+				// so bypassing it let a second local run start while another box
+				// was already working the task.
+				if err := guardDuplicateRun(ctx, *x, minDiskGB, app.Logger); err != nil {
+					return err
+				}
 				return runExec(ctx, app, *x)
 			}
 
@@ -148,7 +168,7 @@ func newDispatchCmd(x *execArgs) *cobra.Command {
 	f.Float64Var(&x.maxBudget, "max-budget", 0, "Override max_budget_usd")
 	f.BoolVar(&x.force, "force", false, "Proceed past a stale claim, or past a fleet that could not be fully probed (never past a lease actually held)")
 	f.StringVar(&host, "host", "", "Pin a specific devbox instead of ranking the fleet")
-	f.BoolVar(&here, "here", false, "Run on this box without probing")
+	f.BoolVar(&here, "here", false, "Run on this box, skipping host selection (the duplicate-run guard still applies)")
 	f.BoolVar(&dryRun, "dry-run", false, "Print the score table and the exact SSH command, then exit")
 	f.IntVar(&minDiskGB, "min-disk-gb", 0, "Minimum usable free disk to accept a host (default 40)")
 	f.BoolVar(&skipQuota, "skip-quota-check", false, "Dispatch even when the shared Claude quota is nearly spent")
@@ -241,6 +261,37 @@ func filterHosts(hosts []fleet.Host, name string) []fleet.Host {
 		}
 	}
 	return out
+}
+
+// guardDuplicateRun applies the fleet-wide duplicate check without selecting a
+// host, so --here gets the same protection a dispatching run gets.
+//
+// It reuses narrowToPin with an empty pin rather than re-deriving the rule:
+// the ordering inside there (check every box, THEN narrow) is the whole point,
+// and a second copy of the check is how the two paths drift apart.
+//
+// A box with no fleet inventory has no cross-host concern, so an unreadable
+// registry is not fatal — but it is logged. Silently skipping a safety check is
+// exactly how this gap arrived.
+func guardDuplicateRun(ctx context.Context, x execArgs, minDiskGB int, logger *slog.Logger) error {
+	target := leaseTarget(x)
+	if target == "" {
+		return nil
+	}
+	hosts, err := fleet.Load(fleet.DefaultFleetDir)
+	if err != nil {
+		logger.Warn("no fleet inventory readable; cross-host duplicate guard skipped",
+			"target", target, "error", err)
+		return nil
+	}
+	selfHostname, _ := os.Hostname()
+	scores := fleet.Probe(ctx, fleet.DefaultSSHRunner{}, jiradozerTool, hosts, fleet.ProbeOptions{
+		SelfDNS:      fleet.SelfPublicDNS(fleet.DevboxConfigPath),
+		SelfHostname: selfHostname,
+		MinDiskGB:    minDiskGB,
+	})
+	_, err = narrowToPin(scores, target, "", x.force)
+	return err
 }
 
 // narrowToPin runs the duplicate-run guard against the WHOLE probed fleet and
