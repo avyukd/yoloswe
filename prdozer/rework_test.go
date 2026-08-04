@@ -675,3 +675,167 @@ func TestWatcher_FailedMerge_RealReworkErrorStillCountsTowardBrake(t *testing.T)
 	require.NoError(t, err)
 	assert.Equal(t, 1, s.ConsecutiveFailures, "a real rework failure still spends the brake")
 }
+
+// A merge-rework stall that arms the cooldown must name the grace-period error,
+// and must say it was the REWORK round that stalled.
+//
+// The stall error is produced by classifyAgentFailure, which serves the polish
+// and merge-rework rounds alike. Recorded at the polish caller instead, this
+// path recorded nothing, and cooldownCause fell back to the generic "stalled
+// without returning a result" — the same defect the polish path was fixed for.
+// The stage is asserted alongside it because a merge-rework stall reported as a
+// polish one sends an operator to the wrong round.
+func TestWatcher_ReworkStallArmedCooldown_NamesTheGraceError(t *testing.T) {
+	gh := failingMergeGH(t)
+	rework := &stubRework{err: fmt.Errorf("merge rework: agent execution: " +
+		"transient CLI error: stream idle: turn forced complete after grace period " +
+		"gated on background tool_use")}
+	w := newWatcherForTest(t, gh, &stubPolish{}, WithRework(rework, oneRoundSpec()))
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicySquash
+	statePath := StatePath("r", 42)
+
+	// newWatcherForTest sets MaxConsecutiveFailures=2, so two stalls arm the
+	// cooldown — well below the polish guard's 2x no-progress threshold, which
+	// this path never reaches anyway.
+	for range 2 {
+		res, err := w.Tick(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, LastActionStalled, res.Action,
+			"premise: a grace-forced rework must classify as a stall")
+	}
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	require.False(t, s.CooldownUntil.IsZero(), "premise: repeated stalls must arm the cooldown")
+	// The merge brake is the only other writer of LastCooldownCause, and it
+	// overwrites unconditionally — so pin that it is not what the assertions
+	// below are reading. Its threshold is reached on this very tick (two
+	// rejected merges against MaxConsecutiveFailures=2, no prior watermark);
+	// it stays silent only because mergeBrakeTripped declines to fire into the
+	// window the stall just opened. A zero watermark is that silence.
+	require.Equal(t, 2, s.MergeAttempts,
+		"premise: the merge brake's threshold is reached on the same tick, so this is a real collision")
+	require.Zero(t, s.CooldownFromAttempt,
+		"the merge brake must not have armed this window, or the cause below is the brake's")
+	assert.Contains(t, s.LastCooldownCause, "grace period",
+		"a stall-armed cooldown must name the grace-period error, not the generic fallback")
+	assert.Contains(t, s.LastCooldownCause, "merge rework round stalled",
+		"the cause must name the round that actually stalled")
+}
+
+// The same collision under a cooldown short enough to expire within the tick
+// that opened it.
+//
+// The brake's own "already cooling down" guard is a question about the clock
+// (time.Now().Before(CooldownUntil)), so at this cooldown length it answers
+// "not cooling down" microseconds after the stall armed the window — and the
+// brake would overwrite the stall cause with its own. Only the explicit
+// streakArmedCooldown flag keeps the attribution right here, which is why the
+// one-hour case above cannot stand in for this one.
+func TestWatcher_ReworkStallArmedCooldown_ShortCooldown_StillNamesTheStall(t *testing.T) {
+	gh := failingMergeGH(t)
+	rework := &stubRework{err: fmt.Errorf("merge rework: agent execution: " +
+		"transient CLI error: stream idle: turn forced complete after grace period " +
+		"gated on background tool_use")}
+	w := newWatcherForTest(t, gh, &stubPolish{}, WithRework(rework, oneRoundSpec()))
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicySquash
+	// Positive, so the streak arm still fires, but far shorter than the work
+	// between arming the window and the brake's check.
+	w.cfg.Backoff.Cooldown = time.Nanosecond
+
+	for range 2 {
+		res, err := w.Tick(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, LastActionStalled, res.Action,
+			"premise: a grace-forced rework must classify as a stall")
+	}
+
+	s, err := LoadState(StatePath("r", 42))
+	require.NoError(t, err)
+	require.False(t, s.CooldownUntil.IsZero(), "premise: repeated stalls must arm the cooldown")
+	require.Equal(t, 2, s.MergeAttempts,
+		"premise: the merge brake's threshold is reached on the same tick")
+	assert.Zero(t, s.CooldownFromAttempt,
+		"the merge brake must not claim a tick the failure streak already armed")
+	assert.Contains(t, s.LastCooldownCause, "grace period",
+		"a stall-armed cooldown must name the grace-period error at any cooldown length")
+	assert.Contains(t, s.LastCooldownCause, "merge rework round stalled",
+		"the cause must name the round that actually stalled")
+}
+
+// The merge brake is a rate limiter on merge attempts still to come, so a tick
+// that ENDS the run must not arm it. Two ticks reach the brake having just
+// taken the clearing arm, and both would otherwise re-arm the window that arm
+// just cleared — with a cause that describes the tick wrongly.
+//
+// The merged tick is the loud one: the brake's cause reads "N merge attempts
+// without landing" about the very attempt that landed. Seeded above the
+// threshold with a zero watermark so the brake's own arithmetic is satisfied
+// and only endsTheRun keeps it quiet.
+func TestWatcher_MergedTick_DoesNotArmTheMergeBrake(t *testing.T) {
+	gh := approvedGreenGH("true")
+	w := newWatcherForTest(t, gh, &stubPolish{}, WithRework(&stubRework{}, oneRoundSpec()))
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicySquash
+
+	statePath := StatePath("r", 42)
+	// Seed the SHAs too, so this is a settled non-first-run tick with nothing
+	// to polish — otherwise a phantom base-move sends it down the polish path.
+	require.NoError(t, (&State{
+		LastCheckAt:     time.Now(),
+		LastSeenHeadSHA: "head1",
+		LastSeenBaseSHA: "base1",
+		MergeAttempts:   4, // newWatcherForTest sets MaxConsecutiveFailures=2.
+	}).Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, LastActionMerged, res.Action)
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	require.Equal(t, 5, s.MergeAttempts,
+		"premise: the brake's threshold is met on the tick that landed the PR")
+	assert.True(t, s.CooldownUntil.IsZero(),
+		"a landed PR must not back off; there is no next attempt to rate-limit")
+	assert.Empty(t, s.LastCooldownCause,
+		"the merged tick cleared the cause, and nothing may re-write it as a merge failure")
+	assert.Zero(t, s.CooldownFromAttempt,
+		"no merge-brake cooldown happened, so the watermark must not claim one")
+}
+
+// The other half: a terminal needs_human tick. Nothing merged here — the PR is
+// green but unapproved, so the run hands off — yet MergeAttempts carried over
+// from earlier rejections still satisfies the brake's arithmetic. Arming a
+// cooldown would rate-limit a run that has already stopped, and would overwrite
+// the cleared cause with a merge story that has nothing to do with the handoff.
+func TestWatcher_NeedsHumanTick_DoesNotArmTheMergeBrake(t *testing.T) {
+	// okPRJSON is REVIEW_REQUIRED, which is exactly the "green but awaiting
+	// approval" arm that returns LastActionNeedsHuman.
+	gh := setupGH(buildPRJSON(okPRJSON, "SUCCESS"), "[]", "base1")
+	gh.setThreads(0)
+	w := newWatcherForTest(t, gh, &stubPolish{})
+
+	statePath := StatePath("r", 42)
+	require.NoError(t, (&State{
+		LastCheckAt:     time.Now(),
+		LastSeenHeadSHA: "head1",
+		LastSeenBaseSHA: "base1",
+		MergeAttempts:   4,
+	}).Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, LastActionNeedsHuman, res.Action)
+
+	s, err := LoadState(statePath)
+	require.NoError(t, err)
+	require.Equal(t, 4, s.MergeAttempts,
+		"premise: prior rejections still satisfy the brake's threshold")
+	assert.True(t, s.CooldownUntil.IsZero(),
+		"a run handed to a human must not also be put on a merge cooldown")
+	assert.Empty(t, s.LastCooldownCause)
+	assert.Zero(t, s.CooldownFromAttempt)
+}

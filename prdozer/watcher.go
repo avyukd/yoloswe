@@ -26,11 +26,16 @@ type Watcher struct {
 	repo     string
 	workDir  string
 	self     string
-	// lastStallError is the scrubbed error from the invocation that tripped the
-	// no-progress guard. Carried alongside stalled because the stall path has no
-	// LastMergeError to quote — that field is only written by the merge path, so
-	// a polish-only stall would otherwise report an empty cause.
+	// lastStallError is the scrubbed error from the invocation that stalled.
+	// Carried alongside stalled because the stall path has no LastMergeError to
+	// quote — that field is only written by the merge path, so a polish-only
+	// stall would otherwise report an empty cause.
 	lastStallError string
+	// lastStallStage names the round that produced lastStallError ("polish" or
+	// "merge rework"). Recorded because classifyAgentFailure serves both, so the
+	// cooldown cause cannot assume the polish one: a stalled merge rework
+	// reported as a stalled polish round sends an operator to the wrong round.
+	lastStallStage string
 	// lastFailureError is the scrubbed error from the agent failure that made
 	// this tick return LastActionFailed. Same reason as lastStallError: the
 	// cooldown reports the cause of the failure that armed it, and a polish or
@@ -49,6 +54,18 @@ type Watcher struct {
 	// reason as diverged: both stop the run with LastActionNeedsHuman, and
 	// without a distinct signal the terminal report cannot tell "waiting on an
 	// approval" from "the rounds never came back". Reset every tick.
+	//
+	// NOT the same thing as LastActionStalled, despite the name — and the two
+	// must not be wired to each other. LastActionStalled says ONE invocation was
+	// cut off mid-round and is deliberately non-terminal, so the cooldown brake
+	// gets to work and a stall that clears still recovers (see state.go). This
+	// flag says the run is OVER: a whole streak of invocations produced no round
+	// at all, so terminalFor reports it instead of the generic needs-human text.
+	// Setting it from classifyAgentFailure — which returns LastActionStalled for
+	// both stages — would end a run on the first grace-forced round and hand a
+	// human a PR the brake would have recovered on its own. That is also why the
+	// guard, and this flag, stay polish-only: only the polish path feeds
+	// InvocationsSinceRound, which is the streak the terminal report quotes.
 	stalled bool
 }
 
@@ -201,20 +218,34 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 	)
 
 	w.diverged = false
-	w.stalled, w.lastStallError = false, ""
+	w.stalled, w.lastStallError, w.lastStallStage = false, "", ""
 	w.lastFailureError = ""
 	priorAttempts, priorMergeErr := state.MergeAttempts, state.LastMergeError
 	priorSelfReviewed := state.SelfReviewedSHA
 	// Counted, not compared by identity: decideAndAct adds keys to the SAME map
 	// when one already exists, so a pointer comparison would see no change.
 	priorOnceDone := len(state.OnceRoundsDone)
+	priorInvocations := state.InvocationsSinceRound
 	action := w.decideAndAct(ctx, snap, cs, state)
 	mergeStateDirty := state.MergeAttempts != priorAttempts ||
 		state.LastMergeError != priorMergeErr ||
 		state.SelfReviewedSHA != priorSelfReviewed ||
 		// Load-bearing: without this a newly completed once round is never saved,
 		// so the next tick reloads without it and runs it again.
-		len(state.OnceRoundsDone) != priorOnceDone
+		len(state.OnceRoundsDone) != priorOnceDone ||
+		// Same hazard as OnceRoundsDone above: decideAndAct owns this counter, and
+		// recordSnapshot only writes when something marks the state dirty, so a
+		// tick whose ONLY change is this counter would drop it — the streak would
+		// reload flat every tick and the guard that stops a stuck run would never
+		// fire.
+		//
+		// It takes a specific tick to reach that, which is why the reproducer is
+		// easy to miss: an ordinary failing tick also moves ConsecutiveFailures,
+		// and the guard's FIRST trip also transitions LastAction to needs_human.
+		// The second trip changes nothing else — same action, and needs_human
+		// already zeroed the failure counter on its way out. See
+		// TestWatcher_Tick_CounterOnlyChange_IsPersisted.
+		state.InvocationsSinceRound != priorInvocations
 
 	res := TickResult{Snapshot: snap, Changeset: cs, Action: action,
 		Diverged: w.diverged, PolishRounds: state.PolishRounds,
@@ -405,7 +436,11 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 				// diagnosis from "the polish rounds never returned", and the one an
 				// operator debugging a kernel#8374 loop would be misled by.
 				w.stalled = true
-				w.lastStallError = safe
+				// Set unconditionally, not only when classifyAgentFailure already
+				// did: this guard also fires for a PLAIN polish failure, which is
+				// never classified and so records nothing above. The stage is
+				// fixed because only the polish path counts toward this guard.
+				w.lastStallError, w.lastStallStage = safe, "polish"
 				w.logger.Warn("stopping: polish invocations are not producing rounds",
 					"invocations_since_round", state.InvocationsSinceRound,
 					"polish_rounds", state.PolishRounds,
@@ -547,6 +582,15 @@ func (w *Watcher) classifyAgentFailure(stage string, err error, safe string) (La
 	// prdozer needs on top is whether the retry should be FREE, and for a stall
 	// it must not be.
 	if reason == transientmeta.ReasonGraceForced {
+		// Recorded HERE rather than at the callers, because this is the one place
+		// that turns a round error into LastActionStalled — and cooldownCause
+		// reads the field for exactly that action. Set at a caller instead, it
+		// covers only that caller: the polish path recorded it and merge rework
+		// did not, so a stall-armed merge-rework cooldown persisted the generic
+		// fallback rather than the grace-period error that armed it. Producing it
+		// alongside the action it belongs to is what keeps the two stages from
+		// drifting apart again.
+		w.lastStallError, w.lastStallStage = safe, stage
 		w.logger.Warn(stage+" was cut off mid-round by the turn grace period; counting it toward the failure brake",
 			"error", safe, "reason", reason)
 		w.status("PR #%d %s stalled mid-round (%s) — counts toward the brake", w.pr, stage, reason)
@@ -909,6 +953,9 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 
 	firstRun := s.LastCheckAt.IsZero()
 	dirty := firstRun || mergeStateDirty
+	// Set by the failure-streak arm below and read by the merge brake after it.
+	// See the brake's comment for why the two cannot both claim this tick.
+	streakArmedCooldown := false
 
 	if s.LastSeenHeadSHA != snap.PR.HeadRefOid {
 		s.LastSeenHeadSHA = snap.PR.HeadRefOid
@@ -957,6 +1004,7 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 		if w.cfg.Backoff.MaxConsecutiveFailures > 0 && s.ConsecutiveFailures >= w.cfg.Backoff.MaxConsecutiveFailures && w.cfg.Backoff.Cooldown > 0 {
 			s.CooldownUntil = time.Now().Add(w.cfg.Backoff.Cooldown)
 			s.LastCooldownCause = w.cooldownCause(s, action)
+			streakArmedCooldown = true
 			w.logger.Warn("entering cooldown after repeated failures",
 				"failures", s.ConsecutiveFailures,
 				"cause", s.LastCooldownCause,
@@ -989,13 +1037,40 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 	// nothing resets it — so brake on that instead. Merge attempts remain
 	// unbounded in the sense that the run resumes after each cooldown and
 	// keeps climbing; the cooldown just rate-limits it and makes it visible.
-	if w.mergeBrakeTripped(s) {
+	// streakArmedCooldown, not mergeBrakeTripped's own "already cooling down"
+	// guard, is what keeps the brake off a tick the failure streak just claimed.
+	// That guard asks time.Now().Before(s.CooldownUntil), which is a question
+	// about the CLOCK: under a sub-microsecond Backoff.Cooldown the window the
+	// arm just opened is already expired by the time the brake looks, and the
+	// brake would overwrite the cause below — the exact misattribution this
+	// branch exists to fix, resurrected by a config value. An explicit flag
+	// makes "one tick arms at most one cooldown" hold for every cooldown length.
+	//
+	// Skipping the brake deliberately leaves CooldownFromAttempt where it was.
+	// The watermark records the attempts a MERGE-BRAKE cooldown accounted for,
+	// and no merge-brake cooldown happened on this tick; advancing it here would
+	// make the field claim otherwise and silently forgive real rejections the
+	// brake never charged for. So the brake fires on a later tick instead —
+	// once, since that firing does advance the watermark. Reviewers read the
+	// stale-looking watermark as a lost write; it is the intended record.
+	//
+	// endsTheRun is the other exclusion, and it is about the brake's PREMISE
+	// rather than about a collision. The brake is a rate limiter on merge
+	// attempts still to come; a tick that ends the run has none to limit, and
+	// mergeBrakeCause would describe it wrongly — loudest on the merged tick,
+	// where the cause reads "N merge attempts without landing" about the very
+	// attempt that landed. A terminal tick took the clearing arm above, so
+	// without this the brake re-arms the window that arm just cleared.
+	// LastActionArmed is deliberately NOT terminal here: the queue has not
+	// landed the PR, ticks continue, and a repeatedly-dequeued PR is exactly
+	// what the brake is for (TestWatcher_QueuePolicy_RepeatedDequeueStillBrakes).
+	if !streakArmedCooldown && !endsTheRun(action) && w.mergeBrakeTripped(s) {
 		s.CooldownUntil = time.Now().Add(w.cfg.Backoff.Cooldown)
 		s.CooldownFromAttempt = s.MergeAttempts
-		// Unconditionally a merge cause, whatever this tick's action was: the
-		// brake counts merge attempts, so LastMergeError IS its reason. Set after
-		// the switch above so a merge brake tripping on the same tick as a stall
-		// reports the brake — it is the condition that actually armed the window.
+		// Unconditionally a merge cause, whatever this tick's action was:
+		// reaching here means the brake is what armed the window, and the brake
+		// counts merge attempts, so LastMergeError IS its reason. The guard
+		// above is what makes "reaching here" imply that.
 		s.LastCooldownCause = mergeBrakeCause(s)
 		dirty = true
 		w.logger.Warn("entering cooldown after repeated merge attempts",
@@ -1023,9 +1098,13 @@ func (w *Watcher) cooldownCause(s *State, action LastAction) string {
 	switch action {
 	case LastActionStalled:
 		if w.lastStallError != "" {
-			return fmt.Sprintf("polish round stalled: %s", w.lastStallError)
+			// Named by the stage that actually stalled. Both the polish and the
+			// merge-rework rounds reach this arm, and they are debugged in
+			// different places, so a fixed "polish" label would send an operator
+			// after the wrong round for half the stalls that arm this cooldown.
+			return fmt.Sprintf("%s round stalled: %s", w.lastStallStage, w.lastStallError)
 		}
-		return "polish rounds stalled without returning a result"
+		return "agent rounds stalled without returning a result"
 	case LastActionReworked:
 		if s.LastMergeError != "" {
 			return fmt.Sprintf("reworking after a failed merge: %s", s.LastMergeError)
@@ -1058,12 +1137,31 @@ func mergeBrakeCause(s *State) string {
 	return fmt.Sprintf("%d merge attempts without landing", s.MergeAttempts)
 }
 
+// endsTheRun reports whether an action stops the babysit loop for good.
+//
+// It must agree with terminalFor in babysit.go, which is what actually ends the
+// loop; this is the watcher-side reading of the same question, kept here so the
+// cooldown code does not have to reach into the babysit layer. The two are
+// pinned against each other over the full action set by
+// TestEndsTheRun_MatchesTerminalFor, so they cannot drift apart silently.
+func endsTheRun(action LastAction) bool {
+	switch action {
+	case LastActionMerged, LastActionClosed, LastActionNeedsHuman:
+		return true
+	}
+	return false
+}
+
 // mergeBrakeTripped reports whether enough merge attempts have accumulated
 // since the last cooldown to warrant another one.
 //
 // It measures attempts SINCE the previous cooldown (CooldownFromAttempt) so a
 // run that resumes after backing off gets a fresh allowance rather than
 // re-tripping on every subsequent tick forever.
+//
+// Its open-window check is deliberately clock-based, which makes it the wrong
+// tool for "did something else already arm a cooldown on THIS tick" — see
+// streakArmedCooldown in recordSnapshot, which answers that question directly.
 func (w *Watcher) mergeBrakeTripped(s *State) bool {
 	maxAttempts := w.cfg.Backoff.MaxConsecutiveFailures
 	if maxAttempts <= 0 || w.cfg.Backoff.Cooldown <= 0 {

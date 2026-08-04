@@ -245,6 +245,14 @@ func TestTerminalFor(t *testing.T) {
 		{LastActionArmed, "", false},
 		{LastActionIdle, "", false},
 		{LastActionFailed, "", false},
+		// Stalled is non-terminal BY DESIGN, and is the entry most likely to be
+		// "fixed" into a terminal one: it shares a name with TickResult.Stalled,
+		// which is terminal. They mean opposite things — this action says one
+		// invocation was cut off mid-round and the cooldown brake should handle
+		// it, while the flag says a whole streak produced no round and the run is
+		// over. Ending the run here would hand a human every PR the brake would
+		// have recovered on its own.
+		{LastActionStalled, "", false},
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.action), func(t *testing.T) {
@@ -516,4 +524,26 @@ func TestBabysitLoop_SpacesTicksFromTickStart(t *testing.T) {
 			"must not push the next tick out to 3.5s")
 	assert.GreaterOrEqual(t, gap, interval-tickCost/2,
 		"pacing still applies: a tick that finished inside its budget waits out the remainder")
+}
+
+// endsTheRun (watcher.go) gates the merge brake on "does this tick end the
+// run", and terminalFor is what actually ends it. They are separate functions
+// in separate files, so pin them against each other over the full action set:
+// a new terminal action added to one and not the other would silently let the
+// brake arm a cooldown on a run that is already over.
+func TestEndsTheRun_MatchesTerminalFor(t *testing.T) {
+	t.Parallel()
+	for _, action := range []LastAction{
+		LastActionMerged, LastActionClosed, LastActionNeedsHuman,
+		LastActionPolished, LastActionReworked, LastActionArmed,
+		LastActionIdle, LastActionFailed, LastActionStalled,
+		LastActionTransient, LastActionDryRun,
+	} {
+		t.Run(string(action), func(t *testing.T) {
+			t.Parallel()
+			_, _, done := terminalFor(TickResult{Action: action}, DiscoveredPR{Number: 42})
+			assert.Equal(t, done, endsTheRun(action),
+				"endsTheRun must agree with terminalFor for %q", action)
+		})
+	}
 }
