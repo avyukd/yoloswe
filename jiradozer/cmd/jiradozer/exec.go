@@ -166,14 +166,13 @@ func runExec(ctx context.Context, app *cliapp.App, args execArgs) (runErr error)
 	}()
 
 	x := &execRun{
-		app:            app,
-		logger:         logger,
-		cfg:            cfg,
-		args:           args,
-		wtMgr:          wtMgr,
-		runID:          runID,
-		lookupPR:       defaultPRLookup,
-		removeWorktree: discardRemover(wtMgr),
+		app:      app,
+		logger:   logger,
+		cfg:      cfg,
+		args:     args,
+		wtMgr:    wtMgr,
+		runID:    runID,
+		lookupPR: defaultPRLookup,
 	}
 
 	// exec owns its own failure reporting, for the same reason it refuses to run
@@ -214,10 +213,6 @@ type execRun struct {
 	// lookupPR resolves the PR opened for a branch. Injected so the recording
 	// path can be tested without a GitHub round trip.
 	lookupPR func(ctx context.Context, branch, dir string) (*wt.PRInfo, error)
-	// removeWorktree tears a checkout down. Injected for the same reason: the
-	// teardown path only runs when something else already failed, so it needs a
-	// test that does not depend on a real repository.
-	removeWorktree func(ctx context.Context, branch string) error
 	// newTracker builds the issue tracker client. Injected so the claim
 	// ORDERING — label attached before the worktree, released again when the
 	// worktree never comes up — can be driven through run() itself rather than
@@ -298,18 +293,20 @@ func (x *execRun) run(ctx context.Context) (runErr error) {
 		}
 	}
 
-	if err := x.createWorktree(ctx); err != nil {
-		x.abandonClaim(ctx)
-		return err
-	}
+	// Name the branch before recording the run: the branch is what makes the
+	// checkout's path knowable in advance, and the path is what gc needs.
+	x.deriveBranch()
 
+	// The run-log goes in BEFORE the checkout, never after it. The run-log IS
+	// gc's ownership namespace — these are ordinary wt worktrees sitting beside
+	// human-owned ones, so gc's only discovery path is walking run-logs, and it
+	// skips any run directory without a readable meta.json. A checkout created
+	// before that first write is therefore a directory nothing can ever name:
+	// no amount of later cleanup finds it, because nothing records that it is
+	// ours. Writing the run-log first makes the window unreachable rather than
+	// merely narrow — a SIGKILL, a lost power rail or a wedged post-create hook
+	// inside `wt.New` all leave a record gc can act on.
 	if err := x.startRunLog(); err != nil {
-		// The run-log IS gc's ownership namespace — a worktree no run-log claims
-		// is never a candidate, because these sit beside human-owned ones with
-		// nothing else marking them as jiradozer's. So a worktree that outlives
-		// a failed startRunLog is orphaned PERMANENTLY. Nothing has run in it
-		// yet, so tearing it down here loses nothing.
-		x.discardUnclaimedWorktree(ctx)
 		x.abandonClaim(ctx)
 		return err
 	}
@@ -327,6 +324,13 @@ func (x *execRun) run(ctx context.Context) (runErr error) {
 		// or a late beat could resurrect the heartbeat of a finished run.
 		stopHeartbeat()
 	}()
+
+	// Under the heartbeat, not before it: a clone with post-create hooks runs
+	// for minutes, and a run that is not beating during them reads as dead to
+	// anything asking `jiradozer runs` whether this box is still working.
+	if err := x.createWorktree(ctx); err != nil {
+		return err
+	}
 
 	if x.args.description != "" {
 		if err := x.createLocalIssue(); err != nil {
@@ -381,7 +385,13 @@ func (x *execRun) checkNotClaimed(issue *tracker.Issue) error {
 		issue.Identifier, jiradozer.LockLabel)
 }
 
-func (x *execRun) createWorktree(ctx context.Context) error {
+// deriveBranch names this run's branch. Split out of createWorktree because
+// the name is needed one step earlier than the checkout: the run-log records
+// where the checkout WILL be, and that path is derived from the branch.
+//
+// Pure — it touches neither disk nor tracker — so it cannot fail, and a run
+// that never gets a worktree still has a branch name to be recorded under.
+func (x *execRun) deriveBranch() {
 	prefix := x.args.branchPrefix
 	if prefix == "" {
 		prefix = x.cfg.Source.BranchPrefix
@@ -397,7 +407,24 @@ func (x *execRun) createWorktree(ctx context.Context) error {
 		leaf = x.runID
 	}
 	x.branch = prefix + "/" + sanitizeBranchLeaf(leaf)
+}
 
+// plannedWorktreePath is where createWorktree is going to put the checkout.
+//
+// Knowable in advance because wt derives it purely from the branch name
+// (wt.Manager.New joins RepoDir() with the branch), and it has to be knowable:
+// the run-log records it before `wt.New` is called, so that a death anywhere
+// inside the checkout still leaves gc a path to reclaim. If wt ever changes
+// that derivation this prediction goes stale silently, which is why
+// TestThePlannedWorktreePathIsWhereWtActuallyPutsIt drives the real manager.
+func (x *execRun) plannedWorktreePath() string {
+	if x.wtMgr == nil || x.branch == "" {
+		return x.cfg.WorkDir
+	}
+	return filepath.Join(x.wtMgr.RepoDir(), x.branch)
+}
+
+func (x *execRun) createWorktree(ctx context.Context) error {
 	goal := x.args.description
 	if x.issue != nil {
 		goal = x.issue.Title
@@ -409,46 +436,24 @@ func (x *execRun) createWorktree(ctx context.Context) error {
 	// Everything downstream — the agent, the local tracker, the workflow — runs
 	// against this directory.
 	x.cfg.WorkDir = path
+	// Reconcile the prediction with what wt actually did. Normally identical;
+	// when it is not, the run-log is pointing gc at a directory that does not
+	// exist while the real checkout leaks, so correcting it matters more than
+	// the write costs.
+	if x.rl != nil && path != x.rl.Meta().WorktreePath {
+		if err := x.rl.UpdateMeta(func(m *jiradozer.RunMeta) { m.WorktreePath = path }); err != nil {
+			x.logger.Warn("failed to record the worktree path", "path", path, "error", err)
+		}
+	}
 	x.logger.Info("worktree created", "branch", x.branch, "path", path)
 	return nil
 }
 
-// discardRemover builds the teardown used for a checkout no run-log claims.
-//
-// force=true deliberately. The only thing that can be in there is whatever
-// wt.New's post-create hooks wrote, and hooks routinely leave untracked build
-// output — exactly what an unforced `git worktree remove` refuses on. Refusing
-// protects no work here (none has run yet); it strands a directory gc can never
-// see. Named rather than inlined so the force decision has a test.
-func discardRemover(mgr *wt.Manager) func(context.Context, string) error {
-	return func(ctx context.Context, branch string) error {
-		return mgr.Remove(ctx, branch, true, true)
-	}
-}
-
-// discardUnclaimedWorktree removes a worktree that no run-log will ever claim.
-//
-// Only ever called between createWorktree and a FAILED startRunLog: at that
-// point the checkout is a fresh branch off base with nothing in it, so this can
-// destroy no work. It is best-effort and loud — if the removal itself fails the
-// path is logged, because that directory is now invisible to `jiradozer gc` and
-// only a human can find it.
-func (x *execRun) discardUnclaimedWorktree(ctx context.Context) {
-	if x.cfg.WorkDir == "" || x.branch == "" || x.removeWorktree == nil {
-		return
-	}
-	if err := x.removeWorktree(ctx, x.branch); err != nil {
-		x.logger.Error("could not remove the worktree of a run that never started; it is not tracked by any run-log and gc will never see it",
-			"path", x.cfg.WorkDir, "branch", x.branch, "error", err)
-		return
-	}
-	x.logger.Info("removed the worktree of a run that never started", "branch", x.branch)
-}
-
-// startRunLog records the run BEFORE any tracker mutation, so a crash from here
-// on is visible to a sweeper. If it were written at the end instead, a run that
-// died mid-flight would leave an untracked worktree and no trace of who made
-// it — the leak this exists to prevent.
+// startRunLog records the run BEFORE the checkout it describes, so that no
+// worktree can exist without a run-log naming it. If it were written after —
+// or at the end, as an outcome record — a run that died mid-checkout would
+// leave a directory gc has no way to discover, since walking run-logs is its
+// only discovery path.
 func (x *execRun) startRunLog() error {
 	meta := jiradozer.RunMeta{
 		RunID:        x.runID,
@@ -458,7 +463,7 @@ func (x *execRun) startRunLog() error {
 		Repo:         x.args.repo,
 		Branch:       x.branch,
 		BaseBranch:   x.cfg.BaseBranch,
-		WorktreePath: x.cfg.WorkDir,
+		WorktreePath: x.plannedWorktreePath(),
 		TmuxSession:  x.args.tmuxSession,
 		LogPath:      x.app.LogPath,
 		State:        jiradozer.RunStateRunning,
@@ -532,12 +537,14 @@ func (x *execRun) claim(ctx context.Context) error {
 
 // abandonClaim drops the lock label for a run that died before the run-log
 // existed, which is the window in which finish() is not yet deferred and so
-// nothing else will release it.
+// nothing else will release it. Since the run-log now precedes the checkout,
+// that window is exactly one failure — startRunLog itself — but it is the one
+// failure that also leaves nothing behind to explain the label.
 //
-// Without this, moving the claim ahead of the worktree would trade a race for a
-// worse failure: a checkout that fails — no disk, a bad base branch — would
-// leave the issue labelled with no run anywhere to explain it, and every later
-// dispatch would refuse it until a human passed --force.
+// Without this, moving the claim ahead of the run-log would trade a race for a
+// worse failure: an unwritable runs directory would leave the issue labelled
+// with no run anywhere to explain it, and every later dispatch would refuse it
+// until a human passed --force.
 //
 // A fresh context for the same reason finish() uses one: the run context is
 // usually already cancelled by the time an abort unwinds, and this write is the
@@ -618,9 +625,16 @@ func (x *execRun) finish(runErr error) {
 	// open", never "it merged", so nothing at this point authorises deleting
 	// the branch's only checkout. `jiradozer gc` reclaims it later by asking
 	// whether the PR actually landed.
+	//
+	// Conditional because the run-log now outlives failures that happen before
+	// the checkout: claiming to have KEPT a worktree that was never created
+	// would send a human looking for a directory that does not exist.
+	kept := x.cfg.WorkDir != ""
 	if err := x.rl.UpdateMeta(func(m *jiradozer.RunMeta) {
-		m.WorktreeKept = true
-		m.WorktreeKeptReason = "terminal state is an open PR, not a merge; reclaimed by `jiradozer gc`"
+		if kept {
+			m.WorktreeKept = true
+			m.WorktreeKeptReason = "terminal state is an open PR, not a merge; reclaimed by `jiradozer gc`"
+		}
 		if pr != nil {
 			m.PRURL = pr.URL
 			m.PRNumber = pr.Number

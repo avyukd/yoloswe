@@ -513,52 +513,32 @@ func TestStartRunLogRecordsTheLeaseItHolds(t *testing.T) {
 }
 
 // The run-log IS gc's ownership namespace: these are ordinary wt worktrees
-// sitting beside human-owned ones, so a worktree no run-log claims is never a
-// candidate. A worktree that outlives a failed startRunLog is therefore
-// orphaned permanently — and nothing has run in it yet, so tearing it down
-// loses nothing.
-func TestAWorktreeIsNotLeftBehindWhenTheRunLogCannotBeCreated(t *testing.T) {
-	var removed []string
-	x := &execRun{
-		logger: testMainLogger(t),
-		cfg:    &jiradozer.Config{WorkDir: t.TempDir()},
-		branch: "jiradozer/INF-1",
-		removeWorktree: func(_ context.Context, branch string) error {
-			removed = append(removed, branch)
-			return nil
-		},
-	}
+// sitting beside human-owned ones, so gc's only discovery path is walking
+// run-logs, and it skips a run directory with no readable meta.json. A checkout
+// created before that first write is therefore a directory nothing can ever
+// name — no teardown reaches it, because a hard kill runs no teardown at all.
+// The record has to exist BEFORE the checkout can, not after it.
+func TestTheRunLogIsWrittenBeforeTheWorktreeCanExist(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 
-	x.discardUnclaimedWorktree(context.Background())
+	trk := &claimRecordingTracker{issue: &tracker.Issue{ID: "id-1", Identifier: "INF-1"}}
+	x := execRunForClaimOrdering(t, trk)
 
-	assert.Equal(t, []string{"jiradozer/INF-1"}, removed,
-		"the checkout must be removed by branch, through the worktree manager")
-}
+	require.Error(t, x.run(context.Background()), "the checkout must fail, so only the pre-worktree path is observed")
 
-// If the teardown itself fails the directory is now invisible to gc and only a
-// human can find it, so the path must survive into the log rather than be
-// swallowed.
-func TestAFailedTeardownIsReportedNotSwallowed(t *testing.T) {
-	var logged bytes.Buffer
-	x := &execRun{
-		logger: slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelError})),
-		cfg:    &jiradozer.Config{WorkDir: "/roots/kernel/jiradozer-INF-1"},
-		branch: "jiradozer/INF-1",
-		removeWorktree: func(context.Context, string) error {
-			return errors.New("worktree is locked")
-		},
-	}
-
-	x.discardUnclaimedWorktree(context.Background())
-
-	out := logged.String()
-	assert.Contains(t, out, "/roots/kernel/jiradozer-INF-1", "a human needs the path to find it")
-	assert.Contains(t, out, "worktree is locked")
+	runs, err := jiradozer.ListRuns()
+	require.NoError(t, err)
+	require.Len(t, runs, 1, "a run whose checkout never came up must still be recorded")
+	assert.Equal(t, x.plannedWorktreePath(), runs[0].WorktreePath,
+		"gc reclaims by this path; a record without one is a run gc cannot act on")
+	assert.NotEmpty(t, runs[0].WorktreePath)
+	assert.Equal(t, jiradozer.RunStateFailed, runs[0].State)
+	assert.False(t, runs[0].WorktreeKept,
+		"nothing was kept: claiming otherwise sends a human after a directory that does not exist")
 }
 
 // recordingGit captures the git command lines a wt.Manager issues, so a test
-// can assert on the flags that actually reach git rather than on a stand-in
-// remover that can never refuse.
+// can drive the real manager without a repository.
 type recordingGit struct{ cmds [][]string }
 
 func (g *recordingGit) Run(_ context.Context, args []string, _ string) (*wt.CmdResult, error) {
@@ -569,47 +549,41 @@ func (g *recordingGit) Run(_ context.Context, args []string, _ string) (*wt.CmdR
 	return &wt.CmdResult{}, nil
 }
 
-// The teardown must pass --force. wt.New runs post-create hooks in the fresh
-// checkout, and hooks routinely leave untracked build output; an unforced
-// `git worktree remove` refuses on exactly that. The refusal would strand a
-// worktree no run-log claims, which is the one thing gc can never find. A test
-// against an injected remover cannot see this — only the real flags can.
-func TestDiscardingAnUnclaimedWorktreeForcesPastHookOutput(t *testing.T) {
+// The run-log records where the checkout WILL be, before wt.New is called, so
+// the prediction has to match what wt actually does. If wt ever changes how it
+// derives the path, the prediction would go stale silently and every run-log
+// would point gc at a directory that does not exist — so the check drives the
+// real manager rather than restating the join.
+func TestThePlannedWorktreePathIsWhereWtActuallyPutsIt(t *testing.T) {
 	root := t.TempDir()
 	repo := "kernel"
-	branch := "jiradozer/INF-1"
-	require.NoError(t, os.MkdirAll(filepath.Join(root, repo, branch), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, repo, ".bare"), 0o755))
 
-	git := &recordingGit{}
-	mgr := wt.NewManager(root, repo, wt.WithGitRunner(git), wt.WithOutput(wt.NewOutput(io.Discard, false)))
-
-	require.NoError(t, discardRemover(mgr)(context.Background(), branch))
-
-	var removeCmd []string
-	for _, c := range git.cmds {
-		if len(c) > 1 && c[0] == "worktree" && c[1] == "remove" {
-			removeCmd = c
-			break
-		}
+	mgr := wt.NewManager(root, repo, wt.WithGitRunner(&recordingGit{}), wt.WithOutput(wt.NewOutput(io.Discard, false)))
+	x := &execRun{
+		logger: testMainLogger(t),
+		cfg:    &jiradozer.Config{BaseBranch: "main"},
+		wtMgr:  mgr,
+		args:   execArgs{issueID: "INF-1", repo: repo},
+		runID:  "r1",
 	}
-	require.NotNil(t, removeCmd, "the teardown must issue a worktree remove")
-	assert.Contains(t, removeCmd, "--force",
-		"an unforced removal refuses on post-create hook output and leaks the worktree")
+	x.deriveBranch()
+
+	// SkipFetch only to keep the test off the network and off `gh auth`; the
+	// path derivation under test happens before either.
+	actual, err := mgr.New(context.Background(), x.branch, "main", "", wt.NewOptions{SkipFetch: true})
+	require.NoError(t, err)
+	assert.Equal(t, actual, x.plannedWorktreePath(),
+		"the path recorded before the checkout must be the path the checkout gets")
 }
 
-// Nothing to discard must be a no-op, not a removal against an empty branch
-// name — wt would resolve that to some other worktree.
-func TestDiscardUnclaimedWorktreeIsANoOpBeforeAWorktreeExists(t *testing.T) {
-	called := false
+// Before a branch is named there is nothing to predict, and a join against an
+// empty branch would name the repository root — a path gc must never be handed.
+func TestThereIsNoPlannedWorktreePathBeforeABranchIsNamed(t *testing.T) {
 	x := &execRun{
-		logger:         testMainLogger(t),
-		cfg:            &jiradozer.Config{},
-		removeWorktree: func(context.Context, string) error { called = true; return nil },
+		cfg:   &jiradozer.Config{},
+		wtMgr: wt.NewManager(t.TempDir(), "kernel"),
 	}
 
-	x.discardUnclaimedWorktree(context.Background())
-	x.branch = "jiradozer/INF-1" // branch known, but no worktree created yet
-	x.discardUnclaimedWorktree(context.Background())
-
-	assert.False(t, called, "nothing may be removed before a worktree exists")
+	assert.Empty(t, x.plannedWorktreePath(), "an unnamed run must not claim the repository root")
 }
