@@ -7,6 +7,7 @@ go_library(
         "main.go",
         "models.go",
         "run.go",
+        "runs.go",
         "team_signals_other.go",
         "team_signals_unix.go",
         "team_supervisor.go",
@@ -43,6 +44,7 @@ go_test(
     srcs = [
         "bootstrap_test.go",
         "main_test.go",
+        "runs_test.go",
     ],
     data = [
         "//jiradozer:jiradozer.example.yaml",

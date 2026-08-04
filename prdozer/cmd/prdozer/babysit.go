@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"text/tabwriter"
@@ -232,6 +233,7 @@ func newRunsCmd() *cobra.Command {
 	var (
 		repoFilter string
 		prFilter   int
+		asJSON     bool
 	)
 	cmd := &cobra.Command{
 		Use:   "runs",
@@ -241,8 +243,7 @@ func newRunsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-			fmt.Fprintln(tw, "STARTED\tREPO\tPR\tRUN\tSTATE\tPOLISH\tMERGES\tLOGS")
+			filtered := make([]prdozer.RunMeta, 0, len(runs))
 			for i := range runs {
 				r := &runs[i]
 				if repoFilter != "" && r.Repo != repoFilter {
@@ -251,6 +252,20 @@ func newRunsCmd() *cobra.Command {
 				if prFilter != 0 && r.PRNumber != prFilter {
 					continue
 				}
+				filtered = append(filtered, *r)
+			}
+			// The table is for humans; --json is for the ops skill, which
+			// otherwise has to parse tabwriter columns over ssh.
+			if asJSON {
+				enc := json.NewEncoder(cmd.OutOrStdout())
+				enc.SetIndent("", "  ")
+				return enc.Encode(filtered)
+			}
+			runs = filtered
+			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
+			fmt.Fprintln(tw, "STARTED\tREPO\tPR\tRUN\tSTATE\tPOLISH\tMERGES\tLOGS")
+			for i := range runs {
+				r := &runs[i]
 				fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%d\t%d\t%s\n",
 					r.StartedAt.Format(time.RFC3339), r.Repo, r.PRNumber, r.RunID,
 					r.State, r.PolishRounds, r.MergeAttempt, r.LogDir)
@@ -260,6 +275,7 @@ func newRunsCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&repoFilter, "repo", "", "Only list runs for this owner/repo")
 	cmd.Flags().IntVar(&prFilter, "pr", 0, "Only list runs for this PR number")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "Emit run metadata as JSON")
 	return cmd
 }
 
