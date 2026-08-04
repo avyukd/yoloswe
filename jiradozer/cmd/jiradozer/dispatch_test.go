@@ -163,6 +163,47 @@ func TestDispatchProbesForTheLeaseNameTheWorkerWillHold(t *testing.T) {
 	assert.False(t, busy, "and a different issue must not collide with it")
 }
 
+// --host must not be a way around the duplicate-run guard.
+//
+// The guard searches the probe results, so narrowing the fleet to the pinned
+// box before searching would hide a lease held anywhere else: pin the idle
+// machine and the busy one is simply not in the slice being examined. Since a
+// --description run has no tracker-side claim to fall back on, that would make
+// the pin the only thing standing between two workers and the same task.
+func TestPinningAHostDoesNotHideALeaseHeldElsewhere(t *testing.T) {
+	scores := []fleet.HostHealth{
+		{Host: "busy", HeldLeases: []string{"INF-1.lock"}},
+		{Host: "idle", PublicDNS: "idle.example"},
+	}
+
+	_, err := narrowToPin(scores, "INF-1", "idle")
+	require.Error(t, err, "the lease on `busy` must be found even though `idle` was pinned")
+	assert.Contains(t, err.Error(), "busy", "the operator needs to be told which box has it")
+
+	// The pin still narrows once the guard has passed, by either name form.
+	for _, pin := range []string{"idle", "IDLE.example"} {
+		out, err := narrowToPin(scores, "INF-2", pin)
+		require.NoError(t, err, "a different task is not blocked by this lease")
+		require.Len(t, out, 1, "ranking still sees only the pinned host")
+		assert.Equal(t, "idle", out[0].Host)
+	}
+
+	// And an unpinned dispatch keeps the whole fleet to rank over.
+	out, err := narrowToPin(scores, "INF-2", "")
+	require.NoError(t, err)
+	assert.Len(t, out, 2)
+}
+
+// A pin that matched the loaded fleet but matches nothing in the probe results
+// cannot happen — both sides compare the same two fields. Say so rather than
+// let PickHost answer "no eligible host", which would send an operator looking
+// at disk and load for a name that simply did not match.
+func TestAPinThatSurvivesLoadingButNotProbingIsNamedAsSuch(t *testing.T) {
+	_, err := narrowToPin([]fleet.HostHealth{{Host: "a"}}, "INF-1", "b")
+	require.ErrorContains(t, err, `host "b"`)
+	assert.NotContains(t, err.Error(), "eligible")
+}
+
 // The remote worker starts with cwd $HOME, so the default relative
 // "jiradozer.yaml" resolves to nothing there and the run dies before doing any
 // work. The config path must be forwarded, in a form the target can resolve.

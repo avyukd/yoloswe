@@ -72,11 +72,12 @@ func newDispatchCmd(x *execArgs) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if host != "" {
-				hosts = filterHosts(hosts, host)
-				if len(hosts) == 0 {
-					return fmt.Errorf("no fleet host named %q", host)
-				}
+			// A typo'd --host is answered from the loaded fleet, before any ssh
+			// round trip. The fleet itself is NOT narrowed here: the duplicate
+			// guard below has to see every box, so the pin is applied to the
+			// probe RESULTS instead (see narrowToPin).
+			if host != "" && len(filterHosts(hosts, host)) == 0 {
+				return fmt.Errorf("no fleet host named %q", host)
 			}
 
 			selfHostname, _ := os.Hostname()
@@ -88,20 +89,14 @@ func newDispatchCmd(x *execArgs) *cobra.Command {
 			ssh := fleet.DefaultSSHRunner{}
 			scores := fleet.Probe(ctx, ssh, jiradozerTool, hosts, opts)
 
-			// Refuse a second run for a task some box is already working. The
-			// lock label catches this cross-host too, but only after the worktree
-			// exists; the lease is the cheaper and earlier signal.
-			//
 			// The target is derived the SAME way the worker will derive it — a
 			// --description run with no --task-id included. Deriving it any other
 			// way here would silently disable this check for exactly the case
 			// that has no tracker-side claim to fall back on.
 			target := leaseTarget(*x)
-			if target != "" {
-				if holder, busy := fleet.FindLeaseHolder(scores, target); busy {
-					return fmt.Errorf("%s is already running on %s (lease held); use `jiradozer runs --issue %s --json` there to check on it",
-						target, holder.Host, target)
-				}
+			scores, err = narrowToPin(scores, target, host)
+			if err != nil {
+				return err
 			}
 
 			chosen, err := fleet.PickHost(scores, jiradozerTool, opts)
@@ -246,6 +241,43 @@ func filterHosts(hosts []fleet.Host, name string) []fleet.Host {
 		}
 	}
 	return out
+}
+
+// narrowToPin runs the duplicate-run guard against the WHOLE probed fleet and
+// only then applies --host.
+//
+// The order is the point, which is why both halves live in one function rather
+// than as two calls a future edit could reorder. The guard refuses a second run
+// for a task some box is already working: the lock label catches that
+// cross-host too, but only after the worktree exists, so the lease is the
+// cheaper and earlier signal. Narrowing first would have made --host a way to
+// bypass it — pin the idle box and the busy one is simply not in the slice
+// being searched — and for a --description run, which has no tracker-side claim
+// to fall back on, the lease is the ONLY fleet-wide exclusion there is.
+func narrowToPin(scores []fleet.HostHealth, target, pin string) ([]fleet.HostHealth, error) {
+	if target != "" {
+		if holder, busy := fleet.FindLeaseHolder(scores, target); busy {
+			return nil, fmt.Errorf("%s is already running on %s (lease held); use `jiradozer runs --issue %s --json` there to check on it",
+				target, holder.Host, target)
+		}
+	}
+	if pin == "" {
+		return scores, nil
+	}
+	var out []fleet.HostHealth
+	for i := range scores {
+		if strings.EqualFold(scores[i].Host, pin) || strings.EqualFold(scores[i].PublicDNS, pin) {
+			out = append(out, scores[i])
+		}
+	}
+	if len(out) == 0 {
+		// Unreachable from dispatch: the pin was matched against these same two
+		// fields in the loaded fleet before probing. Say so rather than let
+		// PickHost report "no eligible host", which would send an operator
+		// looking at disk and load for a name that simply did not match.
+		return nil, fmt.Errorf("host %q matched the fleet but not its probe results", pin)
+	}
+	return out, nil
 }
 
 func printScores(w interface{ Write([]byte) (int, error) }, scores []fleet.HostHealth, opts fleet.ProbeOptions) {

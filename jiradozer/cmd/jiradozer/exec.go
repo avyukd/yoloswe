@@ -215,9 +215,9 @@ type execRun struct {
 	// path can be tested without a GitHub round trip.
 	lookupPR func(ctx context.Context, branch, dir string) (*wt.PRInfo, error)
 	// newTracker builds the issue tracker client. Injected so the claim
-	// ORDERING — label attached before the worktree, released again when the
-	// worktree never comes up — can be driven through run() itself rather than
-	// asserted on the pieces, which is the only way the ordering stays enforced.
+	// ORDERING — run-log written first, label attached next, worktree last —
+	// can be driven through run() itself rather than asserted on the pieces,
+	// which is the only way the ordering stays enforced.
 	newTracker func(cfg *jiradozer.Config, issueID string) (tracker.IssueTracker, error)
 	// worktreePath is set only once wt has actually produced a checkout. It is
 	// the sentinel for "a directory exists that someone could be sent to":
@@ -228,6 +228,9 @@ type execRun struct {
 	runID        string
 	branch       string
 	args         execArgs
+	// claimed records that THIS run attached the lock label. It is the only
+	// thing that authorises removing it again: see claim() and finish().
+	claimed bool
 }
 
 // defaultPRLookup asks gh which PR exists for a branch, from inside the
@@ -276,28 +279,6 @@ func (x *execRun) run(ctx context.Context) (runErr error) {
 		if err := x.checkNotClaimed(issue); err != nil {
 			return err
 		}
-		// Claim HERE, not after the worktree exists. The label is the only
-		// claim another box can see — the flock lease is per-host — and every
-		// instant between the check above and the label being attached is a
-		// window in which a second dispatch reads an unclaimed issue and starts
-		// a duplicate run. Claiming after createWorktree stretched that window
-		// across a full checkout (clone, hooks, minutes); claiming here narrows
-		// it to the round trip below.
-		//
-		// It does not close it: no tracker offers a compare-and-set, so two
-		// workers can still both read "unclaimed" and both label. Narrowing is
-		// what is available without shared fleet state, and it removes the part
-		// of the window that was long enough to hit in practice.
-		//
-		// FATAL, unlike every other tracker write in this file. Proceeding past
-		// a failed AddLabel would build the worktree with no fleet-visible claim
-		// at all, which is the exact state this ordering exists to prevent —
-		// worse than the old ordering, because it looks claimed and is not.
-		// Nothing is abandoned on this path: the label was never attached, and
-		// removing one on a failed add could strip a claim another host owns.
-		if err := x.claim(ctx); err != nil {
-			return fmt.Errorf("claim %s: %w", x.issue.Identifier, err)
-		}
 	}
 
 	// Name the branch before recording the run: the branch is what makes the
@@ -314,12 +295,43 @@ func (x *execRun) run(ctx context.Context) (runErr error) {
 	// merely narrow — a SIGKILL, a lost power rail or a wedged post-create hook
 	// inside `wt.New` all leave a record gc can act on.
 	if err := x.startRunLog(); err != nil {
-		x.abandonClaim(ctx)
 		return err
 	}
 
 	// From here the run is recorded, so every exit path settles the run-log.
 	defer func() { x.finish(runErr) }()
+
+	// Claim after the run-log and before the worktree.
+	//
+	// Before the worktree, because the label is the only claim another box can
+	// see — the flock lease is per-host — and every instant between the check
+	// above and the label being attached is a window in which a second dispatch
+	// reads an unclaimed issue and starts a duplicate run. Claiming after
+	// createWorktree stretched that window across a full checkout (clone,
+	// hooks, minutes); here it is one local file write plus the round trip
+	// below. It does not CLOSE the window: no tracker offers a compare-and-set,
+	// so two workers can still both read "unclaimed" and both label.
+	//
+	// After the run-log, because the two orders fail differently under a hard
+	// kill, and only one of them is recoverable. Claim first and a SIGKILL in
+	// the gap leaves a label on the issue with no record anywhere saying who
+	// took it or why — every later dispatch refuses the issue until a human
+	// finds it and passes --force. Run-log first and the same kill leaves a
+	// record with a stale heartbeat and no label: `runs` and `gc` can both see
+	// it, and nothing is blocked meanwhile.
+	//
+	// FATAL, unlike every other tracker write in this file. Proceeding past a
+	// failed AddLabel would build the worktree with no fleet-visible claim at
+	// all, which is the exact state this ordering exists to prevent — worse
+	// than the old ordering, because it looks claimed and is not. Nothing is
+	// abandoned on this path: the label was never attached, and removing one on
+	// a failed add could strip a claim another host owns. The run-log that now
+	// exists is settled by the deferred finish() above.
+	if x.issue != nil && x.args.issueID != "" {
+		if err := x.claim(ctx); err != nil {
+			return fmt.Errorf("claim %s: %w", x.issue.Identifier, err)
+		}
+	}
 
 	heartbeatCtx, stopBeating := context.WithCancel(ctx)
 	stopHeartbeat := x.rl.StartHeartbeat(heartbeatCtx, jiradozer.HeartbeatInterval, func(err error) {
@@ -540,38 +552,12 @@ func (x *execRun) claim(ctx context.Context) error {
 	if err := x.tracker.AddLabel(ctx, x.issue.ID, jiradozer.LockLabel); err != nil {
 		return err
 	}
+	// Only a label this run actually attached may be removed by finish(). A
+	// failed AddLabel is indistinguishable from "someone else got there first",
+	// and releasing on that path would strip a claim another host owns.
+	x.claimed = true
 	x.logger.Info("claimed issue", "issue", x.issue.Identifier, "label", jiradozer.LockLabel)
 	return nil
-}
-
-// abandonClaim drops the lock label for a run that died before the run-log
-// existed, which is the window in which finish() is not yet deferred and so
-// nothing else will release it. Since the run-log now precedes the checkout,
-// that window is exactly one failure — startRunLog itself — but it is the one
-// failure that also leaves nothing behind to explain the label.
-//
-// Without this, moving the claim ahead of the run-log would trade a race for a
-// worse failure: an unwritable runs directory would leave the issue labelled
-// with no run anywhere to explain it, and every later dispatch would refuse it
-// until a human passed --force.
-//
-// A fresh context for the same reason finish() uses one: the run context is
-// usually already cancelled by the time an abort unwinds, and this write is the
-// one that must still land.
-func (x *execRun) abandonClaim(ctx context.Context) {
-	if x.tracker == nil || x.issue == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	defer cancel()
-	if err := x.tracker.RemoveLabel(ctx, x.issue.ID, jiradozer.LockLabel); err != nil {
-		// Loud: a claim left on an issue nobody is working blocks the fleet
-		// from ever picking it up again, and only the log says why.
-		x.logger.Error("could not release the lock label of a run that never started; the issue stays claimed until this label is removed or --force is passed",
-			"issue", x.issue.Identifier, "label", jiradozer.LockLabel, "error", err)
-		return
-	}
-	x.logger.Info("released the claim of a run that never started", "issue", x.issue.Identifier)
 }
 
 // postStartComment records where this run is happening.
@@ -663,8 +649,18 @@ func (x *execRun) finish(runErr error) {
 
 	if x.tracker != nil && x.issue != nil {
 		x.postEndComment(ctx, state, runErr)
-		if err := x.tracker.RemoveLabel(ctx, x.issue.ID, jiradozer.LockLabel); err != nil {
-			x.logger.Warn("failed to release lock label", "issue", x.issue.Identifier, "error", err)
+		// Gated on claimed, not on the tracker existing. finish() now runs on
+		// paths where the claim itself failed, and a failed AddLabel cannot be
+		// told apart from another host having claimed first — so releasing
+		// unconditionally would let a run that never held the lock strip the
+		// lock of the run that does.
+		if x.claimed {
+			if err := x.tracker.RemoveLabel(ctx, x.issue.ID, jiradozer.LockLabel); err != nil {
+				// Loud: a claim left on an issue nobody is working blocks the
+				// fleet from picking it up again, and only the log says why.
+				x.logger.Error("could not release the lock label; the issue stays claimed until this label is removed or --force is passed",
+					"issue", x.issue.Identifier, "label", jiradozer.LockLabel, "error", err)
+			}
 		}
 	}
 	x.logger.Info("run finished", "run_id", x.runID, "state", state, "run_dir", x.rl.Dir())

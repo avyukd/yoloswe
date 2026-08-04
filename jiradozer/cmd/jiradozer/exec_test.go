@@ -91,6 +91,10 @@ type claimRecordingTracker struct {
 	issue      *tracker.Issue
 	fetchErr   error
 	addLabelEr error
+	// onAddLabel observes the run's state at the exact instant the claim goes
+	// out, which is the only way to assert what a hard kill in that gap would
+	// have left behind.
+	onAddLabel func()
 	calls      []string
 }
 
@@ -121,6 +125,9 @@ func (c *claimRecordingTracker) PostComment(context.Context, string, string) (tr
 func (c *claimRecordingTracker) UpdateIssueState(context.Context, string, string) error { return nil }
 
 func (c *claimRecordingTracker) AddLabel(_ context.Context, _ string, label string) error {
+	if c.onAddLabel != nil {
+		c.onAddLabel()
+	}
 	if c.addLabelEr != nil {
 		return c.addLabelEr
 	}
@@ -173,6 +180,37 @@ func TestTheIssueIsClaimedBeforeTheWorktreeIsCreated(t *testing.T) {
 		"the claim must land between reading the issue and creating the worktree")
 }
 
+// The label must not be attachable before the run-log exists.
+//
+// Both orders leave a window under a hard kill, but only one of them is
+// recoverable. Label first, and a SIGKILL in the gap leaves an issue claimed
+// with no record anywhere naming who took it — every later dispatch refuses it
+// until a human passes --force. Run-log first, and the same kill leaves a
+// record with a stale heartbeat and no label: `runs` and `gc` can both see it,
+// and nothing is blocked meanwhile.
+func TestTheRunIsRecordedBeforeTheIssueIsClaimed(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	trk := &claimRecordingTracker{issue: &tracker.Issue{ID: "id-1", Identifier: "INF-1"}}
+	x := execRunForClaimOrdering(t, trk)
+	// AddLabel is the observation point: whatever the run-log looks like at the
+	// instant the claim goes out is what a kill in the gap would have left.
+	var runDirAtClaim string
+	trk.onAddLabel = func() {
+		if x.rl != nil {
+			runDirAtClaim = x.rl.Dir()
+		}
+	}
+
+	require.Error(t, x.run(context.Background()),
+		"the checkout must fail so the test observes only the pre-worktree path")
+
+	require.NotEmpty(t, runDirAtClaim, "the run-log must already exist when the label is attached")
+	onDisk, err := jiradozer.LoadRunMeta(runDirAtClaim)
+	require.NoError(t, err, "the record has to be READABLE at that instant, not merely allocated")
+	assert.Equal(t, "INF-1", onDisk.IssueIdentifier)
+}
+
 // A claim that silently failed is WORSE than the old ordering: the run builds
 // its worktree looking claimed while no other box can see any claim at all. The
 // pre-worktree AddLabel is therefore the one tracker write in exec that is
@@ -190,9 +228,11 @@ func TestAFailedClaimStopsTheRunBeforeAnyWorktreeExists(t *testing.T) {
 
 	require.ErrorContains(t, err, "claim INF-1")
 	require.ErrorContains(t, err, "tracker unavailable")
-	assert.Empty(t, x.branch, "the run must stop before a worktree is even named")
+	assert.Empty(t, x.worktreePath, "the run must stop before any checkout exists")
 	assert.Equal(t, []string{"fetch"}, trk.calls,
 		"a label that never attached must not then be removed: that would strip another host's claim")
+	assert.Equal(t, jiradozer.RunStateFailed, x.rl.Meta().State,
+		"the run-log outlives the failed claim, so it must be settled rather than left running")
 }
 
 // A --description run's label sits on a per-run local tracker nothing else can
@@ -208,10 +248,8 @@ func TestALocalIssueLabelFailureDoesNotKillTheRun(t *testing.T) {
 		"claim reports the failure; whether it is fatal is the caller's decision")
 }
 
-// Moving the claim earlier must not trade a race for a stuck issue: finish() is
-// only deferred once the run-log exists, so a failure before that has nothing
-// else to release the label — and a label nobody is working blocks every later
-// dispatch until a human passes --force.
+// A label nobody is working blocks every later dispatch until a human passes
+// --force, so an aborted run must hand the issue back.
 func TestAClaimIsReleasedWhenTheWorktreeNeverComesUp(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
@@ -226,36 +264,53 @@ func TestAClaimIsReleasedWhenTheWorktreeNeverComesUp(t *testing.T) {
 
 // The release has to survive the context that carried the failure: by the time
 // an abort unwinds, the run context is usually already cancelled, and this is
-// the one write that must still land.
+// the one write that must still land. finish() therefore builds its own.
 func TestAClaimIsReleasedEvenOnACancelledContext(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	trk := &claimRecordingTracker{issue: &tracker.Issue{ID: "id-1", Identifier: "INF-1"}}
-	x := &execRun{
-		logger:  testMainLogger(t),
-		tracker: trk,
-		issue:   trk.issue,
-	}
+	x := execRunForClaimOrdering(t, trk)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	x.abandonClaim(ctx)
+	require.Error(t, x.run(ctx))
 
-	assert.Equal(t, []string{"remove:" + jiradozer.LockLabel}, trk.calls)
+	assert.Equal(t, "remove:"+jiradozer.LockLabel, trk.calls[len(trk.calls)-1],
+		"a cancelled run context must not take the release down with it")
+}
+
+// Releasing is authorised by having CLAIMED, not by having a tracker. finish()
+// now runs on paths where the AddLabel itself failed, and a failed add cannot
+// be told apart from another host having claimed first — so an unconditional
+// release would let a run that never held the lock strip the lock of the run
+// that does.
+func TestARunThatNeverClaimedDoesNotReleaseAnyoneElsesClaim(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	trk := &claimRecordingTracker{issue: &tracker.Issue{ID: "id-1", Identifier: "INF-1"}}
+	x := newFinishTestRun(t)
+	x.tracker = trk
+	x.issue = trk.issue
+	// claimed stays false: this run reached finish() without ever labelling.
+
+	x.finish(errors.New("claim INF-1: tracker unavailable"))
+
+	assert.Empty(t, trk.calls, "no RemoveLabel may be issued for a claim this run never took")
 }
 
 // A claim left on an issue nobody is working is invisible except in the log, so
 // a failed release must be loud rather than a warning nobody reads.
 func TestAFailedClaimReleaseIsReportedNotSwallowed(t *testing.T) {
-	var logged bytes.Buffer
-	trk := &failingRemoveLabelTracker{}
-	x := &execRun{
-		logger:  slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelError})),
-		tracker: trk,
-		issue:   &tracker.Issue{ID: "id-1", Identifier: "INF-1"},
-	}
+	t.Setenv("HOME", t.TempDir())
 
-	x.abandonClaim(context.Background())
+	var logged bytes.Buffer
+	x := newFinishTestRun(t)
+	x.logger = slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelError}))
+	x.tracker = &failingRemoveLabelTracker{}
+	x.issue = &tracker.Issue{ID: "id-1", Identifier: "INF-1"}
+	x.claimed = true
+
+	x.finish(nil)
 
 	out := logged.String()
 	assert.Contains(t, out, "INF-1", "a human needs to know which issue stays claimed")
@@ -267,18 +322,6 @@ type failingRemoveLabelTracker struct{ claimRecordingTracker }
 
 func (failingRemoveLabelTracker) RemoveLabel(context.Context, string, string) error {
 	return errors.New("tracker unavailable")
-}
-
-// Nothing to release must be a no-op: abandonClaim runs on the failure path,
-// which is reachable before a tracker or issue exists at all.
-func TestAbandonClaimIsANoOpWithNothingClaimed(t *testing.T) {
-	x := &execRun{logger: testMainLogger(t)}
-	x.abandonClaim(context.Background()) // no tracker, no issue
-
-	trk := &claimRecordingTracker{}
-	x.tracker = trk
-	x.abandonClaim(context.Background()) // tracker, but no issue yet
-	assert.Empty(t, trk.calls)
 }
 
 // A lease is held INSIDE the worker for its whole lifetime, so a second worker
