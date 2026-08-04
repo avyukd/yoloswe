@@ -364,6 +364,7 @@ func (x *execRun) startRunLog() error {
 		RunID:        x.runID,
 		TaskID:       x.args.taskID,
 		Description:  x.args.description,
+		LeaseTarget:  leaseTarget(x.args),
 		Repo:         x.args.repo,
 		Branch:       x.branch,
 		BaseBranch:   x.cfg.BaseBranch,

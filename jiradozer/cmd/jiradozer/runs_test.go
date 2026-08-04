@@ -147,3 +147,26 @@ func TestRunsOnEmptyBoxSucceeds(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(runRunsCmd(t, "--json")), &got))
 	require.Empty(t, got)
 }
+
+// `dispatch` refuses a duplicate by lease name and tells the operator to look
+// the run up by it. That instruction has to work: for a --description run the
+// lease name is the ONLY name known before the local tracker assigns one.
+func TestRunsFindsARunByTheLeaseNameDispatchPrinted(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	seedRun(t, jiradozer.RunMeta{
+		RunID: "r1", Repo: "kernel", Branch: "jiradozer/r1",
+		IssueIdentifier: "LOCAL-1", LeaseTarget: "adhoc-deadbeefcafe",
+		State: jiradozer.RunStateRunning,
+	})
+	seedRun(t, jiradozer.RunMeta{
+		RunID: "r2", Repo: "kernel", IssueIdentifier: "INF-9", State: jiradozer.RunStateRunning,
+	})
+
+	out := runRunsCmd(t, "--issue", "adhoc-deadbeefcafe")
+	require.Contains(t, out, "r1")
+	require.NotContains(t, out, "r2", "the filter must still exclude other runs")
+
+	// The identifier the tracker later assigned keeps working too.
+	require.Contains(t, runRunsCmd(t, "--issue", "LOCAL-1"), "r1")
+	require.Contains(t, runRunsCmd(t, "--issue", "INF-9"), "r2")
+}

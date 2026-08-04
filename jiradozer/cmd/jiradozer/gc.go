@@ -49,10 +49,11 @@ func newGCCmd() *cobra.Command {
 			}
 
 			res, err := jiradozer.RunGC(ctx, jiradozer.GCDeps{
-				Git:       &wt.DefaultGitRunner{},
-				PR:        jiradozer.GHPRChecker{GH: &wt.DefaultGHRunner{}},
-				Removers:  removers,
-				LeaseHeld: leaseHeld,
+				Git:        &wt.DefaultGitRunner{},
+				PR:         jiradozer.GHPRChecker{GH: &wt.DefaultGHRunner{}},
+				PRByBranch: jiradozer.GHPRResolver{GH: &wt.DefaultGHRunner{}},
+				Removers:   removers,
+				LeaseHeld:  leaseHeld,
 			}, jiradozer.GCOptions{Apply: apply, Force: force, RunLogTTL: ttl}, app.Logger)
 			if err != nil {
 				return err

@@ -255,3 +255,30 @@ func TestSanitizeBranchLeaf(t *testing.T) {
 	require.Equal(t, "INF-1234", sanitizeBranchLeaf("INF-1234"))
 	require.Equal(t, "a-b", sanitizeBranchLeaf("a b"))
 }
+
+// gc's liveness guard reads the lease name off the run-log. If exec does not
+// write it, the guard asks about the wrong lock for every --description run and
+// answers "not held" about a live worker.
+func TestStartRunLogRecordsTheLeaseItHolds(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	x := &execRun{
+		app:    execTestApp(t),
+		logger: testMainLogger(t),
+		cfg:    &jiradozer.Config{WorkDir: t.TempDir(), BaseBranch: "main"},
+		args:   execArgs{description: "tidy the helm chart", repo: "kernel"},
+		runID:  "r1",
+		branch: "jiradozer/r1",
+	}
+	require.NoError(t, x.startRunLog())
+
+	want := leaseTarget(x.args)
+	require.NotEmpty(t, want)
+	assert.Equal(t, want, x.rl.Meta().LeaseTarget)
+	assert.Equal(t, want, x.rl.Meta().LeaseKey(),
+		"before a local issue exists the lease name is the only name this run has")
+
+	onDisk, err := jiradozer.LoadRunMeta(x.rl.Dir())
+	require.NoError(t, err)
+	assert.Equal(t, want, onDisk.LeaseTarget, "gc reads meta.json, not this process's memory")
+}

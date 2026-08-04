@@ -255,3 +255,138 @@ func requireReason(t *testing.T, res GCResult, kind, substr string) {
 	}
 	t.Fatalf("no %s candidate with reason containing %q; got %+v", kind, substr, res.Candidates)
 }
+
+type fakePRResolver struct {
+	byBranch map[string]string
+	err      error
+	calls    int
+}
+
+func (f *fakePRResolver) ResolveForBranch(_ context.Context, branch, _ string) (string, error) {
+	f.calls++
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.byBranch[branch], nil
+}
+
+// A run records its PR at shutdown, which is exactly when a transient gh
+// failure is most likely — and nothing ever revisits a terminal run's meta. So
+// without recovery here, one bad minute strands a worktree on disk forever.
+func TestGCRecoversAPRTheRunFailedToRecord(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	gcFixture(t, RunMeta{
+		RunID: "r1", IssueIdentifier: "INF-1", Repo: "kernel", Branch: "feature/INF-1",
+		State: RunStateDone, // no PRURL: the shutdown lookup failed
+	})
+
+	rm := &fakeRemover{}
+	resolver := &fakePRResolver{byBranch: map[string]string{
+		"feature/INF-1": "https://github.com/o/r/pull/1",
+	}}
+	deps := gcDeps(fakePRChecker{merged: map[string]bool{"https://github.com/o/r/pull/1": true}}, rm, nil)
+	deps.PRByBranch = resolver
+
+	res, err := RunGC(context.Background(), deps, GCOptions{Apply: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, res.Removed)
+	require.Equal(t, []string{"feature/INF-1"}, rm.removed)
+	require.Equal(t, 1, resolver.calls)
+}
+
+// Recovery must not become a way to guess. A branch with no PR, and a resolver
+// that itself fails, both leave the worktree exactly where it is.
+func TestGCRecoveryStillFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		resolver *fakePRResolver
+		name     string
+	}{
+		{name: "branch has no PR", resolver: &fakePRResolver{byBranch: map[string]string{}}},
+		{name: "resolver itself fails", resolver: &fakePRResolver{err: errors.New("gh: network unreachable")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			gcFixture(t, RunMeta{
+				RunID: "r1", IssueIdentifier: "INF-1", Repo: "kernel", Branch: "feature/INF-1",
+				State: RunStateDone,
+			})
+
+			rm := &fakeRemover{}
+			deps := gcDeps(fakePRChecker{}, rm, nil)
+			deps.PRByBranch = tc.resolver
+
+			res, err := RunGC(context.Background(), deps, GCOptions{Apply: true}, nil)
+			require.NoError(t, err)
+			require.Empty(t, rm.removed)
+			requireReason(t, res, "worktree", "no PR recorded")
+		})
+	}
+}
+
+// A recorded PR is authoritative: recovery is for a MISSING one, and re-asking
+// would cost a gh round trip per candidate on every sweep.
+func TestGCDoesNotReResolveARecordedPR(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	gcFixture(t, RunMeta{
+		RunID: "r1", IssueIdentifier: "INF-1", Repo: "kernel", Branch: "feature/INF-1",
+		State: RunStateDone, PRURL: "https://github.com/o/r/pull/1",
+	})
+
+	rm := &fakeRemover{}
+	resolver := &fakePRResolver{byBranch: map[string]string{"feature/INF-1": "https://github.com/o/r/pull/9"}}
+	deps := gcDeps(fakePRChecker{merged: map[string]bool{"https://github.com/o/r/pull/1": true}}, rm, nil)
+	deps.PRByBranch = resolver
+
+	res, err := RunGC(context.Background(), deps, GCOptions{Apply: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, res.Removed)
+	require.Zero(t, resolver.calls, "the recorded PR must be used as-is")
+}
+
+// The liveness guard must ask about the lock the worker actually holds. A
+// --description run leases a name derived from its description, then acquires a
+// local-tracker identifier that Target() reports instead — so asking by Target
+// answers "not held" about a live worker, which reads as permission to delete
+// its directory.
+func TestGCAsksAboutTheLockAWorkerActuallyHolds(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	gcFixture(t, RunMeta{
+		RunID: "r1", Repo: "kernel", Branch: "jiradozer/r1",
+		IssueIdentifier: "LOCAL-1", LeaseTarget: "adhoc-deadbeefcafe",
+		State: RunStateDone, PRURL: "https://github.com/o/r/pull/1",
+	})
+
+	var asked []string
+	rm := &fakeRemover{}
+	deps := gcDeps(fakePRChecker{merged: map[string]bool{"https://github.com/o/r/pull/1": true}}, rm, nil)
+	deps.LeaseHeld = func(target string) bool {
+		asked = append(asked, target)
+		return target == "adhoc-deadbeefcafe"
+	}
+
+	res, err := RunGC(context.Background(), deps, GCOptions{Apply: true}, nil)
+	require.NoError(t, err)
+	require.Equal(t, []string{"adhoc-deadbeefcafe"}, asked)
+	require.Empty(t, rm.removed, "a live worker's worktree must survive the sweep")
+	requireReason(t, res, "worktree", "holds this task's lease")
+}
+
+// Records written before LeaseTarget existed still have to be swept, and for
+// issue and task runs the two names did coincide.
+func TestLeaseKeyFallsBackToTargetForOlderRecords(t *testing.T) {
+	require.Equal(t, "adhoc-abc", RunMeta{IssueIdentifier: "LOCAL-1", LeaseTarget: "adhoc-abc"}.LeaseKey())
+	require.Equal(t, "INF-1", RunMeta{IssueIdentifier: "INF-1"}.LeaseKey())
+	require.Equal(t, "t-7", RunMeta{TaskID: "t-7"}.LeaseKey())
+	require.Equal(t, "r1", RunMeta{RunID: "r1"}.LeaseKey())
+}
+
+// Every name an operator is ever shown has to find the run again — dispatch
+// prints the lease name, the tracker comment prints the identifier.
+func TestMatchesAcceptsEveryNameARunIsKnownBy(t *testing.T) {
+	m := RunMeta{IssueIdentifier: "LOCAL-1", TaskID: "t-7", LeaseTarget: "adhoc-abc"}
+	require.True(t, m.Matches("LOCAL-1"))
+	require.True(t, m.Matches("t-7"))
+	require.True(t, m.Matches("adhoc-abc"))
+	require.False(t, m.Matches("INF-999"))
+	require.False(t, m.Matches(""), "an empty filter must not match everything by accident")
+}

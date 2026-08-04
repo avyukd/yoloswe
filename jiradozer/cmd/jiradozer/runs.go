@@ -39,7 +39,10 @@ func newRunsCmd() *cobra.Command {
 			filtered := make([]jiradozer.RunMeta, 0, len(runs))
 			for i := range runs {
 				r := &runs[i]
-				if issueFilter != "" && r.IssueIdentifier != issueFilter && r.TaskID != issueFilter {
+				// Matched against every name this run answers to, including the
+				// lease the dispatcher printed — `dispatch` tells an operator to
+				// look a run up by that name, so it has to work.
+				if issueFilter != "" && !r.Matches(issueFilter) {
 					continue
 				}
 				if repoFilter != "" && r.Repo != repoFilter {

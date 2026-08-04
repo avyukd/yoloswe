@@ -63,6 +63,47 @@ type PRChecker interface {
 	Merged(ctx context.Context, prURL string) (merged bool, err error)
 }
 
+// PRResolver finds the PR opened for a branch, for a run whose own record of it
+// is missing. Returns "" when there is no PR — a normal outcome for a run that
+// failed before opening one.
+type PRResolver interface {
+	ResolveForBranch(ctx context.Context, branch, dir string) (prURL string, err error)
+}
+
+// GHPRResolver asks `gh` which PR a branch opened.
+type GHPRResolver struct {
+	GH wt.GHRunner
+}
+
+// ResolveForBranch looks the PR up from inside the worktree, so the repository
+// is unambiguous without the run-log having to record a remote.
+func (r GHPRResolver) ResolveForBranch(ctx context.Context, branch, dir string) (string, error) {
+	info, err := wt.GetPRByBranch(ctx, r.GH, branch, dir)
+	if err != nil {
+		return "", err
+	}
+	if info == nil {
+		return "", nil
+	}
+	return info.URL, nil
+}
+
+// resolvePRForBranch recovers a missing PR URL, or returns "".
+//
+// Failure is deliberately not distinguished from absence here: both mean "this
+// sweep cannot prove the work landed", and the caller already fails closed on
+// an empty result. The next sweep tries again.
+func resolvePRForBranch(ctx context.Context, deps GCDeps, m RunMeta) string {
+	if deps.PRByBranch == nil || m.Branch == "" || m.WorktreePath == "" {
+		return ""
+	}
+	url, err := deps.PRByBranch.ResolveForBranch(ctx, m.Branch, m.WorktreePath)
+	if err != nil {
+		return ""
+	}
+	return url
+}
+
 // GHPRChecker asks `gh` whether a PR merged.
 type GHPRChecker struct {
 	GH wt.GHRunner
@@ -96,9 +137,12 @@ type WorktreeRemover interface {
 
 // GCDeps are the sweeper's injectable collaborators.
 type GCDeps struct {
-	Git      wt.GitRunner
-	PR       PRChecker
-	Removers map[string]WorktreeRemover // keyed by repo name
+	Git wt.GitRunner
+	PR  PRChecker
+	// PRByBranch recovers a PR URL the run itself failed to record. Optional:
+	// nil simply means a run with no recorded PR is never reclaimed.
+	PRByBranch PRResolver
+	Removers   map[string]WorktreeRemover // keyed by repo name
 	// LeaseHeld reports whether a live worker still owns this target on this
 	// box. The lease is the authoritative liveness signal — it is held inside
 	// the worker, so the kernel drops it on any death.
@@ -172,7 +216,12 @@ func gcWorktree(ctx context.Context, deps GCDeps, opts GCOptions, m RunMeta, log
 	// A live run must never lose the directory out from under it. The lease is
 	// asked first because it is the cheapest and most reliable signal, and
 	// because a still-running exec can have any state at all in its meta.
-	if deps.LeaseHeld != nil && deps.LeaseHeld(m.Target()) {
+	//
+	// LeaseKey, not Target: a --description run holds a lock named for its
+	// description but reports a local-tracker identifier as its target, and
+	// asking about the wrong lock name answers "not held" — which reads as
+	// permission to delete a live worker's directory.
+	if deps.LeaseHeld != nil && deps.LeaseHeld(m.LeaseKey()) {
 		c.Reason = "a worker still holds this task's lease"
 		return c
 	}
@@ -184,12 +233,21 @@ func gcWorktree(ctx context.Context, deps GCDeps, opts GCOptions, m RunMeta, log
 			m.State, m.StaleFor(time.Now().UTC()).Truncate(time.Second))
 		return c
 	}
-	if m.PRURL == "" {
+	prURL := m.PRURL
+	if prURL == "" {
+		// Recover rather than give up. A run records its PR at shutdown, which
+		// is exactly when a transient gh/GitHub failure is most likely — and
+		// without a second chance that one bad minute would strand the worktree
+		// on disk forever, since nothing ever revisits a terminal run's meta.
+		// The branch is recorded independently, so the PR is still findable.
+		prURL = resolvePRForBranch(ctx, deps, m)
+	}
+	if prURL == "" {
 		c.Reason = "no PR recorded; cannot prove the work landed"
 		return c
 	}
 
-	merged, err := deps.PR.Merged(ctx, m.PRURL)
+	merged, err := deps.PR.Merged(ctx, prURL)
 	if err != nil {
 		// Fail closed. An unreachable GitHub is not evidence a PR landed.
 		c.Reason = fmt.Sprintf("could not determine PR state: %v", err)

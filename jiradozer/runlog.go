@@ -80,6 +80,15 @@ type RunMeta struct {
 	TaskID      string `json:"task_id,omitempty"`
 	Description string `json:"description,omitempty"`
 
+	// LeaseTarget is the flock lock this run actually holds. It is recorded
+	// rather than re-derived because Target() and the lease can legitimately
+	// disagree: a --description run leases a name derived from the description
+	// (the dispatcher must compute it before the worker exists) and only later
+	// acquires a local-tracker identifier, which is what Target() then reports.
+	// Anything asking "is a worker still alive on this task" must use THIS —
+	// asking about the wrong lock name silently answers "no".
+	LeaseTarget string `json:"lease_target,omitempty"`
+
 	Repo         string `json:"repo"`
 	WTRoot       string `json:"wt_root,omitempty"`
 	Branch       string `json:"branch,omitempty"`
@@ -117,6 +126,24 @@ func (m RunMeta) Target() string {
 		return m.TaskID
 	}
 	return m.RunID
+}
+
+// LeaseKey names the lock this run holds, for a liveness check.
+//
+// It falls back to Target() only for records written before LeaseTarget
+// existed, where the two did coincide for issue and task runs.
+func (m RunMeta) LeaseKey() string {
+	if m.LeaseTarget != "" {
+		return m.LeaseTarget
+	}
+	return m.Target()
+}
+
+// Matches reports whether this run answers to name — its issue identifier, its
+// task id, or the lease the dispatcher named it by. All three are printed to
+// operators at some point, so all three have to find the run again.
+func (m RunMeta) Matches(name string) bool {
+	return name == m.IssueIdentifier || name == m.TaskID || name == m.LeaseTarget
 }
 
 // StaleFor reports how far past its expected heartbeat a non-terminal run is,
