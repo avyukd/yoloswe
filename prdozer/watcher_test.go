@@ -2852,6 +2852,32 @@ func TestRecordHealth_ChargesPushesThatEndedInFailure(t *testing.T) {
 	}
 }
 
+// The failure itself is never what gets billed — the push is.
+//
+// Read twice now as "provider outages are charged as prdozer scope growth",
+// because Transient sits on the billable side of pushedCommits' switch. It is
+// only reachable there when the head MOVED, which for a died-on-529 invocation
+// means it pushed before it died. An outage that pushed nothing leaves the head
+// where it was and costs zero — asserted here so the answer lives in the suite
+// rather than in a review thread.
+func TestRecordHealth_AnOutageThatPushedNothingCostsNothing(t *testing.T) {
+	t.Parallel()
+	for _, action := range []LastAction{LastActionFailed, LastActionStalled, LastActionTransient} {
+		t.Run(string(action), func(t *testing.T) {
+			t.Parallel()
+			w := NewWatcher(DefaultConfig(), nil, nil, 42, ".", "r", nil)
+			state := &State{
+				LastAction: action, LastSeenHeadSHA: "head1", LastSeenCommitCount: 4,
+			}
+
+			w.recordHealth(state, scopeSnapshot("head1", 4, 100))
+
+			assert.Zero(t, state.PolishCommits,
+				"the round died without pushing; there is no growth to charge")
+		})
+	}
+}
+
 // The other side of the same rule: ticks where no agent ran are never charged,
 // so a human pushing to an idle PR does not spend prdozer's budget.
 func TestRecordHealth_TicksWithoutAnAgentAreNeverCharged(t *testing.T) {
