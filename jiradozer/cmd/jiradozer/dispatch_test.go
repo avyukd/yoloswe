@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -172,24 +173,80 @@ func TestDispatchProbesForTheLeaseNameTheWorkerWillHold(t *testing.T) {
 // the pin the only thing standing between two workers and the same task.
 func TestPinningAHostDoesNotHideALeaseHeldElsewhere(t *testing.T) {
 	scores := []fleet.HostHealth{
-		{Host: "busy", HeldLeases: []string{"INF-1.lock"}},
-		{Host: "idle", PublicDNS: "idle.example"},
+		{Host: "busy", Reachable: true, HeldLeases: []string{"INF-1.lock"}},
+		{Host: "idle", Reachable: true, PublicDNS: "idle.example"},
 	}
 
-	_, err := narrowToPin(scores, "INF-1", "idle")
+	_, err := narrowToPin(scores, "INF-1", "idle", false)
 	require.Error(t, err, "the lease on `busy` must be found even though `idle` was pinned")
 	assert.Contains(t, err.Error(), "busy", "the operator needs to be told which box has it")
 
 	// The pin still narrows once the guard has passed, by either name form.
 	for _, pin := range []string{"idle", "IDLE.example"} {
-		out, err := narrowToPin(scores, "INF-2", pin)
+		out, err := narrowToPin(scores, "INF-2", pin, false)
 		require.NoError(t, err, "a different task is not blocked by this lease")
 		require.Len(t, out, 1, "ranking still sees only the pinned host")
 		assert.Equal(t, "idle", out[0].Host)
 	}
 
 	// And an unpinned dispatch keeps the whole fleet to rank over.
-	out, err := narrowToPin(scores, "INF-2", "")
+	out, err := narrowToPin(scores, "INF-2", "", false)
+	require.NoError(t, err)
+	assert.Len(t, out, 2)
+}
+
+// A host whose probe failed reports no leases at all, which is indistinguishable
+// from a host that genuinely holds none. So "nobody holds it" is not an answer
+// until every box has answered: a worker on an ssh-down machine would otherwise
+// be invisible, and for a --description run this lease is the only cross-host
+// exclusion there is. Same fail-closed rule `fleet runs` applies to a partial
+// view.
+func TestAnUnprobeableHostIsNotProofThatNobodyHoldsTheLease(t *testing.T) {
+	scores := []fleet.HostHealth{
+		{Host: "answered", Reachable: true},
+		{Host: "ssh-down", Err: errors.New("connection refused")},
+		{Host: "also-down", Err: errors.New("connection refused")},
+	}
+
+	_, err := narrowToPin(scores, "INF-1", "", false)
+	require.Error(t, err, "an incomplete fleet view cannot clear a task to run")
+	assert.Contains(t, err.Error(), "INF-1")
+	assert.Contains(t, err.Error(), "2 of 3")
+	assert.Contains(t, err.Error(), "also-down, ssh-down",
+		"the unreachable boxes are named, and sorted so identical fleets print identically")
+	assert.Contains(t, err.Error(), "--force", "the refusal has to say how to proceed anyway")
+
+	// --force is the documented way past an incomplete view.
+	out, err := narrowToPin(scores, "INF-1", "", true)
+	require.NoError(t, err)
+	assert.Len(t, out, 3)
+
+	// A fully-probed fleet holding no lease is a real answer, not a refusal.
+	_, err = narrowToPin([]fleet.HostHealth{{Host: "answered", Reachable: true}}, "INF-1", "", false)
+	assert.NoError(t, err)
+}
+
+// --force waves through uncertainty, never a live worker: a lease actually held
+// on a box that answered is a fact, not a stale claim.
+func TestForceDoesNotOverrideALeaseThatIsActuallyHeld(t *testing.T) {
+	scores := []fleet.HostHealth{
+		{Host: "busy", Reachable: true, HeldLeases: []string{"INF-1.lock"}},
+		{Host: "ssh-down", Err: errors.New("connection refused")},
+	}
+
+	_, err := narrowToPin(scores, "INF-1", "", true)
+	require.ErrorContains(t, err, "already running on busy")
+}
+
+// With no target there is nothing to guard, so an unreachable box must not
+// block a dispatch it has no bearing on.
+func TestAnIncompleteFleetOnlyBlocksATaskThatHasALeaseName(t *testing.T) {
+	scores := []fleet.HostHealth{
+		{Host: "answered", Reachable: true},
+		{Host: "ssh-down", Err: errors.New("connection refused")},
+	}
+
+	out, err := narrowToPin(scores, "", "", false)
 	require.NoError(t, err)
 	assert.Len(t, out, 2)
 }
@@ -199,7 +256,7 @@ func TestPinningAHostDoesNotHideALeaseHeldElsewhere(t *testing.T) {
 // let PickHost answer "no eligible host", which would send an operator looking
 // at disk and load for a name that simply did not match.
 func TestAPinThatSurvivesLoadingButNotProbingIsNamedAsSuch(t *testing.T) {
-	_, err := narrowToPin([]fleet.HostHealth{{Host: "a"}}, "INF-1", "b")
+	_, err := narrowToPin([]fleet.HostHealth{{Host: "a", Reachable: true}}, "INF-1", "b", false)
 	require.ErrorContains(t, err, `host "b"`)
 	assert.NotContains(t, err.Error(), "eligible")
 }

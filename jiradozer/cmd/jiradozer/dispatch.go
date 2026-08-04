@@ -94,7 +94,7 @@ func newDispatchCmd(x *execArgs) *cobra.Command {
 			// way here would silently disable this check for exactly the case
 			// that has no tracker-side claim to fall back on.
 			target := leaseTarget(*x)
-			scores, err = narrowToPin(scores, target, host)
+			scores, err = narrowToPin(scores, target, host, x.force)
 			if err != nil {
 				return err
 			}
@@ -146,7 +146,7 @@ func newDispatchCmd(x *execArgs) *cobra.Command {
 	f.StringVar(&x.skipPhases, "skip-phases", "", "Comma-separated phases to skip")
 	f.StringVar(&x.autoApprove, "auto-approve", "", "Auto-approve review gates")
 	f.Float64Var(&x.maxBudget, "max-budget", 0, "Override max_budget_usd")
-	f.BoolVar(&x.force, "force", false, "Proceed even when the issue is already claimed")
+	f.BoolVar(&x.force, "force", false, "Proceed past a stale claim, or past a fleet that could not be fully probed (never past a lease actually held)")
 	f.StringVar(&host, "host", "", "Pin a specific devbox instead of ranking the fleet")
 	f.BoolVar(&here, "here", false, "Run on this box without probing")
 	f.BoolVar(&dryRun, "dry-run", false, "Print the score table and the exact SSH command, then exit")
@@ -254,11 +254,25 @@ func filterHosts(hosts []fleet.Host, name string) []fleet.Host {
 // bypass it — pin the idle box and the busy one is simply not in the slice
 // being searched — and for a --description run, which has no tracker-side claim
 // to fall back on, the lease is the ONLY fleet-wide exclusion there is.
-func narrowToPin(scores []fleet.HostHealth, target, pin string) ([]fleet.HostHealth, error) {
+func narrowToPin(scores []fleet.HostHealth, target, pin string, force bool) ([]fleet.HostHealth, error) {
 	if target != "" {
 		if holder, busy := fleet.FindLeaseHolder(scores, target); busy {
+			// Not overridable by --force. A held lease is a live worker on a
+			// box that answered, which is a different thing from the stale
+			// tracker label --force exists to wave through.
 			return nil, fmt.Errorf("%s is already running on %s (lease held); use `jiradozer runs --issue %s --json` there to check on it",
 				target, holder.Host, target)
+		}
+		// "Nobody holds it" is only an ANSWER if every box was asked. A host
+		// whose probe failed reports no leases at all — indistinguishable from
+		// a host that genuinely holds none — so a worker on an ssh-down box is
+		// invisible here, and for a --description run this lease is the only
+		// cross-host exclusion there is. Fail closed, exactly as `fleet runs`
+		// does when part of the fleet cannot be read: a partial view that reads
+		// as complete is how "nothing is running" becomes a wrong answer.
+		if down := unreachableHosts(scores); len(down) > 0 && !force {
+			return nil, fmt.Errorf("cannot rule out a second run of %s: %d of %d hosts could not be probed (%s); retry when they answer, or pass --force to dispatch on an incomplete fleet view",
+				target, len(down), len(scores), strings.Join(down, ", "))
 		}
 	}
 	if pin == "" {
@@ -278,6 +292,21 @@ func narrowToPin(scores []fleet.HostHealth, target, pin string) ([]fleet.HostHea
 		return nil, fmt.Errorf("host %q matched the fleet but not its probe results", pin)
 	}
 	return out, nil
+}
+
+// unreachableHosts names the boxes whose probe did not come back, so the caller
+// can say WHICH part of the fleet it could not see. Sorted, because the probe
+// runs concurrently and an error message that reorders between identical runs
+// is one an operator cannot diff.
+func unreachableHosts(scores []fleet.HostHealth) []string {
+	var out []string
+	for i := range scores {
+		if !scores[i].Reachable {
+			out = append(out, scores[i].Host)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 func printScores(w interface{ Write([]byte) (int, error) }, scores []fleet.HostHealth, opts fleet.ProbeOptions) {
