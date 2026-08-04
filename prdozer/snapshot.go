@@ -75,13 +75,26 @@ type PRDetails struct {
 	Mergeable         string           `json:"mergeable"`
 	StatusCheckRollup []statusCheckRow `json:"statusCheckRollup"`
 	LatestReviews     []reviewRow      `json:"latestReviews"`
-	Number            int              `json:"number"`
+	// Commits is the PR's commit list, carried only so the scope guard can
+	// measure how many commits a push actually added. Counting pushes instead
+	// under-counts badly: a polish invocation commits once per round and
+	// force-pushes ONCE at the end, so a 5-round invocation reads as a single
+	// commit and a cap of 12 would sit ~60 commits deep before firing.
+	Commits []commitRow `json:"commits"`
+	Number  int         `json:"number"`
 	// Additions/Deletions/ChangedFiles size the PR's diff. Fetched in the same
 	// gh call as everything else, so the scope guard costs no extra round trip.
 	Additions    int  `json:"additions"`
 	Deletions    int  `json:"deletions"`
 	ChangedFiles int  `json:"changedFiles"`
 	IsDraft      bool `json:"isDraft"`
+}
+
+// commitRow is one entry in gh's commits list. Only the count is ever read —
+// the guard needs to know how many commits arrived, not what is in them — but
+// gh exposes no count-only field, so the list is decoded and measured.
+type commitRow struct {
+	OID string `json:"oid"`
 }
 
 // reviewRow is one entry in gh's latestReviews: the most recent review per
@@ -275,7 +288,7 @@ func changesRequestedBy(reviews []reviewRow) []string {
 func fetchPRDetails(ctx context.Context, gh wt.GHRunner, dir string, n int) (*PRDetails, error) {
 	args := []string{
 		"pr", "view", strconv.Itoa(n),
-		"--json", "number,url,headRefName,baseRefName,headRefOid,state,isDraft,reviewDecision,mergeable,statusCheckRollup,latestReviews,additions,deletions,changedFiles",
+		"--json", "number,url,headRefName,baseRefName,headRefOid,state,isDraft,reviewDecision,mergeable,statusCheckRollup,latestReviews,additions,deletions,changedFiles,commits",
 	}
 	res, err := gh.Run(ctx, args, dir)
 	if err != nil {

@@ -302,6 +302,19 @@ func terminalFor(res TickResult, pr DiscoveredPR) (TerminalState, string, bool) 
 				"PR #%d stalled: %d polish invocations produced no completed round, so the run was halted rather than burning further attempts. Nothing is wrong with the PR itself — check the agent backend. Last error: %s",
 				pr.Number, res.InvocationsSinceRound, res.StallError), true
 		}
+		// Ordered ahead of divergence to mirror decideAndAct, where the scope
+		// guard is evaluated first. The two cannot both fire in one tick today,
+		// and keeping the precedence identical in both places is what keeps that
+		// true if either guard's condition ever widens.
+		if res.Ratcheted {
+			// The fourth kind, and the one the generic message inverts: every
+			// round SUCCEEDED. Saying "blocked on a review approval" would send
+			// the operator to find a reviewer, when the PR's problem is that it
+			// has already grown past what one review can usefully cover.
+			return TerminalNeedsHuman, fmt.Sprintf(
+				"PR #%d grew past its scope cap: prdozer's own rounds have added %d commits (limit %d, %d rounds total). Nothing failed — every round succeeded, which is why no other guard caught it. Decide what to cut or split before resuming.",
+				pr.Number, res.PolishCommits, res.PolishCommitLimit, res.PolishRounds), true
+		}
 		if res.Diverged {
 			// Report the streak the guard tripped on, NOT the run's cumulative
 			// PolishRounds: a run that improved several times before stalling

@@ -151,6 +151,14 @@ type TickResult struct {
 	// reported for the same reason RoundsSinceImprovement is: the operator needs
 	// the number that actually caused the stop.
 	InvocationsSinceRound int
+	// PolishCommits is the count the scope guard trips on, reported alongside
+	// Ratcheted for the same reason: "this PR needs a human" is unactionable
+	// without the number that made it true.
+	PolishCommits int
+	// PolishCommitLimit is the configured cap, carried so the report can say how
+	// far past it the PR went rather than quoting a bare count the operator
+	// would have to look up in config to interpret.
+	PolishCommitLimit int
 	// Diverged reports that NeedsHuman was reached because the PR stopped
 	// improving, rather than because it is waiting on an approval. The two need
 	// opposite responses, so the notification must tell them apart.
@@ -161,6 +169,12 @@ type TickResult struct {
 	// third distinct response: nothing about the PR is wrong, the agent never
 	// came back.
 	Stalled bool
+	// Ratcheted reports that NeedsHuman was reached because polish grew the PR
+	// past its scope cap. A fourth distinct cause, and the one least like the
+	// others: nothing failed, nothing stalled, nothing stopped improving — every
+	// round succeeded, and that is the problem. The response is a human deciding
+	// what to cut, not a reviewer approving another round.
+	Ratcheted bool
 }
 
 func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
@@ -255,7 +269,9 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 		Diverged: w.diverged, PolishRounds: state.PolishRounds,
 		RoundsSinceImprovement: state.RoundsSinceImprovement,
 		Stalled:                w.stalled, StallError: w.lastStallError,
-		InvocationsSinceRound: state.InvocationsSinceRound}
+		InvocationsSinceRound: state.InvocationsSinceRound,
+		Ratcheted:             w.ratcheted, PolishCommits: state.PolishCommits,
+		PolishCommitLimit: w.cfg.Backoff.MaxPolishCommits}
 	if w.recordSnapshot(state, snap, action, mergeStateDirty || healthDirty) {
 		if err := state.Save(statePath); err != nil {
 			// State save failure is serious: the action already ran (maybe merged
@@ -899,34 +915,24 @@ func (w *Watcher) diverging(snap *Snapshot, state *State) bool {
 // guard trips one tick later than the round that actually caused the
 // divergence.
 func (w *Watcher) recordHealth(state *State, snap *Snapshot) bool {
-	h, ok := snap.Health()
-	if !ok {
-		return false
-	}
 	// A round counts only when one is actually outstanding — i.e. the PREVIOUS
 	// tick polished and this snapshot is the first look at its result. Charging
 	// on the current action instead would mis-attribute by one tick; charging on
 	// every tick would count a PR that is merely waiting for CI, having done no
 	// work at all.
 	polished := state.LastAction == LastActionPolished
-	if polished {
-		// Cumulative: counted whether or not the round helped, so the terminal
-		// report can say how much work the run did as well as how long it has
-		// been stuck.
-		state.PolishRounds++
-		// A polished tick whose head moved means the round PUSHED. Counted from
-		// the head actually changing rather than from the round returning: a
-		// round that only replied to comments has not grown the PR, and the
-		// scope brake is about growth. Cumulative per PR, never reset.
-		if state.LastSeenHeadSHA != "" && snap.PR.HeadRefOid != "" &&
-			state.LastSeenHeadSHA != snap.PR.HeadRefOid {
-			state.PolishCommits++
-		}
-	}
-	// Record where this PR started so growth is reported against its real
-	// baseline rather than against zero. First observation only.
-	if state.BaselineAdditions == 0 && snap.PR.Additions > 0 {
-		state.BaselineAdditions = snap.PR.Additions
+	// Work accounting runs BEFORE the health gate and independently of it.
+	// snap.Health() is unreadable whenever the unresolved-thread lookup fails,
+	// and recordSnapshot advances LastSeenHeadSHA and LastSeenCommitCount at the
+	// end of the tick either way — so a push charged after the gate is lost for
+	// good on such a tick, and the scope brake would silently under-count the
+	// very commits it exists to stop. The round happened; a failed side query
+	// does not un-happen it.
+	workDirty := w.recordPolishWork(state, snap, polished)
+
+	h, ok := snap.Health()
+	if !ok {
+		return workDirty
 	}
 	if state.BestHealth == nil || h.BetterThan(*state.BestHealth) {
 		state.BestHealth = &h
@@ -936,7 +942,59 @@ func (w *Watcher) recordHealth(state *State, snap *Snapshot) bool {
 	if polished {
 		state.RoundsSinceImprovement++
 	}
-	return polished
+	return polished || workDirty
+}
+
+// recordPolishWork charges this tick against the run's cumulative work counters
+// and the PR's scope budget, reporting whether it changed anything persistable.
+//
+// Split out of recordHealth so it can run before — and regardless of — the
+// health gate: a tick whose thread lookup failed still saw the round, and the
+// scope brake is only as good as the pushes it manages to count.
+func (w *Watcher) recordPolishWork(state *State, snap *Snapshot, polished bool) bool {
+	dirty := false
+	if polished {
+		// Cumulative: counted whether or not the round helped, so the terminal
+		// report can say how much work the run did as well as how long it has
+		// been stuck.
+		state.PolishRounds++
+		state.PolishCommits += pushedCommits(state, snap)
+		dirty = true
+	}
+	// Record where this PR started so growth is reported against its real
+	// baseline rather than against zero. First observation only.
+	if state.BaselineAdditions == 0 && snap.PR.Additions > 0 {
+		state.BaselineAdditions = snap.PR.Additions
+		dirty = true
+	}
+	return dirty
+}
+
+// pushedCommits reports how many commits the previous polish round added.
+//
+// Keyed off the head actually moving rather than off the round returning: a
+// round that only replied to comments has not grown the PR, and the scope brake
+// is about growth.
+//
+// The SIZE of the push comes from the commit count, not from the fact of the
+// push. A polish invocation commits once per round and force-pushes once at the
+// end, so charging one per push reads five rounds of growth as a single commit
+// — a cap of 12 would then sit ~60 commits deep, well past the 23 that made the
+// guard necessary.
+func pushedCommits(state *State, snap *Snapshot) int {
+	if state.LastSeenHeadSHA == "" || snap.PR.HeadRefOid == "" ||
+		state.LastSeenHeadSHA == snap.PR.HeadRefOid {
+		return 0
+	}
+	// Floor of one. The count is unusable when gh served no commit list, or when
+	// state predates the field, or when a rebase or squash left the branch no
+	// longer than it was — but the head moved, so a round's worth of growth did
+	// happen and charging zero would hand a squashing run an unlimited budget.
+	now := len(snap.PR.Commits)
+	if now == 0 || state.LastSeenCommitCount <= 0 || now <= state.LastSeenCommitCount {
+		return 1
+	}
+	return now - state.LastSeenCommitCount
 }
 
 // merge lands the PR according to the configured policy and then VERIFIES the
@@ -1023,6 +1081,14 @@ func (w *Watcher) recordSnapshot(s *State, snap *Snapshot, action LastAction, me
 
 	if s.LastSeenHeadSHA != snap.PR.HeadRefOid {
 		s.LastSeenHeadSHA = snap.PR.HeadRefOid
+		dirty = true
+	}
+	// Only when gh actually served a commit list: an empty one means the field
+	// was missing, not that the PR lost its commits, and overwriting a real
+	// count with zero would charge the next push a floor of one instead of its
+	// true size.
+	if n := len(snap.PR.Commits); n > 0 && s.LastSeenCommitCount != n {
+		s.LastSeenCommitCount = n
 		dirty = true
 	}
 	if snap.BaseSHA != "" && s.LastSeenBaseSHA != snap.BaseSHA {

@@ -171,6 +171,11 @@ type State struct {
 	// ticks while the diff grew sixfold. A run can be perfectly healthy by every
 	// existing measure and still ratchet scope indefinitely.
 	PolishCommits int `json:"polish_commits,omitempty"`
+	// LastSeenCommitCount is how many commits the PR carried at the last tick,
+	// so the next push can be charged for every commit it added rather than for
+	// one. A polish invocation commits per round and pushes once, so charging
+	// per push would let five rounds count as a single commit.
+	LastSeenCommitCount int `json:"last_seen_commit_count,omitempty"`
 	// BaselineAdditions is the PR's diff size when prdozer first saw it, so
 	// growth can be reported against where the PR actually started rather than
 	// against zero.

@@ -1,11 +1,11 @@
 package prdozer
 
 import (
-	"strings"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -552,10 +552,10 @@ func TestEndsTheRun_MatchesTerminalFor(t *testing.T) {
 // selfLoginGH records whether the loop asked who it is authenticated as, and
 // serves a login when it does.
 type selfLoginGH struct {
-	mu     sync.Mutex
-	asked  bool
 	ticked chan struct{}
+	mu     sync.Mutex
 	once   sync.Once
+	asked  bool
 }
 
 func (g *selfLoginGH) Run(_ context.Context, args []string, _ string) (*wt.CmdResult, error) {
@@ -614,4 +614,31 @@ func TestBabysitLoop_ResolvesSelfLoginForCommentFiltering(t *testing.T) {
 	assert.True(t, gh.askedForLogin(),
 		"the loop must resolve its own login, or every self-reply reads as a new comment "+
 			"and triggers another polish round")
+}
+
+// A scope stop is the fourth kind of LastActionNeedsHuman, and the one the
+// generic message inverts outright: every round SUCCEEDED. "Blocked on a review
+// approval" sends the operator to find a reviewer, when what the PR needs is
+// someone to decide what to cut — the same misdiagnosis Diverged and Stalled
+// were added to prevent.
+func TestTerminalFor_RatchetedSaysWhy(t *testing.T) {
+	t.Parallel()
+	pr := DiscoveredPR{Number: 42}
+
+	state, msg, done := terminalFor(TickResult{
+		Action: LastActionNeedsHuman, Ratcheted: true,
+		PolishCommits: 23, PolishCommitLimit: 12, PolishRounds: 7,
+	}, pr)
+	require.True(t, done)
+	assert.Equal(t, TerminalNeedsHuman, state)
+	assert.Contains(t, msg, "scope cap")
+	assert.Contains(t, msg, "23 commits", "the operator needs the number that tripped the guard")
+	assert.Contains(t, msg, "limit 12")
+	assert.NotContains(t, msg, "review approval",
+		"nothing here is waiting on a reviewer")
+
+	_, plain, done := terminalFor(TickResult{Action: LastActionNeedsHuman}, pr)
+	require.True(t, done)
+	assert.NotContains(t, plain, "scope cap",
+		"a PR blocked on an approval must not be reported as over-scoped")
 }

@@ -225,7 +225,6 @@ func parsePRList(s string) ([]int, error) {
 	return out, nil
 }
 
-
 // repoNameFromCwd derives a short repo identifier to namespace state files.
 // Preference order:
 //  1. `git remote get-url origin` → basename of the repo URL (strip .git).

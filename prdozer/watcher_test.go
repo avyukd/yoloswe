@@ -2291,3 +2291,225 @@ func TestWatcher_ScopeRatchet_ZeroDisables(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEqual(t, LastActionNeedsHuman, res.Action, "zero must disable the guard")
 }
+
+// The scope guard is only as good as the pushes it manages to count, so the
+// counter has its own tests — the three above pre-seed PolishCommits and never
+// exercise the code that produces it.
+//
+// scopeSnapshot is a snapshot with the fields the counter reads, and nothing
+// else: head, commit list, diff size.
+func scopeSnapshot(head string, commits, additions int) *Snapshot {
+	rows := make([]commitRow, commits)
+	for i := range rows {
+		rows[i] = commitRow{OID: fmt.Sprintf("c%d", i)}
+	}
+	return &Snapshot{PR: PRDetails{HeadRefOid: head, Commits: rows, Additions: additions}}
+}
+
+// A push is charged for every commit it carried, not for the fact of the push.
+//
+// This is the difference between a cap that works and one that never fires: a
+// polish invocation commits once per round and force-pushes ONCE at the end, so
+// per-push counting reads a 5-round invocation as a single commit. A limit of
+// 12 would then sit around 60 commits deep — three times the 23 that made the
+// guard necessary in the first place.
+func TestRecordHealth_ChargesEveryCommitInAPush(t *testing.T) {
+	t.Parallel()
+	w := NewWatcher(DefaultConfig(), nil, nil, 42, ".", "r", nil)
+	state := &State{
+		LastAction: LastActionPolished, LastSeenHeadSHA: "head1",
+		LastSeenCommitCount: 4,
+	}
+
+	w.recordHealth(state, scopeSnapshot("head2", 9, 100))
+
+	assert.Equal(t, 5, state.PolishCommits,
+		"a push that added five commits costs five, not one")
+	assert.Equal(t, 1, state.PolishRounds)
+}
+
+// A tick whose health is unreadable must still charge the push.
+//
+// Health() reports !ok whenever the unresolved-thread lookup failed, and
+// recordSnapshot advances LastSeenHeadSHA and LastSeenCommitCount at the end of
+// the tick regardless — so a push charged behind the health gate is not merely
+// deferred, it is lost, and the run gets those commits for free.
+func TestRecordHealth_ChargesPushWhenHealthIsUnreadable(t *testing.T) {
+	t.Parallel()
+	w := NewWatcher(DefaultConfig(), nil, nil, 42, ".", "r", nil)
+	snap := scopeSnapshot("head2", 6, 100)
+	snap.UnresolvedThreads = -1 // the thread query failed
+	_, ok := snap.Health()
+	require.False(t, ok, "guarding the premise: this snapshot must be unreadable")
+
+	state := &State{
+		LastAction: LastActionPolished, LastSeenHeadSHA: "head1",
+		LastSeenCommitCount: 2,
+	}
+
+	dirty := w.recordHealth(state, snap)
+
+	assert.Equal(t, 4, state.PolishCommits,
+		"a failed side query does not un-happen the round that pushed")
+	assert.True(t, dirty, "the new count must be persisted, or the next tick reloads without it")
+}
+
+// A round that only replied to comments has not grown the PR, and the scope
+// brake is about growth.
+func TestRecordHealth_UnmovedHeadCostsNothing(t *testing.T) {
+	t.Parallel()
+	w := NewWatcher(DefaultConfig(), nil, nil, 42, ".", "r", nil)
+	state := &State{
+		LastAction: LastActionPolished, LastSeenHeadSHA: "head1",
+		LastSeenCommitCount: 4,
+	}
+
+	w.recordHealth(state, scopeSnapshot("head1", 4, 100))
+
+	assert.Zero(t, state.PolishCommits, "no push, no growth, no charge")
+	assert.Equal(t, 1, state.PolishRounds, "the round still ran")
+}
+
+// A rebase or squash can leave the branch no longer than it was. The head moved,
+// so a round's worth of growth happened; charging zero would hand a squashing
+// run an unlimited budget. Same floor covers a gh payload with no commit list
+// and state written before the field existed.
+func TestRecordHealth_ShrinkingPushStillCostsOne(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name          string
+		commits, seen int
+	}{
+		{"squashed", 2, 7},
+		{"no commit list from gh", 0, 7},
+		{"state predates the field", 9, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			w := NewWatcher(DefaultConfig(), nil, nil, 42, ".", "r", nil)
+			state := &State{
+				LastAction: LastActionPolished, LastSeenHeadSHA: "head1",
+				LastSeenCommitCount: tc.seen,
+			}
+			w.recordHealth(state, scopeSnapshot("head2", tc.commits, 100))
+			assert.Equal(t, 1, state.PolishCommits,
+				"an uncountable push still costs the floor of one")
+		})
+	}
+}
+
+// Only prdozer's own rounds are charged: a human pushing to the branch between
+// ticks must not spend the budget prdozer is being held to.
+func TestRecordHealth_OnlyPolishedTicksAreCharged(t *testing.T) {
+	t.Parallel()
+	w := NewWatcher(DefaultConfig(), nil, nil, 42, ".", "r", nil)
+	state := &State{
+		LastAction: LastActionIdle, LastSeenHeadSHA: "head1",
+		LastSeenCommitCount: 4,
+	}
+
+	w.recordHealth(state, scopeSnapshot("head2", 9, 100))
+
+	assert.Zero(t, state.PolishCommits, "prdozer did not push this")
+	assert.Zero(t, state.PolishRounds)
+}
+
+// The counter must survive a full tick: recordHealth charges the push, and
+// recordSnapshot then advances the baselines it charged against, so the next
+// tick starts from the new head and count rather than double-charging.
+func TestWatcher_Tick_ScopeCounterAdvancesAcrossTicks(t *testing.T) {
+	pushed := buildPRJSON(`{
+  "number": 42,
+  "url": "https://github.com/o/r/pull/42",
+  "headRefName": "feature",
+  "baseRefName": "main",
+  "headRefOid": "head2",
+  "state": "OPEN",
+  "isDraft": false,
+  "reviewDecision": "REVIEW_REQUIRED",
+  "mergeable": "MERGEABLE",
+  "additions": 900,
+  "commits": [{"oid":"c1"},{"oid":"c2"},{"oid":"c3"},{"oid":"c4"},{"oid":"c5"}]
+}`, "FAILURE")
+	gh := setupGH(pushed, "[]", "base1")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	statePath := StatePath("r", 42)
+
+	// The previous tick polished and the round pushed three commits onto the
+	// two the PR already had.
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		LastSeenCommitCount: 2, LastAction: LastActionPolished,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	_, err := w.Tick(context.Background())
+	require.NoError(t, err)
+
+	after, err := LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 3, after.PolishCommits, "three commits arrived on that push")
+	assert.Equal(t, 5, after.LastSeenCommitCount, "the baseline moves to what was just seen")
+	assert.Equal(t, "head2", after.LastSeenHeadSHA)
+
+	// A second tick with nothing new must not re-charge the same push.
+	_, err = w.Tick(context.Background())
+	require.NoError(t, err)
+	after, err = LoadState(statePath)
+	require.NoError(t, err)
+	assert.Equal(t, 3, after.PolishCommits, "the same push must not be charged twice")
+}
+
+// The stop must reach the operator as a SCOPE stop. The guard sets w.ratcheted
+// precisely because "needs a human" otherwise reads as "waiting on an approval",
+// and a flag nothing carries out of the tick cannot do that.
+func TestWatcher_ScopeRatchet_ReportsItselfOnTheResult(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxPolishCommits = 3
+	statePath := StatePath("r", 42)
+
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		PolishCommits: 4,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, LastActionNeedsHuman, res.Action)
+	assert.True(t, res.Ratcheted,
+		"without this the terminal report calls a scope stop an approval block")
+	assert.Equal(t, 4, res.PolishCommits)
+	assert.Equal(t, 3, res.PolishCommitLimit)
+	assert.False(t, res.Diverged, "the scope guard fired, not the divergence guard")
+}
+
+// The scope guard must not block a PR that is already DONE.
+//
+// It sits below the mergeable branches in decideAndAct, which reads like a
+// bypass and was flagged as one. It is deliberate: the guard exists to stop
+// FURTHER polishing, and a mergeable PR is APPROVED with checks green — a human
+// has already looked at the scope and said yes. Hoisting the guard above the
+// merge would strand exactly the PRs that grew large and then got reviewed
+// anyway, leaving them needing a human for a decision a human just made.
+func TestWatcher_ScopeRatchet_DoesNotBlockAnApprovedGreenPR(t *testing.T) {
+	gh := approvedGreenGH("true")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Polish.AutoMerge = true
+	w.cfg.Polish.MergePolicy = MergePolicySquash
+	w.cfg.Backoff.MaxPolishCommits = 3
+	statePath := StatePath("r", 42)
+
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		PolishCommits: 99, // far past the cap
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionMerged, res.Action,
+		"an approved, green PR is finished; the scope brake stops polishing, not merging")
+	assert.False(t, res.Ratcheted)
+}
