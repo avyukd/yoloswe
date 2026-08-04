@@ -137,11 +137,13 @@ func (b *Babysitter) Run(ctx context.Context) (state TerminalState, err error) {
 	return state, nil
 }
 
-// loop ticks the watcher until the PR reaches a terminal state.
-func (b *Babysitter) loop(ctx context.Context, rc *RunContext, runLog *RunLog, pr DiscoveredPR) (TerminalState, string) {
+// newWatcher builds the watcher loop drives.
+//
+// Split out of loop so the wiring can be asserted directly. The bug that made
+// this whole path worth testing was an option that was simply never passed, and
+// nothing observable from outside a running loop would have caught it.
+func (b *Babysitter) newWatcher(ctx context.Context, rc *RunContext, runLog *RunLog) *Watcher {
 	o := b.opts
-	cfg := b.watcherConfig(rc)
-
 	polish := PolishRunner(NewAgentPolisher(b.renderer, b.logger))
 	rework := ReworkRunner(NewAgentRework(b.renderer, b.logger, runLog))
 
@@ -163,12 +165,18 @@ func (b *Babysitter) loop(ctx context.Context, rc *RunContext, runLog *RunLog, p
 			"error", safeErrString(err))
 	}
 
-	w := NewWatcher(cfg, b.gh, polish, o.PRNumber, rc.WorktreePath, o.OwnerRepo, b.logger,
+	return NewWatcher(b.watcherConfig(rc), b.gh, polish, o.PRNumber, rc.WorktreePath, o.OwnerRepo, b.logger,
 		WithRenderer(b.renderer),
 		WithRework(rework, o.Entry.MergeRework),
 		WithPolishSpec(o.Entry.Polish),
 		WithSelfLogin(self),
 	)
+}
+
+// loop ticks the watcher until the PR reaches a terminal state.
+func (b *Babysitter) loop(ctx context.Context, rc *RunContext, runLog *RunLog, pr DiscoveredPR) (TerminalState, string) {
+	o := b.opts
+	w := b.newWatcher(ctx, rc, runLog)
 
 	interval := o.PollInterval
 	if interval <= 0 {

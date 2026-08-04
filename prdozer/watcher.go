@@ -958,7 +958,10 @@ func (w *Watcher) recordPolishWork(state *State, snap *Snapshot, polished bool) 
 		// report can say how much work the run did as well as how long it has
 		// been stuck.
 		state.PolishRounds++
-		state.PolishCommits += pushedCommits(state, snap)
+		dirty = true
+	}
+	if n := pushedCommits(state, snap); n > 0 {
+		state.PolishCommits += n
 		dirty = true
 	}
 	// Record where this PR started so growth is reported against its real
@@ -970,7 +973,13 @@ func (w *Watcher) recordPolishWork(state *State, snap *Snapshot, polished bool) 
 	return dirty
 }
 
-// pushedCommits reports how many commits the previous polish round added.
+// pushedCommits reports how many commits prdozer's previous round added.
+//
+// Charged for BOTH agent actions that touch the branch. Polish is the obvious
+// one; merge rework is the one that gets missed — it rebases and resolves
+// conflicts against a failed merge, pushing commits exactly like a polish round
+// — and a run that keeps failing its merge would otherwise grow for free, which
+// is the failure direction this whole guard exists to close.
 //
 // Keyed off the head actually moving rather than off the round returning: a
 // round that only replied to comments has not grown the PR, and the scope brake
@@ -981,7 +990,19 @@ func (w *Watcher) recordPolishWork(state *State, snap *Snapshot, polished bool) 
 // end, so charging one per push reads five rounds of growth as a single commit
 // — a cap of 12 would then sit ~60 commits deep, well past the 23 that made the
 // guard necessary.
+//
+// A human who pushes to the branch inside the same tick is billed to prdozer,
+// because commit authorship cannot tell the two apart: prdozer commits under
+// the operator's own git identity, so the author login is identical either way.
+// The bias is deliberate rather than merely tolerated — this is a brake, and
+// over-charging stops a run early where under-charging lets it ratchet, which
+// is the outcome that cost five days and $364.
 func pushedCommits(state *State, snap *Snapshot) int {
+	switch state.LastAction {
+	case LastActionPolished, LastActionReworked:
+	default:
+		return 0
+	}
 	if state.LastSeenHeadSHA == "" || snap.PR.HeadRefOid == "" ||
 		state.LastSeenHeadSHA == snap.PR.HeadRefOid {
 		return 0

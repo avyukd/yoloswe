@@ -2513,3 +2513,23 @@ func TestWatcher_ScopeRatchet_DoesNotBlockAnApprovedGreenPR(t *testing.T) {
 		"an approved, green PR is finished; the scope brake stops polishing, not merging")
 	assert.False(t, res.Ratcheted)
 }
+
+// Merge rework grows the PR too, and is the easier one to forget.
+//
+// It runs an agent against the branch to rebase or resolve conflicts against a
+// failed merge, pushing commits exactly like a polish round does. Charging only
+// LastActionPolished lets a run that keeps failing its merge ratchet for free —
+// the same unbounded growth the guard exists to stop, reached by the other door.
+func TestRecordHealth_ChargesMergeReworkPushes(t *testing.T) {
+	t.Parallel()
+	w := NewWatcher(DefaultConfig(), nil, nil, 42, ".", "r", nil)
+	state := &State{
+		LastAction: LastActionReworked, LastSeenHeadSHA: "head1",
+		LastSeenCommitCount: 4,
+	}
+
+	w.recordHealth(state, scopeSnapshot("head2", 6, 100))
+
+	assert.Equal(t, 2, state.PolishCommits, "a rework that pushed twice costs two")
+	assert.Zero(t, state.PolishRounds, "a rework is not a polish round")
+}

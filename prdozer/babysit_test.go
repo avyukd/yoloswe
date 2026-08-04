@@ -642,3 +642,36 @@ func TestTerminalFor_RatchetedSaysWhy(t *testing.T) {
 	assert.NotContains(t, plain, "scope cap",
 		"a PR blocked on an approval must not be reported as over-scoped")
 }
+
+// The watcher babysit builds must carry the self login.
+//
+// Asserted on the constructed watcher rather than through a running loop
+// because the bug was an option that was simply never passed: w.self stayed "",
+// no comment was ever marked IsSelf, and NewComments — an unconditional polish
+// trigger — fired on prdozer's own replies. A test that only checks the `gh api
+// user` call still passes with WithSelfLogin deleted, which is the exact
+// regression it is meant to catch.
+func TestBabysitNewWatcher_CarriesSelfLoginIntoTheWatcher(t *testing.T) {
+	t.Parallel()
+	gh := &selfLoginGH{ticked: make(chan struct{})}
+	b := NewBabysitter(gh, nil, nil, nil, BabysitOptions{OwnerRepo: "o/r", PRNumber: 42})
+
+	w := b.newWatcher(context.Background(), &RunContext{WorktreePath: t.TempDir()}, nil)
+
+	assert.Equal(t, "mzhaom", w.self,
+		"without the login every self-reply reads as a new comment and starts another round")
+}
+
+// A login lookup that fails must disable the filter, not the run: the same
+// best-effort behaviour the orchestrator path already has.
+func TestBabysitNewWatcher_LoginFailureLeavesTheRunAlive(t *testing.T) {
+	t.Parallel()
+	gh := newFakeGH()
+	gh.failPrefix("api user", "gh: not authenticated")
+	b := NewBabysitter(gh, nil, nil, nil, BabysitOptions{OwnerRepo: "o/r", PRNumber: 42})
+
+	w := b.newWatcher(context.Background(), &RunContext{WorktreePath: t.TempDir()}, nil)
+
+	require.NotNil(t, w, "a failed lookup must not take the run down with it")
+	assert.Empty(t, w.self)
+}
