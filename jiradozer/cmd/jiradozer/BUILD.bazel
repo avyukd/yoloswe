@@ -4,6 +4,7 @@ go_library(
     name = "jiradozer_lib",
     srcs = [
         "bootstrap.go",
+        "dispatch.go",
         "exec.go",
         "gc.go",
         "main.go",
@@ -20,6 +21,7 @@ go_library(
     deps = [
         "//agent-cli-wrapper/claude/render",
         "//cliapp",
+        "//fleet",
         "//jiradozer",
         "//jiradozer/tracker",
         "//jiradozer/tracker/github",
@@ -45,6 +47,7 @@ go_test(
     name = "jiradozer_test",
     srcs = [
         "bootstrap_test.go",
+        "dispatch_test.go",
         "exec_test.go",
         "main_test.go",
         "runs_test.go",
@@ -57,6 +60,7 @@ go_test(
     deps = [
         "//agent-cli-wrapper/claude/render",
         "//cliapp",
+        "//fleet",
         "//jiradozer",
         "//jiradozer/tracker",
         "//jiradozer/tracker/local",

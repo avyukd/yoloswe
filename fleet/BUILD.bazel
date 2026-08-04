@@ -6,6 +6,7 @@ go_library(
         "dispatch.go",
         "fleet.go",
         "probe.go",
+        "quota.go",
         "runs.go",
     ],
     importpath = "github.com/bazelment/yoloswe/fleet",
