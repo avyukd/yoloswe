@@ -18,6 +18,7 @@ go_test(
     srcs = [
         "dispatch_test.go",
         "probe_test.go",
+        "runs_test.go",
     ],
     embed = [":fleet"],
     deps = [

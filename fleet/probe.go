@@ -49,8 +49,32 @@ echo "__LOAD__"; cat /proc/loadavg
 echo "__DF__"; df -P "$HOME"; df -P /mnt/nvme 2>/dev/null
 echo "__TMUX__"; tmux list-windows -a 2>/dev/null | wc -l
 echo "__LEASES__"; { cd ` + leaseDir + ` 2>/dev/null && for f in *.lock; do [ -e "$f" ] || continue; flock -n "$f" true 2>/dev/null || echo "$f"; done; } 2>/dev/null || true
-echo "__BIN__"; command -v ` + t.Name + ` || ([ -x "$HOME/bin/` + t.Name + `" ] && echo "$HOME/bin/` + t.Name + `") || ([ -x "$HOME/.local/bin/` + t.Name + `" ] && echo "$HOME/.local/bin/` + t.Name + `") || echo MISSING
+echo "__BIN__"; ` + t.resolveBinExpr() + `
 echo "__END__"`
+}
+
+// binMissing is what resolveBinExpr prints when the tool is nowhere to be
+// found. It is a sentinel rather than an empty line so a truncated section and
+// an absent binary stay distinguishable.
+const binMissing = "MISSING"
+
+// resolveBinExpr renders the shell expression that prints the tool's absolute
+// path on a target box, or binMissing.
+//
+// EVERY remote command that names the tool must resolve it through this one
+// expression. A non-interactive SSH shell's PATH contains neither ~/bin nor
+// ~/.local/bin, and both install shapes are in use: a symlink at ~/bin on boxes
+// that build the binary, and a copied artifact at ~/.local/bin on boxes
+// carrying no worktree. When two call sites resolve differently the fleet goes
+// split-brain — the probe reports a box as healthy and eligible for dispatch
+// while a gather on the same box reports "command not found", which reads as
+// "nothing is running there".
+func (t Tool) resolveBinExpr() string {
+	n := t.Name
+	return `command -v ` + n +
+		` || ([ -x "$HOME/bin/` + n + `" ] && echo "$HOME/bin/` + n + `")` +
+		` || ([ -x "$HOME/.local/bin/` + n + `" ] && echo "$HOME/.local/bin/` + n + `")` +
+		` || echo ` + binMissing
 }
 
 // HostHealth is one probed box.
@@ -275,7 +299,7 @@ func parseProbe(raw string, hh *HostHealth) error {
 			hh.HeldLeases = append(hh.HeldLeases, t)
 		}
 	}
-	if v := firstLine(sections["BIN"]); v != "" && v != "MISSING" {
+	if v := firstLine(sections["BIN"]); v != "" && v != binMissing {
 		hh.HasBinary = true
 		hh.BinaryPath = v
 	}

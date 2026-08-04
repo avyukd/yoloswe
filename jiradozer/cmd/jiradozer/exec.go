@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -148,14 +150,7 @@ func runExec(ctx context.Context, app *cliapp.App, args execArgs) (runErr error)
 	// The lease target is whatever names this task on this box. It is taken
 	// FIRST: it is kernel-backed, so it is the one claim that is correct even
 	// when this process is SIGKILLed.
-	leaseTarget := args.issueID
-	if leaseTarget == "" {
-		leaseTarget = args.taskID
-	}
-	if leaseTarget == "" {
-		leaseTarget = "adhoc-" + runID
-	}
-	lease, err := jiradozer.AcquireLease(leaseTarget)
+	lease, err := jiradozer.AcquireLease(leaseTarget(args))
 	if err != nil {
 		return err
 	}
@@ -168,13 +163,38 @@ func runExec(ctx context.Context, app *cliapp.App, args execArgs) (runErr error)
 	}()
 
 	x := &execRun{
-		app:    app,
-		logger: logger,
-		cfg:    cfg,
-		args:   args,
-		wtMgr:  wtMgr,
-		runID:  runID,
+		app:      app,
+		logger:   logger,
+		cfg:      cfg,
+		args:     args,
+		wtMgr:    wtMgr,
+		runID:    runID,
+		lookupPR: defaultPRLookup,
 	}
+
+	// exec owns its own failure reporting, for the same reason it refuses to run
+	// under an orchestrator: nothing else is watching. The EXTERNAL sink is the
+	// one that matters here — finish() already writes the error to the run-log
+	// and posts it as the end comment, so passing a tracker poster as well would
+	// duplicate that comment on every failure.
+	defer func() {
+		if !shouldReportFailure(runErr) {
+			return
+		}
+		var notifier jiradozer.Notifier
+		if cfg.Notify.SlackWebhook != "" {
+			notifier = jiradozer.SlackWebhookNotifier{WebhookURL: cfg.Notify.SlackWebhook}
+		}
+		jiradozer.ReportFailure(ctx, logger, nil, "", notifier, jiradozer.FailureReport{
+			Tool:          "jiradozer",
+			Target:        x.reportTarget(),
+			Step:          jiradozer.FailingStepFromError(runErr),
+			Err:           runErr,
+			BuildRevision: app.Build.ShortRevision(),
+			LogPath:       app.LogPath,
+		})
+	}()
+
 	return x.run(ctx)
 }
 
@@ -187,9 +207,34 @@ type execRun struct {
 	rl      *jiradozer.RunLog
 	tracker tracker.IssueTracker
 	issue   *tracker.Issue
-	runID   string
-	branch  string
-	args    execArgs
+	// lookupPR resolves the PR opened for a branch. Injected so the recording
+	// path can be tested without a GitHub round trip.
+	lookupPR func(ctx context.Context, branch, dir string) (*wt.PRInfo, error)
+	runID    string
+	branch   string
+	args     execArgs
+}
+
+// defaultPRLookup asks gh which PR exists for a branch, from inside the
+// worktree so the repository is unambiguous.
+func defaultPRLookup(ctx context.Context, branch, dir string) (*wt.PRInfo, error) {
+	return wt.GetPRByBranch(ctx, &wt.DefaultGHRunner{}, branch, dir)
+}
+
+// reportTarget names this run in a failure alert. It prefers the resolved issue
+// identifier, then whatever the caller named, so an alert is never anonymous
+// even when the failure happened before the issue was fetched.
+func (x *execRun) reportTarget() string {
+	if x.issue != nil && x.issue.Identifier != "" {
+		return x.issue.Identifier
+	}
+	if x.args.issueID != "" {
+		return x.args.issueID
+	}
+	if x.args.taskID != "" {
+		return x.args.taskID
+	}
+	return describeTarget(x.args.description)
 }
 
 func (x *execRun) run(ctx context.Context) (runErr error) {
@@ -247,7 +292,20 @@ func (x *execRun) run(ctx context.Context) (runErr error) {
 
 	wf := jiradozer.NewWorkflow(x.tracker, x.issue, x.cfg, x.logger)
 	wf.SetRenderer(x.app.Renderer)
+	wf.OnTransition = x.recordPhase
 	return wf.Run(ctx)
+}
+
+// recordPhase mirrors a workflow step into the run-log.
+//
+// Phase is the only thing that makes a remote worker's progress readable from
+// another box: `jiradozer fleet runs` reads meta.json over ssh and can see
+// neither this host's log nor its terminal. Best-effort — a run must not die
+// because a status write failed.
+func (x *execRun) recordPhase(step jiradozer.WorkflowStep) {
+	if err := x.rl.UpdateMeta(func(m *jiradozer.RunMeta) { m.Phase = step.String() }); err != nil {
+		x.logger.Warn("failed to record workflow phase", "step", step, "error", err)
+	}
 }
 
 // checkNotClaimed turns the lock label into an actual check.
@@ -423,6 +481,14 @@ func (x *execRun) finish(runErr error) {
 		state = jiradozer.RunStateFailed
 	}
 
+	// Record the PR before settling the meta. This is not decoration: gc keys
+	// reclamation solely on PRURL, so a run that finishes without one keeps its
+	// worktree FOREVER — and exec always keeps its worktree. Resolving it here,
+	// from the branch, rather than threading it out of the workflow means it is
+	// recorded however the PR came to exist (create_pr, a resumed run, or a
+	// human opening it mid-flight).
+	pr := x.resolvePR(ctx)
+
 	// The worktree is deliberately kept. A terminal state here means "a PR is
 	// open", never "it merged", so nothing at this point authorises deleting
 	// the branch's only checkout. `jiradozer gc` reclaims it later by asking
@@ -430,6 +496,10 @@ func (x *execRun) finish(runErr error) {
 	if err := x.rl.UpdateMeta(func(m *jiradozer.RunMeta) {
 		m.WorktreeKept = true
 		m.WorktreeKeptReason = "terminal state is an open PR, not a merge; reclaimed by `jiradozer gc`"
+		if pr != nil {
+			m.PRURL = pr.URL
+			m.PRNumber = pr.Number
+		}
 	}); err != nil {
 		x.logger.Warn("failed to record worktree retention", "error", err)
 	}
@@ -444,6 +514,29 @@ func (x *execRun) finish(runErr error) {
 		}
 	}
 	x.logger.Info("run finished", "run_id", x.runID, "state", state, "run_dir", x.rl.Dir())
+}
+
+// resolvePR asks GitHub which PR this run's branch opened, or nil.
+//
+// A missing PR is a NORMAL outcome, not an error: a run that failed before
+// create_pr, or one whose build produced no changes, legitimately has none. So
+// this logs at debug and returns nil rather than warning — but a PR that exists
+// and is not recorded leaks a worktree permanently, which is why the lookup
+// happens on every exit path instead of only the successful one.
+func (x *execRun) resolvePR(ctx context.Context) *wt.PRInfo {
+	if x.lookupPR == nil || x.branch == "" || x.cfg.WorkDir == "" {
+		return nil
+	}
+	pr, err := x.lookupPR(ctx, x.branch, x.cfg.WorkDir)
+	if err != nil {
+		x.logger.Debug("no PR resolved for branch", "branch", x.branch, "error", err)
+		return nil
+	}
+	if pr == nil || pr.URL == "" {
+		return nil
+	}
+	x.logger.Info("recorded PR for run", "branch", x.branch, "pr", pr.URL)
+	return pr
 }
 
 func (x *execRun) postEndComment(ctx context.Context, state jiradozer.RunState, runErr error) {
@@ -464,6 +557,31 @@ func (x *execRun) postEndComment(ctx context.Context, state jiradozer.RunState, 
 	if _, err := x.tracker.PostComment(ctx, x.issue.ID, b.String()); err != nil {
 		x.logger.Warn("failed to post end comment", "issue", x.issue.Identifier, "error", err)
 	}
+}
+
+// leaseTarget names this task for the flock lease.
+//
+// It must be DERIVED, never random, and `dispatch` must compute the same value
+// this worker will. The lease is what lets a dispatcher refuse a second run for
+// work some box is already doing, and that check happens before the worker
+// exists — so a per-run identifier would make every --description dispatch
+// unique and two concurrent dispatches of the same task would both proceed,
+// producing duplicate worktrees and duplicate PRs.
+//
+// A description is hashed rather than used verbatim because it is free-form
+// multi-line text and this becomes a lock FILENAME.
+func leaseTarget(x execArgs) string {
+	if x.issueID != "" {
+		return x.issueID
+	}
+	if x.taskID != "" {
+		return x.taskID
+	}
+	if x.description == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(x.description)))
+	return "adhoc-" + hex.EncodeToString(sum[:6])
 }
 
 // sanitizeBranchLeaf keeps an identifier usable as one branch path segment.

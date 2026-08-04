@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"text/tabwriter"
 
@@ -89,10 +91,12 @@ func newDispatchCmd(x *execArgs) *cobra.Command {
 			// Refuse a second run for a task some box is already working. The
 			// lock label catches this cross-host too, but only after the worktree
 			// exists; the lease is the cheaper and earlier signal.
-			target := x.issueID
-			if target == "" {
-				target = x.taskID
-			}
+			//
+			// The target is derived the SAME way the worker will derive it — a
+			// --description run with no --task-id included. Deriving it any other
+			// way here would silently disable this check for exactly the case
+			// that has no tracker-side claim to fall back on.
+			target := leaseTarget(*x)
 			if target != "" {
 				if holder, busy := fleet.FindLeaseHolder(scores, target); busy {
 					return fmt.Errorf("%s is already running on %s (lease held); use `jiradozer runs --issue %s --json` there to check on it",
@@ -324,6 +328,10 @@ func newFleetRunsCmd() *cobra.Command {
 			}
 			var rows []row
 			var failures []fleet.HostRuns
+			// Unreadable ROWS are surfaced for the same reason unreadable HOSTS
+			// are: silently dropping one makes a truncated or corrupt reply look
+			// like a box with fewer runs than it actually has.
+			unreadable := map[string]int{}
 			for _, hr := range results {
 				if hr.Err != nil {
 					// Kept, not dropped: an unreachable box looks identical to an
@@ -335,6 +343,7 @@ func newFleetRunsCmd() *cobra.Command {
 				for _, raw := range hr.Runs {
 					var m jiradozer.RunMeta
 					if err := json.Unmarshal(raw, &m); err != nil {
+						unreadable[hr.Host]++
 						continue
 					}
 					rows = append(rows, row{RunMeta: m, FleetHost: hr.Host})
@@ -364,6 +373,12 @@ func newFleetRunsCmd() *cobra.Command {
 			// reads as complete is how "no runs anywhere" becomes a wrong answer.
 			for _, f := range failures {
 				fmt.Fprintf(cmd.ErrOrStderr(), "WARNING: %s could not be read: %v\n", f.Host, f.Err)
+			}
+			// Sorted so two identical fleets print identical output; Go randomizes
+			// map iteration.
+			for _, host := range slices.Sorted(maps.Keys(unreadable)) {
+				fmt.Fprintf(cmd.ErrOrStderr(), "WARNING: skipped %d unparseable run record(s) from %s\n",
+					unreadable[host], host)
 			}
 			if len(failures) > 0 {
 				return fmt.Errorf("%d of %d hosts could not be read; this view is incomplete",

@@ -42,10 +42,13 @@ func GatherRuns(ctx context.Context, ssh SSHRunner, tool Tool, hosts []Host, ext
 func gatherOne(ctx context.Context, ssh SSHRunner, tool Tool, h Host, extraArgs []string) HostRuns {
 	hr := HostRuns{Host: h.Hostname}
 
-	// Resolve the binary the same way the probe does. ~/bin is not on a
-	// non-interactive SSH shell's PATH, so a bare name here would report
-	// "command not found" on a perfectly healthy box.
-	cmd := fmt.Sprintf(`b=$(command -v %s || echo "$HOME/bin/%s"); "$b" runs --json`, tool.Name, tool.Name)
+	// Resolve the binary through the SAME expression the probe uses. Neither
+	// ~/bin nor ~/.local/bin is on a non-interactive SSH shell's PATH, so a bare
+	// name here would report "command not found" on a perfectly healthy box —
+	// and resolving differently from the probe is worse still: the box would be
+	// eligible for dispatch yet invisible to a gather.
+	cmd := fmt.Sprintf(`b=$(%s); [ "$b" = %s ] && { echo "%s not found on this host" >&2; exit 127; }; "$b" runs --json`,
+		tool.resolveBinExpr(), binMissing, tool.Name)
 	for _, a := range extraArgs {
 		cmd += " " + shellQuote(a)
 	}
