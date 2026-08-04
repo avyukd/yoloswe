@@ -412,6 +412,11 @@ type ManagerConfig struct { //nolint:govet // fieldalignment: readability over p
 	// Used to propagate BRAMBLE_SOCK to tmux windows so hook commands
 	// can call back to the TUI. Set by main after startIPCServer.
 	IPCSockPath string
+	// ControlSockPath is the path to the bramble control Unix domain socket.
+	// Propagated to tmux windows as BRAMBLE_CONTROL_SOCK so a session can
+	// drive its peers (send-input, send-key). Set by main after
+	// startControlServer.
+	ControlSockPath string
 	// Registry is the shared session registry for cross-repo IPC lookups.
 	// Propagated through sharedManagerConfig so that openRepo can register
 	// new managers automatically.
@@ -525,6 +530,18 @@ func (m *Manager) IPCSockPath() string {
 // before the IPC server.
 func (m *Manager) SetIPCSockPath(path string) {
 	m.config.IPCSockPath = path
+}
+
+// ControlSockPath returns the control socket path, if configured.
+func (m *Manager) ControlSockPath() string {
+	return m.config.ControlSockPath
+}
+
+// SetControlSockPath updates the control socket path after the server has
+// started. Like SetIPCSockPath, this is called from main because the manager
+// is created before the control server.
+func (m *Manager) SetControlSockPath(path string) {
+	m.config.ControlSockPath = path
 }
 
 // SubscribeStateChanges registers a channel to receive copies of all
@@ -1332,6 +1349,39 @@ func resolveAgentModel(modelID string, registry *agent.ModelRegistry) (agent.Age
 	return agent.AgentModel{}, fmt.Errorf("unknown model %q: no curated entry and no recognized prefix (%s)", modelID, agent.KnownModelPrefixes())
 }
 
+// newTmuxRunner builds the runner for a tmux-mode session, copying the
+// manager's configured sockets into the runner that exports them to the
+// window. It is a method rather than inline construction so the
+// config → runner → env plumbing can be asserted without a live tmux server:
+// dropping a socket here is what silently strands a session, and envArgs()
+// alone cannot catch it.
+func (m *Manager) newTmuxRunner(session *Session, prompt, tmuxName string, agentModel agent.AgentModel) *tmuxRunner {
+	permissionMode := ""
+	if session.Type == SessionTypePlanner || session.Type == SessionTypeCodeTalk {
+		permissionMode = "plan"
+	}
+
+	brambleBin, _ := os.Executable()
+	if brambleBin == "" {
+		brambleBin = "bramble" // fallback to PATH lookup
+	}
+	return &tmuxRunner{
+		windowName:      tmuxName,
+		workDir:         session.WorktreePath,
+		prompt:          prompt,
+		model:           agentModel.ID,
+		provider:        agentModel.Provider,
+		permissionMode:  permissionMode,
+		resumeSessionID: session.CLISessionID,
+		sessionID:       string(session.ID),
+		brambleBin:      brambleBin,
+		brambleSock:     m.config.IPCSockPath,
+		controlSock:     m.config.ControlSockPath,
+		yoloMode:        m.config.YoloMode,
+		killOnStop:      false, // Never kill on Stop(); cleanup happens in Close() if TmuxExitOnQuit is set
+	}
+}
+
 // runSession runs a session in a goroutine, handling both planner and builder types.
 // Both types follow the same lifecycle: start → run turns → idle → follow-up → ...
 func (m *Manager) runSession(session *Session, prompt string) {
@@ -1405,29 +1455,7 @@ func (m *Manager) runSession(session *Session, prompt string) {
 		session.RunnerType = RunnerTypeTmux
 		session.mu.Unlock()
 
-		permissionMode := ""
-		if session.Type == SessionTypePlanner || session.Type == SessionTypeCodeTalk {
-			permissionMode = "plan"
-		}
-
-		brambleBin, _ := os.Executable()
-		if brambleBin == "" {
-			brambleBin = "bramble" // fallback to PATH lookup
-		}
-		runner = &tmuxRunner{
-			windowName:      tmuxName,
-			workDir:         session.WorktreePath,
-			prompt:          prompt,
-			model:           agentModel.ID,
-			provider:        agentModel.Provider,
-			permissionMode:  permissionMode,
-			resumeSessionID: session.CLISessionID,
-			sessionID:       string(session.ID),
-			brambleBin:      brambleBin,
-			brambleSock:     m.config.IPCSockPath,
-			yoloMode:        m.config.YoloMode,
-			killOnStop:      false, // Never kill on Stop(); cleanup happens in Close() if TmuxExitOnQuit is set
-		}
+		runner = m.newTmuxRunner(session, prompt, tmuxName, agentModel)
 		// No event handler for tmux mode - all output is in the tmux window
 	} else {
 		// TUI mode: create in-process runner

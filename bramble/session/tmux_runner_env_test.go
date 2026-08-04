@@ -1,0 +1,109 @@
+package session
+
+import (
+	"slices"
+	"strings"
+	"testing"
+)
+
+// A session that does not receive its own ID and the control socket can read
+// its peers (capture-pane rides BRAMBLE_SOCK) but can never address itself or
+// write to them. Assert both are exported into the tmux window.
+func TestTmuxRunnerEnvArgs_CarriesIdentityAndControlSocket(t *testing.T) {
+	r := &tmuxRunner{
+		sessionID:   "builder-abc123",
+		brambleSock: "/run/user/1000/bramble-42.sock",
+		controlSock: "/run/user/1000/bramble-control-42.sock",
+	}
+
+	args := r.envArgs()
+
+	want := []string{
+		"BRAMBLE_SOCK=/run/user/1000/bramble-42.sock",
+		"BRAMBLE_SESSION_ID=builder-abc123",
+		"BRAMBLE_CONTROL_SOCK=/run/user/1000/bramble-control-42.sock",
+	}
+	for _, kv := range want {
+		if !slices.Contains(args, kv) {
+			t.Errorf("envArgs() missing %q\ngot: %v", kv, args)
+		}
+	}
+
+	// Every value must be preceded by its own -e flag.
+	for i, a := range args {
+		if strings.Contains(a, "=") && (i == 0 || args[i-1] != "-e") {
+			t.Errorf("value %q at index %d is not preceded by -e\ngot: %v", a, i, args)
+		}
+	}
+	if len(args) != 2*len(want) {
+		t.Errorf("expected %d args (flag+value per var), got %d: %v", 2*len(want), len(args), args)
+	}
+}
+
+// The helper tests above pass even if Start() stops splicing envArgs() into the
+// tmux command — the window would launch without identity or sockets while every
+// helper assertion still held. Pin the actual argv so that regression fails here.
+func TestTmuxRunnerNewWindowArgs_SplicesEnvIntoInvocation(t *testing.T) {
+	r := &tmuxRunner{
+		windowName:  "happy-tiger",
+		workDir:     "/work/repo",
+		prompt:      "do the thing",
+		model:       "claude-opus-4",
+		sessionID:   "builder-abc123",
+		brambleSock: "/run/user/1000/bramble-42.sock",
+		controlSock: "/run/user/1000/bramble-control-42.sock",
+	}
+
+	args := r.newWindowArgs()
+
+	for _, kv := range []string{
+		IPCSockEnvVar + "=/run/user/1000/bramble-42.sock",
+		SessionIDEnvVar + "=builder-abc123",
+		ControlSockEnvVar + "=/run/user/1000/bramble-control-42.sock",
+	} {
+		i := slices.Index(args, kv)
+		if i < 0 {
+			t.Errorf("new-window argv missing %q\ngot: %v", kv, args)
+			continue
+		}
+		if args[i-1] != "-e" {
+			t.Errorf("%q is not preceded by -e in argv\ngot: %v", kv, args)
+		}
+	}
+
+	// The env pairs must land before -n/-c and the trailing command, or tmux
+	// treats them as part of the command rather than the window's environment.
+	nameIdx := slices.Index(args, "-n")
+	if nameIdx < 0 {
+		t.Fatalf("argv has no -n window name: %v", args)
+	}
+	for i, a := range args {
+		if strings.HasPrefix(a, "BRAMBLE_") && i > nameIdx {
+			t.Errorf("env pair %q appears after -n at %d; tmux would not export it\ngot: %v", a, nameIdx, args)
+		}
+	}
+
+	if args[0] != "new-window" {
+		t.Errorf("argv[0] = %q, want new-window: %v", args[0], args)
+	}
+	if got := args[len(args)-2]; got != "/work/repo" {
+		t.Errorf("working directory not passed via -c, got %q: %v", got, args)
+	}
+}
+
+// A manager configured before the control server starts leaves controlSock
+// empty; the window must still be launchable rather than exporting VAR=.
+func TestTmuxRunnerEnvArgs_OmitsUnsetValues(t *testing.T) {
+	r := &tmuxRunner{brambleSock: "/run/bramble.sock"}
+
+	args := r.envArgs()
+
+	if len(args) != 2 || args[0] != "-e" || args[1] != "BRAMBLE_SOCK=/run/bramble.sock" {
+		t.Fatalf("expected only the IPC socket pair, got: %v", args)
+	}
+	for _, a := range args {
+		if strings.HasSuffix(a, "=") {
+			t.Errorf("emitted empty assignment %q", a)
+		}
+	}
+}

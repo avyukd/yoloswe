@@ -239,24 +239,51 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	registry := session.NewSessionRegistry()
 	registry.Register(sessionManager)
 	sharedManagerConfig.Registry = registry
-	ipcServer, ipcSockPath := startIPCServer(registry, wtRoot, repoName)
-	if ipcServer != nil {
-		defer ipcServer.Close()
-		os.Setenv(ipc.SockEnvVar, ipcSockPath)
-		// Propagate the socket path to the session manager (and the shared
-		// config template used when opening additional repos) so that tmux
-		// windows receive BRAMBLE_SOCK without relying on os.Getenv.
-		sessionManager.SetIPCSockPath(ipcSockPath)
-		sharedManagerConfig.IPCSockPath = ipcSockPath
-	}
+
+	// Ordering here is load-bearing, in three steps: start the control server,
+	// publish both socket paths, and only then let the IPC server listen.
+	//
+	// The IPC server serves RequestNewSession the moment it binds, and that
+	// handler runs all the way to newTmuxRunner, which snapshots both socket
+	// paths out of m.config into the window's environment for that session's
+	// whole lifetime. So every path the manager will ever advertise has to be
+	// final before IPC accepts its first connection. Starting control first is
+	// what makes the failure case honest: if control never binds we publish an
+	// empty path rather than a dead one, and no session can have read the dead
+	// value in the meantime.
+	//
+	// This same before-any-listener property is what makes the unsynchronized
+	// m.config writes safe: they all happen on this goroutine before any
+	// session goroutine exists to observe them.
 
 	// Start the control server (read+write tmux control plane) on its own Unix
 	// socket. Local CLI subcommands (send-input, send-key) and the remote hub
 	// agent client both drive the same control.Dispatcher.
 	controlServer := startControlServer(registry)
+	controlSockPath := ""
 	if controlServer != nil {
 		defer controlServer.Close()
-		os.Setenv(control.SockEnvVar, controlServer.SocketPath())
+		controlSockPath = controlServer.SocketPath()
+		os.Setenv(control.SockEnvVar, controlSockPath)
+	}
+
+	// The IPC server has not started yet, so its path is the one it is about to
+	// bind. Publish it up front; clear it below if the bind fails.
+	ipcSockPath := ipcSocketPath()
+	publishSockPaths(sessionManager, &sharedManagerConfig, ipcSockPath, controlSockPath)
+
+	// Start IPC server so child processes can request new sessions.
+	// The registry aggregates all repo managers so IPC handlers can find
+	// sessions from any repo, including those opened later via Alt-R.
+	ipcServer := startIPCServer(registry, ipcSockPath, wtRoot, repoName)
+	if ipcServer != nil {
+		defer ipcServer.Close()
+		os.Setenv(ipc.SockEnvVar, ipcSockPath)
+	} else {
+		// Nothing bound, so nothing is reachable at that path. Clear it rather
+		// than exporting a dead socket into every tmux window. Safe to do here:
+		// no listener ever accepted a request, so no session read the old value.
+		publishSockPaths(sessionManager, &sharedManagerConfig, "", controlSockPath)
 	}
 
 	// If a hub is configured, dial out to it so the user can reach this
@@ -371,14 +398,53 @@ func detectRepoFromPath(cwd, wtRoot string) (string, error) {
 
 // --- IPC server setup --------------------------------------------------------
 
-func startIPCServer(registry *session.SessionRegistry, wtRoot, repoName string) (*ipc.Server, string) {
-	// Prefer $XDG_RUNTIME_DIR (user-private, tmpfs) over /tmp to avoid
-	// symlink/TOCTOU risks in world-writable directories.
-	runDir := os.Getenv("XDG_RUNTIME_DIR")
-	if runDir == "" {
-		runDir = os.TempDir()
+// socketDir is where this process's Unix domain sockets live. It prefers
+// $XDG_RUNTIME_DIR (user-private, tmpfs) over /tmp to avoid symlink/TOCTOU
+// risks in world-writable directories.
+func socketDir() string {
+	if runDir := os.Getenv("XDG_RUNTIME_DIR"); runDir != "" {
+		return runDir
 	}
-	sockPath := filepath.Join(runDir, fmt.Sprintf("bramble-%d.sock", os.Getpid()))
+	return os.TempDir()
+}
+
+// ipcSocketPath and controlSocketPath derive each server's socket path from the
+// pid alone, so a path is knowable before its server exists. runTUI depends on
+// that: it must publish the IPC path to the manager before the IPC server binds,
+// because that server starts serving session-creating requests immediately.
+//
+// Each is called exactly once per process, into a local that is then both
+// published and handed to the server, so the advertised path and the bound path
+// cannot diverge even though socketDir() re-reads the environment.
+func ipcSocketPath() string {
+	return filepath.Join(socketDir(), fmt.Sprintf("bramble-%d.sock", os.Getpid()))
+}
+
+func controlSocketPath() string {
+	return filepath.Join(socketDir(), fmt.Sprintf("bramble-control-%d.sock", os.Getpid()))
+}
+
+// publishSockPaths makes both socket paths visible to every session the manager
+// will create: directly on the manager for the current repo, and on the shared
+// config template that openRepo copies for repos opened later via Alt-R. The two
+// destinations are written together because a session launched from either sees
+// the same tmux environment, and updating one without the other is how a
+// secondary repo's sessions silently lose a socket.
+//
+// Callers must invoke this before any listener that can create sessions starts
+// accepting: newTmuxRunner snapshots these values, so a session started earlier
+// keeps whatever was set at its creation for its entire lifetime.
+func publishSockPaths(m *session.Manager, shared *session.ManagerConfig, ipcSockPath, controlSockPath string) {
+	m.SetIPCSockPath(ipcSockPath)
+	m.SetControlSockPath(controlSockPath)
+	shared.IPCSockPath = ipcSockPath
+	shared.ControlSockPath = controlSockPath
+}
+
+// startIPCServer binds the IPC server to sockPath, which the caller has already
+// published to the session manager. Taking the path as a parameter rather than
+// recomputing it is what guarantees the two agree.
+func startIPCServer(registry *session.SessionRegistry, sockPath, wtRoot, repoName string) *ipc.Server {
 	srv := ipc.NewServer(sockPath)
 
 	srv.Handle(ipc.RequestPing, func(_ context.Context, _ *ipc.Request) (any, error) {
@@ -452,23 +518,17 @@ func startIPCServer(registry *session.SessionRegistry, wtRoot, repoName string) 
 
 	if err := srv.Start(); err != nil {
 		slog.Warn("IPC server failed to start", "err", err)
-		return nil, ""
+		return nil
 	}
-	socketPath := srv.SocketPath()
-	return srv, socketPath
+	return srv
 }
 
 // startControlServer starts the control-protocol Unix server backed by the
 // session registry and a real tmux controller. Returns nil if it fails to
 // start (non-fatal — the TUI still runs, only remote/CLI control is absent).
 func startControlServer(registry *session.SessionRegistry) *control.UnixServer {
-	runDir := os.Getenv("XDG_RUNTIME_DIR")
-	if runDir == "" {
-		runDir = os.TempDir()
-	}
-	sockPath := filepath.Join(runDir, fmt.Sprintf("bramble-control-%d.sock", os.Getpid()))
 	disp := control.NewDispatcher(registry, tmuxctl.New())
-	srv := control.NewUnixServer(sockPath, disp)
+	srv := control.NewUnixServer(controlSocketPath(), disp)
 	if err := srv.Start(); err != nil {
 		slog.Warn("control server failed to start", "err", err)
 		return nil
@@ -641,6 +701,21 @@ var newSessionCmd = &cobra.Command{
 	},
 }
 
+// resolveOwnSessionID picks the session a self-referential command (notify)
+// reports on. Unlike capture-pane/send-input, whose --session-id names a *peer*,
+// notify always speaks for its caller, so a tmux-launched agent can omit the
+// flag and let $BRAMBLE_SESSION_ID supply its own return address. The flag wins
+// when set, keeping the baked-in stop hook and out-of-band callers unchanged.
+func resolveOwnSessionID(flagID, envID string) (string, error) {
+	if flagID != "" {
+		return flagID, nil
+	}
+	if envID != "" {
+		return envID, nil
+	}
+	return "", fmt.Errorf("no session: pass --session-id or run inside a bramble session ($%s)", session.SessionIDEnvVar)
+}
+
 var notifyCmd = &cobra.Command{
 	Use:   "notify",
 	Short: "Notify bramble that a session needs attention",
@@ -657,7 +732,14 @@ var notifyCmd = &cobra.Command{
 			}
 			return err
 		}
-		sessionID, _ := cmd.Flags().GetString("session-id")
+		flagID, _ := cmd.Flags().GetString("session-id")
+		sessionID, err := resolveOwnSessionID(flagID, os.Getenv(session.SessionIDEnvVar))
+		if err != nil {
+			if silent {
+				return nil
+			}
+			return err
+		}
 		resp, err := client.Send(&ipc.Request{
 			Type:   ipc.RequestNotify,
 			ID:     "cli-notify",
@@ -906,9 +988,10 @@ func init() {
 	newSessionCmd.Flags().Bool("create-worktree", false, "Create a new worktree for the branch")
 	newSessionCmd.Flags().StringP("repo", "r", "", "Target repo name (auto-detected from cwd if omitted)")
 
-	notifyCmd.Flags().String("session-id", "", "Session ID to notify")
+	// Not MarkFlagRequired: inside a tmux session $BRAMBLE_SESSION_ID supplies
+	// the caller's own ID, and RunE errors when neither source yields one.
+	notifyCmd.Flags().String("session-id", "", "Session ID to notify (defaults to $"+session.SessionIDEnvVar+")")
 	notifyCmd.Flags().Bool("silent", false, "Suppress errors silently (used by stop hooks)")
-	_ = notifyCmd.MarkFlagRequired("session-id")
 
 	capturePaneCmd.Flags().String("session-id", "", "Session ID to capture pane from")
 	capturePaneCmd.Flags().Int("lines", 10, "Number of lines to capture")

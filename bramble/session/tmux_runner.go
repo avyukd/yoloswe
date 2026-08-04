@@ -11,6 +11,24 @@ import (
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude"
 )
 
+// ControlSockEnvVar is the environment variable carrying the control socket
+// path. It is declared here, in the package that injects it into tmux windows,
+// because control already imports session — so session importing control back
+// would be a cycle. control.SockEnvVar aliases this constant to keep a single
+// source of truth.
+const ControlSockEnvVar = "BRAMBLE_CONTROL_SOCK"
+
+// SessionIDEnvVar carries a session's own bramble session ID into its tmux
+// window, giving the agent inside a return address it can hand to peers.
+const SessionIDEnvVar = "BRAMBLE_SESSION_ID"
+
+// IPCSockEnvVar carries the legacy IPC socket path. Like ControlSockEnvVar it
+// is declared here, in the package that injects it into tmux windows, and
+// ipc.SockEnvVar aliases it. Keeping the producer's literal and the consumer's
+// literal linked at compile time means a rename cannot leave session exporting
+// one name while ipc clients read another.
+const IPCSockEnvVar = "BRAMBLE_SOCK"
+
 // tmuxRunner implements sessionRunner by creating a tmux window that runs the agent CLI.
 type tmuxRunner struct {
 	windowName      string // tmux window name (e.g., "happy-tiger")
@@ -24,8 +42,53 @@ type tmuxRunner struct {
 	sessionID       string // bramble session ID for IPC notification hook
 	brambleBin      string // absolute path to the bramble binary for hook commands
 	brambleSock     string // IPC socket path to pass to hook commands
+	controlSock     string // control socket path, so the session can drive peers
 	yoloMode        bool   // skip all permission prompts
 	killOnStop      bool   // kill tmux window on Stop()
+}
+
+// envArgs returns the "-e VAR=value" pairs that give the agent inside the
+// window its bramble identity and the sockets it needs to reach the TUI and
+// its peers. Empty values are omitted so a partially configured manager still
+// produces a valid tmux invocation.
+//
+// The session ID is the agent's own return address: list-sessions reports it,
+// and capture-pane/send-input take it as --session-id. The control socket is
+// the only write path into another session's pane. Without both, sessions can
+// observe each other but can never reply.
+func (r *tmuxRunner) envArgs() []string {
+	var args []string
+	for _, kv := range [][2]string{
+		{IPCSockEnvVar, r.brambleSock},
+		{SessionIDEnvVar, r.sessionID},
+		{ControlSockEnvVar, r.controlSock},
+	} {
+		if kv[1] != "" {
+			args = append(args, "-e", kv[0]+"="+kv[1])
+		}
+	}
+	return args
+}
+
+// newWindowArgs builds the full argv for the `tmux new-window` that launches
+// this session. It is split out of Start() so the env exports can be asserted
+// at the invocation boundary rather than only at envArgs(): a regression that
+// stopped splicing envArgs() into the command would leave every helper test
+// passing while windows silently lost their identity and sockets.
+//
+// -P -F "#{window_id}" prints the new window's stable ID to stdout, capturing
+// it atomically at creation time to avoid the TOCTOU race of a post-hoc name
+// lookup (TmuxWindowIDByName) when two sessions start concurrently with the
+// same window name. -e sets an environment variable in the new window; -n names
+// it and -c sets its working directory.
+func (r *tmuxRunner) newWindowArgs() []string {
+	binary, args := r.buildCommand()
+	cmdStr := buildShellCommand(binary, args)
+
+	tmuxArgs := []string{"new-window", "-P", "-F", "#{window_id}"}
+	tmuxArgs = append(tmuxArgs, r.envArgs()...)
+	tmuxArgs = append(tmuxArgs, "-n", r.windowName, "-c", r.workDir, cmdStr)
+	return tmuxArgs
 }
 
 // Start creates a new tmux window in the current session and launches the claude CLI in it.
@@ -43,25 +106,7 @@ func (r *tmuxRunner) Start(ctx context.Context) error {
 		return fmt.Errorf("tmux window %q already exists", r.windowName)
 	}
 
-	// Build the agent command based on provider
-	binary, args := r.buildCommand()
-
-	// Build the full command string for tmux
-	cmdStr := buildShellCommand(binary, args)
-
-	// Create tmux window with the claude command.
-	// -P -F "#{window_id}" prints the new window's stable ID to stdout, capturing
-	// it atomically at creation time to avoid the TOCTOU race of a post-hoc name
-	// lookup (TmuxWindowIDByName) when two sessions start concurrently with the
-	// same window name.
-	// -e: set environment variable in the new window
-	// -n: window name, -c: working directory
-	tmuxArgs := []string{"new-window", "-P", "-F", "#{window_id}"}
-	if r.brambleSock != "" {
-		tmuxArgs = append(tmuxArgs, "-e", "BRAMBLE_SOCK="+r.brambleSock)
-	}
-	tmuxArgs = append(tmuxArgs, "-n", r.windowName, "-c", r.workDir, cmdStr)
-	createCmd := exec.Command("tmux", tmuxArgs...)
+	createCmd := exec.Command("tmux", r.newWindowArgs()...)
 
 	out, err := createCmd.Output()
 	if err != nil {
