@@ -77,7 +77,7 @@ func gcDeps(pr PRChecker, rm *fakeRemover, dirty map[string]bool) GCDeps {
 		// Keyed the way gc looks it up: worktree root AND repo. The fixtures
 		// leave WTRoot empty, which is what a pre-WTRoot record looks like.
 		Removers:  map[string]WorktreeRemover{RunMeta{Repo: "kernel"}.RemoverKey(): rm},
-		LeaseHeld: func(string) bool { return false },
+		LeaseHeld: func(string) (bool, error) { return false, nil },
 	}
 }
 
@@ -154,12 +154,33 @@ func TestGCSkipsAWorktreeWhoseLeaseIsHeld(t *testing.T) {
 
 	rm := &fakeRemover{}
 	deps := gcDeps(fakePRChecker{merged: map[string]bool{"https://github.com/o/r/pull/1": true}}, rm, nil)
-	deps.LeaseHeld = func(string) bool { return true }
+	deps.LeaseHeld = func(string) (bool, error) { return true, nil }
 
 	res, err := RunGC(context.Background(), deps, GCOptions{Apply: true}, nil)
 	require.NoError(t, err)
 	require.Empty(t, rm.removed)
 	requireReason(t, res, "worktree", "holds this task's lease")
+}
+
+// Same invariant as the stat gates: a lease gc could not read is not a lease
+// nobody holds, and "nobody holds it" is what clears a checkout for deletion.
+func TestGCWillNotReclaimOnALeaseItCouldNotRead(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	gcFixture(t, RunMeta{
+		RunID: "r1", IssueIdentifier: "INF-1", Repo: "kernel", Branch: "feature/INF-1",
+		State: RunStateDone, PRURL: "https://github.com/o/r/pull/1",
+	})
+
+	rm := &fakeRemover{}
+	deps := gcDeps(fakePRChecker{merged: map[string]bool{"https://github.com/o/r/pull/1": true}}, rm, nil)
+	deps.LeaseHeld = func(string) (bool, error) {
+		return false, errors.New("permission denied")
+	}
+
+	res, err := RunGC(context.Background(), deps, GCOptions{Apply: true}, nil)
+	require.NoError(t, err, "one unreadable lease must not abort the whole sweep")
+	require.Empty(t, rm.removed)
+	requireReason(t, res, "worktree", "could not verify the task's lease")
 }
 
 // A run that died without settling may hold the only copy of its work.
@@ -394,14 +415,25 @@ func TestGCRecoversAPRTheRunFailedToRecord(t *testing.T) {
 }
 
 // Recovery must not become a way to guess. A branch with no PR, and a resolver
-// that itself fails, both leave the worktree exactly where it is.
+// that itself fails, both leave the worktree exactly where it is — but they say
+// so differently, because one is a permanent state and the other is worth a
+// retry, and an operator reading the preview has to be able to tell which.
 func TestGCRecoveryStillFailsClosed(t *testing.T) {
 	for _, tc := range []struct {
 		resolver *fakePRResolver
 		name     string
+		reason   string
 	}{
-		{name: "branch has no PR", resolver: &fakePRResolver{byBranch: map[string]string{}}},
-		{name: "resolver itself fails", resolver: &fakePRResolver{err: errors.New("gh: network unreachable")}},
+		{
+			name:     "branch has no PR",
+			resolver: &fakePRResolver{byBranch: map[string]string{}},
+			reason:   "no PR recorded",
+		},
+		{
+			name:     "resolver itself fails",
+			resolver: &fakePRResolver{err: errors.New("gh: network unreachable")},
+			reason:   "could not look up a PR for this branch: gh: network unreachable",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
@@ -417,7 +449,7 @@ func TestGCRecoveryStillFailsClosed(t *testing.T) {
 			res, err := RunGC(context.Background(), deps, GCOptions{Apply: true}, nil)
 			require.NoError(t, err)
 			require.Empty(t, rm.removed)
-			requireReason(t, res, "worktree", "no PR recorded")
+			requireReason(t, res, "worktree", tc.reason)
 		})
 	}
 }
@@ -458,9 +490,9 @@ func TestGCAsksAboutTheLockAWorkerActuallyHolds(t *testing.T) {
 	var asked []string
 	rm := &fakeRemover{}
 	deps := gcDeps(fakePRChecker{merged: map[string]bool{"https://github.com/o/r/pull/1": true}}, rm, nil)
-	deps.LeaseHeld = func(target string) bool {
+	deps.LeaseHeld = func(target string) (bool, error) {
 		asked = append(asked, target)
-		return target == "adhoc-deadbeefcafe"
+		return target == "adhoc-deadbeefcafe", nil
 	}
 
 	res, err := RunGC(context.Background(), deps, GCOptions{Apply: true}, nil)

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"syscall"
 	"text/tabwriter"
@@ -127,16 +129,25 @@ func removersForRuns(runs []jiradozer.RunMeta) (map[string]jiradozer.WorktreeRem
 // the file behind (removing it races a process about to flock it), so a file
 // count is a count of tasks this box has EVER run. prdozer's probe made exactly
 // that mistake and every host permanently excluded itself after two runs.
-func leaseHeld(target string) bool {
+// The error return is the third answer, the same shape worktreeExists uses: a
+// lease this box cannot open is not a lease nobody holds, and gc reads "not
+// held" as clearance to delete somebody's checkout.
+func leaseHeld(target string) (bool, error) {
 	f, err := os.OpenFile(jiradozer.LeasePath(target), os.O_RDWR, 0)
 	if err != nil {
-		return false // no lease file at all
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil // no lease file at all: nothing has ever run this here
+		}
+		return false, err
 	}
 	defer f.Close()
+	// Any flock failure counts as held. EWOULDBLOCK is the expected one, and the
+	// rest (EINTR, ENOLCK) are equally inconclusive — erring toward "held" here
+	// only ever costs a sweep.
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return true // someone else holds it
+		return true, nil
 	}
 	// We just took it ourselves, which proves nobody else had it.
 	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-	return false
+	return false, nil
 }

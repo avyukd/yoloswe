@@ -92,18 +92,16 @@ func (r GHPRResolver) ResolveForBranch(ctx context.Context, branch, dir string) 
 
 // resolvePRForBranch recovers a missing PR URL, or returns "".
 //
-// Failure is deliberately not distinguished from absence here: both mean "this
-// sweep cannot prove the work landed", and the caller already fails closed on
-// an empty result. The next sweep tries again.
-func resolvePRForBranch(ctx context.Context, deps GCDeps, m RunMeta) string {
+// Both outcomes fail closed at the caller, so the error changes no decision —
+// but it changes what the sweep can tell a human. "This branch has no PR" and
+// "gh could not answer" are different problems with different fixes, and a
+// preview that prints one reason for both sends an operator looking for a PR
+// that is sitting there merged.
+func resolvePRForBranch(ctx context.Context, deps GCDeps, m RunMeta) (string, error) {
 	if deps.PRByBranch == nil || m.Branch == "" || m.WorktreePath == "" {
-		return ""
+		return "", nil
 	}
-	url, err := deps.PRByBranch.ResolveForBranch(ctx, m.Branch, m.WorktreePath)
-	if err != nil {
-		return ""
-	}
-	return url
+	return deps.PRByBranch.ResolveForBranch(ctx, m.Branch, m.WorktreePath)
 }
 
 // GHPRChecker asks `gh` whether a PR merged.
@@ -152,7 +150,11 @@ type GCDeps struct {
 	// LeaseHeld reports whether a live worker still owns this target on this
 	// box. The lease is the authoritative liveness signal — it is held inside
 	// the worker, so the kernel drops it on any death.
-	LeaseHeld func(target string) bool
+	//
+	// It returns an error rather than a bare bool because "I could not check"
+	// and "nobody holds it" must not arrive as the same value: gc treats the
+	// latter as clearance to delete a checkout.
+	LeaseHeld func(target string) (bool, error)
 }
 
 // RunGC reclaims worktrees whose PR has landed, then expires old run-logs.
@@ -253,9 +255,16 @@ func gcWorktree(ctx context.Context, deps GCDeps, opts GCOptions, m RunMeta, log
 	// description but reports a local-tracker identifier as its target, and
 	// asking about the wrong lock name answers "not held" — which reads as
 	// permission to delete a live worker's directory.
-	if deps.LeaseHeld != nil && deps.LeaseHeld(m.LeaseKey()) {
-		c.Reason = "a worker still holds this task's lease"
-		return c
+	if deps.LeaseHeld != nil {
+		held, err := deps.LeaseHeld(m.LeaseKey())
+		if err != nil {
+			c.Reason = fmt.Sprintf("could not verify the task's lease: %v", err)
+			return c
+		}
+		if held {
+			c.Reason = "a worker still holds this task's lease"
+			return c
+		}
 	}
 	if !m.State.IsTerminal() {
 		// Not terminal AND no lease: the run died without settling. Its
@@ -272,7 +281,15 @@ func gcWorktree(ctx context.Context, deps GCDeps, opts GCOptions, m RunMeta, log
 		// without a second chance that one bad minute would strand the worktree
 		// on disk forever, since nothing ever revisits a terminal run's meta.
 		// The branch is recorded independently, so the PR is still findable.
-		prURL = resolvePRForBranch(ctx, deps, m)
+		resolved, err := resolvePRForBranch(ctx, deps, m)
+		if err != nil {
+			// Same non-decision as an empty result — keep the worktree — but say
+			// which one it was, so a stranded checkout reads as a gh problem to
+			// retry rather than a branch nobody ever opened a PR for.
+			c.Reason = fmt.Sprintf("could not look up a PR for this branch: %v", err)
+			return c
+		}
+		prURL = resolved
 	}
 	if prURL == "" {
 		c.Reason = "no PR recorded; cannot prove the work landed"

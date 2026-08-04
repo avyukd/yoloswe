@@ -18,6 +18,7 @@ import (
 	"github.com/bazelment/yoloswe/cliapp"
 	"github.com/bazelment/yoloswe/jiradozer"
 	"github.com/bazelment/yoloswe/jiradozer/tracker"
+	"github.com/bazelment/yoloswe/jiradozer/tracker/github"
 	"github.com/bazelment/yoloswe/jiradozer/tracker/local"
 	"github.com/bazelment/yoloswe/wt"
 )
@@ -719,10 +720,10 @@ func (x *execRun) postEndComment(ctx context.Context, state jiradozer.RunState, 
 // perfectly valid run as already-running elsewhere.
 func leaseTarget(x execArgs) string {
 	if x.issueID != "" {
-		return x.issueID
+		return canonicalIssueTarget(x.issueID)
 	}
 	if x.taskID != "" {
-		return x.taskID
+		return strings.ToLower(strings.TrimSpace(x.taskID))
 	}
 	if x.description == "" {
 		return ""
@@ -731,6 +732,33 @@ func leaseTarget(x execArgs) string {
 	// and "a"+"bcd" would hash alike, and a repo name can contain anything.
 	sum := sha256.Sum256([]byte(x.repo + "\x00" + strings.TrimSpace(x.description)))
 	return "adhoc-" + hex.EncodeToString(sum[:6])
+}
+
+// canonicalIssueTarget folds every spelling of one issue onto one lock name.
+//
+// The lease has to be derivable without contacting a tracker — that is the
+// whole reason `dispatch` can use it as a cheap pre-flight check — so this
+// canonicalizes syntactically, mirroring what each tracker already does with
+// the identifier it is handed:
+//
+//   - GitHub accepts "owner/repo#42" and the issue URL for the same issue, and
+//     reports "owner/repo#42" as its identity (tracker/github/client.go:386).
+//     Both spellings fold to that.
+//   - The local tracker resolves LOCAL-1 and local-1 to one file by lowercasing
+//     (tracker/local/local.go:130). So case folds here too, which also covers
+//     Linear-style "INF-1234" being typed either way.
+//
+// The exact output does not matter; agreeing does. Two spellings that reach two
+// lock names silently disable the guard that refuses a second run for a task
+// already in flight — and unlike the tracker's lock label, which is applied
+// against the canonical issue after a fetch, nothing downstream catches it
+// before both runs have built worktrees.
+func canonicalIssueTarget(issueID string) string {
+	issueID = strings.TrimSpace(issueID)
+	if owner, repo, number, err := github.ParseIdentifier(issueID); err == nil {
+		return fmt.Sprintf("%s/%s#%d", owner, repo, number)
+	}
+	return strings.ToLower(issueID)
 }
 
 // sanitizeBranchLeaf keeps an identifier usable as one branch path segment.

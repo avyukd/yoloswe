@@ -413,10 +413,35 @@ func TestRecordPhaseMirrorsWorkflowStepsIntoTheRunLog(t *testing.T) {
 // a check that runs BEFORE the worker exists. It can therefore only work if
 // both sides derive the same name, which is why this is one function.
 func TestLeaseTargetIsDerivedIdenticallyForDispatchAndExec(t *testing.T) {
-	assert.Equal(t, "INF-1234", leaseTarget(execArgs{issueID: "INF-1234", taskID: "t-7"}),
+	assert.Equal(t, "inf-1234", leaseTarget(execArgs{issueID: "INF-1234", taskID: "t-7"}),
 		"an issue identifier wins: it is the cross-host claim")
 	assert.Equal(t, "t-7", leaseTarget(execArgs{taskID: "t-7", description: "tidy things"}))
 	assert.Equal(t, "", leaseTarget(execArgs{}))
+}
+
+// The guard only excludes a duplicate when both spellings of one issue reach
+// one lock name. The trackers already fold these — GitHub reports
+// "owner/repo#42" whichever form it was handed, and the local tracker
+// lowercases before it looks for a file — so a lease keyed on the raw CLI
+// string let the same issue be dispatched twice under two spellings, with
+// nothing catching it until both runs had built worktrees.
+func TestOneIssueLeasesOneNameHoweverItIsSpelled(t *testing.T) {
+	canonical := leaseTarget(execArgs{issueID: "acme/app#42"})
+	assert.Equal(t, "acme/app#42", canonical)
+	assert.Equal(t, canonical, leaseTarget(execArgs{issueID: "https://github.com/acme/app/issues/42"}),
+		"the URL and the shorthand are the same issue to the tracker")
+	assert.Equal(t, canonical, leaseTarget(execArgs{issueID: "  acme/app#42  "}))
+
+	assert.Equal(t, leaseTarget(execArgs{issueID: "LOCAL-1"}), leaseTarget(execArgs{issueID: "local-1"}),
+		"the local tracker resolves both to one file, so they must lease one name")
+	assert.Equal(t, leaseTarget(execArgs{taskID: "T-7"}), leaseTarget(execArgs{taskID: "t-7"}))
+
+	// Folding must not go so far that two different issues collide.
+	assert.NotEqual(t, canonical, leaseTarget(execArgs{issueID: "acme/app#43"}))
+	assert.NotEqual(t, canonical, leaseTarget(execArgs{issueID: "acme/other#42"}))
+	// A string no tracker can parse is still usable as a lock name, unchanged
+	// apart from case — refusing it would disable the guard entirely.
+	assert.Equal(t, "some-odd-id", leaseTarget(execArgs{issueID: "SOME-ODD-ID"}))
 }
 
 // A --description run with no --task-id used to lease a per-run random name, so

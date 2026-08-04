@@ -1,6 +1,9 @@
 package main
 
 import (
+	"errors"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -77,4 +80,35 @@ func TestRemoversFallBackToTheCurrentRootWhenARecordNamesNone(t *testing.T) {
 	r := removers[jiradozer.RunMeta{Repo: "kernel"}.RemoverKey()]
 	require.NotNil(t, r)
 	require.Equal(t, "/roots/new", removerRoot(t, r))
+}
+
+// leaseHeld is the last gate before an irreversible removal, and it used to
+// answer "not held" for every OpenFile failure — so an EACCES or EIO on the
+// lease directory read as clearance to delete a live worker's checkout.
+func TestAnUnreadableLeaseIsNotAFreeLease(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// Make the lease directory a regular file, so opening anything beneath it
+	// fails with ENOTDIR rather than ENOENT. Deterministic, and unlike a chmod-0
+	// fixture it still fails when the tests run as root.
+	leaseDir := jiradozer.ExpandHome(jiradozer.LeaseDir)
+	require.NoError(t, os.MkdirAll(filepath.Dir(leaseDir), 0o755))
+	require.NoError(t, os.WriteFile(leaseDir, []byte("x"), 0o600))
+
+	held, err := leaseHeld("INF-1")
+	require.Error(t, err, "an unopenable lease path must report that it could not tell")
+	require.False(t, errors.Is(err, fs.ErrNotExist), "and not as a missing file")
+	require.False(t, held)
+}
+
+// The ordinary case still has to work: no lease file means nothing has ever run
+// this target here. Release leaves the file behind deliberately, so absence —
+// not presence — is the only safe reading of ENOENT.
+func TestAMissingLeaseFileIsAnAnswer(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	held, err := leaseHeld("INF-1")
+	require.NoError(t, err)
+	require.False(t, held)
 }
