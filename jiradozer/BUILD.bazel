@@ -9,6 +9,7 @@ go_library(
         "config.go",
         "discovery.go",
         "gitstate.go",
+        "lease.go",
         "notify.go",
         "orchestrator.go",
         "orchestrator_logtail.go",

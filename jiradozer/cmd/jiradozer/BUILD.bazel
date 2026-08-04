@@ -4,6 +4,7 @@ go_library(
     name = "jiradozer_lib",
     srcs = [
         "bootstrap.go",
+        "exec.go",
         "main.go",
         "models.go",
         "run.go",
@@ -43,6 +44,7 @@ go_test(
     name = "jiradozer_test",
     srcs = [
         "bootstrap_test.go",
+        "exec_test.go",
         "main_test.go",
         "runs_test.go",
     ],
