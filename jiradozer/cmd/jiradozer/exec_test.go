@@ -570,6 +570,42 @@ func TestStartRunLogRecordsTheLeaseItHolds(t *testing.T) {
 	assert.Equal(t, want, onDisk.LeaseTarget, "gc reads meta.json, not this process's memory")
 }
 
+// LeaseKey returns "" when a record cannot name its lock, and gc reads that as
+// "never reclaim" — permanently, since nothing revisits a terminal run. That is
+// the right reading of a damaged record, but it is only affordable because a
+// record this writer produces is never that shape. exec accepts exactly two run
+// shapes, so pinning both here is what keeps the refusal a safety net rather
+// than a slow disk leak.
+func TestEveryRunShapeRecordsALeaseName(t *testing.T) {
+	shapes := map[string]execArgs{
+		"issue":       {issueID: "INF-1", repo: "kernel"},
+		"description": {description: "tidy the helm chart", repo: "kernel"},
+		// --task-id rides along with either, and must not displace the name.
+		"description with task id": {description: "tidy it", taskID: "T-7", repo: "kernel"},
+	}
+	for name, args := range shapes {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+
+			x := &execRun{
+				app:    execTestApp(t),
+				logger: testMainLogger(t),
+				cfg:    &jiradozer.Config{WorkDir: t.TempDir(), BaseBranch: "main"},
+				args:   args,
+				runID:  "r1",
+				branch: "jiradozer/r1",
+			}
+			require.NoError(t, x.startRunLog())
+
+			onDisk, err := jiradozer.LoadRunMeta(x.rl.Dir())
+			require.NoError(t, err)
+			require.Equal(t, leaseTarget(args), onDisk.LeaseTarget)
+			require.NotEmpty(t, onDisk.LeaseKey(),
+				"a run gc cannot ask about is a worktree gc can never reclaim")
+		})
+	}
+}
+
 // The run-log IS gc's ownership namespace: these are ordinary wt worktrees
 // sitting beside human-owned ones, so gc's only discovery path is walking
 // run-logs, and it skips a run directory with no readable meta.json. A checkout

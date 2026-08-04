@@ -183,14 +183,21 @@ func (m RunMeta) EffectiveWTRoot() string {
 // name that was never taken answers "not held", which reads as permission to
 // delete a live worker's checkout.
 //
-// The fallbacks cover records written before LeaseTarget existed, and they
-// follow the same precedence the lease name itself is derived by, because the
-// only safe fallback is one that reconstructs the name that was actually taken.
+// In practice nothing reaches the fallbacks: exec is the only writer of these
+// records, it records LeaseTarget on every run, and TestEveryRunShapeRecordsALeaseName
+// holds it to that for both run shapes. A record without one is therefore a
+// damaged record — a truncated write, a hand-edit, or a leftover from a build
+// that predates the field, none of which are shapes to reclaim disk on faith.
+// So the fallbacks are salvage, not compatibility, and they follow the same
+// precedence the lease name is derived by, because the only useful salvage is
+// one that reconstructs the name actually taken.
 //
-// Target() is deliberately NOT a fallback. For a --description run it reports a
+// Target() is deliberately NOT among them. For a --description run it reports a
 // local-tracker identifier or the run id, while the lock was named for the
 // description — so Target() hands back a name no lock ever had, and asking
-// about it answers "free" about a directory a worker is still using.
+// about it answers "free" about a directory a worker is still using. Refusing
+// to answer costs a stranded checkout that `jiradozer gc` names, with its
+// reason, on every sweep; answering wrongly costs a live worker's work.
 func (m RunMeta) LeaseKey() string {
 	if m.LeaseTarget != "" {
 		return m.LeaseTarget
@@ -198,9 +205,9 @@ func (m RunMeta) LeaseKey() string {
 	if m.Description != "" {
 		// A --description run: the lock is a hash of the description, unless
 		// the dispatcher named the task, in which case the task id won. The
-		// hash cannot be reproduced from this record — the oldest records used
-		// the run id instead, and the newer scheme folds in the repo — so
-		// without a task id there is no honest answer.
+		// hash is not reproduced here on purpose — a second copy of the
+		// derivation is a second thing to drift, and this branch exists only
+		// for records the writer never produced.
 		return m.TaskID
 	}
 	if m.IssueIdentifier != "" {
