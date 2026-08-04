@@ -127,7 +127,7 @@ func run(ctx context.Context, app *cliapp.App, args runArgs) error {
 	if err := wt.CheckGitHubAuth(ctx, gh); err != nil {
 		return err
 	}
-	self, err := currentGitHubLogin(ctx, gh)
+	self, err := prdozer.CurrentGitHubLogin(ctx, gh)
 	if err != nil {
 		logger.Warn("could not determine GitHub login; self-comment filtering disabled", "error", err)
 	}
@@ -225,16 +225,6 @@ func parsePRList(s string) ([]int, error) {
 	return out, nil
 }
 
-func currentGitHubLogin(ctx context.Context, gh wt.GHRunner) (string, error) {
-	res, err := gh.Run(ctx, []string{"api", "user", "--jq", ".login"}, "")
-	if err != nil {
-		if res != nil && res.Stderr != "" {
-			return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(res.Stderr))
-		}
-		return "", err
-	}
-	return strings.TrimSpace(res.Stdout), nil
-}
 
 // repoNameFromCwd derives a short repo identifier to namespace state files.
 // Preference order:

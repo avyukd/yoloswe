@@ -1,6 +1,7 @@
 package prdozer
 
 import (
+	"strings"
 	"context"
 	"fmt"
 	"os"
@@ -546,4 +547,71 @@ func TestEndsTheRun_MatchesTerminalFor(t *testing.T) {
 				"endsTheRun must agree with terminalFor for %q", action)
 		})
 	}
+}
+
+// selfLoginGH records whether the loop asked who it is authenticated as, and
+// serves a login when it does.
+type selfLoginGH struct {
+	mu     sync.Mutex
+	asked  bool
+	ticked chan struct{}
+	once   sync.Once
+}
+
+func (g *selfLoginGH) Run(_ context.Context, args []string, _ string) (*wt.CmdResult, error) {
+	g.mu.Lock()
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "api user") {
+		g.asked = true
+		g.mu.Unlock()
+		return &wt.CmdResult{Stdout: "mzhaom\n"}, nil
+	}
+	g.mu.Unlock()
+	g.once.Do(func() { close(g.ticked) })
+	// Anything else: an empty-but-valid payload keeps the tick moving.
+	return &wt.CmdResult{Stdout: "{}"}, nil
+}
+
+func (g *selfLoginGH) askedForLogin() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.asked
+}
+
+// The babysit loop must resolve its own GitHub login and hand it to the watcher.
+//
+// Without it w.self is "", so Snapshot never marks a comment IsSelf, and
+// NewComments — an unconditional polish trigger — fires on prdozer's own
+// replies. The run then polishes in response to itself: kernel#7040 read
+// UNRES=0 / SUCCESS / APPROVED on every tick and still ran six rounds, with the
+// comment count climbing in lockstep with the rounds producing it.
+//
+// The orchestrator path has always passed WithSelfLogin; only babysit did not.
+func TestBabysitLoop_ResolvesSelfLoginForCommentFiltering(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	gh := &selfLoginGH{ticked: make(chan struct{})}
+
+	runLog, err := NewRunLog(RunMeta{Repo: "o/r", PRNumber: 42, RunID: "self-login-test"})
+	require.NoError(t, err)
+
+	b := NewBabysitter(gh, nil, nil, nil, BabysitOptions{
+		OwnerRepo:    "o/r",
+		PRNumber:     42,
+		PollInterval: time.Hour,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.loop(ctx, &RunContext{WorktreePath: t.TempDir()}, runLog, DiscoveredPR{Number: 42})
+
+	select {
+	case <-gh.ticked:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the loop never ran a tick")
+	}
+	cancel()
+
+	assert.True(t, gh.askedForLogin(),
+		"the loop must resolve its own login, or every self-reply reads as a new comment "+
+			"and triggers another polish round")
 }

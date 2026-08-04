@@ -50,6 +50,10 @@ type Watcher struct {
 	// diverged is set by the divergence guard within a tick so Tick can
 	// report WHY it stopped. Reset at the top of every tick.
 	diverged bool
+	// ratcheted is set by the scope guard, for the same reason: needs_human
+	// otherwise reads as "waiting on an approval", and "this PR grew too far"
+	// needs a different response — a human deciding what to cut, not a review.
+	ratcheted bool
 	// stalled is set by the no-progress guard within a tick, for the same
 	// reason as diverged: both stop the run with LastActionNeedsHuman, and
 	// without a distinct signal the terminal report cannot tell "waiting on an
@@ -217,7 +221,7 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 		"rounds_since_improvement", state.RoundsSinceImprovement,
 	)
 
-	w.diverged = false
+	w.diverged, w.ratcheted = false, false
 	w.stalled, w.lastStallError, w.lastStallStage = false, "", ""
 	w.lastFailureError = ""
 	priorAttempts, priorMergeErr := state.MergeAttempts, state.LastMergeError
@@ -314,6 +318,13 @@ func (w *Watcher) decideAndAct(ctx context.Context, snap *Snapshot, cs Changeset
 	case !cs.NeedsPolish() && !w.needsSelfReview(snap, state):
 		w.status("PR #%d unchanged — idle", w.pr)
 		return LastActionIdle
+	case w.ratcheting(snap, state):
+		// The PR has grown past what polishing should produce. Ordered BEFORE
+		// the divergence guard because the two answer different questions and
+		// this one is the only guard that can fire on a run whose every round
+		// succeeded — which is exactly the state kernel#8374 stayed in for five
+		// days and 23 commits.
+		return LastActionNeedsHuman
 	case w.diverging(snap, state):
 		// More polish rounds are not producing a better PR. Stop and hand it
 		// to a human rather than burning rounds — and money — making it worse.
@@ -759,6 +770,46 @@ func (w *Watcher) expireStaleDivergence(state *State, snap *Snapshot) bool {
 // recordHealth, so the decision uses the outcome of work already done rather
 // than predicting the next round — and so a snapshot that finally improves is
 // scored before it can be used to stop the run.
+// ratcheting reports whether prdozer's own rounds have grown this PR past the
+// point where more polishing is the right answer.
+//
+// This is the scope brake, and it is the only guard here that is not a liveness
+// check. ConsecutiveFailures watches for rounds that error, RoundsSinceImprovement
+// for rounds that do not improve, InvocationsSinceRound for rounds that never
+// return. kernel#8374 evaded all three by SUCCEEDING: every round genuinely
+// closed the findings the previous round drew, so BestHealth kept being beaten
+// and RoundsSinceImprovement sat at zero across eight consecutive ticks — while
+// the PR went from 6 files/+407 to 13 files/+2509 and spread into three services
+// it never originally touched.
+//
+// Stops on the COMMIT count, not the diff size. Diff growth is reported but
+// never terminal: kernel#8466's round-one restructure was large and correct, and
+// a size threshold tuned to catch #8374 would have aborted it. The commit count
+// is the sharper signal because it measures how many times prdozer decided the
+// PR was not done yet.
+func (w *Watcher) ratcheting(snap *Snapshot, state *State) bool {
+	limit := w.cfg.Backoff.MaxPolishCommits
+	if limit <= 0 || state.PolishCommits < limit {
+		return false
+	}
+	grew := ""
+	if state.BaselineAdditions > 0 && snap.PR.Additions > state.BaselineAdditions {
+		grew = fmt.Sprintf(" diff +%d->+%d additions across %d files",
+			state.BaselineAdditions, snap.PR.Additions, snap.PR.ChangedFiles)
+	}
+	w.ratcheted = true
+	w.logger.Warn("stopping: polish has added enough commits that the PR needs a human look",
+		"polish_commits", state.PolishCommits,
+		"limit", limit,
+		"polish_rounds", state.PolishRounds,
+		"additions", snap.PR.Additions,
+		"baseline_additions", state.BaselineAdditions,
+		"changed_files", snap.PR.ChangedFiles)
+	w.status("PR #%d stopped: prdozer has added %d commits (limit %d).%s",
+		w.pr, state.PolishCommits, limit, grew)
+	return true
+}
+
 func (w *Watcher) diverging(snap *Snapshot, state *State) bool {
 	limit := w.cfg.Backoff.MaxRoundsWithoutImprovement
 	if limit <= 0 || state.BestHealth == nil {
@@ -863,6 +914,19 @@ func (w *Watcher) recordHealth(state *State, snap *Snapshot) bool {
 		// report can say how much work the run did as well as how long it has
 		// been stuck.
 		state.PolishRounds++
+		// A polished tick whose head moved means the round PUSHED. Counted from
+		// the head actually changing rather than from the round returning: a
+		// round that only replied to comments has not grown the PR, and the
+		// scope brake is about growth. Cumulative per PR, never reset.
+		if state.LastSeenHeadSHA != "" && snap.PR.HeadRefOid != "" &&
+			state.LastSeenHeadSHA != snap.PR.HeadRefOid {
+			state.PolishCommits++
+		}
+	}
+	// Record where this PR started so growth is reported against its real
+	// baseline rather than against zero. First observation only.
+	if state.BaselineAdditions == 0 && snap.PR.Additions > 0 {
+		state.BaselineAdditions = snap.PR.Additions
 	}
 	if state.BestHealth == nil || h.BetterThan(*state.BestHealth) {
 		state.BestHealth = &h

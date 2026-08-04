@@ -155,6 +155,26 @@ type State struct {
 	// RoundsSinceImprovement counts consecutive polish rounds that failed to
 	// beat BestHealth. Reset to zero whenever a new best is reached.
 	RoundsSinceImprovement int `json:"rounds_since_improvement,omitempty"`
+	// PolishCommits counts commits prdozer's own rounds have added to this PR,
+	// cumulative across every run and never reset.
+	//
+	// Per PR, not per run, because scope is a property of the PR: kernel#8374
+	// reached 23 commits and +2509/-88 across 13 files via two runs of 3 and 4
+	// rounds each, so any per-run cap would have caught none of it.
+	//
+	// This is the one brake that is not a liveness check. All the others watch
+	// for a run that FAILS (ConsecutiveFailures), STAGNATES
+	// (RoundsSinceImprovement) or never returns (InvocationsSinceRound).
+	// #8374 evaded every one of them by succeeding: each round genuinely closed
+	// the findings the previous round drew, so BestHealth kept being beaten and
+	// the streak kept resetting to zero — it sat at 0 across eight consecutive
+	// ticks while the diff grew sixfold. A run can be perfectly healthy by every
+	// existing measure and still ratchet scope indefinitely.
+	PolishCommits int `json:"polish_commits,omitempty"`
+	// BaselineAdditions is the PR's diff size when prdozer first saw it, so
+	// growth can be reported against where the PR actually started rather than
+	// against zero.
+	BaselineAdditions int `json:"baseline_additions,omitempty"`
 	// InvocationsSinceRound counts polish invocations that ended WITHOUT the
 	// round returning a result. Reset to zero whenever one completes.
 	//

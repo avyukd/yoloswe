@@ -145,10 +145,29 @@ func (b *Babysitter) loop(ctx context.Context, rc *RunContext, runLog *RunLog, p
 	polish := PolishRunner(NewAgentPolisher(b.renderer, b.logger))
 	rework := ReworkRunner(NewAgentRework(b.renderer, b.logger, runLog))
 
+	// Self-comment filtering. The orchestrator has always passed this; the
+	// babysit path never did, so w.self stayed "" and IsSelf was never true.
+	//
+	// That is not cosmetic: NewComments is an unconditional polish trigger, so
+	// every reply prdozer posts ("Fixed in <sha>") came back on the next
+	// snapshot as somebody else's new comment and started another round. On
+	// kernel#7040 the PR read UNRES=0 / SUCCESS / APPROVED on every single tick
+	// and still ran six rounds, its comment count climbing in lockstep with the
+	// rounds producing them; new=0 appeared only after polishing stopped.
+	//
+	// Best-effort: a failed lookup disables the filter rather than the run,
+	// which is the behaviour the orchestrator already has.
+	self, err := CurrentGitHubLogin(ctx, b.gh)
+	if err != nil {
+		b.logger.Warn("could not determine GitHub login; self-comment filtering disabled",
+			"error", safeErrString(err))
+	}
+
 	w := NewWatcher(cfg, b.gh, polish, o.PRNumber, rc.WorktreePath, o.OwnerRepo, b.logger,
 		WithRenderer(b.renderer),
 		WithRework(rework, o.Entry.MergeRework),
 		WithPolishSpec(o.Entry.Polish),
+		WithSelfLogin(self),
 	)
 
 	interval := o.PollInterval

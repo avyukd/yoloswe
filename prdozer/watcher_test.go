@@ -2223,3 +2223,71 @@ func TestWatcher_Tick_CounterOnlyChange_IsPersisted(t *testing.T) {
 	assert.Equal(t, 5, after.InvocationsSinceRound,
 		"a tick whose only change is the no-progress counter must still be saved")
 }
+
+// The scope brake must stop a run whose rounds all SUCCEED.
+//
+// This is the kernel#8374 shape and the reason it needs its own guard: every
+// liveness check reads that run as healthy. Rounds do not error, so
+// ConsecutiveFailures stays 0. Each round closes the findings the previous one
+// drew, so BestHealth keeps being beaten and RoundsSinceImprovement resets to 0
+// — it sat at zero across eight consecutive ticks. Rounds return, so
+// InvocationsSinceRound stays 0. Meanwhile the PR grew from 6 files/+407 to 13
+// files/+2509 over 23 commits and five days, and nothing stopped it.
+func TestWatcher_ScopeRatchet_StopsAHealthyButGrowingRun(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxPolishCommits = 3
+	statePath := StatePath("r", 42)
+
+	// Deliberately the picture of health by every OTHER guard: no failures, no
+	// stalls, and a fresh improvement streak. Only the commit count is high.
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		PolishCommits: 3, ConsecutiveFailures: 0, RoundsSinceImprovement: 0,
+		InvocationsSinceRound: 0,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, LastActionNeedsHuman, res.Action,
+		"a run that keeps succeeding while the PR keeps growing must still stop")
+}
+
+// Below the limit the guard must stay out of the way, or it becomes a round cap
+// wearing a different name.
+func TestWatcher_ScopeRatchet_SilentBelowTheLimit(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxPolishCommits = 12
+	statePath := StatePath("r", 42)
+
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		PolishCommits: 11,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.NotEqual(t, LastActionNeedsHuman, res.Action,
+		"one commit below the limit is still ordinary work")
+}
+
+// Zero disables the guard, so an operator can opt a repo out without patching.
+func TestWatcher_ScopeRatchet_ZeroDisables(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "FAILURE"), "[]", "base1")
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.cfg.Backoff.MaxPolishCommits = 0
+	statePath := StatePath("r", 42)
+
+	pre := &State{
+		LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1",
+		PolishCommits: 500,
+	}
+	require.NoError(t, pre.Save(statePath))
+
+	res, err := w.Tick(context.Background())
+	require.NoError(t, err)
+	assert.NotEqual(t, LastActionNeedsHuman, res.Action, "zero must disable the guard")
+}

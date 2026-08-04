@@ -76,7 +76,12 @@ type PRDetails struct {
 	StatusCheckRollup []statusCheckRow `json:"statusCheckRollup"`
 	LatestReviews     []reviewRow      `json:"latestReviews"`
 	Number            int              `json:"number"`
-	IsDraft           bool             `json:"isDraft"`
+	// Additions/Deletions/ChangedFiles size the PR's diff. Fetched in the same
+	// gh call as everything else, so the scope guard costs no extra round trip.
+	Additions    int  `json:"additions"`
+	Deletions    int  `json:"deletions"`
+	ChangedFiles int  `json:"changedFiles"`
+	IsDraft      bool `json:"isDraft"`
 }
 
 // reviewRow is one entry in gh's latestReviews: the most recent review per
@@ -270,7 +275,7 @@ func changesRequestedBy(reviews []reviewRow) []string {
 func fetchPRDetails(ctx context.Context, gh wt.GHRunner, dir string, n int) (*PRDetails, error) {
 	args := []string{
 		"pr", "view", strconv.Itoa(n),
-		"--json", "number,url,headRefName,baseRefName,headRefOid,state,isDraft,reviewDecision,mergeable,statusCheckRollup,latestReviews",
+		"--json", "number,url,headRefName,baseRefName,headRefOid,state,isDraft,reviewDecision,mergeable,statusCheckRollup,latestReviews,additions,deletions,changedFiles",
 	}
 	res, err := gh.Run(ctx, args, dir)
 	if err != nil {
@@ -443,4 +448,22 @@ func ghError(err error, res *wt.CmdResult) error {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(res.Stderr))
 	}
 	return err
+}
+
+// CurrentGitHubLogin reports the login `gh` is authenticated as, for
+// self-comment filtering.
+//
+// Load-bearing rather than cosmetic: a snapshot marks a comment IsSelf only
+// when its author matches, and NewComments is an unconditional polish trigger.
+// With no login every reply prdozer posts comes back as somebody else's new
+// comment, so the run polishes in response to itself. See WithSelfLogin.
+func CurrentGitHubLogin(ctx context.Context, gh wt.GHRunner) (string, error) {
+	res, err := gh.Run(ctx, []string{"api", "user", "--jq", ".login"}, "")
+	if err != nil {
+		if res != nil && res.Stderr != "" {
+			return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(res.Stderr))
+		}
+		return "", err
+	}
+	return strings.TrimSpace(res.Stdout), nil
 }
