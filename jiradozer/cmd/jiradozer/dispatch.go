@@ -299,12 +299,19 @@ func guardDuplicateRun(ctx context.Context, x execArgs, minDiskGB int, logger *s
 	if target == "" {
 		return nil
 	}
-	hosts, err := fleet.Load(guardFleetDir)
-	if errors.Is(err, fs.ErrNotExist) {
+	// The absent-registry test is a STAT on the root, not errors.Is on Load's
+	// error: fleet.Load wraps fs.ErrNotExist from two different places — the
+	// missing root, which is the benign "this box has no fleet" case, and a
+	// registry entry that vanished between ReadDir and ReadFile, which is a
+	// PARTIAL view. Matching the sentinel cannot tell those apart, so it would
+	// let a half-readable fleet skip the guard — the exact fail-open this
+	// function exists to close.
+	if _, statErr := os.Stat(fleet.ExpandHome(guardFleetDir)); errors.Is(statErr, fs.ErrNotExist) {
 		logger.Warn("no fleet inventory on this box; cross-host duplicate guard skipped",
-			"target", target, "error", err)
+			"target", target, "dir", guardFleetDir)
 		return nil
 	}
+	hosts, err := fleet.Load(guardFleetDir)
 	if err != nil {
 		return fmt.Errorf("cannot rule out a second run of %s: %w", target, err)
 	}

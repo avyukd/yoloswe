@@ -340,6 +340,100 @@ func TestGuardDuplicateRunDegradesWithoutAFleet(t *testing.T) {
 	require.NoError(t, err, "an absent fleet must not block a local run")
 }
 
+// stubSSH answers every probe with one canned blob, so a test can put a box
+// into a chosen state without a network.
+type stubSSH struct{ out string }
+
+func (s stubSSH) Run(context.Context, string, string) (string, error) { return s.out, nil }
+
+// probeOutputHoldingLease renders the probe blob for a healthy box that holds
+// the lock for target. It goes through SanitizeSlug rather than hardcoding a
+// name so the fixture tracks the real lease-naming rule.
+func probeOutputHoldingLease(target string) string {
+	return strings.Join([]string{
+		"__NPROC__", "8",
+		"__LOAD__", "0.1 0.1 0.1 1/1 1",
+		"__DF__", "Filesystem 1024-blocks Used Available Capacity Mounted on",
+		"/dev/root 100000000 1 99000000 1% /",
+		"__TMUX__", "0",
+		"__LEASES__", fleet.SanitizeSlug(target) + ".lock",
+		"__BIN__", "/home/ubuntu/bin/jiradozer",
+		"__END__", "",
+	}, "\n")
+}
+
+// withFakeFleet points the guard at a one-host registry whose probe reports the
+// lease for target already held, and returns that lease target.
+func withFakeFleet(t *testing.T, x execArgs) string {
+	t.Helper()
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "boxa.json"),
+		[]byte(`{"hostname":"boxa","public_dns":"boxa.example.com","ssh_user":"ubuntu"}`), 0o600))
+
+	target := leaseTarget(x)
+	require.NotEmpty(t, target)
+
+	oldDir, oldSSH := guardFleetDir, guardSSH
+	guardFleetDir, guardSSH = dir, stubSSH{out: probeOutputHoldingLease(target)}
+	t.Cleanup(func() { guardFleetDir, guardSSH = oldDir, oldSSH })
+	return target
+}
+
+// The ordering this PR exists to establish, asserted on the REAL `--here` path:
+// the duplicate guard runs BEFORE the dry-run return, so a preview reports the
+// refusal a real run would hit instead of promising work that would be rejected.
+//
+// This is the test that actually pins the ordering. The absent-fleet cases
+// cannot: there the guard is a no-op, so moving it back below the dry-run
+// return leaves them green.
+func TestDryRunHereReportsAHeldLeaseInsteadOfPromisingToRun(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	args := execArgs{description: "should never run", repo: "no-such-repo-exists"}
+	target := withFakeFleet(t, args)
+
+	out, err := runDispatchCmd(t, "--here", "--dry-run", "--skip-quota-check",
+		"--description", args.description, "--repo", args.repo)
+
+	require.Error(t, err, "a held lease must refuse the preview, not print it: %s", out)
+	assert.Contains(t, err.Error(), target, "the refusal must name the task already being worked")
+	assert.NotContains(t, out, "would run",
+		"printing the preview means the guard ran after the dry-run return")
+}
+
+// The same guard on the executing `--here` path: a held lease refuses before
+// runExec, which is the duplicate run this whole check exists to prevent.
+func TestHereRefusesToStartASecondRunOfAHeldTask(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	args := execArgs{description: "already in flight", repo: "no-such-repo-exists"}
+	target := withFakeFleet(t, args)
+
+	_, err := runDispatchCmd(t, "--here", "--skip-quota-check",
+		"--description", args.description, "--repo", args.repo)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), target)
+}
+
+// A fleet directory that EXISTS but cannot be read fully is a partial view, not
+// an empty one. It must fail closed: fleet.Load reports a vanished or malformed
+// entry as fs.ErrNotExist-wrapped too, so matching that sentinel on Load's error
+// would let a half-readable registry skip the guard entirely.
+func TestGuardFailsClosedOnAnUnreadableFleet(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "boxa.json"), []byte("{not json"), 0o600))
+
+	oldDir := guardFleetDir
+	guardFleetDir = dir
+	t.Cleanup(func() { guardFleetDir = oldDir })
+
+	err := guardDuplicateRun(context.Background(),
+		execArgs{description: "x", repo: "yoloswe"}, 0, testMainLogger(t))
+
+	require.Error(t, err, "a fleet that is present but unreadable must not read as 'nobody is running it'")
+	assert.Contains(t, err.Error(), "cannot rule out a second run")
+}
+
 // A --description run has no tracker-side claim, so its lease target is derived
 // from its CONTENT and is stable across invocations. That is what makes the
 // duplicate guard work for ad-hoc tasks at all — a per-run identifier would be
