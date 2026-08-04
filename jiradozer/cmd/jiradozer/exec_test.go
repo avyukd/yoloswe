@@ -141,10 +141,14 @@ func execRunForClaimOrdering(t *testing.T, trk *claimRecordingTracker) *execRun 
 	return &execRun{
 		app:    execTestApp(t),
 		logger: testMainLogger(t),
-		cfg:    &jiradozer.Config{BaseBranch: "main"},
-		wtMgr:  wt.NewManager(t.TempDir(), "kernel"),
-		args:   execArgs{issueID: "INF-1", repo: "kernel"},
-		runID:  "r1",
+		// WorkDir carries the production default, not "". A fixture that leaves
+		// it empty makes every "was a worktree created" assertion below pass
+		// vacuously — which is how a `kept := cfg.WorkDir != ""` test survived
+		// being wrong.
+		cfg:   &jiradozer.Config{WorkDir: ".", BaseBranch: "main"},
+		wtMgr: wt.NewManager(t.TempDir(), "kernel"),
+		args:  execArgs{issueID: "INF-1", repo: "kernel"},
+		runID: "r1",
 		newTracker: func(*jiradozer.Config, string) (tracker.IssueTracker, error) {
 			return trk, nil
 		},
@@ -350,6 +354,31 @@ func TestFinishToleratesARunWithNoPR(t *testing.T) {
 	assert.True(t, m.WorktreeKept, "a failed run keeps its worktree; the work exists nowhere else")
 }
 
+// work_dir is the configured BASE directory, and LoadConfig defaults it to
+// ".", so it is non-empty on every real run from config load onward. Reading it
+// as "a checkout exists" makes a run that died before wt.New report a kept
+// worktree at "." and sends a human after a directory that was never created —
+// and, worse, invites `gh` to answer about whatever repository the process
+// happened to be started in.
+func TestFinishDoesNotClaimAWorktreeItNeverCreated(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	x := newFinishTestRun(t)
+	x.cfg.WorkDir = "." // the production default
+	x.worktreePath = "" // createWorktree never ran
+	x.lookupPR = func(context.Context, string, string) (*wt.PRInfo, error) {
+		t.Fatal("no checkout exists, so there is nowhere to ask gh from")
+		return nil, nil
+	}
+
+	x.finish(errors.New("create worktree for jiradozer/INF-1: not a git repository"))
+
+	m := x.rl.Meta()
+	assert.False(t, m.WorktreeKept, "nothing was kept; work_dir is not evidence of a checkout")
+	assert.Empty(t, m.WorktreeKeptReason)
+	assert.Equal(t, jiradozer.RunStateFailed, m.State)
+}
+
 // A cancellation is a stop, not a failure: recording it as failed would make
 // every Ctrl-C look like a broken run to a fleet-wide listing.
 func TestFinishRecordsACancellationAsCancelled(t *testing.T) {
@@ -374,13 +403,17 @@ func newFinishTestRun(t *testing.T) *execRun {
 		State:           jiradozer.RunStateRunning,
 	})
 	require.NoError(t, err)
+	// A run that reaches finish() normally has a checkout, and createWorktree
+	// points both fields at it — so the fixture does too.
+	checkout := t.TempDir()
 	return &execRun{
-		app:    execTestApp(t),
-		logger: testMainLogger(t),
-		cfg:    &jiradozer.Config{WorkDir: t.TempDir()},
-		rl:     rl,
-		runID:  runID,
-		branch: "jiradozer/INF-1",
+		app:          execTestApp(t),
+		logger:       testMainLogger(t),
+		cfg:          &jiradozer.Config{WorkDir: checkout},
+		worktreePath: checkout,
+		rl:           rl,
+		runID:        runID,
+		branch:       "jiradozer/INF-1",
 		lookupPR: func(context.Context, string, string) (*wt.PRInfo, error) {
 			return nil, errors.New("no pull requests found for branch")
 		},

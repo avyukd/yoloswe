@@ -502,13 +502,54 @@ func TestGCAsksAboutTheLockAWorkerActuallyHolds(t *testing.T) {
 	requireReason(t, res, "worktree", "holds this task's lease")
 }
 
-// Records written before LeaseTarget existed still have to be swept, and for
-// issue and task runs the two names did coincide.
-func TestLeaseKeyFallsBackToTargetForOlderRecords(t *testing.T) {
+// Records written before LeaseTarget existed still have to be swept. The
+// fallbacks may only reconstruct a name that was actually taken — a plausible
+// one is worse than none, because "no such lock" reads as "nobody is working
+// here" and clears a checkout for deletion.
+func TestLeaseKeyOnlyAnswersWhenItCanNameTheRealLock(t *testing.T) {
+	// Recorded wins outright.
 	require.Equal(t, "adhoc-abc", RunMeta{IssueIdentifier: "LOCAL-1", LeaseTarget: "adhoc-abc"}.LeaseKey())
+	// An issue or task run leased its own identifier, so the old records match.
 	require.Equal(t, "INF-1", RunMeta{IssueIdentifier: "INF-1"}.LeaseKey())
 	require.Equal(t, "t-7", RunMeta{TaskID: "t-7"}.LeaseKey())
-	require.Equal(t, "r1", RunMeta{RunID: "r1"}.LeaseKey())
+	// A --description run leased a hash of the description. LOCAL-1 is the
+	// local tracker's issue, not a lock name, and the run id never was one
+	// either — both must come back empty rather than confidently wrong.
+	require.Empty(t, RunMeta{RunID: "r1", Description: "tidy the chart"}.LeaseKey())
+	require.Empty(t, RunMeta{RunID: "r1", Description: "tidy the chart", IssueIdentifier: "LOCAL-1"}.LeaseKey())
+	require.Empty(t, RunMeta{RunID: "r1"}.LeaseKey())
+	// Except when the dispatcher named the task: then the task id is the lock,
+	// exactly as leaseTarget derives it.
+	require.Equal(t, "t-7", RunMeta{RunID: "r1", Description: "tidy the chart", TaskID: "t-7"}.LeaseKey())
+}
+
+// The fallback used to be Target(), which for a --description run is a
+// local-tracker id — a lock name that never existed. gc would ask about it,
+// hear "not held", and go on to delete the directory of a worker that was still
+// running. A record that cannot name its lock must stop the sweep instead.
+func TestGCWillNotReclaimARecordThatCannotNameItsLease(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	_, wtPath := gcFixture(t, RunMeta{
+		RunID: "r1", Repo: "kernel", Branch: "jiradozer/r1",
+		// A pre-LeaseTarget --description record: local issue, no lease name.
+		IssueIdentifier: "LOCAL-1", Description: "tidy the helm chart",
+		State: RunStateDone, PRURL: "https://github.com/o/r/pull/1",
+	})
+
+	var asked []string
+	rm := &fakeRemover{}
+	deps := gcDeps(fakePRChecker{merged: map[string]bool{"https://github.com/o/r/pull/1": true}}, rm, nil)
+	deps.LeaseHeld = func(target string) (bool, error) {
+		asked = append(asked, target)
+		return false, nil
+	}
+
+	res, err := RunGC(context.Background(), deps, GCOptions{Apply: true}, nil)
+	require.NoError(t, err)
+	require.Empty(t, asked, "a name no lock ever had must not be asked about at all")
+	require.Empty(t, rm.removed)
+	require.DirExists(t, wtPath)
+	requireReason(t, res, "worktree", "does not record which lease it holds")
 }
 
 // Every name an operator is ever shown has to find the run again — dispatch

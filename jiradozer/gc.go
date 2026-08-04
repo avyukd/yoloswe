@@ -256,7 +256,17 @@ func gcWorktree(ctx context.Context, deps GCDeps, opts GCOptions, m RunMeta, log
 	// asking about the wrong lock name answers "not held" — which reads as
 	// permission to delete a live worker's directory.
 	if deps.LeaseHeld != nil {
-		held, err := deps.LeaseHeld(m.LeaseKey())
+		key := m.LeaseKey()
+		if key == "" {
+			// The record cannot name its own lock, so there is no question to
+			// ask — and an unasked question is not permission to reclaim. Only
+			// pre-LeaseTarget --description runs land here, and they are
+			// exactly the shape where a guessed name would answer "not held"
+			// about a directory a worker is still using.
+			c.Reason = "the run does not record which lease it holds — inspect before reclaiming"
+			return c
+		}
+		held, err := deps.LeaseHeld(key)
 		if err != nil {
 			c.Reason = fmt.Sprintf("could not verify the task's lease: %v", err)
 			return c

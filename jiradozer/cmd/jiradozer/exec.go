@@ -219,9 +219,15 @@ type execRun struct {
 	// worktree never comes up — can be driven through run() itself rather than
 	// asserted on the pieces, which is the only way the ordering stays enforced.
 	newTracker func(cfg *jiradozer.Config, issueID string) (tracker.IssueTracker, error)
-	runID      string
-	branch     string
-	args       execArgs
+	// worktreePath is set only once wt has actually produced a checkout. It is
+	// the sentinel for "a directory exists that someone could be sent to":
+	// cfg.WorkDir cannot serve that purpose, because it starts life as the
+	// configured base directory (LoadConfig defaults it to ".") and is only
+	// overwritten with the real path on success.
+	worktreePath string
+	runID        string
+	branch       string
+	args         execArgs
 }
 
 // defaultPRLookup asks gh which PR exists for a branch, from inside the
@@ -437,6 +443,8 @@ func (x *execRun) createWorktree(ctx context.Context) error {
 	// Everything downstream — the agent, the local tracker, the workflow — runs
 	// against this directory.
 	x.cfg.WorkDir = path
+	// And this is the only place that may say a checkout exists.
+	x.worktreePath = path
 	// Reconcile the prediction with what wt actually did. Normally identical;
 	// when it is not, the run-log is pointing gc at a directory that does not
 	// exist while the real checkout leaks, so correcting it matters more than
@@ -578,7 +586,11 @@ func (x *execRun) postStartComment(ctx context.Context) {
 	fmt.Fprintf(&b, "**jiradozer** started on `%s`\n\n", host)
 	fmt.Fprintf(&b, "- run: `%s`\n", x.runID)
 	fmt.Fprintf(&b, "- branch: `%s`\n", x.branch)
-	fmt.Fprintf(&b, "- worktree: `%s`\n", x.cfg.WorkDir)
+	// worktreePath, not cfg.WorkDir: this comment only runs after the checkout,
+	// where the two agree — but only one of them is a directory that is
+	// guaranteed to exist, and a path printed to an operator has to be one they
+	// can cd into.
+	fmt.Fprintf(&b, "- worktree: `%s`\n", x.worktreePath)
 	fmt.Fprintf(&b, "- run log: `%s`\n", x.rl.Dir())
 	if x.app.LogPath != "" {
 		fmt.Fprintf(&b, "- log: `%s`\n", x.app.LogPath)
@@ -629,8 +641,10 @@ func (x *execRun) finish(runErr error) {
 	//
 	// Conditional because the run-log now outlives failures that happen before
 	// the checkout: claiming to have KEPT a worktree that was never created
-	// would send a human looking for a directory that does not exist.
-	kept := x.cfg.WorkDir != ""
+	// would send a human looking for a directory that does not exist. The test
+	// is worktreePath, not cfg.WorkDir — the latter is non-empty from config
+	// load onward and so is true even on a run that never reached wt.New.
+	kept := x.worktreePath != ""
 	if err := x.rl.UpdateMeta(func(m *jiradozer.RunMeta) {
 		if kept {
 			m.WorktreeKept = true
@@ -664,10 +678,14 @@ func (x *execRun) finish(runErr error) {
 // and is not recorded leaks a worktree permanently, which is why the lookup
 // happens on every exit path instead of only the successful one.
 func (x *execRun) resolvePR(ctx context.Context) *wt.PRInfo {
-	if x.lookupPR == nil || x.branch == "" || x.cfg.WorkDir == "" {
+	// The lookup has to run inside this run's checkout: `gh` resolves the repo
+	// from the directory it runs in, so asking from a base directory that is
+	// merely where worktrees live — or from "." — either fails or answers about
+	// somebody else's repository.
+	if x.lookupPR == nil || x.branch == "" || x.worktreePath == "" {
 		return nil
 	}
-	pr, err := x.lookupPR(ctx, x.branch, x.cfg.WorkDir)
+	pr, err := x.lookupPR(ctx, x.branch, x.worktreePath)
 	if err != nil {
 		x.logger.Debug("no PR resolved for branch", "branch", x.branch, "error", err)
 		return nil
@@ -690,7 +708,13 @@ func (x *execRun) postEndComment(ctx context.Context, state jiradozer.RunState, 
 	if m.PRURL != "" {
 		fmt.Fprintf(&b, "- PR: %s\n", m.PRURL)
 	}
-	fmt.Fprintf(&b, "- worktree kept at `%s` (reclaimed by `jiradozer gc` once the PR lands)\n", x.cfg.WorkDir)
+	// Only when one was actually kept, and named by the path wt produced. The
+	// configured work_dir is the wrong answer twice over: it is the base
+	// directory rather than the checkout, and it is set even on a run that
+	// failed before the checkout existed.
+	if m.WorktreeKept {
+		fmt.Fprintf(&b, "- worktree kept at `%s` (reclaimed by `jiradozer gc` once the PR lands)\n", x.worktreePath)
+	}
 	if runErr != nil {
 		fmt.Fprintf(&b, "\nError:\n```\n%s\n```\n", jiradozer.Truncate(runErr.Error(), 2000))
 	}

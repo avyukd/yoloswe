@@ -177,13 +177,36 @@ func (m RunMeta) EffectiveWTRoot() string {
 
 // LeaseKey names the lock this run holds, for a liveness check.
 //
-// It falls back to Target() only for records written before LeaseTarget
-// existed, where the two did coincide for issue and task runs.
+// Returning "" means "this record cannot say", the same convention
+// EffectiveWTRoot uses — and here the caller has exactly one safe reading of
+// it: refuse to reclaim. Guessing is worse than not answering, because a lock
+// name that was never taken answers "not held", which reads as permission to
+// delete a live worker's checkout.
+//
+// The fallbacks cover records written before LeaseTarget existed, and they
+// follow the same precedence the lease name itself is derived by, because the
+// only safe fallback is one that reconstructs the name that was actually taken.
+//
+// Target() is deliberately NOT a fallback. For a --description run it reports a
+// local-tracker identifier or the run id, while the lock was named for the
+// description — so Target() hands back a name no lock ever had, and asking
+// about it answers "free" about a directory a worker is still using.
 func (m RunMeta) LeaseKey() string {
 	if m.LeaseTarget != "" {
 		return m.LeaseTarget
 	}
-	return m.Target()
+	if m.Description != "" {
+		// A --description run: the lock is a hash of the description, unless
+		// the dispatcher named the task, in which case the task id won. The
+		// hash cannot be reproduced from this record — the oldest records used
+		// the run id instead, and the newer scheme folds in the repo — so
+		// without a task id there is no honest answer.
+		return m.TaskID
+	}
+	if m.IssueIdentifier != "" {
+		return m.IssueIdentifier
+	}
+	return m.TaskID
 }
 
 // Matches reports whether this run answers to name — its issue identifier, its
