@@ -261,6 +261,16 @@ Buckets → `must_fix` / `consider_fix` / `batch_ack` / `escalate` (`spiral_matc
 
 **Ownership:** own pre-existing code in touched files. `must_fix` unless false positive (cite file:line). Low/nit → fix if trivial else `ack`. Skips: `false_positive`, `wont_fix`, `stale`.
 
+**Scope contract — the PR's remit is fixed at round 1.** "Touched files" means files the PR touched when you *first saw it*, not files a later round dragged in. Otherwise ownership ratchets: each round's fix touches new files, which the next round then owns, and the PR grows without limit — while every round looks productive, because each one really is closing the previous round's findings.
+
+Before fixing anything outside the round-1 file set, ask whether this finding is *this PR's job*. Usually it isn't:
+
+- **Outside the round-1 files** → `wont_fix`, and say where it belongs ("not in this PR's diff — worth a ticket against `<owner>`"). You already do this when you notice; make it the rule rather than the lucky round.
+- **A flaw in a fix an earlier round of this same run made** → fix it, that is genuinely yours. But if the same subsystem needs a *third* correction, stop and escalate: three passes at one mechanism means the design is wrong, and the fourth commit will not settle it.
+- **New machinery to support a fix** (a cache, a latch, a reaper) → prefer the smaller change that needs none. New machinery draws new findings, which is how a two-file fix becomes a thirteen-file one.
+
+When you decline on scope, record it as `wont_fix` with the reason — a declined finding is a real outcome, not a gap.
+
 **Invariants:** same `invariant` from ≥2 reviewers → consensus on all sites. Prefer producer-side fix.
 
 **Spirals:** single-source may auto-demote to stale if evidence gone (±10 lines) or cited line was in prior round's diff. Multi-source → escalate. Default (no `--ask`): re-fix once (`spiral_refix: true`), stop on 2nd recurrence.
