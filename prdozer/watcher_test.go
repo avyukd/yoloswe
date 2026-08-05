@@ -3007,6 +3007,45 @@ func TestTakeSnapshot_BestEffortFetchesDegrade(t *testing.T) {
 		})
 	}
 
+	// Degrading one signal must not cost another. If losing comments also dropped
+	// the failed-run IDs, degrading would cost more than the abort it replaced.
+	//
+	// Only the SURVIVING signal is asserted here. The mirror property — that the
+	// failed signal contributes no data — is deliberately NOT tested: both
+	// producers already return a nil slice with their error, so the zeroing in
+	// TakeSnapshot is unreachable and an "is empty" assertion passes with that
+	// code deleted. A vacuous assertion is worse than none; the reasoning lives
+	// in a comment beside the guard instead.
+	//
+	// The table above cannot cover this: its fixture returns an empty list for
+	// every fetch, so "dropped" and "preserved" look identical.
+	t.Run("the healthy signal survives", func(t *testing.T) {
+		t.Run("comments throttled, failed-runs preserved", func(t *testing.T) {
+			gh := setupGH(buildPRJSON(okPRJSON, "SUCCESS"), `[{"databaseId":99}]`, "base1")
+			gh.failPrefix("api --paginate repos/o/r/pulls/42/comments", rateLimited)
+
+			snap, err := TakeSnapshot(context.Background(), gh, ".", 42, SnapshotOptions{})
+			require.NoError(t, err)
+			require.NotNil(t, snap)
+			assert.Equal(t, []int64{99}, snap.FailedRunIDs,
+				"degrading the comments fetch must not drop the failed-run IDs")
+		})
+
+		t.Run("failed-runs throttled, comments preserved", func(t *testing.T) {
+			gh := setupGH(buildPRJSON(okPRJSON, "SUCCESS"), "[]", "base1")
+			gh.addPrefix("api --paginate repos/o/r/issues/42/comments",
+				`[{"id":7,"user":{"login":"alice","type":"User"},"created_at":"2026-01-01T00:00:00Z"}]`)
+			gh.failPrefix("run list", rateLimited)
+
+			snap, err := TakeSnapshot(context.Background(), gh, ".", 42, SnapshotOptions{})
+			require.NoError(t, err)
+			require.NotNil(t, snap)
+			require.Len(t, snap.Comments, 1,
+				"degrading the failed-runs fetch must not drop the comments")
+			assert.Equal(t, "alice", snap.Comments[0].Author)
+		})
+	})
+
 	// Both at once — a real throttle hits every endpoint, so the tick must still
 	// survive losing two signals rather than only tolerating one.
 	t.Run("both throttled", func(t *testing.T) {

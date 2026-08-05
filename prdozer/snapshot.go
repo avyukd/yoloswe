@@ -268,19 +268,42 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 	// Errors are SCRUBBED, not raw: these strings are logged, persisted into the
 	// run record and Slacked, and a gh error can carry the endpoint config
 	// including key-bearing env vars.
+	//
+	// The entry deliberately holds no per-fetch "clear" closure: a struct with a
+	// string beside a func pointer trips govet fieldalignment (40 pointer bytes,
+	// could be 32), which gates this repo — govet runs enable-all and
+	// fieldalignment is not in .golangci.yml's disable list, the same constraint
+	// the Snapshot struct above is ordered under. No permutation helps; all six
+	// are 40. Nothing is lost by dropping it: see the zeroing note below.
 	for _, f := range []struct {
 		err   error
 		label string
-		clear func()
 	}{
-		{failedErr, fmt.Sprintf("failed runs for %s", pr.HeadRefName), func() { failed = nil }},
-		{commentsErr, fmt.Sprintf("comments for #%d", prNumber), func() { comments = nil }},
+		{failedErr, fmt.Sprintf("failed runs for %s", pr.HeadRefName)},
+		{commentsErr, fmt.Sprintf("comments for #%d", prNumber)},
 	} {
 		if f.err == nil {
 			continue
 		}
 		degraded = append(degraded, fmt.Sprintf("%s: %s", f.label, safeErrString(f.err)))
-		f.clear()
+	}
+	// Belt-and-braces: a degraded signal must contribute no data, so a caller
+	// cannot read a half-populated slice as a complete answer.
+	//
+	// These are UNREACHABLE today and no test can kill them: every error path in
+	// both fetchFailedRunIDs and fetchAllComments returns a nil slice beside its
+	// error, so the assignments never observably change anything (deleting them
+	// leaves the suite green — verified). They are kept as a local guard rather
+	// than deleted because the property they enforce — errored ⇒ no data — is
+	// currently a convention of two producers three call layers away that no
+	// signature enforces. A future fetch that returns a partially paginated list
+	// with its error would otherwise leak it into the snapshot silently, and the
+	// cost of holding the line here is two branches.
+	if failedErr != nil {
+		failed = nil
+	}
+	if commentsErr != nil {
+		comments = nil
 	}
 	pr.TotalCommits = totalCommits
 	return &Snapshot{
