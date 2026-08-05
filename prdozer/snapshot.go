@@ -254,7 +254,12 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 	// snapshot costs the tick, and every tick after it for as long as the throttle
 	// lasts.
 	if failedErr != nil {
-		degraded = append(degraded, fmt.Sprintf("failed runs for %s: %v", pr.HeadRefName, failedErr))
+		// Scrubbed, not raw. This string is logged, persisted into the run record
+		// and Slacked, and a gh/provider error can carry the endpoint config —
+		// including key-bearing env vars. Every other path that surfaces an error
+		// to those sinks goes through safeErrString; this one must too.
+		degraded = append(degraded,
+			fmt.Sprintf("failed runs for %s: %s", pr.HeadRefName, safeErrString(failedErr)))
 		failed = nil
 	}
 	if commentsErr != nil {
