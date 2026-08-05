@@ -3,12 +3,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -376,6 +380,18 @@ func TestFinishRecordsThePRSoGCCanReclaimTheWorktree(t *testing.T) {
 	onDisk, err := jiradozer.LoadRunMeta(x.rl.Dir())
 	require.NoError(t, err)
 	assert.Equal(t, "https://github.com/o/r/pull/42", onDisk.PRURL)
+
+	// The trail carries it too. Asserted here rather than in a fixture of its
+	// own because this is the only test that makes lookupPR succeed — every
+	// other trail fixture forces it to fail, so a producer that stopped writing
+	// pr_url on the one path that has a PR would go unnoticed. A replay reads
+	// events.jsonl, not meta.json, and the PR URL is what joins a run to its
+	// review.
+	events, err := jiradozer.LoadEvents(x.rl.Dir())
+	require.NoError(t, err)
+	require.NotEmpty(t, events)
+	finished := firstEventOfKind(t, events, jiradozer.EventRunFinished)
+	assert.Equal(t, "https://github.com/o/r/pull/42", finished.Fields["pr_url"])
 }
 
 // A run that failed before create_pr legitimately has no PR. That must settle
@@ -395,6 +411,15 @@ func TestFinishToleratesARunWithNoPR(t *testing.T) {
 	assert.Equal(t, jiradozer.RunStateFailed, m.State)
 	assert.Contains(t, m.Error, "agent exited 1")
 	assert.True(t, m.WorktreeKept, "a failed run keeps its worktree; the work exists nowhere else")
+
+	// The ABSENCE of the field is what keeps the assertion above meaningful: a
+	// producer that stamped every terminal event with a pr_url — empty string
+	// included — would satisfy the positive case and tell a reader a run has a
+	// PR when it has none.
+	events, err := jiradozer.LoadEvents(x.rl.Dir())
+	require.NoError(t, err)
+	finished := firstEventOfKind(t, events, jiradozer.EventRunFinished)
+	assert.NotContains(t, finished.Fields, "pr_url", "a run with no PR must not claim one")
 }
 
 // work_dir is the configured BASE directory, and LoadConfig defaults it to
@@ -483,6 +508,468 @@ func TestRecordPhaseMirrorsWorkflowStepsIntoTheRunLog(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, jiradozer.StepBuilding.String(), onDisk.Phase,
 		"a remote reader sees meta.json, never this process's memory")
+}
+
+// stubGH answers `gh auth status` so a test can drive the real wt.Manager
+// without a GitHub credential. createWorktree calls wt.New WITHOUT SkipFetch,
+// so FetchOrigin reaches CheckGitHubAuth and any test that gets past the
+// checkout would otherwise shell out to the real `gh`.
+type stubGH struct{}
+
+func (stubGH) Run(context.Context, []string, string) (*wt.CmdResult, error) {
+	return &wt.CmdResult{}, nil
+}
+
+// runToCompletionAndLoadTrail drives a whole successful lifecycle and reads
+// the trail back off disk, the way a dispatcher on another box does.
+//
+// Every other exec fixture deliberately fails the checkout, because
+// runStepAgent is unexported and a package main test cannot fake the agent.
+// Skipping all four phases is the way around that: skipCompletedOrConfigured-
+// Phases walks plan→build→validate→ship, finds each one skipped, and
+// forceTransitions straight to StepDone without ever invoking an agent.
+//
+// Returns the run alongside the trail so a caller can compare a recorded value
+// against what the fixture independently says it should be, rather than only
+// against another field of the same trail.
+func runToCompletionAndLoadTrail(t *testing.T) (*execRun, []jiradozer.Event) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+
+	root := t.TempDir()
+	repo := "kernel"
+	require.NoError(t, os.MkdirAll(filepath.Join(root, repo, ".bare"), 0o755))
+	mgr := wt.NewManager(root, repo,
+		wt.WithGitRunner(&recordingGit{}),
+		wt.WithGHRunner(stubGH{}),
+		wt.WithOutput(wt.NewOutput(io.Discard, false)))
+
+	cfg := &jiradozer.Config{WorkDir: ".", BaseBranch: "main"}
+	// Set directly rather than through ApplySkipPhases: the field is the input
+	// the workflow reads, and naming all four phases is what drives the run to
+	// StepDone with no agent.
+	cfg.SkipPhases = []string{"plan", "build", "validate", "ship"}
+
+	trk := &claimRecordingTracker{issue: &tracker.Issue{ID: "id-1", Identifier: "INF-1"}}
+	x := &execRun{
+		app:    execTestApp(t),
+		logger: testMainLogger(t),
+		cfg:    cfg,
+		wtMgr:  mgr,
+		args:   execArgs{issueID: "INF-1", repo: repo},
+		runID:  "r1",
+		newTracker: func(*jiradozer.Config, string) (tracker.IssueTracker, error) {
+			return trk, nil
+		},
+		lookupPR: func(context.Context, string, string) (*wt.PRInfo, error) {
+			return nil, errors.New("no pull requests found for branch")
+		},
+	}
+
+	require.NoError(t, x.run(context.Background()),
+		"all four phases are skipped, so the workflow runs to StepDone with no agent")
+
+	events, err := jiradozer.LoadEvents(x.rl.Dir())
+	require.NoError(t, err)
+	// NotEmpty here, and deliberately: LoadEvents returns (nil, nil) for a
+	// missing file, so every assertion that merely ranges over events passes
+	// vacuously on a run that wrote nothing at all.
+	require.NotEmpty(t, events, "a completed run must leave an event trail, not an empty directory")
+	return x, events
+}
+
+// meta.json cannot substitute for the trail: it is a SNAPSHOT — Phase is
+// overwritten on every transition and State on every settle — so the sequence
+// of what happened, and when, survives nowhere else.
+func TestACompletedRunWritesItsEventTrail(t *testing.T) {
+	_, events := runToCompletionAndLoadTrail(t)
+
+	kinds := make([]string, 0, len(events))
+	for _, ev := range events {
+		assert.False(t, ev.At.IsZero(), "an event with no timestamp cannot order a trail")
+		assert.NotEmpty(t, ev.Kind)
+		kinds = append(kinds, ev.Kind)
+	}
+
+	assert.Contains(t, kinds, jiradozer.EventWorktreeCreated)
+	assert.Contains(t, kinds, jiradozer.EventPhase)
+
+	// The trail is ordered and bracketed: a reader replaying it has to see the
+	// run open before it closes, whatever happened in between.
+	assert.Equal(t, jiradozer.EventRunStarted, kinds[0])
+	assert.Equal(t, jiradozer.EventRunFinished, kinds[len(kinds)-1])
+}
+
+// firstEventOfKind returns the first event of a kind, failing the test when the
+// trail has none — a missing kind is the failure these payload assertions are
+// for, and ranging over an absent event would pass vacuously instead.
+func firstEventOfKind(t *testing.T, events []jiradozer.Event, kind string) jiradozer.Event {
+	t.Helper()
+	for _, ev := range events {
+		if ev.Kind == kind {
+			return ev
+		}
+	}
+	require.FailNowf(t, "kind missing from trail", "no %s event", kind)
+	return jiradozer.Event{}
+}
+
+// The kinds alone are not the format. A reader on another box keys off the
+// PAYLOAD — which run, which branch, which checkout — so an event that kept its
+// kind and dropped its fields still breaks every consumer, while an assertion
+// that only counts kinds stays green through it.
+func TestTheEventTrailCarriesThePayloadReadersKeyOff(t *testing.T) {
+	x, events := runToCompletionAndLoadTrail(t)
+
+	started := firstEventOfKind(t, events, jiradozer.EventRunStarted)
+	// Detail is Target(): the identifier a dispatcher correlates a run by.
+	assert.Equal(t, "INF-1", started.Detail)
+	assert.Equal(t, "r1", started.Fields["run_id"])
+	assert.Equal(t, "kernel", started.Fields["repo"])
+	// The exact branch, not merely a non-empty one. These fields are what a
+	// reader USES — a human runs `git checkout` on the branch, gc reclaims the
+	// path — so a writer that recorded a plausible-looking wrong value is the
+	// failure, and NotEmpty cannot see it. Spelled out rather than read back off
+	// x.branch, which would only assert the trail agrees with the field it was
+	// copied from.
+	assert.Equal(t, "jiradozer/INF-1", started.Fields["branch"],
+		"the branch is derived from the issue this run claimed")
+
+	created := firstEventOfKind(t, events, jiradozer.EventWorktreeCreated)
+	// Detail is the checkout path — the one field that survives the worktree
+	// itself being reclaimed, so it has to be recorded, not re-derived. Pinned
+	// against wt's own derivation (repo dir joined with the branch) rather than
+	// against x.worktreePath, so a run that recorded a path pointing somewhere
+	// nobody will look fails here instead of agreeing with itself.
+	assert.Equal(t, filepath.Join(x.wtMgr.RepoDir(), "jiradozer/INF-1"), created.Detail,
+		"the recorded checkout is where wt actually put it")
+	assert.Equal(t, started.Fields["branch"], created.Fields["branch"],
+		"both events name the same branch, or they cannot be joined")
+
+	finished := firstEventOfKind(t, events, jiradozer.EventRunFinished)
+	assert.Equal(t, string(jiradozer.RunStateDone), finished.Detail)
+	// A run that ended cleanly carries no error. Asserting its ABSENCE is what
+	// keeps the failure case below meaningful: without this, a producer that
+	// stamped every run with an error would still pass both tests.
+	assert.NotContains(t, finished.Fields, "error", "a run that succeeded must not record one")
+}
+
+// The failure path is the one a reader most needs the trail for — a run that
+// died has no PR and a Phase frozen wherever it stopped, so the terminal event
+// is the only record of WHY. It is also the payload most easily lost: nothing
+// in the success path exercises it.
+func TestTheTerminalEventRecordsWhyAFailedRunEnded(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	x := newFinishTestRun(t)
+	x.finish(errors.New("create worktree for jiradozer/INF-1: not a git repository"))
+
+	events, err := jiradozer.LoadEvents(x.rl.Dir())
+	require.NoError(t, err)
+	require.NotEmpty(t, events, "a failed run still owes a reader a terminal event")
+
+	finished := firstEventOfKind(t, events, jiradozer.EventRunFinished)
+	assert.Equal(t, string(jiradozer.RunStateFailed), finished.Detail)
+	assert.Contains(t, finished.Fields["error"], "not a git repository",
+		"the reason belongs in the trail, or a reader must open meta.json to learn it")
+}
+
+// A Ctrl-C'd or timed-out run is NOT a failed one — a dispatcher retries the
+// first and escalates the second — and the terminal event is where that
+// distinction is recorded.
+//
+// It is worth pinning separately because the workflow's own phase trail
+// disagrees: jiradozer.Workflow routes a cancelled step through fail(), which
+// transitions to StepFailed, so the last `phase` event on a cancelled run reads
+// `failed`. Both records are accurate about different things — the phase names
+// the state machine's step, the terminal event names the run's outcome — and
+// the terminal event is the one a reader classifies a run by. Collapsing that
+// disagreement means giving the state machine a reachable StepCancelled, which
+// is a change to state.go's transition table, not to the trail.
+func TestTheTerminalEventTellsACancelledRunFromAFailedOne(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	for _, tc := range []struct {
+		err  error
+		name string
+	}{
+		{context.Canceled, "interrupted"},
+		{context.DeadlineExceeded, "timed out"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			x := newFinishTestRun(t)
+			// Wrapped, because that is how the error reaches finish(): the
+			// workflow annotates it on the way out, and a classifier using ==
+			// instead of errors.Is would silently record every one of these as
+			// a failure.
+			x.finish(fmt.Errorf("build step: %w", tc.err))
+
+			events, err := jiradozer.LoadEvents(x.rl.Dir())
+			require.NoError(t, err)
+			require.NotEmpty(t, events, "a cancelled run still owes a reader a terminal event")
+
+			finished := firstEventOfKind(t, events, jiradozer.EventRunFinished)
+			assert.Equal(t, string(jiradozer.RunStateCancelled), finished.Detail,
+				"a cancelled run must not be recorded as a failed one")
+			assert.Contains(t, finished.Fields["error"], tc.err.Error(),
+				"the reason it stopped belongs in the trail either way")
+		})
+	}
+}
+
+func TestTheEventTrailRecordsEveryPhaseTheRunPassedThrough(t *testing.T) {
+	_, events := runToCompletionAndLoadTrail(t)
+
+	var phases []string
+	var finished *jiradozer.Event
+	for _, ev := range events {
+		switch ev.Kind {
+		case jiradozer.EventPhase:
+			phases = append(phases, ev.Detail)
+		case jiradozer.EventRunFinished:
+			finished = &ev
+		}
+	}
+
+	// meta.Phase holds only the LAST of these, so the SEQUENCE is exactly what
+	// the trail adds over the snapshot — and asserting only that `done` is in
+	// there, or only that it comes last, still passes on a producer that
+	// dropped every intermediate transition. Pin the whole ordered walk: this
+	// fixture skips all four phases, so the run steps through the start of each
+	// one before jumping to StepDone.
+	//
+	// The phases' NAMES, not their numeric values: a WorkflowStep is an int, so
+	// a plain conversion would write unprintable runes into the trail.
+	assert.Equal(t, []string{
+		jiradozer.StepPlanning.String(),
+		jiradozer.StepBuilding.String(),
+		jiradozer.StepValidating.String(),
+		jiradozer.StepShipping.String(),
+		jiradozer.StepDone.String(),
+	}, phases, "the trail records every transition the run passed through, in order")
+
+	// The terminal state belongs in the trail too, or a reader replaying it
+	// cannot tell a run that finished from one that was killed mid-flight.
+	require.NotNil(t, finished, "the trail must record how the run ended")
+	assert.Equal(t, string(jiradozer.RunStateDone), finished.Detail)
+}
+
+// The one exit path that returns no error at all: a panic.
+//
+// A panic unwinding through run() leaves the named return nil, so the terminal
+// defer settled the log as if the run had succeeded — meta.json `done` and a
+// `run_finished` event whose detail read `done` — while the process was in the
+// middle of crashing. Those two records are all a dispatcher on another box
+// gets, so a crashed run was indistinguishable from one that shipped: exactly
+// the "a run that stops without recording why" case finish() exists to prevent,
+// arrived at through the door nobody checked.
+//
+// Driven through run() rather than by calling finish() directly, because the
+// defect is in the defer's wiring, not in finish(): finish(err) was always
+// correct, it was simply never handed the error. A finish()-level test passes
+// with the recover deleted.
+func TestAPanickingRunIsRecordedAsAFailureNotASuccess(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	trk := &claimRecordingTracker{issue: &tracker.Issue{ID: "id-1", Identifier: "INF-1"}}
+	// Panics from inside claim(), which run() reaches just after startRunLog and
+	// the terminal defer — so the run-log exists and the window is the real one.
+	trk.onAddLabel = func() { panic("agent exploded") }
+	x := execRunForClaimOrdering(t, trk)
+
+	// Re-raised, not swallowed: recovering settles the record, it does not turn
+	// a bug into a merely-failed run. A test that only checked the trail would
+	// stay green on a version that ate the panic.
+	require.PanicsWithValue(t, "agent exploded", func() {
+		_ = x.run(context.Background())
+	}, "the panic is recorded and then re-raised")
+
+	require.NotNil(t, x.rl, "claim() runs after startRunLog, so the log exists")
+	events, err := jiradozer.LoadEvents(x.rl.Dir())
+	require.NoError(t, err)
+	require.NotEmpty(t, events, "a crashing run still owes a reader a terminal event")
+
+	finished := firstEventOfKind(t, events, jiradozer.EventRunFinished)
+	assert.Equal(t, string(jiradozer.RunStateFailed), finished.Detail,
+		"a run that crashed must not leave a trail that reads as done")
+	assert.Contains(t, finished.Fields["error"], "agent exploded",
+		"the trail names what killed the run, or the crash is only in a log nobody fetches")
+	// The snapshot and the trail are read by different callers — `jiradozer
+	// runs` opens meta.json, a replay reads events.jsonl — so both have to agree
+	// or the disagreement is the bug.
+	assert.Equal(t, jiradozer.RunStateFailed, x.rl.Meta().State,
+		"meta.json and the trail must tell the same story")
+}
+
+// A crash must reach the ALERT, not just the local run-log.
+//
+// exec owns its failure reporting because nothing else is watching, and that
+// report is gated on runErr — which a panic leaves nil. Settling the run-log
+// fixed the record on this box and did nothing for the operator, who learns
+// about a fleet worker from the alert or not at all. runExec's defer therefore
+// recovers and reports on the panic branch, using the same reporter as the
+// ordinary branch so no ordering between two defers can drop the alert.
+//
+// This test covers which errors are worth waking somebody for.
+// TestACrashedRunAlertsOnItsWayOut covers the deferred wiring that supplies
+// them; neither is sufficient alone.
+func TestAPanicIsWorthAnAlertButACancellationIsNot(t *testing.T) {
+	t.Parallel()
+
+	newRun, sent := alertingExecRun(t)
+
+	// The exact shape runExec's recover branch builds.
+	newRun().reportFailure(context.Background(), fmt.Errorf("panic: %v", "assignment to entry in nil map"))
+	require.Len(t, sent(), 1, "a crash is the failure least likely to be noticed without an alert")
+	assert.Contains(t, sent()[0], "nil map", "the alert has to say what happened")
+	assert.Contains(t, sent()[0], "INF-1", "an anonymous alert cannot be acted on")
+
+	// A clean run and a Ctrl-C are both non-events. Alerting on them is how a
+	// channel becomes one nobody reads, which costs the case above.
+	newRun().reportFailure(context.Background(), nil)
+	newRun().reportFailure(context.Background(), fmt.Errorf("build step: %w", context.Canceled))
+	assert.Len(t, sent(), 1, "only the crash was worth an alert")
+}
+
+// recordingSlackServer stands in for the Slack webhook, returning its URL and a
+// reader for the alert texts it received.
+func recordingSlackServer(t *testing.T) (webhookURL string, sent func() []string) {
+	t.Helper()
+
+	var mu sync.Mutex
+	var posted []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		var payload map[string]string
+		_ = json.Unmarshal(body, &payload)
+		mu.Lock()
+		posted = append(posted, payload["text"])
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	return srv.URL, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), posted...)
+	}
+}
+
+// alertingExecRun returns a factory for execRuns whose Slack webhook points at
+// a recording test server, plus a reader for the alert texts it received.
+func alertingExecRun(t *testing.T) (newRun func() *execRun, sent func() []string) {
+	t.Helper()
+
+	url, sent := recordingSlackServer(t)
+
+	newRun = func() *execRun {
+		cfg := &jiradozer.Config{}
+		cfg.Notify.SlackWebhook = url
+		return &execRun{
+			app:    execTestApp(t),
+			logger: testMainLogger(t),
+			cfg:    cfg,
+			args:   execArgs{issueID: "INF-1"},
+		}
+	}
+	return newRun, sent
+}
+
+// Deleting reportExit's recover must break a test.
+//
+// TestAPanicIsWorthAnAlertButACancellationIsNot pins which errors alert, but it
+// calls reportFailure directly — so it would still pass with the recover gone,
+// and the crash case is exactly the one that reaches the operator through the
+// alert or not at all. This drives the hook the way runExec does, deferred, and
+// asserts the two things only that shape provides: the panic is turned into an
+// alert on its way out, and it is still re-raised afterwards.
+func TestACrashedRunAlertsOnItsWayOut(t *testing.T) {
+	t.Parallel()
+
+	newRun, sent := alertingExecRun(t)
+
+	// Deferred, never called: reportExit's recover only fires from a deferred
+	// frame. This is runExec's exit path with its body replaced by a panic.
+	crash := func(x *execRun) (runErr error) {
+		defer x.reportExit(context.Background(), &runErr)
+		panic("assignment to entry in nil map")
+	}
+	assert.PanicsWithValue(t, "assignment to entry in nil map", func() { _ = crash(newRun()) },
+		"reporting a crash is not the same as surviving it")
+	require.Len(t, sent(), 1, "a crash nobody is told about is a crash nobody fixes")
+	assert.Contains(t, sent()[0], "nil map", "the alert has to say what happened")
+
+	// The ordinary branch: the error the function returns is the one reported,
+	// which is why runErr is read at exit rather than captured at defer time.
+	failed := func(x *execRun) (runErr error) {
+		defer x.reportExit(context.Background(), &runErr)
+		runErr = errors.New("workflow step failed")
+		return runErr
+	}
+	require.Error(t, failed(newRun()))
+	require.Len(t, sent(), 2, "an ordinary failure alerts too")
+	assert.Contains(t, sent()[1], "workflow step failed")
+
+	// A clean exit is not news.
+	clean := func(x *execRun) (runErr error) {
+		defer x.reportExit(context.Background(), &runErr)
+		return nil
+	}
+	require.NoError(t, clean(newRun()))
+	assert.Len(t, sent(), 2, "a run that worked has nothing to report")
+}
+
+// The hook being right is only half of it: runExec has to actually install it.
+//
+// TestACrashedRunAlertsOnItsWayOut defers reportExit the way runExec does, so it
+// covers the hook but not the one line that arms it — deleting
+// `defer x.reportExit(...)` from runExec left every test green. This drives the
+// real runExec, so the alert can only arrive if that line is there.
+//
+// The run is failed by the cheapest honest means: a github tracker asked for an
+// issue that is not owner/repo#N. That passes config validation — which runs
+// before the defer is installed and so cannot be the failure under test — and
+// is then rejected by createTracker with no network and no worktree, at the
+// first step after the defer is installed.
+func TestRunExecInstallsTheFailureReporter(t *testing.T) {
+	// HOME scopes the lease dir, WT_ROOT the worktree root, so this test's
+	// lease cannot collide with a sibling's. Both preclude t.Parallel().
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("WT_ROOT", t.TempDir())
+	t.Setenv(jiradozer.OrchestratedEnvVar, "")
+
+	webhookURL, sent := recordingSlackServer(t)
+
+	// The real starter config, so this fails where the test says it does rather
+	// than in validation over a hand-rolled stub missing a required field.
+	cfgPath := writeRunConfig(t, "github", t.TempDir())
+	cfg, err := os.ReadFile(cfgPath)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(cfgPath,
+		append(cfg, []byte("\nnotify:\n  slack_webhook: "+webhookURL+"\n")...), 0o600))
+
+	err = runExec(context.Background(), execTestApp(t), execArgs{
+		issueID:    "INF-77",
+		repo:       "kernel",
+		configPath: cfgPath,
+	})
+	require.ErrorContains(t, err, "github tracker", "the run has to fail for there to be anything to report")
+
+	require.Len(t, sent(), 1, "a fleet worker's failure reaches the operator through this alert or not at all")
+	assert.Contains(t, sent()[0], "INF-77", "an anonymous alert cannot be acted on")
+}
+
+// These are methods on a half-built execRun, and Append on a nil RunLog panics
+// — which would take a run down over a log line.
+func TestEventAppendsAreSkippedWhenNoRunLogExists(t *testing.T) {
+	trk := &claimRecordingTracker{issue: &tracker.Issue{ID: "id-1", Identifier: "local-1"}}
+	x := &execRun{logger: testMainLogger(t), tracker: trk, issue: trk.issue}
+
+	require.NotPanics(t, func() {
+		_ = x.claim(context.Background())
+		x.recordPhase(jiradozer.StepBuilding)
+	}, "a helper firing before the run-log exists must not panic on a nil run-log")
 }
 
 // dispatch refuses a duplicate by asking which box holds this task's lease —

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"time"
@@ -177,29 +178,63 @@ func runExec(ctx context.Context, app *cliapp.App, args execArgs) (runErr error)
 	}
 
 	// exec owns its own failure reporting, for the same reason it refuses to run
-	// under an orchestrator: nothing else is watching. The EXTERNAL sink is the
-	// one that matters here — finish() already writes the error to the run-log
-	// and posts it as the end comment, so passing a tracker poster as well would
-	// duplicate that comment on every failure.
-	defer func() {
-		if !shouldReportFailure(runErr) {
-			return
-		}
-		var notifier jiradozer.Notifier
-		if cfg.Notify.SlackWebhook != "" {
-			notifier = jiradozer.SlackWebhookNotifier{WebhookURL: cfg.Notify.SlackWebhook}
-		}
-		jiradozer.ReportFailure(ctx, logger, nil, "", notifier, jiradozer.FailureReport{
-			Tool:          "jiradozer",
-			Target:        x.reportTarget(),
-			Step:          jiradozer.FailingStepFromError(runErr),
-			Err:           runErr,
-			BuildRevision: app.Build.ShortRevision(),
-			LogPath:       app.LogPath,
-		})
-	}()
+	// under an orchestrator: nothing else is watching. The lease release
+	// deferred above still runs after this one.
+	defer x.reportExit(ctx, &runErr)
 
 	return x.run(ctx)
+}
+
+// reportExit is runExec's exit hook: it must be deferred, never called, because
+// its recover only fires from a deferred frame.
+//
+// The recover lives HERE, in the same defer that reports the ordinary error,
+// and that is the point: a panic leaves runErr nil, so the report is skipped on
+// the one failure least likely to be noticed without an alert. Splitting "name
+// the panic" and "send the report" across two defers would make the alert
+// depend on their relative order — a constraint nothing in the file states and
+// any later edit could silently swap. Here both branches call the same
+// reporter, so there is no order to get wrong.
+//
+// runErr is taken by pointer because a deferred call's arguments are evaluated
+// at defer time: by value it would always report the nil the named return
+// started as, never the error the function is exiting with.
+//
+// The panic is re-raised, matching run()'s own recover: reporting a bug is not
+// the same as surviving it.
+//
+//nolint:gocritic // ptrToRefParam: see above, the pointer is load-bearing.
+func (x *execRun) reportExit(ctx context.Context, runErr *error) {
+	if p := recover(); p != nil {
+		x.reportFailure(ctx, fmt.Errorf("panic: %v", p))
+		panic(p)
+	}
+	x.reportFailure(ctx, *runErr)
+}
+
+// reportFailure sends this run's EXTERNAL failure alert, or nothing.
+//
+// The external sink is the one that matters: finish() already writes the error
+// to the run-log and posts it as the end comment, so passing a tracker poster
+// here as well would duplicate that comment on every failure. A cancellation is
+// a stop rather than a failure and is filtered out by shouldReportFailure —
+// which also makes nil the no-op, so the caller needs no branch of its own.
+func (x *execRun) reportFailure(ctx context.Context, runErr error) {
+	if !shouldReportFailure(runErr) {
+		return
+	}
+	var notifier jiradozer.Notifier
+	if x.cfg.Notify.SlackWebhook != "" {
+		notifier = jiradozer.SlackWebhookNotifier{WebhookURL: x.cfg.Notify.SlackWebhook}
+	}
+	jiradozer.ReportFailure(ctx, x.logger, nil, "", notifier, jiradozer.FailureReport{
+		Tool:          "jiradozer",
+		Target:        x.reportTarget(),
+		Step:          jiradozer.FailingStepFromError(runErr),
+		Err:           runErr,
+		BuildRevision: x.app.Build.ShortRevision(),
+		LogPath:       x.app.LogPath,
+	})
 }
 
 // execRun holds one task execution's resolved dependencies.
@@ -298,8 +333,31 @@ func (x *execRun) run(ctx context.Context) (runErr error) {
 		return err
 	}
 
-	// From here the run is recorded, so every exit path settles the run-log.
-	defer func() { x.finish(runErr) }()
+	// From here the run is recorded, so every exit path settles the run-log —
+	// including the one that returns nothing. A panic unwinding through here
+	// leaves the named return nil, so a plain finish(runErr) settles meta.json
+	// as `done` and writes a `run_finished` event whose detail says the run
+	// succeeded, while the process is in the middle of crashing. A dispatcher
+	// on another box reads only those two records, and cannot tell that run
+	// apart from one that actually shipped.
+	defer func() {
+		p := recover()
+		if p == nil {
+			x.finish(runErr)
+			return
+		}
+		// The stack goes to the log, not into the error: the error text also
+		// becomes meta.json's failure reason and the issue's end comment, and
+		// neither is improved by a hundred frames. Captured inside the deferred
+		// call, where the panicking frames are still on the stack.
+		x.logger.Error("run panicked", "run_id", x.runID, "panic", p, "stack", string(debug.Stack()))
+		x.finish(fmt.Errorf("panic: %v", p))
+		// Re-raised, never swallowed. A panic is a bug, and a run that quietly
+		// downgraded one to a failed status would hide it from everything above
+		// — the point of recovering here is only to settle the record first, so
+		// the crash stops being silent, not to survive it.
+		panic(p)
+	}()
 
 	// Claim after the run-log and before the worktree.
 	//
@@ -383,10 +441,21 @@ func (x *execRun) run(ctx context.Context) (runErr error) {
 // another box: `jiradozer fleet runs` reads meta.json over ssh and can see
 // neither this host's log nor its terminal. Best-effort — a run must not die
 // because a status write failed.
+//
+// It writes both the snapshot and the trail, because meta.Phase keeps only the
+// last step; see jiradozer.Event for why the sequence needs its own record.
+//
+// The step's NAME, not the WorkflowStep itself: it is an int, and marshalling
+// it raw would put a number in the trail that means nothing to a reader and
+// silently shifts if the enum is ever reordered.
 func (x *execRun) recordPhase(step jiradozer.WorkflowStep) {
+	if x.rl == nil {
+		return
+	}
 	if err := x.rl.UpdateMeta(func(m *jiradozer.RunMeta) { m.Phase = step.String() }); err != nil {
 		x.logger.Warn("failed to record workflow phase", "step", step, "error", err)
 	}
+	x.event(jiradozer.EventPhase, step.String(), nil)
 }
 
 // checkNotClaimed turns the lock label into an actual check.
@@ -467,6 +536,7 @@ func (x *execRun) createWorktree(ctx context.Context) error {
 		}
 	}
 	x.logger.Info("worktree created", "branch", x.branch, "path", path)
+	x.event(jiradozer.EventWorktreeCreated, path, map[string]any{"branch": x.branch})
 	return nil
 }
 
@@ -508,7 +578,31 @@ func (x *execRun) startRunLog() error {
 	}
 	x.rl = rl
 	x.logger.Info("run started", "run_id", x.runID, "run_dir", rl.Dir(), "target", meta.Target())
+	x.event(jiradozer.EventRunStarted, meta.Target(), map[string]any{
+		"run_id": x.runID,
+		"branch": x.branch,
+		"repo":   x.args.repo,
+	})
 	return nil
+}
+
+// event appends one line to the run's audit trail.
+//
+// Best-effort, for the same reason recordPhase is: the trail is a record of a
+// run, never a dependency of one, and a run that died because a log write
+// failed would be strictly worse than a run with a gap in its log.
+//
+// The nil check guards helpers invoked on a run that has not reached
+// startRunLog. run() reaches none of them in that state, but these are methods
+// on a half-built struct and Append on a nil RunLog panics — taking the run
+// down over a log line.
+func (x *execRun) event(kind, detail string, fields map[string]any) {
+	if x.rl == nil {
+		return
+	}
+	if err := x.rl.Append(kind, detail, fields); err != nil {
+		x.logger.Warn("failed to append run event", "kind", kind, "error", err)
+	}
 }
 
 // createLocalIssue builds the --description mode issue.
@@ -646,6 +740,20 @@ func (x *execRun) finish(runErr error) {
 	if err := x.rl.Finish(state, "", runErr); err != nil {
 		x.logger.Warn("failed to write terminal run meta", "error", err)
 	}
+
+	// Closes the trail, and does it here rather than at the end of finish():
+	// everything below is a tracker round trip that can hang or fail, and a
+	// trail whose last line is missing cannot be told apart from a run that was
+	// killed mid-flight. The error goes in the fields so a reader replaying the
+	// trail sees why a run ended without opening meta.json.
+	finishFields := map[string]any{}
+	if runErr != nil {
+		finishFields["error"] = jiradozer.Truncate(runErr.Error(), 2000)
+	}
+	if pr != nil {
+		finishFields["pr_url"] = pr.URL
+	}
+	x.event(jiradozer.EventRunFinished, string(state), finishFields)
 
 	if x.tracker != nil && x.issue != nil {
 		x.postEndComment(ctx, state, runErr)
