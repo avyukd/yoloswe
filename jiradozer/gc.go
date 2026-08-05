@@ -2,12 +2,13 @@ package jiradozer
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -116,18 +117,71 @@ type GHPRChecker struct {
 // mergeCommit is populated for a merge queue's speculative build well before
 // anything lands — so any of those would authorise deleting a worktree whose
 // work is not yet in main.
+// It goes through `gh api`, NOT `gh pr view --json merged`: `merged` is not a
+// field `gh pr view` accepts, so that form fails on every call with "Unknown
+// JSON field". The failure is invisible in the worst possible way — Merged
+// returns an error, gc fails closed, and every worktree is kept with a plausible
+// "could not determine PR state" reason. A sweeper that never sweeps looks
+// exactly like a cautious one, so the leak it exists to fix goes on silently.
+//
+// `gh pr view` does expose mergedAt, which is nearly equivalent, but .merged via
+// the REST API is the authoritative answer and the one worth depending on here.
+//
+// The two spellings are easy to conflate, so to be concrete: `merged` is absent
+// from `gh pr view`'s field set but present as a boolean in the response of REST
+// GET /repos/{owner}/{repo}/pulls/{number}, which is the endpoint below. It
+// prints bare `true`/`false` under `--jq .merged`.
 func (c GHPRChecker) Merged(ctx context.Context, prURL string) (bool, error) {
-	res, err := c.GH.Run(ctx, []string{"pr", "view", prURL, "--json", "merged"}, "")
+	owner, repo, number, err := parsePRURL(prURL)
 	if err != nil {
-		return false, fmt.Errorf("gh pr view %s: %w", prURL, err)
+		return false, err
 	}
-	var out struct {
-		Merged bool `json:"merged"`
+	endpoint := fmt.Sprintf("repos/%s/%s/pulls/%d", owner, repo, number)
+	res, err := c.GH.Run(ctx, []string{"api", endpoint, "--jq", ".merged"}, "")
+	if err != nil {
+		return false, fmt.Errorf("gh api %s: %w", endpoint, err)
 	}
-	if err := json.Unmarshal([]byte(res.Stdout), &out); err != nil {
-		return false, fmt.Errorf("parse gh output for %s: %w", prURL, err)
+	switch strings.TrimSpace(res.Stdout) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		// Anything else is not an answer. Returning false here would read as
+		// "not merged" and keep the worktree, which is the safe direction — but
+		// it would also hide a broken query forever, which is how this bug
+		// survived. Fail loudly instead.
+		return false, fmt.Errorf("gh api %s: unexpected .merged value %q", endpoint, strings.TrimSpace(res.Stdout))
 	}
-	return out.Merged, nil
+}
+
+// prURLRE matches the PR URLs recorded in a run-log.
+//
+// Anchored at the host on purpose. The substring "github.com/o/r/pull/1" also
+// occurs in "https://notgithub.com/o/r/pull/1", so an unanchored pattern would
+// answer that URL with github.com's o/r — the wrong repository, on the one path
+// that authorises deleting a worktree. A URL this does not match fails loudly in
+// parsePRURL instead, which keeps the worktree.
+//
+// github.com only, matching repoSlugFromURL in prdozer: nothing here plumbs a
+// host through to `gh`, so an enterprise URL has no correct answer to give and
+// is rejected rather than silently rewritten to github.com.
+//
+// The trailing boundary keeps "/pull/12x" from reading as PR 12, while still
+// allowing the "/files" and "#discussion_r…" tails gh and browsers append.
+var prURLRE = regexp.MustCompile(`^(?:https?://)?github\.com/([^/?#]+)/([^/?#]+)/pull/(\d+)(?:[/?#]|$)`)
+
+// parsePRURL pulls owner/repo/number out of a PR URL.
+func parsePRURL(prURL string) (owner, repo string, number int, err error) {
+	m := prURLRE.FindStringSubmatch(prURL)
+	if m == nil {
+		return "", "", 0, fmt.Errorf("cannot parse PR URL %q", prURL)
+	}
+	n, err := strconv.Atoi(m[3])
+	if err != nil {
+		return "", "", 0, fmt.Errorf("cannot parse PR number in %q: %w", prURL, err)
+	}
+	return m[1], m[2], n, nil
 }
 
 // WorktreeRemover removes a reclaimed worktree. Same contract as

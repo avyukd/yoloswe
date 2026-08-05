@@ -650,3 +650,111 @@ func TestGCSaysWhichRootHasNoRemover(t *testing.T) {
 	require.Zero(t, res.Removed)
 	requireReason(t, res, "worktree", "/roots/gone")
 }
+
+// recordingGH captures the argv gc hands to gh.
+type recordingGH struct {
+	err    error
+	stdout string
+	args   []string
+}
+
+func (g *recordingGH) Run(_ context.Context, args []string, _ string) (*wt.CmdResult, error) {
+	g.args = args
+	return &wt.CmdResult{Stdout: g.stdout}, g.err
+}
+
+// The real GHPRChecker was never exercised — every gc test used a fake
+// PRChecker — so it shipped calling `gh pr view --json merged`, which gh
+// rejects with "Unknown JSON field: merged" on EVERY call. gc then failed
+// closed on every worktree with a plausible "could not determine PR state",
+// which is indistinguishable from a sweeper being careful. It never reclaimed
+// anything.
+//
+// This asserts the argv, which is the only part a fake can get wrong for free.
+//
+// Whole-argv equality, not Contains: ".merged" is a substring of ".mergedAt",
+// so a containment check passes a regression to `--jq .mergedAt` — which REST
+// spells merged_at, so it returns null, Merged errors, and gc goes back to
+// failing closed on every worktree. The one selector that answers the question
+// has to be the one asserted.
+func TestGHPRCheckerAsksTheAPIForMerged(t *testing.T) {
+	gh := &recordingGH{stdout: "true\n"}
+	merged, err := GHPRChecker{GH: gh}.Merged(context.Background(),
+		"https://github.com/bazelment/yoloswe/pull/302")
+	require.NoError(t, err)
+	require.True(t, merged)
+
+	require.Equal(t,
+		[]string{"api", "repos/bazelment/yoloswe/pulls/302", "--jq", ".merged"},
+		gh.args,
+		"`gh pr view --json merged` is not a valid query, and state/mergeStateStatus/"+
+			"mergeCommit/mergedAt do not answer 'did this land'")
+}
+
+func TestGHPRCheckerReadsFalseAndRejectsNonsense(t *testing.T) {
+	gh := &recordingGH{stdout: "false\n"}
+	merged, err := GHPRChecker{GH: gh}.Merged(context.Background(),
+		"https://github.com/o/r/pull/1")
+	require.NoError(t, err)
+	require.False(t, merged)
+
+	// A reply that is not true/false is not an answer. Reporting it as "not
+	// merged" would be the safe direction but would hide a broken query
+	// forever — which is exactly how the pr-view bug survived.
+	bad := &recordingGH{stdout: `{"merged":true}`}
+	_, err = GHPRChecker{GH: bad}.Merged(context.Background(), "https://github.com/o/r/pull/1")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unexpected")
+}
+
+func TestParsePRURL(t *testing.T) {
+	o, r, n, err := parsePRURL("https://github.com/bazelment/yoloswe/pull/302")
+	require.NoError(t, err)
+	require.Equal(t, "bazelment", o)
+	require.Equal(t, "yoloswe", r)
+	require.Equal(t, 302, n)
+
+	_, _, _, err = parsePRURL("not a url")
+	require.Error(t, err)
+}
+
+// The parse is what picks the repository the merged check asks about, and its
+// answer authorises deleting a worktree. A URL it should not claim has to fail
+// loudly — answering with the wrong repo's .merged is how a worktree whose work
+// never landed gets swept.
+func TestParsePRURLRejectsURLsItDoesNotOwn(t *testing.T) {
+	for _, bad := range []string{
+		// A lookalike host contains "github.com/o/r/pull/1" as a substring; an
+		// unanchored pattern would answer it with github.com's o/r.
+		"https://notgithub.com/o/r/pull/1",
+		"https://evil.example/github.com/o/r/pull/1",
+		// Enterprise hosts have no correct answer here — nothing plumbs a host
+		// through to `gh` — so they are rejected, not rewritten to github.com.
+		"https://ghe.example.com/o/r/pull/1",
+		// Not a PR number.
+		"https://github.com/o/r/pull/12x",
+		"https://github.com/o/r/pull/",
+		// Not a PR.
+		"https://github.com/o/r/issues/1",
+	} {
+		_, _, _, err := parsePRURL(bad)
+		require.Error(t, err, "parsePRURL(%q) must not claim this URL", bad)
+	}
+}
+
+// The tails gh and the browser append are still the same PR.
+func TestParsePRURLAcceptsTrailingPath(t *testing.T) {
+	for _, u := range []string{
+		"https://github.com/bazelment/yoloswe/pull/302",
+		"https://github.com/bazelment/yoloswe/pull/302/files",
+		"https://github.com/bazelment/yoloswe/pull/302#discussion_r1",
+		"http://github.com/bazelment/yoloswe/pull/302",
+		"github.com/bazelment/yoloswe/pull/302",
+	} {
+		o, r, n, err := parsePRURL(u)
+		require.NoError(t, err, u)
+		require.Equal(t, "bazelment", o, u)
+		require.Equal(t, "yoloswe", r, u)
+		require.Equal(t, 302, n, u)
+	}
+}
