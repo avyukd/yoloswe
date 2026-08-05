@@ -239,32 +239,71 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 		baseSHA, _ = fetchBaseSHA(ctx, gh, dir, pr.BaseRefName)
 	}()
 	wg.Wait()
-	// A failed-runs fetch that dies is DEGRADED, not fatal.
+	// A best-effort fetch that dies is DEGRADED, not fatal.
 	//
-	// This was the only one of the four concurrent fetches that aborted the whole
-	// snapshot. Unresolved threads mark -1 for "unknown" and the base SHA is
-	// swallowed outright, so a tick already knows how to proceed on partial data —
-	// this one call did not, and it is the most failure-prone of the set:
-	// `actions/runs` is polled every tick per PR and is the first endpoint GitHub
-	// throttles. Three concurrent runs tripped the secondary rate limit and then
-	// could not tick at all for 35 minutes, each returning HTTP 403 here while
-	// every other signal in the snapshot was fine. prdozer caused the outage and
-	// then had no way to ride it out.
+	// Two of the four concurrent fetches used to abort the whole snapshot, while
+	// the other two already tolerated failure — unresolved threads mark -1 for
+	// "unknown" and the base SHA is swallowed outright. So a tick always knew how
+	// to proceed on partial data; these two calls just did not let it.
 	//
-	// Losing this signal costs the CIFailed trigger for one tick. Losing the whole
-	// snapshot costs the tick, and every tick after it for as long as the throttle
-	// lasts.
+	// Both are throttle-prone: `actions/runs` and the comments pagination are
+	// polled every tick per PR, and are the first endpoints GitHub's secondary
+	// rate limit hits. Concurrent runs tripped it and then could not tick at all
+	// for 35 minutes, each returning HTTP 403 here while every other signal in the
+	// snapshot was fine — prdozer caused the outage and had no way to ride it out.
+	//
+	// Losing one signal costs one trigger for one tick: CIFailed for failed runs,
+	// NewComments for comments. Losing the snapshot costs the tick, and every tick
+	// after it for as long as the throttle lasts.
+	// Every best-effort fetch degrades through ONE list, so a new fetch cannot be
+	// added on the fatal path by omission.
+	//
+	// The previous shape fixed only the failed-runs branch and left the comments
+	// branch three lines below it still returning an error. A throttled tick got
+	// exactly one step further before aborting on the next fatal fetch — the same
+	// wedge, a different message. Two adjacent branches that must behave
+	// identically is a class of bug, not an instance; collapsing them removes the
+	// place the mistake can live.
+	//
+	// Errors are SCRUBBED, not raw: these strings are logged, persisted into the
+	// run record and Slacked, and a gh error can carry the endpoint config
+	// including key-bearing env vars.
+	//
+	// The entry deliberately holds no per-fetch "clear" closure: a struct with a
+	// string beside a func pointer trips govet fieldalignment (40 pointer bytes,
+	// could be 32), which gates this repo — govet runs enable-all and
+	// fieldalignment is not in .golangci.yml's disable list, the same constraint
+	// the Snapshot struct above is ordered under. No permutation helps; all six
+	// are 40. Nothing is lost by dropping it: see the zeroing note below.
+	for _, f := range []struct {
+		err   error
+		label string
+	}{
+		{failedErr, fmt.Sprintf("failed runs for %s", pr.HeadRefName)},
+		{commentsErr, fmt.Sprintf("comments for #%d", prNumber)},
+	} {
+		if f.err == nil {
+			continue
+		}
+		degraded = append(degraded, fmt.Sprintf("%s: %s", f.label, safeErrString(f.err)))
+	}
+	// Belt-and-braces: a degraded signal must contribute no data, so a caller
+	// cannot read a half-populated slice as a complete answer.
+	//
+	// These are UNREACHABLE today and no test can kill them: every error path in
+	// both fetchFailedRunIDs and fetchAllComments returns a nil slice beside its
+	// error, so the assignments never observably change anything (deleting them
+	// leaves the suite green — verified). They are kept as a local guard rather
+	// than deleted because the property they enforce — errored ⇒ no data — is
+	// currently a convention of two producers three call layers away that no
+	// signature enforces. A future fetch that returns a partially paginated list
+	// with its error would otherwise leak it into the snapshot silently, and the
+	// cost of holding the line here is two branches.
 	if failedErr != nil {
-		// Scrubbed, not raw. This string is logged, persisted into the run record
-		// and Slacked, and a gh/provider error can carry the endpoint config —
-		// including key-bearing env vars. Every other path that surfaces an error
-		// to those sinks goes through safeErrString; this one must too.
-		degraded = append(degraded,
-			fmt.Sprintf("failed runs for %s: %s", pr.HeadRefName, safeErrString(failedErr)))
 		failed = nil
 	}
 	if commentsErr != nil {
-		return nil, fmt.Errorf("comments for #%d: %w", prNumber, commentsErr)
+		comments = nil
 	}
 	pr.TotalCommits = totalCommits
 	return &Snapshot{
