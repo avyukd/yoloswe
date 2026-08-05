@@ -27,6 +27,13 @@ type Snapshot struct {
 	StatusRollup string
 	Comments     []CommentRef
 	FailedRunIDs []int64
+	// Degraded names the best-effort fetches that failed this tick, so a
+	// partial snapshot is visible instead of silently looking complete. A tick
+	// proceeds on partial data — losing one signal for one tick beats losing
+	// every tick for as long as the outage lasts — but it must SAY so, or a
+	// missing CIFailed trigger reads as "CI is fine". Grouped with the other
+	// slices so it packs alongside them (govet fieldalignment).
+	Degraded []string
 	// ChangesRequestedBy lists the reviewers whose latest review requested
 	// changes, so they can be asked to look again once the work is pushed.
 	ChangesRequestedBy []string
@@ -35,12 +42,6 @@ type Snapshot struct {
 	// on push.
 	IsBotReviewer map[string]bool
 	PR            PRDetails
-	// Degraded names the best-effort fetches that failed this tick, so a
-	// partial snapshot is visible instead of silently looking complete. A tick
-	// proceeds on partial data — losing one signal for one tick beats losing
-	// every tick for as long as the outage lasts — but it must SAY so, or a
-	// missing CIFailed trigger reads as "CI is fine".
-	Degraded []string
 	// UnresolvedThreads counts review threads still awaiting work, or -1 when
 	// it could not be read. -1 disables the divergence guard for this tick
 	// rather than being mistaken for a healthy zero. Last so the int packs into
