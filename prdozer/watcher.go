@@ -234,6 +234,13 @@ func (w *Watcher) Tick(ctx context.Context) (TickResult, error) {
 		"unresolved_threads", snap.UnresolvedThreads,
 		"rounds_since_improvement", state.RoundsSinceImprovement,
 	)
+	// A degraded snapshot proceeded on partial data. Logged at WARN because the
+	// missing signal is silent by construction: no failed-run IDs looks exactly
+	// like a green branch, and the operator has to be able to tell them apart.
+	if len(snap.Degraded) > 0 {
+		w.logger.Warn("snapshot degraded; ticking on partial data",
+			"degraded", strings.Join(snap.Degraded, "; "))
+	}
 
 	w.diverged, w.ratcheted = false, false
 	w.stalled, w.lastStallError, w.lastStallStage = false, "", ""

@@ -35,6 +35,12 @@ type Snapshot struct {
 	// on push.
 	IsBotReviewer map[string]bool
 	PR            PRDetails
+	// Degraded names the best-effort fetches that failed this tick, so a
+	// partial snapshot is visible instead of silently looking complete. A tick
+	// proceeds on partial data — losing one signal for one tick beats losing
+	// every tick for as long as the outage lasts — but it must SAY so, or a
+	// missing CIFailed trigger reads as "CI is fine".
+	Degraded []string
 	// UnresolvedThreads counts review threads still awaiting work, or -1 when
 	// it could not be read. -1 disables the divergence guard for this tick
 	// rather than being mistaken for a healthy zero. Last so the int packs into
@@ -196,6 +202,7 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 		unresolved             int
 		totalCommits           int
 		failedErr, commentsErr error
+		degraded               []string
 	)
 	wg.Add(5)
 	go func() {
@@ -231,8 +238,24 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 		baseSHA, _ = fetchBaseSHA(ctx, gh, dir, pr.BaseRefName)
 	}()
 	wg.Wait()
+	// A failed-runs fetch that dies is DEGRADED, not fatal.
+	//
+	// This was the only one of the four concurrent fetches that aborted the whole
+	// snapshot. Unresolved threads mark -1 for "unknown" and the base SHA is
+	// swallowed outright, so a tick already knows how to proceed on partial data —
+	// this one call did not, and it is the most failure-prone of the set:
+	// `actions/runs` is polled every tick per PR and is the first endpoint GitHub
+	// throttles. Three concurrent runs tripped the secondary rate limit and then
+	// could not tick at all for 35 minutes, each returning HTTP 403 here while
+	// every other signal in the snapshot was fine. prdozer caused the outage and
+	// then had no way to ride it out.
+	//
+	// Losing this signal costs the CIFailed trigger for one tick. Losing the whole
+	// snapshot costs the tick, and every tick after it for as long as the throttle
+	// lasts.
 	if failedErr != nil {
-		return nil, fmt.Errorf("failed runs for %s: %w", pr.HeadRefName, failedErr)
+		degraded = append(degraded, fmt.Sprintf("failed runs for %s: %v", pr.HeadRefName, failedErr))
+		failed = nil
 	}
 	if commentsErr != nil {
 		return nil, fmt.Errorf("comments for #%d: %w", prNumber, commentsErr)
@@ -248,6 +271,7 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 		ChangesRequestedBy: changesRequestedBy(pr.LatestReviews),
 		IsBotReviewer:      botReviewers(pr.LatestReviews),
 		UnresolvedThreads:  unresolved,
+		Degraded:           degraded,
 	}, nil
 }
 

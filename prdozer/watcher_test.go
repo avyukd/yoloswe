@@ -2903,3 +2903,29 @@ func TestRecordHealth_TicksWithoutAnAgentAreNeverCharged(t *testing.T) {
 		})
 	}
 }
+
+// A rate-limited failed-runs fetch must DEGRADE the snapshot, not abort it.
+//
+// This was the only one of the four concurrent fetches that returned a fatal
+// error — unresolved threads mark -1 for unknown and the base SHA is swallowed
+// outright. `actions/runs` is polled every tick per PR and is the first endpoint
+// GitHub throttles, so concurrent runs tripped the secondary rate limit and then
+// could not tick at all for 35 minutes, while every other signal was fine.
+func TestTakeSnapshot_FailedRunsRateLimited_DegradesNotAborts(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "SUCCESS"), "[]", "base1")
+	gh.failPrefix("run list", "failed to get runs: HTTP 403: API rate limit exceeded "+
+		"for user ID 5767792 (https://api.github.com/repos/o/r/actions/runs?status=failure)")
+
+	snap, err := TakeSnapshot(context.Background(), gh, ".", 42, SnapshotOptions{})
+	require.NoError(t, err,
+		"a throttled failed-runs fetch must not abort the tick — every other signal was fine")
+	require.NotNil(t, snap)
+	assert.NotEmpty(t, snap.Degraded,
+		"the tick proceeded on partial data, so it must say so: no failed-run IDs "+
+			"is indistinguishable from a green branch")
+	assert.Empty(t, snap.FailedRunIDs,
+		"an unread signal must be empty, never a stale or invented value")
+	// The rest must still be usable, or degrading bought nothing.
+	assert.Equal(t, StatusSuccess, snap.StatusRollup)
+	assert.Equal(t, "head1", snap.PR.HeadRefOid)
+}
