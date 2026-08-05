@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -11,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/bazelment/yoloswe/cliapp"
 	"github.com/bazelment/yoloswe/fleet"
 	"github.com/bazelment/yoloswe/jiradozer"
 )
@@ -289,4 +292,181 @@ func TestDispatchArgsForwardAConfigPathTheTargetCanResolve(t *testing.T) {
 	joined = strings.Join(dispatchArgs(execArgs{
 		issueID: "INF-1", repo: "kernel", configPath: "/etc/jd.yaml"}, "s"), " ")
 	assert.Contains(t, joined, "--config /etc/jd.yaml")
+}
+
+// runDispatchCmd executes the real dispatch command so ORDERING is what is
+// under test. The bug this covers was purely an ordering mistake — `--here`
+// returned above both guards — which no unit test of a helper could have seen.
+func runDispatchCmd(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	var x execArgs
+	cmd := newDispatchCmd(&x)
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs(args)
+	cmd.SetContext(cliapp.WithApp(context.Background(), &cliapp.App{Logger: testMainLogger(t)}))
+	err := cmd.Execute()
+	return out.String(), err
+}
+
+// A dry run must never execute, whatever the dispatch shape. `--dry-run --here`
+// used to fall straight into runExec and do the work for real.
+//
+// The assertion is load-bearing in a specific way: --repo names a repo that does
+// not exist and no config is passed, so if the dry run ever executes, runExec
+// fails and this returns an error. Passing REQUIRES not having run.
+func TestDryRunHereNeverExecutes(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	out, err := runDispatchCmd(t, "--here", "--dry-run", "--skip-quota-check",
+		"--description", "should never run", "--repo", "no-such-repo-exists")
+
+	require.NoError(t, err, "a dry run reached execution and failed there: %s", out)
+	assert.Contains(t, out, "would run IN-PROCESS")
+	// Nothing may be claimed by a preview.
+	require.NoDirExists(t, filepath.Join(os.Getenv("HOME"), ".jiradozer", "runs"))
+	require.NoDirExists(t, filepath.Join(os.Getenv("HOME"), ".jiradozer", "leases"))
+}
+
+// --here skips host SELECTION, not the duplicate guard. With no fleet inventory
+// readable there is no cross-host concern, so the guard degrades to a no-op
+// rather than blocking the local escape hatch.
+func TestGuardDuplicateRunDegradesWithoutAFleet(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // no ~/magent/fleet here
+
+	err := guardDuplicateRun(context.Background(),
+		execArgs{description: "x", taskID: "t-1", repo: "yoloswe"}, 0, testMainLogger(t))
+	require.NoError(t, err, "an absent fleet must not block a local run")
+}
+
+// stubSSH answers every probe with one canned blob, so a test can put a box
+// into a chosen state without a network.
+type stubSSH struct{ out string }
+
+func (s stubSSH) Run(context.Context, string, string) (string, error) { return s.out, nil }
+
+// probeOutputHoldingLease renders the probe blob for a healthy box that holds
+// the lock for target. It goes through SanitizeSlug rather than hardcoding a
+// name so the fixture tracks the real lease-naming rule.
+func probeOutputHoldingLease(target string) string {
+	return strings.Join([]string{
+		"__NPROC__", "8",
+		"__LOAD__", "0.1 0.1 0.1 1/1 1",
+		"__DF__", "Filesystem 1024-blocks Used Available Capacity Mounted on",
+		"/dev/root 100000000 1 99000000 1% /",
+		"__TMUX__", "0",
+		"__LEASES__", fleet.SanitizeSlug(target) + ".lock",
+		"__BIN__", "/home/ubuntu/bin/jiradozer",
+		"__END__", "",
+	}, "\n")
+}
+
+// withFakeFleet points the guard at a one-host registry whose probe reports the
+// lease for target already held, and returns that lease target.
+func withFakeFleet(t *testing.T, x execArgs) string {
+	t.Helper()
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "boxa.json"),
+		[]byte(`{"hostname":"boxa","public_dns":"boxa.example.com","ssh_user":"ubuntu"}`), 0o600))
+
+	target := leaseTarget(x)
+	require.NotEmpty(t, target)
+
+	oldDir, oldSSH := guardFleetDir, guardSSH
+	guardFleetDir, guardSSH = dir, stubSSH{out: probeOutputHoldingLease(target)}
+	t.Cleanup(func() { guardFleetDir, guardSSH = oldDir, oldSSH })
+	return target
+}
+
+// The ordering this PR exists to establish, asserted on the REAL `--here` path:
+// the duplicate guard runs BEFORE the dry-run return, so a preview reports the
+// refusal a real run would hit instead of promising work that would be rejected.
+//
+// This is the test that actually pins the ordering. The absent-fleet cases
+// cannot: there the guard is a no-op, so moving it back below the dry-run
+// return leaves them green.
+func TestDryRunHereReportsAHeldLeaseInsteadOfPromisingToRun(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	args := execArgs{description: "should never run", repo: "no-such-repo-exists"}
+	target := withFakeFleet(t, args)
+
+	out, err := runDispatchCmd(t, "--here", "--dry-run", "--skip-quota-check",
+		"--description", args.description, "--repo", args.repo)
+
+	require.Error(t, err, "a held lease must refuse the preview, not print it: %s", out)
+	assert.Contains(t, err.Error(), target, "the refusal must name the task already being worked")
+	assert.NotContains(t, out, "would run",
+		"printing the preview means the guard ran after the dry-run return")
+}
+
+// The same guard on the executing `--here` path: a held lease refuses before
+// runExec, which is the duplicate run this whole check exists to prevent.
+func TestHereRefusesToStartASecondRunOfAHeldTask(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	args := execArgs{description: "already in flight", repo: "no-such-repo-exists"}
+	target := withFakeFleet(t, args)
+
+	_, err := runDispatchCmd(t, "--here", "--skip-quota-check",
+		"--description", args.description, "--repo", args.repo)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), target)
+}
+
+// A fleet directory that EXISTS but cannot be read fully is a partial view, not
+// an empty one, and must fail closed.
+//
+// The vanished-entry case is the one that motivated stat-ing the root instead of
+// matching fs.ErrNotExist on Load's error: fleet.Load surfaces BOTH a missing
+// registry root and an entry that disappeared between ReadDir and ReadFile as
+// fs.ErrNotExist, so the sentinel alone cannot tell "this box has no fleet" from
+// "I could not see all of it". A dangling symlink reproduces the latter
+// deterministically — it is listed by ReadDir and then fails ReadFile.
+func TestGuardFailsClosedOnAPartiallyReadableFleet(t *testing.T) {
+	for _, tc := range []struct {
+		setup func(t *testing.T, dir string)
+		name  string
+	}{
+		{name: "malformed entry", setup: func(t *testing.T, dir string) {
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "boxa.json"), []byte("{not json"), 0o600))
+		}},
+		{name: "vanished entry", setup: func(t *testing.T, dir string) {
+			// Listed by ReadDir, absent by ReadFile: fs.ErrNotExist from a fleet
+			// that is emphatically NOT absent.
+			require.NoError(t, os.Symlink(filepath.Join(dir, "gone.json"), filepath.Join(dir, "boxa.json")))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			dir := t.TempDir()
+			tc.setup(t, dir)
+
+			oldDir := guardFleetDir
+			guardFleetDir = dir
+			t.Cleanup(func() { guardFleetDir = oldDir })
+
+			err := guardDuplicateRun(context.Background(),
+				execArgs{description: "x", repo: "yoloswe"}, 0, testMainLogger(t))
+
+			require.Error(t, err, "a fleet present but only partly readable must not read as 'nobody is running it'")
+			assert.Contains(t, err.Error(), "cannot rule out a second run")
+		})
+	}
+}
+
+// A --description run has no tracker-side claim, so its lease target is derived
+// from its CONTENT and is stable across invocations. That is what makes the
+// duplicate guard work for ad-hoc tasks at all — a per-run identifier would be
+// unique every time and could never collide with the run it needs to exclude.
+func TestAdHocLeaseTargetIsStableAcrossRuns(t *testing.T) {
+	a := execArgs{description: "tidy the helm chart", repo: "yoloswe"}
+	first, second := leaseTarget(a), leaseTarget(a)
+
+	require.NotEmpty(t, first)
+	require.Equal(t, first, second, "an ad-hoc target must be reproducible, or it can never collide")
+
+	// Different task, or same task in a different repo, must not collide.
+	require.NotEqual(t, first, leaseTarget(execArgs{description: "something else", repo: "yoloswe"}))
+	require.NotEqual(t, first, leaseTarget(execArgs{description: "tidy the helm chart", repo: "kernel"}))
 }
