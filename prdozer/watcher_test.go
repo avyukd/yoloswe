@@ -1,6 +1,7 @@
 package prdozer
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -2902,4 +2903,67 @@ func TestRecordHealth_TicksWithoutAnAgentAreNeverCharged(t *testing.T) {
 			assert.Zero(t, state.PolishCommits, "prdozer ran nothing; this push is not its growth")
 		})
 	}
+}
+
+// A rate-limited failed-runs fetch must DEGRADE the snapshot, not abort it.
+//
+// This was the only one of the four concurrent fetches that returned a fatal
+// error — unresolved threads mark -1 for unknown and the base SHA is swallowed
+// outright. `actions/runs` is polled every tick per PR and is the first endpoint
+// GitHub throttles, so concurrent runs tripped the secondary rate limit and then
+// could not tick at all for 35 minutes, while every other signal was fine.
+func TestTakeSnapshot_FailedRunsRateLimited_DegradesNotAborts(t *testing.T) {
+	gh := setupGH(buildPRJSON(okPRJSON, "SUCCESS"), "[]", "base1")
+	gh.failPrefix("run list", "failed to get runs: HTTP 403: API rate limit exceeded "+
+		"for user ID 5767792 (https://api.github.com/repos/o/r/actions/runs?status=failure)")
+
+	snap, err := TakeSnapshot(context.Background(), gh, ".", 42, SnapshotOptions{})
+	require.NoError(t, err,
+		"a throttled failed-runs fetch must not abort the tick — every other signal was fine")
+	require.NotNil(t, snap)
+	assert.NotEmpty(t, snap.Degraded,
+		"the tick proceeded on partial data, so it must say so: no failed-run IDs "+
+			"is indistinguishable from a green branch")
+	assert.Empty(t, snap.FailedRunIDs,
+		"an unread signal must be empty, never a stale or invented value")
+	// The rest must still be usable, or degrading bought nothing.
+	assert.Equal(t, StatusSuccess, snap.StatusRollup)
+	assert.Equal(t, "head1", snap.PR.HeadRefOid)
+}
+
+// The degraded WARN must actually fire, and must carry a SCRUBBED error.
+//
+// Two gaps this closes. The sibling TakeSnapshot test proves the snapshot
+// degrades, but nothing exercised the warning in Tick — delete it and the suite
+// stayed green, so "a partial tick is visible" was an untested claim. And the
+// string reaching that log is persisted and Slacked, so it goes through
+// safeErrString like every other error on those sinks: a gh failure can carry
+// the endpoint config, including key-bearing env vars.
+func TestWatcher_Tick_DegradedSnapshot_WarnsWithScrubbedError(t *testing.T) {
+	var buf bytes.Buffer
+	gh := setupGH(buildPRJSON(okPRJSON, "SUCCESS"), "[]", "base1")
+	gh.failPrefix("run list", "failed to get runs: HTTP 403: API rate limit exceeded "+
+		"(token=ghp_SUPERSECRETVALUE endpoint=https://api.github.com/repos/o/r/actions/runs)")
+
+	w := newWatcherForTest(t, gh, &stubPolish{})
+	w.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	pre := &State{LastCheckAt: time.Now(), LastSeenHeadSHA: "head1", LastSeenBaseSHA: "base1"}
+	require.NoError(t, pre.Save(StatePath("r", 42)))
+
+	_, err := w.Tick(context.Background())
+	require.NoError(t, err, "a degraded snapshot must still tick")
+
+	logged := buf.String()
+	assert.Contains(t, logged, "snapshot degraded",
+		"the tick proceeded on partial data and must say so — no failed-run IDs "+
+			"is indistinguishable from a green branch")
+	assert.NotContains(t, logged, "ghp_SUPERSECRETVALUE",
+		"the degraded error is persisted and Slacked, so it must be scrubbed")
+	// Control: the raw stderr DOES carry the secret, so the assertion above is
+	// testing the scrub rather than a string that never held one. (An earlier
+	// version of this control asserted the token survived safeErrString — it
+	// does not, which is the point: without the control that made the NotContains
+	// pass for the wrong reason.)
+	require.Contains(t, gh.failures["run list"].Stderr, "ghp_SUPERSECRETVALUE",
+		"control: the unscrubbed source must contain the marker, or the scrub assertion is vacuous")
 }
