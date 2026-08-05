@@ -2967,3 +2967,68 @@ func TestWatcher_Tick_DegradedSnapshot_WarnsWithScrubbedError(t *testing.T) {
 	require.Contains(t, gh.failures["run list"].Stderr, "ghp_SUPERSECRETVALUE",
 		"control: the unscrubbed source must contain the marker, or the scrub assertion is vacuous")
 }
+
+// EVERY best-effort fetch must degrade, not abort.
+//
+// Table-driven over both throttle-prone fetches because fixing one and leaving
+// the other is exactly what happened: the failed-runs branch was made
+// non-fatal while the comments branch three lines below still returned an
+// error, so a throttled tick got one step further and aborted on the next one —
+// same wedge, different message. A per-path test would have passed while the
+// class was still broken.
+func TestTakeSnapshot_BestEffortFetchesDegrade(t *testing.T) {
+	const secret = "ghp_SUPERSECRETVALUE"
+	rateLimited := "HTTP 403: API rate limit exceeded (token=" + secret + ")"
+
+	for _, tc := range []struct {
+		name      string
+		failWhat  string // gh arg prefix to fail
+		wantInMsg string
+	}{
+		{"failed runs throttled", "run list", "failed runs"},
+		{"comments throttled", "api --paginate repos/o/r/pulls/42/comments", "comments"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gh := setupGH(buildPRJSON(okPRJSON, "SUCCESS"), "[]", "base1")
+			gh.failPrefix(tc.failWhat, rateLimited)
+
+			snap, err := TakeSnapshot(context.Background(), gh, ".", 42, SnapshotOptions{})
+			require.NoError(t, err,
+				"a throttled best-effort fetch must not abort the tick — the other signals were fine")
+			require.NotNil(t, snap)
+			require.NotEmpty(t, snap.Degraded, "a partial tick must say so")
+			assert.Contains(t, strings.Join(snap.Degraded, "; "), tc.wantInMsg,
+				"the degraded entry must name WHICH signal was lost")
+			assert.NotContains(t, strings.Join(snap.Degraded, "; "), secret,
+				"degraded strings are logged, persisted and Slacked, so they must be scrubbed")
+			// The rest must remain usable, or degrading bought nothing.
+			assert.Equal(t, StatusSuccess, snap.StatusRollup)
+			assert.Equal(t, "head1", snap.PR.HeadRefOid)
+		})
+	}
+
+	// Both at once — a real throttle hits every endpoint, so the tick must still
+	// survive losing two signals rather than only tolerating one.
+	t.Run("both throttled", func(t *testing.T) {
+		gh := setupGH(buildPRJSON(okPRJSON, "SUCCESS"), "[]", "base1")
+		gh.failPrefix("run list", rateLimited)
+		gh.failPrefix("api --paginate repos/o/r/pulls/42/comments", rateLimited)
+
+		snap, err := TakeSnapshot(context.Background(), gh, ".", 42, SnapshotOptions{})
+		require.NoError(t, err, "a throttle hits every endpoint; the tick must survive both")
+		require.NotNil(t, snap)
+		assert.Len(t, snap.Degraded, 2, "both lost signals must be named, not just the first")
+		assert.Empty(t, snap.FailedRunIDs)
+		assert.Empty(t, snap.Comments)
+	})
+
+	// Control: the unscrubbed source really does carry the marker, so the
+	// NotContains assertions above are testing the scrub rather than a string
+	// that never held a secret.
+	t.Run("control: source carries the secret", func(t *testing.T) {
+		gh := setupGH(buildPRJSON(okPRJSON, "SUCCESS"), "[]", "base1")
+		gh.failPrefix("run list", rateLimited)
+		require.Contains(t, gh.failures["run list"].Stderr, secret,
+			"if the fixture never carried the marker, the scrub assertions prove nothing")
+	})
+}

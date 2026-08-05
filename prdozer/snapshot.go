@@ -239,32 +239,48 @@ func TakeSnapshot(ctx context.Context, gh wt.GHRunner, dir string, prNumber int,
 		baseSHA, _ = fetchBaseSHA(ctx, gh, dir, pr.BaseRefName)
 	}()
 	wg.Wait()
-	// A failed-runs fetch that dies is DEGRADED, not fatal.
+	// A best-effort fetch that dies is DEGRADED, not fatal.
 	//
-	// This was the only one of the four concurrent fetches that aborted the whole
-	// snapshot. Unresolved threads mark -1 for "unknown" and the base SHA is
-	// swallowed outright, so a tick already knows how to proceed on partial data —
-	// this one call did not, and it is the most failure-prone of the set:
-	// `actions/runs` is polled every tick per PR and is the first endpoint GitHub
-	// throttles. Three concurrent runs tripped the secondary rate limit and then
-	// could not tick at all for 35 minutes, each returning HTTP 403 here while
-	// every other signal in the snapshot was fine. prdozer caused the outage and
-	// then had no way to ride it out.
+	// Two of the four concurrent fetches used to abort the whole snapshot, while
+	// the other two already tolerated failure — unresolved threads mark -1 for
+	// "unknown" and the base SHA is swallowed outright. So a tick always knew how
+	// to proceed on partial data; these two calls just did not let it.
 	//
-	// Losing this signal costs the CIFailed trigger for one tick. Losing the whole
-	// snapshot costs the tick, and every tick after it for as long as the throttle
-	// lasts.
-	if failedErr != nil {
-		// Scrubbed, not raw. This string is logged, persisted into the run record
-		// and Slacked, and a gh/provider error can carry the endpoint config —
-		// including key-bearing env vars. Every other path that surfaces an error
-		// to those sinks goes through safeErrString; this one must too.
-		degraded = append(degraded,
-			fmt.Sprintf("failed runs for %s: %s", pr.HeadRefName, safeErrString(failedErr)))
-		failed = nil
-	}
-	if commentsErr != nil {
-		return nil, fmt.Errorf("comments for #%d: %w", prNumber, commentsErr)
+	// Both are throttle-prone: `actions/runs` and the comments pagination are
+	// polled every tick per PR, and are the first endpoints GitHub's secondary
+	// rate limit hits. Concurrent runs tripped it and then could not tick at all
+	// for 35 minutes, each returning HTTP 403 here while every other signal in the
+	// snapshot was fine — prdozer caused the outage and had no way to ride it out.
+	//
+	// Losing one signal costs one trigger for one tick: CIFailed for failed runs,
+	// NewComments for comments. Losing the snapshot costs the tick, and every tick
+	// after it for as long as the throttle lasts.
+	// Every best-effort fetch degrades through ONE list, so a new fetch cannot be
+	// added on the fatal path by omission.
+	//
+	// The previous shape fixed only the failed-runs branch and left the comments
+	// branch three lines below it still returning an error. A throttled tick got
+	// exactly one step further before aborting on the next fatal fetch — the same
+	// wedge, a different message. Two adjacent branches that must behave
+	// identically is a class of bug, not an instance; collapsing them removes the
+	// place the mistake can live.
+	//
+	// Errors are SCRUBBED, not raw: these strings are logged, persisted into the
+	// run record and Slacked, and a gh error can carry the endpoint config
+	// including key-bearing env vars.
+	for _, f := range []struct {
+		err   error
+		label string
+		clear func()
+	}{
+		{failedErr, fmt.Sprintf("failed runs for %s", pr.HeadRefName), func() { failed = nil }},
+		{commentsErr, fmt.Sprintf("comments for #%d", prNumber), func() { comments = nil }},
+	} {
+		if f.err == nil {
+			continue
+		}
+		degraded = append(degraded, fmt.Sprintf("%s: %s", f.label, safeErrString(f.err)))
+		f.clear()
 	}
 	pr.TotalCommits = totalCommits
 	return &Snapshot{
