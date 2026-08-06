@@ -59,6 +59,38 @@ A promoted config that does not move the fleet escape rate within one measuremen
 cycle gets reverted rather than kept for appearances. "No measurable effect" is a
 result, not a reason to keep a change.
 
+## Escape-rate baseline (2026-08-06)
+
+Re-measured across the full corpus with `escape_rate.py --all`:
+
+| Metric | Value |
+|---|---|
+| Runs measured / skipped | 274 / 368 |
+| Substantive external findings | 1,260 |
+| **Raw escape rate** | **61.7%** (777) |
+| **Judged escape rate** | **2.7%** (3 of 111, over 21 runs with frozen GT) |
+| Escaped P1 | 179 (raw) |
+| **Escaped but in scope** | **742 of 777 — 95.5%** |
+
+**Quote the judged rate.** Raw is inflated 23× here, consistent with bot claims measuring
+~9–14% precision on this corpus. The raw number counts claims that were never defects.
+
+**This is a new baseline, not a measurement of any change.** The prior recorded figures
+(raw 52.6% / judged 10.7%) came from **11** measurable runs; this covers **274**, and 21
+judged runs against 5 before. The corpus grew roughly 25×, so the movement is in what is
+being measured, not in reviewer quality — do not read 52.6% → 61.7% as a regression.
+
+**Nothing has yet exercised `--diff-base` or `verdict.py`.** Zero pr-polish runs have
+completed since those landed: the most recent (`yoloswe-309`, 05:26Z) predates both — it
+wrote no verdict and its review logs carry no `--diff-base`. Attribution has to wait for
+runs that actually used them.
+
+**The one durable finding: 95.5% of escapes are in scope.** The reviewer already had the
+file and missed the bug. The original measurement put this at 87% on 38 findings; it now
+holds at 95.5% on 777, across a corpus 25× larger. Widening scope cannot fix a miss on a
+file already in scope — this is a depth problem, and it is the most robustly supported
+claim in this document.
+
 ## Data boundary
 
 The dataset lives **outside the repository**, at `~/.bramble/code-review-eval/`:

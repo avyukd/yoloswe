@@ -445,6 +445,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     result = compute_verdict(state, repo_root=args.repo_root)
     if args.write:
         (args.state_dir / "verdict.json").write_text(json.dumps(result, indent=2))
+        # Also fold it into the state file. The sidecar alone is invisible to
+        # every consumer that already reads pr-polish-state.json — the
+        # harvester, escape_rate.py, and anything auditing a past run — so
+        # writing only verdict.json leaves the verdict undiscoverable
+        # exactly where it would be looked for. Written atomically (temp +
+        # rename) so a crash mid-write cannot truncate the state a run
+        # depends on, and only after the sidecar succeeds.
+        state_path = args.state_dir / "pr-polish-state.json"
+        if state_path.is_file():
+            try:
+                current = json.loads(state_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                current = None
+            if isinstance(current, dict):
+                current["verdict"] = result
+                tmp = state_path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(current, indent=2))
+                tmp.replace(state_path)
     print(json.dumps(result, indent=2))
     # Non-zero on anything but a clean bill: this is what makes the verdict
     # usable from a script rather than only readable by a human.

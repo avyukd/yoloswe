@@ -381,11 +381,30 @@ Use `remote-head` not `git rev-parse origin/<branch>` (worktree lag).
 
 ```bash
 python3 $SKILL_DIR/scripts/pr_ops.py state-mark-complete $CTX <reason>
+
+# Compute the verdict from state + git rather than asserting it in prose.
+# Exits non-zero when the run is not ready, so a non-LLM caller can gate on
+# it. --write persists it to state["verdict"] and verdict.json.
+#
+# --repo-root is load-bearing, not optional: without it fix-claim
+# verification is SKIPPED and reports `fix_claims: {}` with no blocker —
+# every `action: "fixed"` row is taken on faith. With it, the same run
+# raises `unverified_fix_claim` for a row whose file the round's commits
+# never touched. pr-polish always runs from the repo, so $(pwd) is right.
+python3 $SKILL_DIR/scripts/verdict.py "$STATE_DIR" --repo-root "$(pwd)" --write || true
 ```
 
 Reasons: `converged`, `all-low`, `false-positive-top`, `capped-at-max`, `spiral-escalated`, `pr-mismatch-abort`, `sync-conflict`, `dirty-tree-preflight`, `user-paused`, `abandoned`.
 
-Print: metrics, round table, full `comment_actions` table (`Round | Source | Path:Line | Severity | Action | Notes`), state file path, ready/not-ready verdict.
+Print: metrics, round table, full `comment_actions` table (`Round | Source | Path:Line | Severity | Action | Notes`), state file path.
+
+**Report `verdict.py`'s output, do not re-derive it.** Its `blockers` are checkable
+facts — an `action: "fixed"` row whose file the round's commits never touched, a
+`capped-at-max` exit, an unresolved high-severity finding. Prose that contradicts a
+blocker is the failure this replaces: a run that exhausted its budget with work
+outstanding used to reach the same confident summary as one that genuinely converged.
+`|| true` keeps the non-zero exit from aborting the summary; the verdict itself carries
+the signal.
 
 ## Measuring this loop's quality
 
