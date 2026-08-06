@@ -525,7 +525,7 @@ func TestFinalizeEnvelope_NilResumeCallbackOmitsField(t *testing.T) {
 func TestLoadPromptOptions_NoFile(t *testing.T) {
 	// Empty path is the legacy/default case: no hints loaded, but
 	// SkipTestExecution must still pass through.
-	opts, err := loadPromptOptions(reviewer.ReviewModeCode, "", "", true)
+	opts, err := loadPromptOptions(reviewer.ReviewModeCode, "", "", "", true, diffScope{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -544,7 +544,7 @@ func TestLoadPromptOptions_ValidFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		t.Fatalf("write hints file: %v", err)
 	}
-	opts, err := loadPromptOptions(reviewer.ReviewModeCode, path, "", false)
+	opts, err := loadPromptOptions(reviewer.ReviewModeCode, path, "", "", false, diffScope{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -572,7 +572,7 @@ func TestLoadPromptOptions_MalformedFallsBack(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{not valid json"), 0o644); err != nil {
 		t.Fatalf("write hints file: %v", err)
 	}
-	opts, err := loadPromptOptions(reviewer.ReviewModeCode, path, "", true)
+	opts, err := loadPromptOptions(reviewer.ReviewModeCode, path, "", "", true, diffScope{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -598,7 +598,7 @@ func TestLoadPromptOptions_MissingFileFallsBack(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
-	opts, err := loadPromptOptions(reviewer.ReviewModeCode, filepath.Join(t.TempDir(), "nonexistent.json"), "", false)
+	opts, err := loadPromptOptions(reviewer.ReviewModeCode, filepath.Join(t.TempDir(), "nonexistent.json"), "", "", false, diffScope{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -624,7 +624,7 @@ func TestBuildPromptForRun_WidensWithRealHintsFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		t.Fatalf("write hints: %v", err)
 	}
-	got, err := buildPromptForRun(reviewer.ReviewModeCode, "review goal", path, "", false, promptStyleFresh)
+	got, err := buildPromptForRun(reviewer.ReviewModeCode, "review goal", path, "", "", false, promptStyleFresh, diffScope{})
 	if err != nil {
 		t.Fatalf("buildPromptForRun: %v", err)
 	}
@@ -660,7 +660,7 @@ func TestBuildPromptForRun_V2HintsThreadCallerCalleeFraming(t *testing.T) {
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		t.Fatalf("write hints: %v", err)
 	}
-	got, err := buildPromptForRun(reviewer.ReviewModeCode, "review goal", path, "", false, promptStyleFresh)
+	got, err := buildPromptForRun(reviewer.ReviewModeCode, "review goal", path, "", "", false, promptStyleFresh, diffScope{})
 	if err != nil {
 		t.Fatalf("buildPromptForRun: %v", err)
 	}
@@ -682,7 +682,7 @@ func TestBuildPromptForRun_NoHintsMatchesLegacy(t *testing.T) {
 	// Empty hints path must produce today's narrow prompt, byte-equal to
 	// the legacy BuildJSONPrompt output. This is the no-regressions
 	// guarantee for callers that haven't opted into the wider scope.
-	got, err := buildPromptForRun(reviewer.ReviewModeCode, "g", "", "", false, promptStyleFresh)
+	got, err := buildPromptForRun(reviewer.ReviewModeCode, "g", "", "", "", false, promptStyleFresh, diffScope{})
 	if err != nil {
 		t.Fatalf("buildPromptForRun: %v", err)
 	}
@@ -707,7 +707,7 @@ func TestBuildPromptForRun_FollowUpThreadsScopeHintsFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		t.Fatalf("write hints: %v", err)
 	}
-	got, err := buildPromptForRun(reviewer.ReviewModeCode, "Round 5. Prior fixes: ...", path, "", true /* skipTestExecution */, promptStyleFollowUp)
+	got, err := buildPromptForRun(reviewer.ReviewModeCode, "Round 5. Prior fixes: ...", path, "", "", true /* skipTestExecution */, promptStyleFollowUp, diffScope{})
 	if err != nil {
 		t.Fatalf("buildPromptForRun: %v", err)
 	}
@@ -746,7 +746,7 @@ func TestBuildPromptForRun_FollowUpUsesShortPrompt(t *testing.T) {
 	// scope clauses are conditional: present when opts carries them so a
 	// silent resume fallback (resume_status="fallback") doesn't read
 	// this prompt cold and miss them.
-	got, err := buildPromptForRun(reviewer.ReviewModeCode, "g", "", "", true /* skipTestExecution */, promptStyleFollowUp)
+	got, err := buildPromptForRun(reviewer.ReviewModeCode, "g", "", "", "", true /* skipTestExecution */, promptStyleFollowUp, diffScope{})
 	if err != nil {
 		t.Fatalf("buildPromptForRun: %v", err)
 	}
@@ -844,7 +844,7 @@ func TestBuildPromptForRun_MalformedHintsFallsBackToLegacy(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{not json"), 0o644); err != nil {
 		t.Fatalf("write hints: %v", err)
 	}
-	got, err := buildPromptForRun(reviewer.ReviewModeCode, "g", path, "", true, promptStyleFresh)
+	got, err := buildPromptForRun(reviewer.ReviewModeCode, "g", path, "", "", true, promptStyleFresh, diffScope{})
 	if err != nil {
 		t.Fatalf("buildPromptForRun: %v", err)
 	}
@@ -1034,7 +1034,7 @@ func TestMaxSeverity(t *testing.T) {
 }
 
 func TestValidateModeFlags_DefaultIsCode(t *testing.T) {
-	mode, err := validateModeFlags("", "", "", false)
+	mode, err := validateModeFlags("", "", "", "", false, diffScope{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1044,7 +1044,7 @@ func TestValidateModeFlags_DefaultIsCode(t *testing.T) {
 }
 
 func TestValidateModeFlags_RubricFileWithoutDesignDocMode(t *testing.T) {
-	_, err := validateModeFlags("code", "", "/tmp/rubric.txt", false)
+	_, err := validateModeFlags("code", "", "/tmp/rubric.txt", "", false, diffScope{})
 	if err == nil {
 		t.Fatal("expected error: rubric-file requires design-doc mode")
 	}
@@ -1054,7 +1054,7 @@ func TestValidateModeFlags_RubricFileWithoutDesignDocMode(t *testing.T) {
 }
 
 func TestValidateModeFlags_DesignDocRequiresRubricFile(t *testing.T) {
-	_, err := validateModeFlags("design-doc", "", "", false)
+	_, err := validateModeFlags("design-doc", "", "", "", false, diffScope{})
 	if err == nil {
 		t.Fatal("expected error: design-doc mode requires rubric-file")
 	}
@@ -1073,7 +1073,7 @@ func TestValidateModeFlags_DesignDocWarnsOnIgnoredFlags(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
-	mode, err := validateModeFlags("design-doc", "/tmp/hints.json", "/tmp/rubric.txt", true)
+	mode, err := validateModeFlags("design-doc", "/tmp/hints.json", "/tmp/rubric.txt", "", true, diffScope{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1090,7 +1090,7 @@ func TestValidateModeFlags_DesignDocWarnsOnIgnoredFlags(t *testing.T) {
 }
 
 func TestValidateModeFlags_UnknownModeRejected(t *testing.T) {
-	_, err := validateModeFlags("security-review", "", "", false)
+	_, err := validateModeFlags("security-review", "", "", "", false, diffScope{})
 	if err == nil {
 		t.Fatal("expected error for unknown mode")
 	}
@@ -1216,7 +1216,7 @@ func TestLoadPromptOptions_DesignDocRubric(t *testing.T) {
 	if err := os.WriteFile(path, []byte("q1?\nq2?\nq3?\n"), 0o644); err != nil {
 		t.Fatalf("write rubric: %v", err)
 	}
-	opts, err := loadPromptOptions(reviewer.ReviewModeDesignDoc, "", path, false)
+	opts, err := loadPromptOptions(reviewer.ReviewModeDesignDoc, "", path, "", false, diffScope{})
 	if err != nil {
 		t.Fatalf("loadPromptOptions: %v", err)
 	}
@@ -1241,7 +1241,7 @@ func TestBuildPromptForRun_DesignDocEndToEnd(t *testing.T) {
 	if err := os.WriteFile(path, []byte("Is this the best long-term choice?\nCan we make it simpler?\n"), 0o644); err != nil {
 		t.Fatalf("write rubric: %v", err)
 	}
-	got, err := buildPromptForRun(reviewer.ReviewModeDesignDoc, "Reviewing design doc bramble-jsonl-practices.md", "", path, false, promptStyleFresh)
+	got, err := buildPromptForRun(reviewer.ReviewModeDesignDoc, "Reviewing design doc bramble-jsonl-practices.md", "", path, "", false, promptStyleFresh, diffScope{})
 	if err != nil {
 		t.Fatalf("buildPromptForRun: %v", err)
 	}
@@ -1258,5 +1258,155 @@ func TestBuildPromptForRun_DesignDocEndToEnd(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("design-doc prompt missing %q\nprompt:\n%s", want, got)
 		}
+	}
+}
+
+// --- --review-prompt-file (persona override) ---
+//
+// The override exists so prompt variants can be A/B'd against a frozen
+// ground-truth benchmark as config rather than as a rebuild. These tests
+// pin the two halves of that contract: the persona is substitutable, and
+// the machine-readable parts are not.
+
+func TestPersonaOverrideReplacesBuiltInPersona(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "persona.txt")
+	persona := "You are a paranoid reviewer. Find concurrency bugs only."
+	if err := os.WriteFile(path, []byte(persona), 0o644); err != nil {
+		t.Fatalf("write persona: %v", err)
+	}
+	got, err := buildPromptForRun(reviewer.ReviewModeCode, "g", "", "", path, false, promptStyleFresh, diffScope{})
+	if err != nil {
+		t.Fatalf("buildPromptForRun: %v", err)
+	}
+	if !strings.Contains(got, persona) {
+		t.Errorf("prompt must carry the override persona\n--- got ---\n%s", got)
+	}
+	if strings.Contains(got, "bias toward code quality and correctness") {
+		t.Errorf("built-in persona must be gone when overridden\n--- got ---\n%s", got)
+	}
+}
+
+func TestPersonaOverrideKeepsJSONContract(t *testing.T) {
+	// A variant must not be able to break envelope parsing — otherwise a
+	// "better" prompt could score well while producing unusable output.
+	path := filepath.Join(t.TempDir(), "persona.txt")
+	if err := os.WriteFile(path, []byte("Be terse."), 0o644); err != nil {
+		t.Fatalf("write persona: %v", err)
+	}
+	got, err := buildPromptForRun(reviewer.ReviewModeCode, "g", "", "", path, false, promptStyleFresh, diffScope{})
+	if err != nil {
+		t.Fatalf("buildPromptForRun: %v", err)
+	}
+	baseline := reviewer.BuildJSONPrompt("g")
+	for _, marker := range []string{"issues", "verdict", "severity"} {
+		if !strings.Contains(got, marker) {
+			t.Errorf("override dropped JSON contract marker %q", marker)
+		}
+		if !strings.Contains(baseline, marker) {
+			t.Fatalf("test marker %q not in baseline; update the markers", marker)
+		}
+	}
+}
+
+func TestPersonaOverrideKeepsGoalAndSkipTestClause(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "persona.txt")
+	if err := os.WriteFile(path, []byte("Be terse."), 0o644); err != nil {
+		t.Fatalf("write persona: %v", err)
+	}
+	got, err := buildPromptForRun(reviewer.ReviewModeCode, "REVIEW-GOAL-SENTINEL", "", "", path, true, promptStyleFresh, diffScope{})
+	if err != nil {
+		t.Fatalf("buildPromptForRun: %v", err)
+	}
+	if !strings.Contains(got, "REVIEW-GOAL-SENTINEL") {
+		t.Error("goal text must survive the persona override")
+	}
+	// Dropping this would let a variant start running builds mid-benchmark.
+	if !strings.Contains(got, "test") {
+		t.Error("skip-test-execution clause must survive the persona override")
+	}
+}
+
+func TestMissingPersonaFileFallsBackToBuiltIn(t *testing.T) {
+	// Degrade like --scope-hints-file: losing the experiment beats losing
+	// the review.
+	missing := filepath.Join(t.TempDir(), "nope.txt")
+	got, err := buildPromptForRun(reviewer.ReviewModeCode, "g", "", "", missing, false, promptStyleFresh, diffScope{})
+	if err != nil {
+		t.Fatalf("buildPromptForRun must not fail on a missing persona file: %v", err)
+	}
+	if got != reviewer.BuildJSONPrompt("g") {
+		t.Error("missing persona file must yield the built-in prompt verbatim")
+	}
+}
+
+func TestEmptyPersonaFileFallsBackToBuiltIn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "empty.txt")
+	if err := os.WriteFile(path, []byte("   \n\t\n"), 0o644); err != nil {
+		t.Fatalf("write persona: %v", err)
+	}
+	got, err := buildPromptForRun(reviewer.ReviewModeCode, "g", "", "", path, false, promptStyleFresh, diffScope{})
+	if err != nil {
+		t.Fatalf("buildPromptForRun: %v", err)
+	}
+	if got != reviewer.BuildJSONPrompt("g") {
+		t.Error("whitespace-only persona file must yield the built-in prompt")
+	}
+}
+
+func TestPersonaOverrideRejectedInDesignDocMode(t *testing.T) {
+	_, err := validateModeFlags("design-doc", "", "/tmp/rubric.txt", "/tmp/persona.txt", false, diffScope{})
+	if err == nil {
+		t.Fatal("--review-prompt-file must be rejected in design-doc mode")
+	}
+	if !strings.Contains(err.Error(), "--review-prompt-file") {
+		t.Errorf("error must name the offending flag, got: %v", err)
+	}
+}
+
+// TestDiffScopeFlagValidation pins the CLI-boundary rules for
+// --diff-base/--diff-head. A silently-ignored or silently-dropped diff
+// scope is the exact failure the flag exists to prevent: the run looks
+// correct while the reviewer measures a different diff.
+func TestDiffScopeFlagValidation(t *testing.T) {
+	t.Run("valid base accepted in code mode", func(t *testing.T) {
+		if _, err := validateModeFlags("code", "", "", "", false,
+			diffScope{base: "35e2b581d06cef4b34daff5a2b476fb3ec361194"}); err != nil {
+			t.Fatalf("valid base rejected: %v", err)
+		}
+	})
+	t.Run("malformed base rejected, not silently dropped", func(t *testing.T) {
+		_, err := validateModeFlags("code", "", "", "", false,
+			diffScope{base: "a b; rm -rf /"})
+		if err == nil {
+			t.Fatal("malformed --diff-base accepted")
+		}
+		if !strings.Contains(err.Error(), "not a valid git revision") {
+			t.Errorf("unhelpful error: %v", err)
+		}
+	})
+	t.Run("head without base rejected", func(t *testing.T) {
+		if _, err := validateModeFlags("code", "", "", "", false,
+			diffScope{head: "HEAD"}); err == nil {
+			t.Fatal("--diff-head without --diff-base accepted")
+		}
+	})
+	t.Run("rejected in design-doc mode", func(t *testing.T) {
+		_, err := validateModeFlags("design-doc", "", "/tmp/r.txt", "", false,
+			diffScope{base: "abc123"})
+		if err == nil {
+			t.Fatal("--diff-base accepted in design-doc mode")
+		}
+	})
+}
+
+// TestDiffScopeReachesPrompt closes the loop from flag to prompt text.
+func TestDiffScopeReachesPrompt(t *testing.T) {
+	got, err := buildPromptForRun(reviewer.ReviewModeCode, "g", "", "", "",
+		false, promptStyleFresh, diffScope{base: "abc123def"})
+	if err != nil {
+		t.Fatalf("buildPromptForRun: %v", err)
+	}
+	if !strings.Contains(got, "git diff abc123def..HEAD") {
+		t.Errorf("diff scope did not reach the prompt:\n%s", got)
 	}
 }

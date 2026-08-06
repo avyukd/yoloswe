@@ -176,11 +176,12 @@ against** — built by judging, not by reading `comment_actions`:
 }
 ```
 
-`true_positives` is the **complete real-bug census**. The convergence test
-(see below) guarantees every censused bug is covered by a reviewer finding,
-so there is no separate "missed issues" field. When a PR exhausts the round
-budget without saturating, `census_converged` is `false` and the still-
-uncovered census items are recorded in `per_round_diff`.
+`census` is the **complete real-bug set** for the diff — including defects
+no reviewer caught. Those uncovered items are the recall signal replay
+scores against, so convergence deliberately does not require them to be
+covered; `per_round_diff` records `uncovered_census_items` per round. A
+converged dataset with a large uncovered set means the reviewers were quiet,
+not that the ground truth is incomplete.
 
 The judge assigns each finding's `severity` itself — `reviewer_severity` is
 the reviewer's reported value, kept alongside so the divergence is
@@ -202,13 +203,18 @@ defect is genuinely unsettled.
 Each collection round, the judge sub-agent verdicts every reviewer finding
 (`true_positive` / `false_positive` / `unsure`) **and** independently
 censuses the real bugs in the diff. `collect_lib.census_converged` returns
-true when, after a round, **all three** hold:
+true when, after a round, **both** hold:
 
-1. the cumulative census set is unchanged versus the prior round (no new
-   real bug surfaced), and
-2. every census item is covered by a `true_positive` finding (the reviewers,
-   in aggregate, caught every real bug the judge censused), and
-3. no contested finding is still unresolved.
+1. the round censused no new real bug (`new_census_items` is empty — the
+   judge, re-reading the same diff against a fresh round of reviewer
+   findings, recorded nothing it did not already have), and
+2. no contested finding is still unresolved.
+
+Reviewer *coverage* of the census is deliberately not a condition. The judge
+censuses bugs no reviewer caught — that is its job — so gating on full
+coverage made convergence unreachable on any diff carrying a low/nit defect
+the reviewers skip: a saturated run would spend its whole round budget and
+still freeze as "unconverged". Coverage is reported, not gated.
 
 At least two rounds are always required. `unsure` verdicts carry no ground
 truth and are dropped — they are neither a true nor a false positive, and
@@ -427,8 +433,16 @@ python3 .../replay.py kernel-3945 \
 ```
 
 With no positional target, replay samples `--sample N` (default 5) PRs that
-have a frozen `ground_truth_v3`. A PR without that block exits 2 with a
-pointer to run collection mode.
+have a frozen `ground_truth_v3` **and `harvest_source: "pr-polish"`**. A PR
+without that block exits 2 with a pointer to run collection mode.
+
+`--source {pr-polish,github}` (repeatable) overrides the tier filter.
+GitHub-sourced records are excluded by default because their ground truth is
+bot-derived and ~83% false positives; they stay on disk for auditing. A
+record written before schema 3 has no `harvest_source` and counts as
+`pr-polish`, since it predates the GitHub source. Naming a GitHub-sourced PR
+explicitly still scores it, with a warning that its numbers are not
+comparable to pr-polish-sourced ones.
 
 ## Testing
 

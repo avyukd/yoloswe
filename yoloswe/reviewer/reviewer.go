@@ -195,6 +195,45 @@ type PromptOptions struct {
 	// SanitizePromptHint to keep markdown structure intact.
 	Rubric []string
 
+	// PersonaOverride replaces the built-in code-review persona and focus
+	// areas — the tunable half of the prompt. The JSON output contract and
+	// the scope-hint clauses are deliberately NOT overridable: a prompt
+	// variant must not be able to break envelope parsing or silently drop
+	// scope, which would make its benchmark score meaningless.
+	//
+	// Empty means "use the built-in persona", so every existing caller is
+	// byte-identical. Ignored unless Mode is ReviewModeCode.
+	//
+	// This exists so prompt variants can be A/B'd against a frozen
+	// ground-truth benchmark as ordinary config rather than as a rebuild,
+	// with the variant recorded alongside its score.
+	PersonaOverride string
+
+	// DiffBase names the commit the review's diff is measured against —
+	// the merge base of the change under review, not the current tip of
+	// the base branch. When set, the prompt states the exact diff command
+	// instead of leaving the agent to infer one.
+	//
+	// This matters more than it looks. With no base stated, agents guess,
+	// and the obvious guess — `git diff main...HEAD` — is wrong whenever
+	// the local base branch has advanced past the change's merge base: the
+	// three-dot diff then spans every unrelated commit merged in between.
+	// Measured on a replayed PR (kernel-8276, 2026-08-05): the reviewer
+	// saw **336 files instead of the change's 22**. Worse, the guess is
+	// not stable — across 15 recorded sessions some runs used
+	// `main...HEAD`, some `merge-base`, some both, making diff scope an
+	// uncontrolled variable underneath every score.
+	//
+	// Empty means "say nothing", so callers that cannot compute a base are
+	// byte-identical to the previous prompt. Ignored unless Mode is
+	// ReviewModeCode — a design-doc review has no diff.
+	DiffBase string
+
+	// DiffHead is the optional other end of the diff range. Defaults to
+	// HEAD when empty, which is what a worktree checked out at the
+	// reviewed commit wants.
+	DiffHead string
+
 	// TestScopeHints lists co-located test paths the agent should read. When
 	// non-empty, the test-quality clause is appended to the prompt and the
 	// paths are inlined under it (capped at testScopeHintsCap entries).
@@ -261,8 +300,27 @@ func buildBasePrompt(goal string, opts PromptOptions) string {
 	case ReviewModeDesignDoc:
 		return buildDesignDocBasePrompt(goal, opts)
 	default:
+		if opts.PersonaOverride != "" {
+			return buildOverriddenCodeBasePrompt(
+				goal, opts.PersonaOverride, opts.SkipTestExecution)
+		}
 		return buildCodeBasePrompt(goal, opts.SkipTestExecution)
 	}
+}
+
+// buildOverriddenCodeBasePrompt substitutes a caller-supplied persona for
+// the built-in one, keeping everything the machine depends on.
+//
+// The goal text and the skip-test-execution clause are still appended by
+// this layer rather than left to the override: the goal is per-run data,
+// not prompt policy, and dropping the skip clause would let a variant
+// start running builds mid-benchmark.
+func buildOverriddenCodeBasePrompt(goal, persona string, skipTestExecution bool) string {
+	base := persona + "\n" + buildGoalText(goal)
+	if skipTestExecution {
+		base += skipTestExecutionSuffix
+	}
+	return base
 }
 
 // buildCodeBasePrompt is the legacy code-review persona + focus list. The
@@ -564,6 +622,73 @@ Trace every public API/handler/exported symbol modified in the changed packages
 to its consumers. Read both sides of each surface and flag:` + crossServiceContractItems
 }
 
+// ValidGitRevision reports whether s is safe to inline into the prompt as
+// part of a git command.
+//
+// SanitizePromptHint is the wrong gate here: it rejects any leading digit
+// run, which would throw away a perfectly good SHA like "35e2b58...". This
+// accepts the characters git revisions actually use and nothing else — in
+// particular no whitespace, quotes, backticks, or shell metacharacters, so
+// an inlined revision cannot break out of the command it appears in or
+// inject markdown structure into the prompt.
+func ValidGitRevision(s string) bool {
+	if s == "" || len(s) > 128 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z',
+			c >= 'A' && c <= 'Z',
+			c >= '0' && c <= '9':
+		case c == '.' || c == '_' || c == '-' || c == '/' || c == '^' || c == '~':
+		default:
+			return false
+		}
+	}
+	// ".." would turn one revision into a range and silently rescope the
+	// diff; a leading "-" would read as a flag.
+	if strings.Contains(s, "..") || s[0] == '-' {
+		return false
+	}
+	return true
+}
+
+// diffScopeClause states the exact diff under review. See PromptOptions.
+// DiffBase for why leaving this to the agent is not safe.
+func diffScopeClause(base, head string) string {
+	if !ValidGitRevision(base) {
+		return ""
+	}
+	if head == "" {
+		head = "HEAD"
+	} else if !ValidGitRevision(head) {
+		return ""
+	}
+	return fmt.Sprintf(`
+
+Start by running this command to read the diff under review:
+
+    git diff %s..%s
+
+You must actually run it — do not review from the goal text alone. Use that
+command — with two dots, and with this base commit — as the
+definition of "the diff" everywhere in these instructions. Do NOT substitute
+a branch name such as `+"`main...HEAD`"+`: the local base branch may have advanced
+well past this change's merge base, which would pull in unrelated commits
+and bury the change under review. Reading surrounding code for context is
+expected and encouraged.
+
+Report a defect in an UNCHANGED file when this change is what makes it
+wrong. The common shape is an incomplete change: the diff establishes a new
+rule, adds a field that must be kept in sync, or migrates some call sites,
+and leaves siblings behind that no longer satisfy it. Those unfixed
+siblings are defects in THIS change — the fix is to edit the unchanged file
+— so cite them at their own file and line. What does not belong is a
+pre-existing problem the diff neither creates nor touches.`,
+		base, head)
+}
+
 // buildScopeSuffix concatenates the optional clauses dictated by opts. Each
 // clause is gated purely by data presence so callers without scope info pay
 // no cost — the returned string is empty when neither clause applies, which
@@ -578,6 +703,9 @@ to its consumers. Read both sides of each surface and flag:` + crossServiceContr
 // because their ChangedPackages list happened to be unsanitary.
 func buildScopeSuffix(opts PromptOptions) string {
 	var s string
+	// Diff scope leads: it defines the noun ("the diff") that every later
+	// clause and the persona itself refer to.
+	s += diffScopeClause(opts.DiffBase, opts.DiffHead)
 	if len(opts.TestScopeHints) > 0 {
 		s += testQualityClause(opts.TestScopeHints)
 	}

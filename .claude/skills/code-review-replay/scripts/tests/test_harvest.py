@@ -297,6 +297,536 @@ class NormalizeRemoteUrlTests(unittest.TestCase):
         )
 
 
+class ResolveDiffScopeTests(unittest.TestCase):
+    """Local git first, GitHub fallback — with gh stubbed, never networked."""
+
+    GH = {"head_sha": "h" * 40, "base_sha": "b" * 40}
+
+    def _with_gh_stub(self, fn, *, responses, record_calls=None):
+        import subprocess as _sp
+
+        real_run = hl.subprocess.run
+
+        def fake_run(cmd, *a, **kw):
+            # Only intercept `gh`; real git must still run so the local-path
+            # test exercises actual merge-base resolution.
+            if cmd[0] != "gh":
+                return real_run(cmd, *a, **kw)
+            endpoint = cmd[-1]
+            if record_calls is not None:
+                record_calls.append(endpoint)
+            for key, payload in responses.items():
+                if key in endpoint:
+                    return _sp.CompletedProcess(
+                        cmd, 0, stdout=json.dumps(payload), stderr=""
+                    )
+            return _sp.CompletedProcess(cmd, 1, stdout="", stderr="no stub")
+
+        hl.subprocess.run = fake_run
+        try:
+            return fn()
+        finally:
+            hl.subprocess.run = real_run
+
+    def test_no_head_before_anywhere(self):
+        scope = hl.resolve_diff_scope({}, repo_path=None)
+        self.assertIsNone(scope.head_before)
+        self.assertFalse(scope.merge_base_resolved)
+        self.assertEqual(scope.merge_base_error, "no head_before")
+
+    def test_head_before_falls_back_to_github_head_sha(self):
+        # No local state round data, but a discovered GitHub row.
+        calls: list[str] = []
+        scope = self._with_gh_stub(
+            lambda: hl.resolve_diff_scope(
+                {}, repo_path=None, gh=self.GH, slug="org/repo",
+                pr_number="42",
+            ),
+            responses={
+                "compare/": {"merge_base_commit": {"sha": "m" * 40}},
+                "files": [{"filename": "a.py"}, {"filename": "b.py"}],
+            },
+            record_calls=calls,
+        )
+        self.assertEqual(scope.head_before, "h" * 40)
+        self.assertEqual(scope.merge_base_sha, "m" * 40)
+        self.assertTrue(scope.merge_base_resolved)
+        self.assertEqual(scope.merge_base_resolved_by, "github")
+        self.assertEqual(scope.files_changed, ["a.py", "b.py"])
+        self.assertEqual(scope.files_changed_resolved_by, "github")
+
+    def test_local_git_wins_and_makes_no_api_call(self):
+        # The whole point of preferring git: it must not spend API budget.
+        calls: list[str] = []
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            hl.git(repo, "init", "-q")
+            hl.git(repo, "config", "user.email", "t@t")
+            hl.git(repo, "config", "user.name", "t")
+            (repo / "f.txt").write_text("x")
+            hl.git(repo, "add", "f.txt")
+            hl.git(repo, "commit", "-qm", "one")
+            head = hl.git(repo, "rev-parse", "HEAD").stdout.strip()
+            scope = self._with_gh_stub(
+                lambda: hl.resolve_diff_scope(
+                    {"head_before": head},
+                    repo_path=repo,
+                    base_branch=head,  # merge-base of a commit with itself
+                    gh=self.GH, slug="org/repo", pr_number="42",
+                ),
+                responses={}, record_calls=calls,
+            )
+        self.assertTrue(scope.merge_base_resolved)
+        self.assertEqual(scope.merge_base_resolved_by, "git")
+        self.assertEqual(calls, [])
+
+    def test_github_error_is_appended_to_the_git_error(self):
+        # The git error says why the local path failed (e.g. "fetch this
+        # commit"), which is the actionable half — it must not be lost.
+        scope = self._with_gh_stub(
+            lambda: hl.resolve_diff_scope(
+                {"head_before": "h" * 40},
+                repo_path=None, gh=self.GH, slug="org/repo", pr_number="42",
+            ),
+            responses={"compare/": {"no_merge_base": True}},
+        )
+        self.assertFalse(scope.merge_base_resolved)
+        self.assertIn("no repo mapping", scope.merge_base_error)
+        self.assertIn("github:", scope.merge_base_error)
+
+    def test_no_slug_means_local_only(self):
+        scope = hl.resolve_diff_scope(
+            {"head_before": "h" * 40}, repo_path=None,
+        )
+        self.assertFalse(scope.merge_base_resolved)
+        self.assertEqual(scope.merge_base_resolved_by, "git")
+        self.assertEqual(scope.files_changed, [])
+
+
+class HarvestSourceTests(unittest.TestCase):
+    """Provenance marking, and back-compat for pre-schema-3 records."""
+
+    def test_missing_key_reads_as_pr_polish(self):
+        # Every record written before schema 3 came from local pr-polish
+        # state, so an absent key is not an error.
+        self.assertEqual(hl.record_harvest_source({}), "pr-polish")
+        self.assertEqual(
+            hl.record_harvest_source({"schema_version": 2}), "pr-polish"
+        )
+
+    def test_explicit_values_round_trip(self):
+        self.assertEqual(
+            hl.record_harvest_source({"harvest_source": "github"}), "github"
+        )
+        self.assertEqual(
+            hl.record_harvest_source({"harvest_source": "pr-polish"}),
+            "pr-polish",
+        )
+
+    def test_unknown_value_falls_back(self):
+        self.assertEqual(
+            hl.record_harvest_source({"harvest_source": "nonsense"}),
+            "pr-polish",
+        )
+
+    def test_index_entry_from_disk_defaults_old_records(self):
+        with tempfile.TemporaryDirectory() as d:
+            out_dir = Path(d)
+            # A schema-2 record with no harvest_source key.
+            (out_dir / "kernel-4189.json").write_text(json.dumps({
+                "schema_version": 2,
+                "pr": {"repo_name": "kernel", "pr_number": "4189",
+                       "repo_url": "u", "pr_url": "u",
+                       "completed": True, "total_rounds": 1},
+                "harvested_rounds": [],
+            }))
+            index = hl.build_index(
+                [], generated_at="t", harvester_sha="abc", out_dir=out_dir,
+            )
+            self.assertEqual(index["prs"][0]["harvest_source"], "pr-polish")
+
+
+class GithubOnlyStateTests(unittest.TestCase):
+    """The synthesized state must land on the canonical round unchanged."""
+
+    def _gh(self):
+        return {
+            "repo_name": "kernel", "pr_number": "4102",
+            "head_sha": "a" * 40, "base_sha": "b" * 40,
+            "merged_at": "2026-07-29T00:00:00Z", "head_ref": "feat/x",
+        }
+
+    def test_yields_exactly_the_canonical_round(self):
+        state = hl.github_only_state(self._gh())
+        self.assertEqual(hl.select_rounds_to_harvest(state), [(1, "r1_only")])
+
+    def test_head_before_comes_from_github(self):
+        state = hl.github_only_state(self._gh())
+        self.assertEqual(hl.get_round(state, 1)["head_before"], "a" * 40)
+
+    def test_completed_so_include_incomplete_does_not_drop_it(self):
+        # A merged PR is not "incomplete"; the lower fidelity is carried by
+        # exit_reason + harvest_source, not by faking an unfinished run.
+        state = hl.github_only_state(self._gh())
+        self.assertTrue(state["completed"])
+        self.assertEqual(state["exit_reason"], "github_only")
+
+    def test_no_comment_actions_to_join(self):
+        state = hl.github_only_state(self._gh())
+        self.assertEqual(hl.get_round(state, 1)["comment_actions"], [])
+
+
+class DiscoverGithubPRsTests(unittest.TestCase):
+    """gh pr list parsing, filtering, and argv shape — never networked."""
+
+    ROWS = [
+        {"number": 8361, "mergedAt": "2026-07-30T22:19:17Z",
+         "headRefOid": "a" * 40, "baseRefOid": "b" * 40,
+         "headRefName": "feat/x", "title": "one"},
+        {"number": 8356, "mergedAt": "2026-07-30T20:56:18Z",
+         "headRefOid": "c" * 40, "baseRefOid": "d" * 40,
+         "headRefName": "fix/y", "title": "two"},
+    ]
+
+    def _call(self, *, rows=None, rc=0, captured=None, **kwargs):
+        import subprocess as _sp
+
+        real_run = hl.subprocess.run
+
+        def fake_run(cmd, *a, **kw):
+            if captured is not None:
+                captured.extend(cmd)
+            return _sp.CompletedProcess(
+                cmd, rc,
+                stdout=json.dumps(self.ROWS if rows is None else rows),
+                stderr="boom" if rc else "",
+            )
+
+        hl.subprocess.run = fake_run
+        try:
+            return hl.discover_github_prs("org/kernel", **kwargs)
+        finally:
+            hl.subprocess.run = real_run
+
+    def test_parses_rows_into_candidates(self):
+        rows, err = self._call()
+        self.assertIsNone(err)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["repo_name"], "kernel")
+        self.assertEqual(rows[0]["pr_number"], "8361")
+        self.assertEqual(rows[0]["head_sha"], "a" * 40)
+        self.assertEqual(rows[0]["base_sha"], "b" * 40)
+        self.assertEqual(rows[0]["slug"], "org/kernel")
+
+    def test_exclude_filters_already_harvested(self):
+        rows, _ = self._call(exclude={"kernel-8361"})
+        self.assertEqual([r["pr_number"] for r in rows], ["8356"])
+
+    def test_merged_since_becomes_a_search_arg(self):
+        captured: list[str] = []
+        self._call(captured=captured, merged_since="2026-07-23")
+        self.assertIn("--search", captured)
+        self.assertIn("merged:>=2026-07-23", captured)
+
+    def test_no_merged_since_sends_no_search(self):
+        captured: list[str] = []
+        self._call(captured=captured)
+        self.assertNotIn("--search", captured)
+
+    def test_failure_returns_error_not_raise(self):
+        rows, err = self._call(rc=1)
+        self.assertEqual(rows, [])
+        self.assertIn("exit 1", err)
+
+    def test_rows_without_a_number_are_skipped(self):
+        rows, _ = self._call(rows=[{"title": "no number"}])
+        self.assertEqual(rows, [])
+
+
+class AlreadyHarvestedTests(unittest.TestCase):
+    def test_lists_record_stems_and_skips_index(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            (out / "kernel-1.json").write_text("{}")
+            (out / "kernel-2.json").write_text("{}")
+            (out / "index.json").write_text("{}")
+            (out / "notes.txt").write_text("x")
+            self.assertEqual(
+                hl.already_harvested(out), {"kernel-1", "kernel-2"}
+            )
+
+    def test_missing_dir_is_empty(self):
+        self.assertEqual(
+            hl.already_harvested(Path("/nonexistent/xyz")), set()
+        )
+
+
+class BuildPRRecordGithubSourceTests(unittest.TestCase):
+    """End-to-end: a record for a PR with no local pr-polish state at all."""
+
+    GH = {
+        "repo_name": "kernel", "pr_number": "4102", "slug": "org/kernel",
+        "head_sha": "h" * 40, "base_sha": "b" * 40,
+        "merged_at": "2026-07-29T00:00:00Z", "head_ref": "feat/x",
+    }
+
+    def _build(self):
+        import subprocess as _sp
+
+        real_run = hl.subprocess.run
+
+        def fake_run(cmd, *a, **kw):
+            if cmd[0] != "gh":
+                return real_run(cmd, *a, **kw)
+            endpoint = cmd[-1]
+            if "compare/" in endpoint:
+                payload = {"merge_base_commit": {"sha": "m" * 40}}
+            elif "files" in endpoint:
+                payload = [{"filename": "svc/a.py"}]
+            else:
+                payload = []
+            return _sp.CompletedProcess(
+                cmd, 0, stdout=json.dumps(payload), stderr=""
+            )
+
+        hl.subprocess.run = fake_run
+        try:
+            return hl.build_pr_record(
+                None,  # no local state dir
+                "kernel",
+                "4102",
+                repo_map=hl.RepoMap({}),
+                pr_summary="Fix the thing\n\nBody text.",
+                harvester_sha="abc",
+                harvested_at="2026-07-30T00:00:00Z",
+                bramble_ops_path=Path("/nonexistent/bramble_ops.py"),
+                fetch_attempted=False,
+                harvest_source="github",
+                gh=self.GH,
+            )
+        finally:
+            hl.subprocess.run = real_run
+
+    def test_builds_a_usable_single_round_record(self):
+        rec = self._build()
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.harvest_source, "github")
+        self.assertEqual(rec.schema_version, 3)
+        self.assertEqual(len(rec.harvested_rounds), 1)
+        rnd = rec.harvested_rounds[0]
+        self.assertEqual(rnd.signal_tier, "r1_only")
+        self.assertEqual(rnd.head_before, "h" * 40)
+
+    def test_diff_scope_resolves_via_github(self):
+        rnd = self._build().harvested_rounds[0]
+        self.assertTrue(rnd.merge_base_resolved)
+        self.assertEqual(rnd.merge_base_sha, "m" * 40)
+        self.assertEqual(rnd.merge_base_resolved_by, "github")
+        self.assertEqual(rnd.files_changed, ["svc/a.py"])
+        self.assertEqual(rnd.files_changed_resolved_by, "github")
+
+    def test_no_review_runs_without_local_envelopes(self):
+        # The documented fidelity cost: no local envelopes exist, so
+        # --include-harvested contributes nothing for this record.
+        self.assertEqual(self._build().harvested_rounds[0].review_runs, [])
+        self.assertFalse(
+            self._build().harvested_rounds[0].scope_hints_present
+        )
+
+    def test_goal_text_is_the_pr_summary(self):
+        rnd = self._build().harvested_rounds[0]
+        self.assertEqual(rnd.goal_text, "Fix the thing\n\nBody text.")
+        self.assertTrue(rnd.goal_recoverable)
+
+    def test_urls_fall_back_to_the_discovered_slug(self):
+        # No local checkout means get_repo_url returns nothing.
+        rec = self._build()
+        self.assertEqual(rec.pr["repo_url"], "https://github.com/org/kernel")
+        self.assertEqual(
+            rec.pr["pr_url"], "https://github.com/org/kernel/pull/4102"
+        )
+
+    def test_requires_gh_row(self):
+        with self.assertRaises(ValueError):
+            hl.build_pr_record(
+                None, "kernel", "4102",
+                repo_map=hl.RepoMap({}), pr_summary=None,
+                harvester_sha="abc", harvested_at="t",
+                bramble_ops_path=Path("/nonexistent"),
+                harvest_source="github", gh=None,
+            )
+
+
+class CommitScopedRoundsTests(unittest.TestCase):
+    """Each comment must be judged against the commit it actually reviewed.
+
+    Pinning every comment to the PR's final head inverts the ground truth: a
+    bot correctly reports a bug, the author fixes it, and a judge reading the
+    post-fix code records the claim as a false positive.
+    """
+
+    def _repo(self, td):
+        repo = Path(td)
+        hl.git(repo, "init", "-q")
+        hl.git(repo, "config", "user.email", "t@t")
+        hl.git(repo, "config", "user.name", "t")
+        shas = []
+        for i in range(3):
+            (repo / f"f{i}.py").write_text("x\n")
+            hl.git(repo, "add", "-A")
+            hl.git(repo, "commit", "-qm", f"c{i}")
+            shas.append(hl.git(repo, "rev-parse", "HEAD").stdout.strip())
+        return repo, shas
+
+    def _c(self, sha, path="a.py"):
+        return {"source": "github-inline", "original_commit_id": sha,
+                "path": path, "body": "x"}
+
+    def test_one_round_per_reviewed_commit(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo, shas = self._repo(td)
+            rounds = hl.commit_scoped_rounds(
+                {"head_sha": shas[-1]},
+                [self._c(shas[0]), self._c(shas[1]), self._c(shas[1])],
+                repo_path=repo,
+            )
+            self.assertEqual(len(rounds), 2)
+            self.assertEqual([len(r["comment_actions"]) for r in rounds], [1, 2])
+
+    def test_rounds_are_ordered_oldest_first(self):
+        # Round 1 must be the earliest reviewed state, so the r1 tier keeps
+        # meaning "fresh eyes".
+        with tempfile.TemporaryDirectory() as td:
+            repo, shas = self._repo(td)
+            rounds = hl.commit_scoped_rounds(
+                {"head_sha": shas[-1]},
+                [self._c(shas[2]), self._c(shas[0])],
+                repo_path=repo,
+            )
+            self.assertEqual(rounds[0]["head_before"], shas[0])
+            self.assertEqual(rounds[1]["head_before"], shas[2])
+
+    def test_unreachable_sha_is_flagged_not_hidden(self):
+        # Force-pushed commits (~8% of the pilot corpus) cannot be judged at
+        # the state they reviewed; folding them in silently would look like
+        # same-state review.
+        with tempfile.TemporaryDirectory() as td:
+            repo, shas = self._repo(td)
+            rounds = hl.commit_scoped_rounds(
+                {"head_sha": shas[-1]},
+                [self._c(shas[0]), self._c("0" * 40)],
+                repo_path=repo,
+            )
+            last = rounds[-1]
+            self.assertTrue(last["head_unreachable"])
+            self.assertEqual(last["head_before"], shas[-1])
+            self.assertEqual(len(last["comment_actions"]), 1)
+
+    def test_comment_without_a_sha_is_an_orphan(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo, shas = self._repo(td)
+            c = self._c(shas[0]); del c["original_commit_id"]
+            rounds = hl.commit_scoped_rounds(
+                {"head_sha": shas[-1]}, [c], repo_path=repo)
+            self.assertEqual(len(rounds), 1)
+            self.assertTrue(rounds[0]["head_unreachable"])
+
+    def test_no_comments_still_yields_one_round(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo, shas = self._repo(td)
+            rounds = hl.commit_scoped_rounds(
+                {"head_sha": shas[-1]}, [], repo_path=repo)
+            self.assertEqual(len(rounds), 1)
+            self.assertEqual(rounds[0]["head_before"], shas[-1])
+
+    def test_every_round_is_kept_not_just_first_and_last(self):
+        # The default rule keeps only R1 + final, which would discard most of
+        # the review states the SHAs were recovered for.
+        with tempfile.TemporaryDirectory() as td:
+            repo, shas = self._repo(td)
+            state = hl.github_only_state(
+                {"head_sha": shas[-1]},
+                [self._c(s) for s in shas],
+                repo_path=repo,
+            )
+            picked = hl.select_rounds_to_harvest(state)
+            self.assertEqual(len(picked), len(state["rounds"]))
+            self.assertEqual(picked[0][1], "r1")
+
+    def test_opt_in_only(self):
+        # Without comments the legacy single-round shape is preserved.
+        state = hl.github_only_state({"head_sha": "a" * 40})
+        self.assertEqual(len(state["rounds"]), 1)
+        self.assertEqual(
+            hl.select_rounds_to_harvest(state), [(1, "r1_only")]
+        )
+
+
+class EnvelopePathTests(unittest.TestCase):
+    """pr-polish writes envelopes flat (``rN/``) or per-attempt (``rN/aM/``).
+
+    Both layouts are live in ``~/.bramble/projects``; reading only the flat
+    one silently harvested zero review_runs for every recent PR.
+    """
+
+    def _state_dir(self, td: str) -> Path:
+        return Path(td) / "kernel-1"
+
+    def test_flat_layout(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = self._state_dir(td)
+            (state / "r1").mkdir(parents=True)
+            env = state / "r1" / "codex-envelope.json"
+            env.write_text("{}")
+            self.assertEqual(hl._envelope_path(state, 1, "codex"), env)
+
+    def test_attempt_layout(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = self._state_dir(td)
+            (state / "r1" / "a1").mkdir(parents=True)
+            env = state / "r1" / "a1" / "codex-envelope.json"
+            env.write_text("{}")
+            self.assertEqual(hl._envelope_path(state, 1, "codex"), env)
+
+    def test_last_attempt_wins(self):
+        # A retried round leaves an envelope per attempt; the last is the
+        # outcome pr-polish acted on. a10 must sort after a2, not before.
+        with tempfile.TemporaryDirectory() as td:
+            state = self._state_dir(td)
+            for a in ("a1", "a2", "a10"):
+                (state / "r1" / a).mkdir(parents=True)
+                (state / "r1" / a / "codex-envelope.json").write_text("{}")
+            self.assertEqual(
+                hl._envelope_path(state, 1, "codex"),
+                state / "r1" / "a10" / "codex-envelope.json",
+            )
+
+    def test_falls_back_to_last_attempt_that_has_one(self):
+        # A backend that failed to produce an envelope on the final attempt
+        # still has its earlier one harvested rather than being dropped.
+        with tempfile.TemporaryDirectory() as td:
+            state = self._state_dir(td)
+            for a in ("a1", "a2"):
+                (state / "r1" / a).mkdir(parents=True)
+            env = state / "r1" / "a1" / "cursor-envelope.json"
+            env.write_text("{}")
+            self.assertEqual(hl._envelope_path(state, 1, "cursor"), env)
+
+    def test_missing_envelope_returns_round_level_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = self._state_dir(td)
+            (state / "r1").mkdir(parents=True)
+            self.assertFalse(hl._envelope_path(state, 1, "gemini").exists())
+
+    def test_scope_hints_stay_at_round_level(self):
+        with tempfile.TemporaryDirectory() as td:
+            state = self._state_dir(td)
+            (state / "r1" / "a1").mkdir(parents=True)
+            self.assertFalse(hl._scope_hints_present(state, 1))
+            (state / "r1" / "scope-hints.json").write_text("{}")
+            self.assertTrue(hl._scope_hints_present(state, 1))
+
+
 class SelectRoundsTests(unittest.TestCase):
     def test_completed_multi_round(self):
         state = {
@@ -395,7 +925,9 @@ class BuildPRRecordKernel3945Snapshot(unittest.TestCase):
             fetch_attempted=False,  # offline integration test
         )
         self.assertIsNotNone(record)
-        self.assertEqual(record.schema_version, 2)
+        self.assertEqual(record.schema_version, 3)
+        # A record built from a local pr-polish dir is full fidelity.
+        self.assertEqual(record.harvest_source, "pr-polish")
         self.assertEqual(record.pr["repo_name"], "kernel")
         self.assertEqual(record.pr["pr_number"], "3945")
         # kernel-3945 had 5 rounds, completed=True → R1 + R5
@@ -452,7 +984,8 @@ class BuildPRRecordKernel3945Snapshot(unittest.TestCase):
             loaded = json.loads(path.read_text())
             self.assertEqual(loaded["pr"]["pr_number"], "3945")
             self.assertEqual(len(loaded["harvested_rounds"]), 2)
-            self.assertEqual(loaded["schema_version"], 2)
+            self.assertEqual(loaded["schema_version"], 3)
+            self.assertEqual(loaded["harvest_source"], "pr-polish")
             self.assertEqual(
                 loaded["pr_comments_attribution_basis"], "no_timestamp"
             )
@@ -894,6 +1427,91 @@ class BuildPRRecordMiddleRoundFoldTests(unittest.TestCase):
                     self.assertNotIn("attributed_round", c)
 
 
+class RateLimitBackoffTests(unittest.TestCase):
+    """_run_gh backs off through a rate limit instead of failing instantly.
+
+    A bulk harvest reliably trips GitHub's *secondary* rate limit while the
+    core quota still reads thousands remaining. Without backoff, every
+    remaining PR fails identically and degrades to the state-recorded
+    comment set — producing records that look harvested but carry no
+    external review census.
+    """
+
+    RATE_ERR = (
+        "gh: API rate limit exceeded for user ID 5767792. (HTTP 403)"
+    )
+
+    def _stub(self, outcomes, slept):
+        """outcomes: list of (returncode, stderr) consumed per attempt."""
+        import subprocess as _sp
+
+        calls = {"n": 0}
+
+        def fake_run(cmd, *a, **kw):
+            i = min(calls["n"], len(outcomes) - 1)
+            rc, err = outcomes[i]
+            calls["n"] += 1
+            return _sp.CompletedProcess(
+                cmd, rc, stdout="[]" if rc == 0 else "", stderr=err
+            )
+
+        return fake_run, calls
+
+    def test_detects_rate_limit_message(self):
+        self.assertTrue(hl.is_rate_limit_error(self.RATE_ERR))
+        self.assertTrue(
+            hl.is_rate_limit_error("You have exceeded a secondary RATE LIMIT EXCEEDED")
+        )
+        self.assertFalse(hl.is_rate_limit_error("404 Not Found"))
+        self.assertFalse(hl.is_rate_limit_error(None))
+
+    def test_retries_then_succeeds(self):
+        slept = []
+        fake_run, calls = self._stub(
+            [(1, self.RATE_ERR), (1, self.RATE_ERR), (0, "")], slept
+        )
+        real = hl.subprocess.run
+        hl.subprocess.run = fake_run
+        try:
+            res, err = hl._run_gh(
+                ["gh", "api", "x"], "x", sleep=slept.append
+            )
+        finally:
+            hl.subprocess.run = real
+        self.assertIsNone(err)
+        self.assertEqual(res.returncode, 0)
+        self.assertEqual(calls["n"], 3)
+        # Backed off before each retry, on the documented schedule.
+        self.assertEqual(slept, list(hl._RATE_LIMIT_BACKOFF_S[:2]))
+
+    def test_non_rate_limit_error_does_not_retry(self):
+        slept = []
+        fake_run, calls = self._stub([(1, "404 Not Found")], slept)
+        real = hl.subprocess.run
+        hl.subprocess.run = fake_run
+        try:
+            _, err = hl._run_gh(["gh", "api", "x"], "x", sleep=slept.append)
+        finally:
+            hl.subprocess.run = real
+        self.assertIn("404", err)
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(slept, [])
+
+    def test_exhausted_retries_returns_the_rate_limit_error(self):
+        slept = []
+        fake_run, calls = self._stub([(1, self.RATE_ERR)], slept)
+        real = hl.subprocess.run
+        hl.subprocess.run = fake_run
+        try:
+            _, err = hl._run_gh(["gh", "api", "x"], "x", sleep=slept.append)
+        finally:
+            hl.subprocess.run = real
+        # Caller must still see a rate-limit error so it can stop the run.
+        self.assertTrue(hl.is_rate_limit_error(err))
+        self.assertEqual(calls["n"], len(hl._RATE_LIMIT_BACKOFF_S) + 1)
+        self.assertEqual(slept, list(hl._RATE_LIMIT_BACKOFF_S))
+
+
 class FetchPRCommentsTests(unittest.TestCase):
     """fetch_pr_comments with gh stubbed via monkeypatched subprocess.run."""
 
@@ -1017,12 +1635,13 @@ class BuildIndexTests(unittest.TestCase):
                 harvester_sha="abc",
                 out_dir=Path(d),
             )
-            self.assertEqual(index["schema_version"], 2)
+            self.assertEqual(index["schema_version"], 3)
             self.assertEqual(len(index["prs"]), 1)
             entry = index["prs"][0]
             self.assertEqual(entry["pr_number"], "3945")
             self.assertEqual(entry["file"], "kernel-3945.json")
             self.assertEqual(entry["harvested_rounds"], 0)
+            self.assertEqual(entry["harvest_source"], "pr-polish")
             # No per-PR file on disk -> GT not collected.
             self.assertFalse(entry["ground_truth_collected"])
             self.assertIsNone(entry["census_converged"])
@@ -1045,6 +1664,81 @@ class BuildIndexTests(unittest.TestCase):
             entry = index["prs"][0]
             self.assertTrue(entry["ground_truth_collected"])
             self.assertTrue(entry["census_converged"])
+
+
+    def test_index_keeps_prs_this_run_did_not_harvest(self):
+        # A filtered harvest (--only) must not shrink the manifest to the
+        # PRs it touched: replay.py samples its targets from this file's
+        # ground_truth_collected flag, so dropping an entry silently makes a
+        # frozen ground truth unreplayable while it still sits on disk.
+        with tempfile.TemporaryDirectory() as d:
+            out_dir = Path(d)
+            # A previously collected PR this run does NOT harvest.
+            (out_dir / "kernel-4189.json").write_text(json.dumps({
+                "schema_version": 2,
+                "pr": {
+                    "repo_name": "kernel", "pr_number": "4189",
+                    "repo_url": "https://github.com/x/kernel",
+                    "pr_url": "https://github.com/x/kernel/pull/4189",
+                    "completed": True, "total_rounds": 3,
+                },
+                "harvested_rounds": [{"round": 1}, {"round": 3}],
+                "ground_truth_v3": {
+                    "schema_version": 4, "census_converged": True,
+                },
+            }))
+            # This run harvests only kernel-3945.
+            (out_dir / "kernel-3945.json").write_text(json.dumps({
+                "schema_version": 2,
+            }))
+            index = hl.build_index(
+                [self._record()],
+                generated_at="2026-05-20T00:00:00Z",
+                harvester_sha="abc",
+                out_dir=out_dir,
+            )
+            by_pr = {e["pr_number"]: e for e in index["prs"]}
+            self.assertIn("3945", by_pr)
+            self.assertIn("4189", by_pr)
+            carried = by_pr["4189"]
+            self.assertTrue(carried["ground_truth_collected"])
+            self.assertTrue(carried["census_converged"])
+            self.assertEqual(carried["harvested_rounds"], 2)
+
+    def test_index_skips_unreadable_and_non_record_files(self):
+        # A stray file in the dataset dir must not abort the harvest.
+        with tempfile.TemporaryDirectory() as d:
+            out_dir = Path(d)
+            (out_dir / "notes.json").write_text("{}")
+            (out_dir / "broken.json").write_text("{not json")
+            index = hl.build_index(
+                [self._record()],
+                generated_at="2026-05-20T00:00:00Z",
+                harvester_sha="abc",
+                out_dir=out_dir,
+            )
+            self.assertEqual([e["pr_number"] for e in index["prs"]], ["3945"])
+
+    def test_index_sorts_pr_numbers_numerically(self):
+        with tempfile.TemporaryDirectory() as d:
+            out_dir = Path(d)
+            for num in ("999", "8276"):
+                (out_dir / f"kernel-{num}.json").write_text(json.dumps({
+                    "schema_version": 2,
+                    "pr": {
+                        "repo_name": "kernel", "pr_number": num,
+                        "repo_url": "u", "pr_url": "u",
+                        "completed": True, "total_rounds": 1,
+                    },
+                    "harvested_rounds": [],
+                }))
+            index = hl.build_index(
+                [], generated_at="t", harvester_sha="abc", out_dir=out_dir,
+            )
+            # Lexical order would put 8276 before 999.
+            self.assertEqual(
+                [e["pr_number"] for e in index["prs"]], ["999", "8276"]
+            )
 
 
 class WritePrRecordTests(unittest.TestCase):

@@ -958,6 +958,143 @@ func TestBuildJSONPromptWithScope_SkipTestExecutionPropagates(t *testing.T) {
 	}
 }
 
+// TestPersonaOverride_ReplacesSuppressorsKeepsContract pins the seam the
+// recall bake-off depends on. loadPersonaFile only *warns* when the file is
+// missing, so a mis-wired variant silently reviews with the built-in
+// persona and reports the baseline's score under the variant's name. This
+// test makes that failure loud: it asserts the override body lands, that
+// the two persona-only suppression clauses are gone, and that the pieces
+// the machine owns (goal text, skip-test clause) survive.
+// TestDiffScopeClause_StatesExactRange pins the fix for the measured
+// wrong-scope bug: with no base stated, agents guessed `main...HEAD`, which
+// on a replayed PR yielded 336 files instead of the change's 22 because the
+// local base branch had advanced past the merge base.
+func TestDiffScopeClause_StatesExactRange(t *testing.T) {
+	out := BuildJSONPromptWithScope("g", PromptOptions{
+		DiffBase: "35e2b581d06cef4b34daff5a2b476fb3ec361194",
+	})
+	if !strings.Contains(out, "git diff 35e2b581d06cef4b34daff5a2b476fb3ec361194..HEAD") {
+		t.Errorf("diff scope clause missing or malformed:\n%s", out)
+	}
+	// The whole point is steering off the wrong guess.
+	if !strings.Contains(out, "main...HEAD") {
+		t.Errorf("clause should name the wrong guess it is warding off")
+	}
+}
+
+func TestDiffScopeClause_ExplicitHeadOverridesDefault(t *testing.T) {
+	out := BuildJSONPromptWithScope("g", PromptOptions{
+		DiffBase: "abc123", DiffHead: "def456",
+	})
+	if !strings.Contains(out, "git diff abc123..def456") {
+		t.Errorf("explicit DiffHead not honoured:\n%s", out)
+	}
+}
+
+func TestDiffScopeClause_OmittedWhenNoBase(t *testing.T) {
+	// Byte-equality guarantee for every caller that cannot compute a base.
+	legacy := BuildJSONPromptWithScope("g", PromptOptions{})
+	if strings.Contains(legacy, "Start by running this command") {
+		t.Errorf("empty PromptOptions must not emit a diff scope clause")
+	}
+}
+
+func TestDiffScopeClause_SurvivesPersonaOverride(t *testing.T) {
+	// Scope is machine-owned: a prompt variant must not be able to drop it,
+	// or its benchmark score would be measured against a different diff
+	// than the baseline's.
+	out := BuildJSONPromptWithScope("g", PromptOptions{
+		DiffBase:        "abc123",
+		PersonaOverride: "SENTINEL persona",
+	})
+	if !strings.Contains(out, "git diff abc123..HEAD") {
+		t.Errorf("persona override dropped the diff scope clause")
+	}
+}
+
+func TestDiffScopeClause_DesignDocModeHasNoDiff(t *testing.T) {
+	out := BuildJSONPromptWithScope("g", PromptOptions{
+		Mode: ReviewModeDesignDoc, Rubric: []string{"q?"},
+		DiffBase: "abc123",
+	})
+	if strings.Contains(out, "git diff") {
+		t.Errorf("design-doc review must not carry a diff scope clause")
+	}
+}
+
+func TestValidGitRevision(t *testing.T) {
+	good := []string{
+		"35e2b581d06cef4b34daff5a2b476fb3ec361194", "HEAD", "main",
+		"origin/main", "v1.2.3", "HEAD~3", "HEAD^", "feature/a_b-c",
+	}
+	for _, s := range good {
+		if !ValidGitRevision(s) {
+			t.Errorf("ValidGitRevision(%q) = false, want true", s)
+		}
+	}
+	bad := []string{
+		"", "a b", "a;rm -rf /", "a`whoami`", "a$(id)", "a'b", `a"b`,
+		"a\nb", "a|b", "a&b", "a>b",
+		"a..b",                   // a range would silently rescope the diff
+		"--flag",                 // reads as a flag
+		"a<b",                    // redirection
+		strings.Repeat("a", 129), // over the length cap
+	}
+	for _, s := range bad {
+		if ValidGitRevision(s) {
+			t.Errorf("ValidGitRevision(%q) = true, want false", s)
+		}
+	}
+}
+
+// A malformed revision must never silently produce a prompt with no scope
+// clause — that is the guessing bug reintroduced under a flag that looks
+// like it is working. The CLI rejects these before this layer, and this
+// pins the builder's half of that contract.
+func TestDiffScopeClause_MalformedBaseEmitsNothing(t *testing.T) {
+	for _, bad := range []string{"a b", "a;rm -rf /", "main...HEAD"} {
+		out := BuildJSONPromptWithScope("g", PromptOptions{DiffBase: bad})
+		if strings.Contains(out, "Start by running this command") {
+			t.Errorf("malformed base %q leaked into the prompt", bad)
+		}
+	}
+}
+
+func TestPersonaOverride_ReplacesSuppressorsKeepsContract(t *testing.T) {
+	const sentinel = "PERSONA-OVERRIDE-SENTINEL"
+	out := BuildJSONPromptWithScope("the goal", PromptOptions{
+		PersonaOverride:   sentinel,
+		SkipTestExecution: true,
+	})
+
+	if !strings.Contains(out, sentinel) {
+		t.Fatalf("persona override did not reach the prompt")
+	}
+	// Persona-only suppressors: an override can and must remove these.
+	for _, s := range []string{
+		"Prioritize systemic problems over local ones",
+		"avoid nit-level comments",
+	} {
+		if strings.Contains(out, s) {
+			t.Errorf("persona-only suppressor survived override: %q", s)
+		}
+	}
+	// Machine-owned pieces must survive the override.
+	if !strings.Contains(out, "the goal") {
+		t.Errorf("goal text was dropped by the persona override")
+	}
+	if !strings.Contains(out, "Do NOT run tests or build commands") {
+		t.Errorf("skip-test-execution clause was dropped by the override")
+	}
+	// The JSON output contract is not overridable, and it carries its own
+	// copy of the do-not-strain clause. No persona variant can remove it,
+	// so no variant should be read as having tested its absence.
+	if !strings.Contains(out, "do not strain to find something to flag") {
+		t.Errorf("output-rules copy of do-not-strain should be unreachable "+
+			"by a persona override, but it is missing from:\n%s", out)
+	}
+}
+
 func TestBuildPromptWithScope_NoOptionsMatchesLegacy(t *testing.T) {
 	// Same shim guarantee for the free-form variant.
 	for _, goal := range []string{"x", ""} {
@@ -1251,5 +1388,48 @@ func TestLegacyJSONPromptGolden(t *testing.T) {
 	}
 	if string(want) != got {
 		t.Errorf("legacy JSON prompt drift detected.\n--- want (testdata/legacy_json_prompt.txt) ---\n%s\n--- got ---\n%s", want, got)
+	}
+}
+
+// TestDiffScopeClause_InstructsRunningTheCommand pins the imperative added
+// after gemini-3.5-flash returned "accepted, 0 issues" on all 6 runs of a
+// 10-defect diff while making ZERO tool calls — it reviewed from the goal
+// text alone. Codex infers that it should run the diff; gemini waits to be
+// told. Naming the command is not the same as asking for it to be run.
+func TestDiffScopeClause_InstructsRunningTheCommand(t *testing.T) {
+	out := BuildJSONPromptWithScope("g", PromptOptions{DiffBase: "abc123"})
+	for _, want := range []string{
+		"Start by running this command",
+		"You must actually run it",
+		"git diff abc123..HEAD",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("diff scope clause missing %q", want)
+		}
+	}
+}
+
+// TestDiffScopeClause_AllowsUnchangedFileDefects pins the correction to an
+// earlier version of this clause, which said "reporting issues in code
+// outside this diff is not [expected]". That instruction suppressed exactly
+// the incomplete-change defects a reviewer is most valuable for: on the
+// benchmark corpus, 14 of 196 frozen true positives sit in files the PR did
+// not modify, and their topics read "callbacks STILL use raw tenant
+// comparison", "callsites STILL missing protect=True" — sibling sites a
+// migration left behind, whose fix is to edit the unchanged file.
+func TestDiffScopeClause_AllowsUnchangedFileDefects(t *testing.T) {
+	out := BuildJSONPromptWithScope("g", PromptOptions{DiffBase: "abc123"})
+	if strings.Contains(out, "reporting issues in code outside this diff is not") {
+		t.Error("the suppressing clause is back; incomplete-change defects " +
+			"will go unreported")
+	}
+	for _, want := range []string{
+		"Report a defect in an UNCHANGED file",
+		"incomplete change",
+		"pre-existing problem the diff neither creates nor touches",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("scope clause missing %q", want)
+		}
 	}
 }

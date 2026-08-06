@@ -16,6 +16,7 @@ if str(SCRIPT_DIR) not in sys.path:
 import collect  # noqa: E402
 import collect_lib as cl  # noqa: E402
 import harvest_lib as hl  # noqa: E402
+import humanreview_lib as hr  # noqa: E402
 
 
 def _fv(file, line, verdict, *, severity="high", topic="t", reason="r",
@@ -116,6 +117,124 @@ class SameDefectTests(unittest.TestCase):
     def test_missing_line_is_file_level_match(self):
         self.assertTrue(cl.same_defect("a.py", None, "a.py", 99))
         self.assertTrue(cl.same_defect("a.py", 10, "a.py", None))
+
+
+class FileLevelCollisionValidationTests(unittest.TestCase):
+    """At most one ``line: null`` verdict per path.
+
+    Regression intent: defect identity is ``(file, line)``, so two
+    file-level findings on one path collapse into a single entry and flip
+    each other into a contested state no round can resolve. kernel-8229
+    emitted four on one file and became uncollectable. Rejecting at the
+    input boundary is the fix — see ``_file_level_collision_error`` for why
+    keying on topic or occurrence index was measured and rejected instead.
+    """
+
+    def test_string_location_error_names_the_fix(self):
+        # The commonest judge mistake: a location written as "path:line"
+        # instead of an object. The message is what the judge sees when asked
+        # to self-correct, so it must show the required shape, not just say
+        # "not an object". Two judges in one batch made this error.
+        v = {"finding_verdicts": [_fv("a.py", 1, "true_positive")],
+             "census": [{"file": "a.py", "line": 1, "severity": "low",
+                         "description": "d"}],
+             "census_merges": [
+                 {"members": ["a.py:1", "a.py:9"], "reason": "same defect"}
+             ]}
+        err = cl.validate_judge_verdict(v)
+        self.assertIsNotNone(err)
+        self.assertIn("must be an object", err)
+        self.assertIn('"file"', err)
+        self.assertIn('"line"', err)
+        self.assertIn("a.py:1", err)  # quotes the offending value back
+
+    def test_one_file_level_verdict_is_fine(self):
+        v = {"finding_verdicts": [
+            _fv("a.py", None, "true_positive"),
+            _fv("a.py", 10, "true_positive"),
+        ], "census": []}
+        self.assertIsNone(cl.validate_judge_verdict(v))
+
+    def test_two_file_level_on_same_path_rejected(self):
+        v = {"finding_verdicts": [
+            _fv("a.py", None, "true_positive"),
+            _fv("a.py", None, "false_positive"),
+        ], "census": []}
+        err = cl.validate_judge_verdict(v)
+        self.assertIsNotNone(err)
+        self.assertIn("file-level", err)
+
+    def test_file_level_on_different_paths_is_fine(self):
+        v = {"finding_verdicts": [
+            _fv("a.py", None, "true_positive"),
+            _fv("b.py", None, "true_positive"),
+        ], "census": []}
+        self.assertIsNone(cl.validate_judge_verdict(v))
+
+    def test_kernel_8229_four_file_level_findings_rejected(self):
+        # The exact shape that made kernel-8229 uncollectable.
+        v = {"finding_verdicts": [
+            _fv("r.py", None, "true_positive"),
+            _fv("r.py", None, "false_positive"),
+            _fv("r.py", None, "false_positive"),
+            _fv("r.py", None, "true_positive"),
+        ], "census": []}
+        err = cl.validate_judge_verdict(v)
+        self.assertIsNotNone(err)
+        self.assertIn("Anchor each finding", err)
+
+    def test_agreeing_file_level_verdicts_are_allowed(self):
+        # Same location, same ruling: these merge into one entry and pool
+        # surfaced_by. That is the intended dedupe, not a collision.
+        v = {"finding_verdicts": [
+            _fv("r.py", None, "true_positive"),
+            _fv("r.py", None, "true_positive"),
+        ], "census": []}
+        self.assertIsNone(cl.validate_judge_verdict(v))
+
+    def test_conflicting_verdicts_within_line_slack_rejected(self):
+        # The second shape of the same bug, found while repairing
+        # kernel-8229: anchoring two conflicting findings one row apart
+        # re-created the deadlock at the fold layer, below the validator.
+        v = {"finding_verdicts": [
+            _fv("r.py", 58, "true_positive"),
+            _fv("r.py", 59, "false_positive"),
+        ], "census": []}
+        err = cl.validate_judge_verdict(v)
+        self.assertIsNotNone(err)
+        self.assertIn("row", err)
+
+    def test_agreeing_verdicts_within_line_slack_are_allowed(self):
+        v = {"finding_verdicts": [
+            _fv("r.py", 76, "true_positive"),
+            _fv("r.py", 78, "true_positive"),
+        ], "census": []}
+        self.assertIsNone(cl.validate_judge_verdict(v))
+
+    def test_conflicting_verdicts_beyond_line_slack_are_allowed(self):
+        # Far enough apart to be distinct defects — must not be rejected.
+        v = {"finding_verdicts": [
+            _fv("r.py", 58, "true_positive"),
+            _fv("r.py", 151, "false_positive"),
+        ], "census": []}
+        self.assertIsNone(cl.validate_judge_verdict(v))
+
+    def test_paths_normalized_before_comparison(self):
+        # A worktree-absolute path and its repo-relative form are one file.
+        v = {"finding_verdicts": [
+            _fv("/tmp/replay-xyz/a.py", None, "true_positive"),
+            _fv("a.py", None, "false_positive"),
+        ], "census": []}
+        self.assertIsNotNone(cl.validate_judge_verdict(v))
+
+    def test_unsure_file_level_does_not_collide(self):
+        # `unsure` sets no ground truth, so it never enters the accumulator.
+        v = {"finding_verdicts": [
+            _fv("a.py", None, "true_positive"),
+            {"file": "a.py", "line": None, "verdict": "unsure",
+             "topic": "t", "reason": "r"},
+        ], "census": []}
+        self.assertIsNone(cl.validate_judge_verdict(v))
 
 
 class ValidateJudgeVerdictTests(unittest.TestCase):
@@ -259,7 +378,12 @@ class CensusConvergenceTests(unittest.TestCase):
             })
         self.assertTrue(cl.census_converged(c))
 
-    def test_no_converge_when_census_uncovered(self):
+    def test_converges_despite_uncovered_census_item(self):
+        # A real bug no reviewer caught is the recall signal replay exists to
+        # measure — it must NOT block convergence. Gating on full coverage
+        # made saturation unreachable on any diff with a low/nit defect the
+        # reviewers skip: the run would spend its whole round budget and
+        # still freeze as "unconverged".
         c = cl.CumulativeGT()
         for r in (1, 2):
             cl.merge_judge_round(c, r, {
@@ -267,8 +391,50 @@ class CensusConvergenceTests(unittest.TestCase):
                 # c.py:99 is a real bug NO finding caught -> uncovered.
                 "census": [_census("a.py", 10), _census("c.py", 99)],
             })
-        self.assertFalse(cl.census_converged(c))
+        self.assertTrue(cl.census_converged(c))
+        # Still reported, just not gating.
         self.assertEqual(len(cl.census_uncovered(c)), 1)
+
+    def test_converges_on_the_round_that_adds_nothing(self):
+        # Regression for kernel-8276: the census grew 8 -> 10 -> 12 and then
+        # round 4 added nothing, but convergence still reported False and
+        # `should_continue` stayed True, so a saturated run would have burnt
+        # its whole 10-round budget. A round that censuses no new defect is
+        # the saturation signal.
+        c = cl.CumulativeGT()
+        cl.merge_judge_round(c, 1, {
+            "finding_verdicts": [_fv("a.py", 10, "true_positive")],
+            "census": [_census("a.py", 10)],
+        })
+        cl.merge_judge_round(c, 2, {
+            "finding_verdicts": [_fv("a.py", 10, "true_positive")],
+            "census": [_census("a.py", 10), _census("b.py", 20)],
+        })
+        self.assertFalse(cl.census_converged(c))
+        # Round 3 re-cites both, censusing nothing new -> saturated.
+        cl.merge_judge_round(c, 3, {
+            "finding_verdicts": [_fv("a.py", 10, "true_positive")],
+            "census": [_census("a.py", 10), _census("b.py", 20)],
+        })
+        self.assertEqual(c.per_round_diff[-1]["new_census_items"], [])
+        self.assertTrue(cl.census_converged(c))
+
+    def test_unresolved_contested_still_blocks(self):
+        # Dropping the coverage gate must not weaken the contested gate.
+        c = cl.CumulativeGT()
+        for r in (1, 2):
+            cl.merge_judge_round(c, r, {
+                "finding_verdicts": [_fv("a.py", 10, "true_positive")],
+                "census": [_census("a.py", 10)],
+            })
+        self.assertTrue(cl.census_converged(c))
+        c.contested.append(
+            cl.GTEntry(
+                file="z.py", line=1, topic="x",
+                severity="high", first_seen_round=2, resolved=False,
+            )
+        )
+        self.assertFalse(cl.census_converged(c))
 
     def test_no_converge_when_census_grew(self):
         c = cl.CumulativeGT()
@@ -384,9 +550,9 @@ class CensusMergeTests(unittest.TestCase):
         # merged_locations, so the TP finding there covers it.
         self.assertEqual(len(c.census), 1)
         self.assertEqual(len(cl.census_uncovered(c)), 0)
-        # The merge added 1358 to the key set, so round 2 changed the
-        # census — a quiet round 3 is needed to converge.
-        self.assertFalse(cl.census_converged(c))
+        # A merge re-describes a defect already censused; it adds no NEW
+        # census item, so it does not by itself hold convergence open.
+        self.assertTrue(cl.census_converged(c))
         cl.merge_judge_round(c, 3, {
             "finding_verdicts": [_fv("hooks.ts", 1358, "true_positive")],
             "census": [_census("hooks.ts", 1338)],
@@ -396,6 +562,183 @@ class CensusMergeTests(unittest.TestCase):
         })
         self.assertEqual(len(cl.census_uncovered(c)), 0)
         self.assertTrue(cl.census_converged(c))
+
+
+class SeedCandidatesTests(unittest.TestCase):
+    """Seeds are candidate locations, never findings or ground truth."""
+
+    def _round(self, actions):
+        return {"raw_comment_actions": actions}
+
+    def test_extracts_inline_comments_with_location(self):
+        out = collect.seed_candidates(self._round([
+            {"source": "github-inline", "path": "a.py", "line": 10,
+             "author": "coderabbitai[bot]", "body": "Off-by-one here."},
+        ]))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["file"], "a.py")
+        self.assertEqual(out[0]["line"], 10)
+        self.assertEqual(out[0]["claim"], "Off-by-one here.")
+
+    def test_skips_non_inline_and_locationless(self):
+        out = collect.seed_candidates(self._round([
+            {"source": "github-issue", "body": "LGTM"},
+            {"source": "github-inline", "body": "no path"},
+            {"source": "github-inline", "path": "a.py", "body": ""},
+            {"source": "codex", "path": "a.py", "body": "local finding"},
+        ]))
+        self.assertEqual(out, [])
+
+    def test_filters_bot_status_noise(self):
+        out = collect.seed_candidates(self._round([
+            {"source": "github-inline", "path": "a.py", "line": 1,
+             "body": "Groot review started for abc123."},
+            {"source": "github-inline", "path": "a.py", "line": 2,
+             "body": "**Actionable comments posted: 0**"},
+            {"source": "github-inline", "path": "b.py", "line": 3,
+             "body": "This leaks a file handle on the error path."},
+        ]))
+        self.assertEqual([c["file"] for c in out], ["b.py"])
+
+    def test_respects_limit(self):
+        actions = [
+            {"source": "github-inline", "path": f"f{i}.py", "line": i,
+             "body": "real finding text"}
+            for i in range(60)
+        ]
+        self.assertEqual(len(collect.seed_candidates(self._round(actions))), 40)
+        self.assertEqual(
+            len(collect.seed_candidates(self._round(actions), limit=5)), 5
+        )
+
+    def test_claim_is_truncated(self):
+        out = collect.seed_candidates(self._round([
+            {"source": "github-inline", "path": "a.py", "line": 1,
+             "body": "x" * 5000},
+        ]))
+        self.assertEqual(len(out[0]["claim"]), 1200)
+
+
+class EnsureCommitPresentTests(unittest.TestCase):
+    """A GitHub-sourced record names a commit the checkout may not have."""
+
+    def _repo(self, td: str) -> tuple[Path, str]:
+        repo = Path(td)
+        hl.git(repo, "init", "-q")
+        hl.git(repo, "config", "user.email", "t@t")
+        hl.git(repo, "config", "user.name", "t")
+        (repo / "f.txt").write_text("x")
+        hl.git(repo, "add", "f.txt")
+        hl.git(repo, "commit", "-qm", "one")
+        return repo, hl.git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    def test_present_commit_makes_no_fetch(self):
+        # The common case must stay offline — no network on every setup.
+        calls: list[list[str]] = []
+        real_git = collect.hl.git
+
+        def spy(repo, *args):
+            calls.append(list(args))
+            return real_git(repo, *args)
+
+        with tempfile.TemporaryDirectory() as td:
+            repo, head = self._repo(td)
+            collect.hl.git = spy
+            try:
+                collect.ensure_commit_present(repo, head, "42")
+            finally:
+                collect.hl.git = real_git
+        self.assertFalse(any(a and a[0] == "fetch" for a in calls))
+
+    def test_missing_commit_is_fetched_then_verified(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo, _ = self._repo(td)
+            missing = "0" * 40
+            # No `origin` remote, so the fetch cannot succeed -> the error
+            # must name the force-push/deleted-fork cause, not just fail.
+            with self.assertRaises(SystemExit) as cm:
+                collect.ensure_commit_present(repo, missing, "42")
+            msg = str(cm.exception)
+            self.assertIn("000000000000", msg)
+            self.assertIn("pull/42/head", msg)
+            self.assertIn("force-pushed", msg)
+
+    def test_fetch_is_attempted_before_giving_up(self):
+        calls: list[list[str]] = []
+        real_git = collect.hl.git
+
+        def spy(repo, *args):
+            calls.append(list(args))
+            return real_git(repo, *args)
+
+        with tempfile.TemporaryDirectory() as td:
+            repo, _ = self._repo(td)
+            collect.hl.git = spy
+            try:
+                with self.assertRaises(SystemExit):
+                    collect.ensure_commit_present(repo, "0" * 40, "99")
+            finally:
+                collect.hl.git = real_git
+        self.assertTrue(
+            any(a[:3] == ["fetch", "origin", "pull/99/head"] for a in calls)
+        )
+
+
+class FindingsFromEnvelopeTests(unittest.TestCase):
+    """A failed review must never read as a finding-free review.
+
+    Regression for kernel-8276: codex stalled on the idle watchdog and
+    gemini's client was decommissioned. Both still wrote an envelope, but
+    with status=error and an empty review — folding those in would have told
+    the judge two reviewers looked and found nothing.
+    """
+
+    def _write(self, td: str, payload: dict) -> Path:
+        p = Path(td) / "envelope.json"
+        p.write_text(json.dumps(payload))
+        return p
+
+    def test_ok_envelope_yields_findings(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, {
+                "status": "ok",
+                "review": {"verdict": "rejected", "issues": [
+                    {"file": "a.py", "line": 10, "severity": "high",
+                     "message": "boom"},
+                ]},
+            })
+            out = collect._findings_from_envelope(p, "cursor")
+            self.assertEqual(len(out), 1)
+            self.assertEqual(out[0]["surfaced_by"], ["cursor"])
+
+    def test_ok_envelope_with_no_issues_is_a_real_zero(self):
+        # An honest "accepted, found nothing" must still pass through — it
+        # is a legitimate data point, unlike a backend failure.
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, {
+                "status": "ok",
+                "review": {"verdict": "accepted", "issues": []},
+            })
+            self.assertEqual(collect._findings_from_envelope(p, "cursor"), [])
+
+    def test_error_envelope_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, {
+                "status": "error",
+                "error": "codex: review idle: no events for 3m0s",
+                "review": {},
+            })
+            with self.assertRaises(SystemExit) as cm:
+                collect._findings_from_envelope(p, "codex")
+            self.assertIn("status='error'", str(cm.exception))
+
+    def test_status_absent_is_tolerated(self):
+        # Older envelopes predate the status field; absence is not failure.
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, {
+                "review": {"verdict": "accepted", "issues": []},
+            })
+            self.assertEqual(collect._findings_from_envelope(p, "cursor"), [])
 
 
 class CommentActionXrefTests(unittest.TestCase):
@@ -700,6 +1043,113 @@ class WorktreeTests(unittest.TestCase):
                 collect.remove_worktree(session, repo)
 
 
+class FileLevelVerdictIdentityTests(unittest.TestCase):
+    """A ``line: null`` verdict must not re-rule line-level entries.
+
+    Regression intent: ``_entry_matches`` used ``same_defect``, whose
+    file-level-subsumes-line-level rule is right for *scoring* but wrong for
+    *folding*. One ``line: null`` verdict matched every line-level entry in
+    the same file and re-ruled them all. Observed on kernel-8229: four
+    file-level verdicts in one file walked line 58 through
+    TP -> TP -> TP -> FP -> FP -> TP, parking it in ``contested`` where no
+    later round could resolve it. Two PRs were left uncollectable.
+    """
+
+    def test_file_level_verdict_does_not_flip_line_level_entry(self):
+        c = cl.CumulativeGT()
+        cl.merge_judge_round(c, 1, {
+            "finding_verdicts": [_fv("a.py", 58, "true_positive")],
+            "census": [],
+        })
+        # A *different* defect in the same file, reported file-level.
+        cl.merge_judge_round(c, 2, {
+            "finding_verdicts": [_fv("a.py", None, "false_positive")],
+            "census": [],
+        })
+        # Two distinct entries, nothing contested: the line-level TP stands
+        # and the file-level FP is its own row.
+        self.assertEqual(len(c.contested), 0)
+        self.assertEqual([e.line for e in c.true_positives], [58])
+        self.assertEqual([e.line for e in c.false_positives], [None])
+
+    def test_line_level_verdict_does_not_flip_file_level_entry(self):
+        c = cl.CumulativeGT()
+        cl.merge_judge_round(c, 1, {
+            "finding_verdicts": [_fv("a.py", None, "true_positive")],
+            "census": [],
+        })
+        cl.merge_judge_round(c, 2, {
+            "finding_verdicts": [_fv("a.py", 14, "false_positive")],
+            "census": [],
+        })
+        self.assertEqual(len(c.contested), 0)
+        self.assertEqual([e.line for e in c.true_positives], [None])
+        self.assertEqual([e.line for e in c.false_positives], [14])
+
+    def test_file_level_entries_still_match_each_other(self):
+        # null-to-null is the same defect, so a genuine flip still registers.
+        c = cl.CumulativeGT()
+        cl.merge_judge_round(c, 1, {
+            "finding_verdicts": [_fv("a.py", None, "true_positive")],
+            "census": [],
+        })
+        cl.merge_judge_round(c, 2, {
+            "finding_verdicts": [_fv("a.py", None, "false_positive")],
+            "census": [],
+        })
+        self.assertEqual(len(c.contested), 1)
+        self.assertIsNone(c.contested[0].line)
+
+    def test_kernel_8229_shape_converges(self):
+        """The exact shape that deadlocked kernel-8229.
+
+        One file, four line-level defects plus a file-level one, both rounds
+        agreeing. Before the fix the file-level verdict re-ruled the
+        line-level entries repeatedly and left them contested forever.
+
+        Only one file-level verdict here: two of them on the same path *are*
+        one defect by construction, so a TP and an FP among them is a genuine
+        flip and would contest correctly. The bug was never about that — it
+        was file-level bleeding into line-level.
+        """
+        # 76 and 78 are within _LINE_SLACK, so they collapse into one entry
+        # by design — the distinct line-level defects here are 58, 76, 97.
+        line_fvs = [_fv("r.py", n, "true_positive") for n in (58, 76, 78, 97)]
+        file_fvs = [_fv("r.py", None, "true_positive")]
+        c = cl.CumulativeGT()
+        for rnd in (1, 2):
+            cl.merge_judge_round(c, rnd, {
+                "finding_verdicts": line_fvs + file_fvs, "census": [],
+            })
+        # Both rounds agreed on everything, so nothing may be contested and
+        # the run must be able to converge.
+        self.assertEqual(cl.unresolved_contested(c), [])
+        self.assertTrue(cl.census_converged(c))
+        self.assertEqual(
+            sorted(e.line for e in c.true_positives if e.line is not None),
+            [58, 76, 97],
+        )
+        # The file-level verdict stands as its own entry, not folded into one
+        # of the line-level ones.
+        self.assertEqual(
+            [e.line for e in c.true_positives if e.line is None], [None]
+        )
+
+    def test_line_slack_still_groups_nearby_lines(self):
+        # The strict rule is about None, not about slack: two verdicts a few
+        # rows apart are still the same defect and must still flip.
+        c = cl.CumulativeGT()
+        cl.merge_judge_round(c, 1, {
+            "finding_verdicts": [_fv("a.py", 100, "true_positive")],
+            "census": [],
+        })
+        cl.merge_judge_round(c, 2, {
+            "finding_verdicts": [_fv("a.py", 100, "false_positive")],
+            "census": [],
+        })
+        self.assertEqual(len(c.contested), 1)
+
+
 class ContestedVerdictTests(unittest.TestCase):
     """A finding judged inconsistently across rounds must be quarantined,
     never silently kept in TP or FP.
@@ -709,7 +1159,17 @@ class ContestedVerdictTests(unittest.TestCase):
     actually agreed on.
     """
 
-    def test_flip_tp_to_fp_lands_in_contested(self):
+    def test_flip_is_binding_and_lands_in_the_new_bucket(self):
+        """A later round's verdict overrides an earlier one.
+
+        Regression intent: the flip used to mark the entry ``resolved=False``
+        and leave it in ``contested`` only. That stranded it — the frozen GT
+        scores the TP/FP buckets, so a contested-only entry vanished from the
+        ground truth — and it could never be cleared, because the
+        disagreement is *created* by this verdict, so no round could re-rule
+        an entry that was not contested when the round began. Observed on
+        kernel-8329 with a 2-round budget.
+        """
         c = cl.CumulativeGT()
         cl.merge_judge_round(c, 1, {
             "finding_verdicts": [_fv("a.py", 10, "true_positive")],
@@ -720,16 +1180,19 @@ class ContestedVerdictTests(unittest.TestCase):
             "finding_verdicts": [_fv("a.py", 10, "false_positive")],
             "census": [],
         })
-        # The flip empties both buckets and quarantines the defect.
+        # Round 2 wins: the defect is now a false positive, and is scoreable.
         self.assertEqual(len(c.true_positives), 0)
-        self.assertEqual(len(c.false_positives), 0)
+        self.assertEqual(len(c.false_positives), 1)
+        # The disagreement is still auditable...
         self.assertEqual(len(c.contested), 1)
-        self.assertFalse(c.contested[0].resolved)
-        # Both verdicts are in the history.
-        kinds = [h["verdict"] for h in c.contested[0].verdict_history]
+        # ...but it is settled, so it does not block convergence.
+        self.assertTrue(c.contested[0].resolved)
+        self.assertEqual(cl.unresolved_contested(c), [])
+        # Both verdicts remain in the history.
+        kinds = [h["verdict"] for h in c.false_positives[0].verdict_history]
         self.assertEqual(kinds, ["true_positive", "false_positive"])
 
-    def test_unresolved_contested_blocks_convergence(self):
+    def test_flip_does_not_block_convergence(self):
         c = cl.CumulativeGT()
         cl.merge_judge_round(c, 1, {
             "finding_verdicts": [_fv("a.py", 10, "true_positive")],
@@ -739,9 +1202,20 @@ class ContestedVerdictTests(unittest.TestCase):
             "finding_verdicts": [_fv("a.py", 10, "false_positive")],
             "census": [],
         })
-        # Census is empty + stable, but a contested entry is unresolved.
-        self.assertFalse(cl.census_converged(c))
-        self.assertEqual(len(cl.unresolved_contested(c)), 1)
+        # Census empty + stable and the flip is binding -> converged.
+        self.assertEqual(len(cl.unresolved_contested(c)), 0)
+        self.assertTrue(cl.census_converged(c))
+
+    def test_flip_back_in_a_third_round_keeps_the_latest_verdict(self):
+        c = cl.CumulativeGT()
+        for rnd, verdict in ((1, "true_positive"), (2, "false_positive"),
+                             (3, "true_positive")):
+            cl.merge_judge_round(c, rnd, {
+                "finding_verdicts": [_fv("a.py", 10, verdict)], "census": [],
+            })
+        self.assertEqual(len(c.true_positives), 1)
+        self.assertEqual(len(c.false_positives), 0)
+        self.assertEqual(cl.unresolved_contested(c), [])
 
     def test_round_verdict_resolves_contested(self):
         c = cl.CumulativeGT()
@@ -758,7 +1232,11 @@ class ContestedVerdictTests(unittest.TestCase):
             "finding_verdicts": [_fv("a.py", 10, "false_positive")],
             "census": [],
         })
-        self.assertEqual(len(c.contested), 0)
+        # `contested` is a permanent audit record of the disagreement, not a
+        # quarantine queue — the entry stays listed but is settled, and it is
+        # the TP/FP buckets that carry the scoreable ground truth.
+        self.assertEqual(len(c.contested), 1)
+        self.assertTrue(c.contested[0].resolved)
         self.assertEqual(len(c.false_positives), 1)
         self.assertTrue(c.false_positives[0].resolved)
         # All three rounds are in the history.
@@ -988,3 +1466,251 @@ class RepoRootDiscoveryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnchangedFileTruePositiveTests(unittest.TestCase):
+    """GT entries in unmodified files are incomplete-change defects.
+
+    Regression intent: a judge censuses the diff *and its neighbourhood*,
+    so it can record a real defect in a file the PR never modified. A
+    reviewer scoped to the diff cannot report it, so the entry silently
+    subtracts from every recall figure. Measured across the corpus on
+    2026-08-06: 14 of 196 true positives (7.1%) in 11 of 48 records, and
+    one record entirely out of scope.
+    """
+
+    def _rec(self, changed, tp_files):
+        return {
+            "schema_version": 3,
+            "harvested_rounds": [{"files_changed": changed}],
+            "ground_truth_v3": {
+                "schema_version": 4,
+                "true_positives": [
+                    {"file": f, "line": 1, "severity": "high", "topic": "t"}
+                    for f in tp_files
+                ],
+                "false_positives": [],
+                "contested": [],
+                "per_round_diff": [],
+                "census_converged": True,
+            },
+        }
+
+    def test_flags_entry_outside_files_changed(self):
+        rec = self._rec(["a.py"], ["a.py", "b.py"])
+        oos = cl.unchanged_file_true_positives(rec)
+        self.assertEqual([e["file"] for e in oos], ["b.py"])
+
+    def test_all_in_scope_returns_empty(self):
+        rec = self._rec(["a.py", "b.py"], ["a.py", "b.py"])
+        self.assertEqual(cl.unchanged_file_true_positives(rec), [])
+
+    def test_empty_files_changed_flags_nothing(self):
+        # An empty scope means "unknown", not "nothing was changed".
+        # Guessing would reclassify every entry and mask the real ones.
+        rec = self._rec([], ["a.py", "b.py"])
+        self.assertEqual(cl.unchanged_file_true_positives(rec), [])
+
+    def test_missing_rounds_flags_nothing(self):
+        rec = self._rec(["a.py"], ["b.py"])
+        rec["harvested_rounds"] = []
+        self.assertEqual(cl.unchanged_file_true_positives(rec), [])
+
+    def test_validate_warns_not_errors(self):
+        # Warn so the miss can be attributed, not so the denominator can
+        # be shrunk — see the helper docstring.
+        errors, warnings = cl.validate_dataset(self._rec(["a.py"], ["a.py", "b.py"]))
+        self.assertEqual(errors, [])
+        self.assertTrue(
+            any("did not modify" in w for w in warnings),
+            f"expected an out-of-diff warning, got {warnings}",
+        )
+
+
+class ApplyHumanReviewCommandTests(unittest.TestCase):
+    """End-to-end tests for the ONE command that writes the frozen benchmark.
+
+    `humanreview_lib` is unit-tested separately; this covers the CLI wrapper
+    that composes it — the fingerprint refusal, `--dry-run`'s no-write
+    guarantee, `--strip`, the post-apply `validate_dataset` gate, and the
+    path-containment assertion. Gap identified by cursor in PR #309 review:
+    the library was well covered while the command that drives it was not.
+    """
+
+    def _setup(self, td, *, converged=True):
+        root = Path(td)
+        ds_dir = root / "dataset"
+        ds_dir.mkdir()
+        entry = {
+            "file": "a/b.py", "line": 10, "severity": "high", "topic": "t",
+            "first_seen_round": 1, "surfaced_by": ["codex"],
+            "judge_reason": "r", "reviewer_severity": "high",
+            "verdict_history": [], "resolved": True,
+            "comment_action_xref": None,
+        }
+        dataset = {
+            "schema_version": 3, "harvest_source": "pr-polish",
+            "pr": {"repo_name": "kernel", "pr_number": "1"},
+            "harvested_rounds": [{"head_before": "a" * 40,
+                                  "files_changed": ["a/b.py"]}],
+            "ground_truth_v3": {
+                "schema_version": 4, "frozen_at": "2026-01-01T00:00:00Z",
+                "collector_git_sha": "abc", "rounds_run": 2,
+                "census_converged": converged,
+                "true_positives": [dict(entry)], "false_positives": [],
+                "contested": [], "per_round_diff": [], "dataset_xref": {},
+            },
+        }
+        (ds_dir / "kernel-1.json").write_text(json.dumps(dataset))
+        return root, ds_dir
+
+    def _stage(self, root, gt, verdicts):
+        ov = hr.new_overlay("kernel-1", gt)
+        ov["verdicts"] = verdicts
+        hr.save_overlay(hr.overlay_path(root, "kernel-1"), ov)
+        return ov
+
+    def _gt(self, ds_dir):
+        return json.loads(
+            (ds_dir / "kernel-1.json").read_text())["ground_truth_v3"]
+
+    def _verdict(self, op, **kw):
+        v = {"op": op, "file": "a/b.py", "line": 10, "reviewer": "t",
+             "at": "2026-08-06T00:00:00Z", "reason": "because"}
+        v.update(kw)
+        return v
+
+    def test_dry_run_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, ds_dir = self._setup(td)
+            self._stage(root, self._gt(ds_dir), [self._verdict("confirm")])
+            before = (ds_dir / "kernel-1.json").read_bytes()
+            rc = collect.apply_human_review_command(
+                target="kernel-1", dataset_dir=ds_dir, eval_root=root,
+                dry_run=True, strip=False, force=False)
+            self.assertEqual(rc, 0)
+            self.assertEqual((ds_dir / "kernel-1.json").read_bytes(), before)
+
+    def test_apply_is_idempotent_across_repeated_runs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, ds_dir = self._setup(td)
+            self._stage(root, self._gt(ds_dir), [
+                self._verdict("reject"),
+                self._verdict("add", file="c/d.py", line=5, severity="low",
+                              topic="new"),
+            ])
+            seen = []
+            for _ in range(3):
+                rc = collect.apply_human_review_command(
+                    target="kernel-1", dataset_dir=ds_dir, eval_root=root,
+                    dry_run=False, strip=False, force=False)
+                self.assertEqual(rc, 0)
+                seen.append((ds_dir / "kernel-1.json").read_bytes())
+            self.assertEqual(seen[0], seen[1])
+            self.assertEqual(seen[1], seen[2])
+
+    def test_refuses_when_ground_truth_changed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, ds_dir = self._setup(td)
+            self._stage(root, self._gt(ds_dir), [self._verdict("confirm")])
+            # Simulate a re-collection: a new judged finding appears.
+            doc = json.loads((ds_dir / "kernel-1.json").read_text())
+            doc["ground_truth_v3"]["true_positives"].append({
+                "file": "new/x.py", "line": 3, "severity": "high",
+                "topic": "re-collected", "first_seen_round": 3,
+                "surfaced_by": ["codex"], "judge_reason": "",
+                "reviewer_severity": None, "verdict_history": [],
+                "resolved": True, "comment_action_xref": None})
+            (ds_dir / "kernel-1.json").write_text(json.dumps(doc))
+            before = (ds_dir / "kernel-1.json").read_bytes()
+
+            rc = collect.apply_human_review_command(
+                target="kernel-1", dataset_dir=ds_dir, eval_root=root,
+                dry_run=False, strip=False, force=False)
+            self.assertEqual(rc, 2)
+            self.assertEqual((ds_dir / "kernel-1.json").read_bytes(), before,
+                             "a refused apply must not write")
+
+    def test_force_overrides_a_changed_ground_truth(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, ds_dir = self._setup(td)
+            self._stage(root, self._gt(ds_dir), [self._verdict("confirm")])
+            doc = json.loads((ds_dir / "kernel-1.json").read_text())
+            doc["ground_truth_v3"]["true_positives"][0]["topic"] = "reworded"
+            (ds_dir / "kernel-1.json").write_text(json.dumps(doc))
+
+            rc = collect.apply_human_review_command(
+                target="kernel-1", dataset_dir=ds_dir, eval_root=root,
+                dry_run=False, strip=False, force=True)
+            self.assertEqual(rc, 0)
+            self.assertIn("human_verdict", self._gt(ds_dir)["true_positives"][0])
+
+    def test_strip_restores_the_pre_human_block(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, ds_dir = self._setup(td)
+            before = json.loads(
+                (ds_dir / "kernel-1.json").read_text())["ground_truth_v3"]
+            self._stage(root, self._gt(ds_dir), [
+                self._verdict("reject"),
+                self._verdict("add", file="c/d.py", line=5, severity="low",
+                              topic="new"),
+            ])
+            collect.apply_human_review_command(
+                target="kernel-1", dataset_dir=ds_dir, eval_root=root,
+                dry_run=False, strip=False, force=False)
+            rc = collect.apply_human_review_command(
+                target="kernel-1", dataset_dir=ds_dir, eval_root=root,
+                dry_run=False, strip=True, force=False)
+            self.assertEqual(rc, 0)
+            after = self._gt(ds_dir)
+            key = lambda e: (e["file"], str(e["line"]))  # noqa: E731
+            for bucket in ("true_positives", "false_positives"):
+                self.assertEqual(
+                    sorted(after.get(bucket) or [], key=key),
+                    sorted(before.get(bucket) or [], key=key),
+                    f"{bucket} did not round-trip")
+
+    def test_rejects_a_traversal_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, ds_dir = self._setup(td)
+            rc = collect.apply_human_review_command(
+                target="../../../etc/passwd", dataset_dir=ds_dir,
+                eval_root=root, dry_run=True, strip=False, force=False)
+            self.assertEqual(rc, 2)
+
+    def test_missing_overlay_is_an_error_not_a_silent_noop(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, ds_dir = self._setup(td)
+            rc = collect.apply_human_review_command(
+                target="kernel-1", dataset_dir=ds_dir, eval_root=root,
+                dry_run=False, strip=False, force=False)
+            self.assertEqual(rc, 2)
+
+    def test_unconverged_census_warns_but_applies(self):
+        """Unconverged records need the human pass MOST — warn, never block."""
+        with tempfile.TemporaryDirectory() as td:
+            root, ds_dir = self._setup(td, converged=False)
+            self._stage(root, self._gt(ds_dir), [self._verdict("confirm")])
+            rc = collect.apply_human_review_command(
+                target="kernel-1", dataset_dir=ds_dir, eval_root=root,
+                dry_run=False, strip=False, force=False)
+            self.assertEqual(rc, 0)
+            gt = self._gt(ds_dir)
+            self.assertIn("human_verdict", gt["true_positives"][0])
+            self.assertFalse(gt["census_converged"],
+                             "a human pass must not flip convergence")
+
+    def test_applied_record_still_validates(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, ds_dir = self._setup(td)
+            self._stage(root, self._gt(ds_dir), [
+                self._verdict("reseverity", severity="nit"),
+                self._verdict("add", file="c/d.py", line=5, severity="medium",
+                              topic="new"),
+            ])
+            collect.apply_human_review_command(
+                target="kernel-1", dataset_dir=ds_dir, eval_root=root,
+                dry_run=False, strip=False, force=False)
+            doc = json.loads((ds_dir / "kernel-1.json").read_text())
+            errors, _ = cl.validate_dataset(doc)
+            self.assertEqual(errors, [])

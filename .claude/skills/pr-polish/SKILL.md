@@ -69,7 +69,9 @@ echo "$PREFLIGHT" | jq -r '.warnings[]? | "[preflight warning] " + .' >&2
 python3 $SKILL_DIR/scripts/pr_ops.py identify
 ```
 
-Pin: `$CTX`, `$STATE_DIR`, `$STATE_FILE`, `$BRANCH`, `$PR_NUMBER`, `$REPO`. 
+Pin: `$CTX`, `$STATE_DIR`, `$STATE_FILE`, `$BRANCH`, `$PR_NUMBER`, `$REPO`, `$BASE`
+(`identify`'s `base` field — the PR's `baseRefName`, or the detected default
+branch in branch-only mode; used for the review's diff scope in Step 3.b). 
 
 `pr_number: null` → skip PR-comment/CI fetch.
 
@@ -157,6 +159,17 @@ mkdir -p "$LOG_DIR"
 
 SCOPE_HINTS=$(python3 $SKILL_DIR/scripts/scope_gate.py --state-dir "$STATE_DIR" 2>"$LOG_DIR/scope-gate-stderr.txt")
 
+# Pin the reviewed range. Without --diff-base the agent infers the diff, and
+# the natural inference — `git diff main...HEAD` — is wrong whenever the local
+# base branch has drifted: a stale main narrows the diff (the reviewer never
+# sees code the PR touched), an advanced main widens it with unrelated
+# commits. Measured on a replayed PR: 336 files instead of 22, and the guess
+# varied run to run. Empty (detached HEAD, missing origin/main) simply omits
+# the flag and restores the previous inferred-scope behaviour.
+DIFF_BASE=$(git merge-base "origin/${BASE:-main}" HEAD 2>/dev/null || true)
+DIFF_BASE_ARG=""
+[ -n "$DIFF_BASE" ] && DIFF_BASE_ARG="--diff-base $DIFF_BASE"
+
 [ "$IS_NEW_SERIES" = "1" ] && [ "$PR_NUMBER" != "null" ] && {
   python3 $SKILL_DIR/scripts/pr_ops.py fetch-comments > $STATE_DIR/pp-comments.json
   python3 $SKILL_DIR/scripts/pr_ops.py ci-failed-tests > $STATE_DIR/pp-ci.json
@@ -203,7 +216,7 @@ PIDS=()
 ( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:codex:r{ROUND} \
   timeout 1200 $BRAMBLE_BIN code-review --backend codex --model gpt-5.4-mini \
     --skip-test-execution --verbose --idle-timeout 5m \
-    --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" \
+    --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
     ${CODEX_RESUME:+--resume-session-id "$CODEX_RESUME"} \
     --envelope-file "$LOG_DIR/codex-envelope.json" \
   2>&1 | tee "$LOG_DIR/codex-stderr.txt" | sed 's/^/[codex] /' ) &
@@ -212,7 +225,7 @@ PIDS+=($!)
 ( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:cursor:r{ROUND} \
   timeout 1200 $BRAMBLE_BIN code-review --backend cursor --model composer-2.5 \
     --skip-test-execution --verbose --idle-timeout 5m \
-    --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" \
+    --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
     ${CURSOR_RESUME:+--resume-session-id "$CURSOR_RESUME"} \
     --envelope-file "$LOG_DIR/cursor-envelope.json" \
   2>&1 | tee "$LOG_DIR/cursor-stderr.txt" | sed 's/^/[cursor] /' ) &
@@ -229,7 +242,7 @@ if [ "$USE_GEMINI" = "1" ]; then
   ( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:gemini:r{ROUND} \
     timeout 1200 $BRAMBLE_BIN code-review --backend gemini --model gemini-3-flash-preview \
       --skip-test-execution --verbose --idle-timeout 5m \
-      --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" \
+      --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
       ${GEMINI_RESUME:+--resume-session-id "$GEMINI_RESUME"} \
       --envelope-file "$LOG_DIR/gemini-envelope.json" \
     2>&1 | tee "$LOG_DIR/gemini-stderr.txt" | sed 's/^/[gemini] /' ) &
@@ -339,3 +352,22 @@ python3 $SKILL_DIR/scripts/pr_ops.py state-mark-complete $CTX <reason>
 Reasons: `converged`, `all-low`, `false-positive-top`, `capped-at-max`, `spiral-escalated`, `pr-mismatch-abort`, `sync-conflict`, `dirty-tree-preflight`, `user-paused`, `abandoned`.
 
 Print: metrics, round table, full `comment_actions` table (`Round | Source | Path:Line | Severity | Action | Notes`), state file path, ready/not-ready verdict.
+
+## Measuring this loop's quality
+
+`scripts/escape_rate.py` measures the **escape rate** — substantive findings external
+reviewers posted after this loop declared the PR done, that its own reviewers never
+surfaced. Each is a defect the local loop should have caught, so it is the metric
+this skill is tuned against.
+
+```bash
+python3 $SKILL_DIR/scripts/escape_rate.py <state-dir>   # one run
+python3 $SKILL_DIR/scripts/escape_rate.py --all         # fleet-wide
+```
+
+It needs the harvested dataset for a post-run comment census: `pp-comments.json` is
+captured *during* the run and so cannot contain the escapes. `escaped_in_scope`
+separates depth failures (reviewer saw the file, missed the bug) from scope failures.
+
+Full operating procedure — cadence, bake-off runbook, promotion checklist:
+`docs/design/code-review-benchmark-process.md`.

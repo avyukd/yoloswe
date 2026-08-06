@@ -123,12 +123,13 @@ class GTEntry:
 class GroundTruthV3:
     """The frozen, judged ground-truth set for one PR's diff.
 
-    ``true_positives`` is the *complete* real-bug census: the convergence
-    test guarantees every censused bug is covered by a reviewer finding, so
-    a converged dataset has no separate "missed issues" list. When a PR
-    exhausts the round budget without saturating, ``census_converged`` is
-    ``False`` and ``per_round_diff`` records exactly which census items were
-    still uncovered.
+    ``census`` is the complete real-bug set for the diff, including defects
+    **no reviewer caught** — those are the recall signal replay scores
+    against, so convergence deliberately does not require them to be
+    covered. ``per_round_diff`` records which census items were uncovered at
+    each round (``uncovered_census_items``); a large uncovered set on a
+    converged dataset means the reviewers were quiet, not that the ground
+    truth is incomplete.
 
     ``contested`` holds findings judged inconsistently across rounds (e.g.
     ``true_positive`` in one round, ``false_positive`` in another). An
@@ -226,7 +227,32 @@ def same_defect(
 
 
 def _entry_matches(entry: GTEntry, fv: dict) -> bool:
-    return same_defect(entry.file, entry.line, fv.get("file"), fv.get("line"))
+    """Whether a judge verdict re-rules an existing accumulator entry.
+
+    Deliberately **stricter** than :func:`same_defect`: identity here is the
+    exact normalized ``(file, line)`` pair, with ``None`` matching only
+    ``None``.
+
+    ``same_defect`` lets a file-level location subsume a line-level one in
+    the same file, which is right for *scoring* (a reviewer that flags a file
+    should get credit for the line-level defect in it). It is wrong for
+    *folding*, because a single ``line: null`` verdict would then match every
+    line-level entry in that file and re-rule them all. Observed on
+    kernel-8229: four file-level verdicts in one file walked line 58 through
+    ``TP -> TP -> TP -> FP -> FP -> TP``, parking it in ``contested`` where
+    no later round could resolve it — every resolution was immediately
+    re-flipped by the next file-level verdict. Two distinct defects in one
+    file, one anchored to a line and one not, are two entries, not one.
+
+    Only the ``None`` rule is tightened. Two *line-level* verdicts a few rows
+    apart are still one defect (``_LINE_SLACK``): reviewers routinely anchor
+    the same bug at slightly different lines, and collapsing those is what
+    lets ``surfaced_by`` accumulate across rounds.
+    """
+    a_line, b_line = entry.line, fv.get("line")
+    if (a_line is None) != (b_line is None):
+        return False
+    return same_defect(entry.file, a_line, fv.get("file"), b_line)
 
 
 def _loc_key(file: object, line: object) -> tuple[str, Optional[int]]:
@@ -270,12 +296,104 @@ def _loc_error(item: object, label: str) -> Optional[str]:
     so reject it at the input boundary, matching :func:`validate_dataset`'s
     output-side check.
     """
+    if isinstance(item, str):
+        # The commonest judge mistake by far: writing a location as the
+        # string "path/to/file.py:12" instead of an object. Two judges in one
+        # batch did it, so name the fix rather than just the violation —
+        # the message is what the judge sees when asked to correct itself.
+        return (
+            f"{label} is the string {item!r}; a location must be an object "
+            '— {"file": "path/to/file.py", "line": 12} '
+            "(use null for line on a file-level entry)"
+        )
     if not isinstance(item, dict):
         return f"{label} is not an object"
     if not item.get("file") or not isinstance(item.get("file"), str):
         return f"{label} missing 'file'"
     if "line" not in item:
         return f"{label} missing 'line'"
+    return None
+
+
+def _file_level_collision_error(fv: list) -> Optional[str]:
+    """Reject two *conflicting* verdicts that share one defect identity.
+
+    Defect identity in the accumulator is ``(normalized_file, line)`` with
+    ``_LINE_SLACK`` rows of tolerance. Two findings that collide on that key
+    collapse into a single entry, and if their verdicts disagree the entry
+    flips — parking it in ``contested`` where no later round can resolve it,
+    because each resolution is re-flipped by the next.
+
+    Two shapes trigger this, and both are rejected here:
+
+    - two ``line: null`` findings on the same path (they share ``(path,
+      None)``), and
+    - two line-level findings within ``_LINE_SLACK`` rows in the same file.
+
+    Verdicts that agree are left alone: those merge into one entry and pool
+    their ``surfaced_by``, which is the intended dedupe.
+
+    Observed on kernel-8229: one round emitted four distinct file-level
+    findings on ``reservation_archive_release.py`` (unbounded fan-out TP,
+    deadline-placement FP, per-attempt-deadline FP, missing-test TP). They
+    became one entry cycling ``TP -> FP -> FP -> TP``, and the PR could not
+    converge.
+
+    The three alternatives were measured on the real corpus and rejected:
+    keying on ``topic`` fails because wording drifts across rounds (198 of
+    226 same-location findings were reworded, 88%), so genuine flips would
+    read as new defects; an occurrence index fails because the per-path
+    count is not stable across rounds (3 of 10 recurring paths changed
+    count), so it would pair defect #3 with a different defect #3; a
+    synthetic per-round id cannot match across rounds at all, which is what
+    flip detection needs.
+
+    So the constraint is pushed to the input boundary: a judge may emit at
+    most one file-level finding per path, and must anchor the rest to the
+    line they concern. Most already are anchorable in practice — the
+    genuinely file-scoped shape ("no test covers this contract") is rare
+    enough that one slot per file suffices.
+    """
+    rulings: list[tuple[int, dict]] = [
+        (i, v)
+        for i, v in enumerate(fv)
+        if isinstance(v, dict) and v.get("verdict") != VERDICT_UNSURE
+    ]
+    for pos, (i, v) in enumerate(rulings):
+        for j, w in rulings[:pos]:
+            v_null, w_null = v.get("line") is None, w.get("line") is None
+            if v_null != w_null:
+                # A file-level and a line-level finding are distinct entries
+                # by construction — see :func:`_entry_matches`.
+                continue
+            if not same_defect(
+                v.get("file"), v.get("line"), w.get("file"), w.get("line")
+            ):
+                continue
+            if v.get("verdict") == w.get("verdict"):
+                # Same location, same ruling — these merge harmlessly into
+                # one entry and accumulate `surfaced_by`. That is the
+                # intended dedupe, not a collision.
+                continue
+            where = (
+                f"file-level (line: null) verdict for {normalize_finding_path(v.get('file'))!r}"
+                if v_null
+                else (
+                    f"verdict at {normalize_finding_path(v.get('file'))}:"
+                    f"{v.get('line')}, within {_LINE_SLACK} rows of "
+                    f"finding_verdicts[{j}] at line {w.get('line')},"
+                )
+            )
+            return (
+                f"finding_verdicts[{i}] is a conflicting {where} — "
+                f"finding_verdicts[{j}] rules the same location "
+                f"{w.get('verdict')!r} but this one rules "
+                f"{v.get('verdict')!r}. Defect identity is (file, line) with "
+                f"{_LINE_SLACK}-row slack, so these collapse into one entry "
+                "and flip each other into a contested state no later round "
+                "can resolve. Anchor each finding to the distinct line it "
+                "concerns, or drop the duplicate."
+            )
     return None
 
 
@@ -308,6 +426,9 @@ def validate_judge_verdict(obj: object) -> Optional[str]:
             loc_err = _loc_error(v, f"finding_verdicts[{i}]")
             if loc_err:
                 return loc_err
+    dup_err = _file_level_collision_error(fv)
+    if dup_err:
+        return dup_err
     census = obj.get("census")
     if census is not None:
         if not isinstance(census, list):
@@ -473,8 +594,12 @@ def _route_finding_verdict(
     1. **Resolution** — the defect is in ``contested``: this round's verdict
        is binding. Append to history, move it into TP or FP, mark resolved.
     2. **Flip** — the defect stands in TP and this round says FP (or vice
-       versa): move it to ``contested`` (``resolved=False``) with both
-       verdicts in history. It blocks convergence until a round re-rules it.
+       versa): the later round's judge is the authority, so its verdict is
+       binding. The entry moves to the bucket this verdict names and is
+       ``resolved=True``, while also being recorded in ``contested`` so the
+       disagreement stays auditable in the frozen block. It does **not**
+       block convergence: the disagreement is created by this very verdict,
+       so no round could ever "re-rule" it (see the inline note below).
     3. **Agreement** — the defect stands in the bucket this verdict targets:
        accumulate (surfaced_by, history, latest severity).
     4. **New** — unseen defect: create the entry in the right bucket.
@@ -494,31 +619,49 @@ def _route_finding_verdict(
             cumulative.false_positives, cumulative.true_positives
         )
 
-    # 1. Resolution — this verdict re-rules a contested defect.
+    # 1. Resolution — this verdict re-rules a defect recorded as contested
+    #    that is not currently in either bucket (legacy state, or an entry
+    #    quarantined by an older accumulator).
     contested = _find_entry(cumulative.contested, fv)
-    if contested is not None:
+    if contested is not None and _find_entry(
+        cumulative.true_positives, fv
+    ) is None and _find_entry(cumulative.false_positives, fv) is None:
         cumulative.contested.remove(contested)
         _accumulate_into(contested, fv, round_n, kind)
         contested.resolved = True
-        existing = _find_entry(same_bucket, fv)
-        if existing is not None:
-            # The resolving verdict's bucket already holds a sibling entry —
-            # fold the contested entry's history in and keep the one entry.
-            existing.verdict_history.extend(contested.verdict_history)
-            for src in contested.surfaced_by:
-                if src not in existing.surfaced_by:
-                    existing.surfaced_by.append(src)
-        else:
-            same_bucket.append(contested)
+        same_bucket.append(contested)
         return
 
     # 2. Flip — the defect stands in the OTHER bucket.
+    #
+    # A later round's judge is the authority: it saw this defect listed in
+    # `contested_findings` (or in the cumulative buckets) and ruled against
+    # the earlier round deliberately. So the flip is *itself* the binding
+    # re-ruling, and the entry lands in the new bucket resolved.
+    #
+    # Marking it unresolved instead created a state no round could ever
+    # clear: the disagreement is *created* by this verdict, so nothing in
+    # this round can "re-rule" an entry that was not contested when the
+    # round began — only a further round could, and the budget is usually
+    # 2. Observed on kernel-8329, where a judge produced a binding verdict
+    # (verified against a live Postgres) that still could not clear the
+    # flag. `verdict_history` retains both rulings either way, so the
+    # disagreement stays auditable without blocking convergence forever.
     flipped = _find_entry(other_bucket, fv)
     if flipped is not None:
         other_bucket.remove(flipped)
         _accumulate_into(flipped, fv, round_n, kind)
-        flipped.resolved = False
-        cumulative.contested.append(flipped)
+        flipped.resolved = True
+        # The entry must land in the bucket this verdict names, not sit in
+        # `contested` alone: `build_ground_truth` scores only the TP and FP
+        # buckets, so a contested-only entry is absent from the ground truth
+        # rather than merely flagged. It is *also* recorded in `contested`
+        # so the disagreement stays visible in the frozen block — the same
+        # object, so later flips update one record rather than appending a
+        # duplicate each time.
+        if _find_entry(cumulative.contested, fv) is None:
+            cumulative.contested.append(flipped)
+        same_bucket.append(flipped)
         return
 
     # 3. Agreement — the defect already stands in the target bucket.
@@ -624,30 +767,37 @@ def unresolved_contested(cumulative: CumulativeGT) -> list[GTEntry]:
 
 
 def census_converged(cumulative: CumulativeGT) -> bool:
-    """The three-part saturation test.
+    """The two-part saturation test.
 
-    Converges when **all** hold after the most recent round:
+    Converges when **both** hold after the most recent round:
 
-      1. the cumulative census set was unchanged versus the prior round
-         (no new real bug surfaced), and
-      2. every census item is covered by a true-positive finding (the
-         reviewers, in aggregate, caught every real bug the judge censused),
-         and
-      3. no contested finding is still unresolved — the judges have not left
+      1. the round censused no new real bug (the judge, re-reading the same
+         diff with a fresh round of reviewer findings, found nothing it had
+         not already recorded), and
+      2. no contested finding is still unresolved — the judges have not left
          a defect they disagreed on un-re-ruled.
 
-    Needs at least two rounds — a single round has nothing to be "unchanged"
+    Needs at least two rounds — a single round has nothing to be "new"
     against. The empty-census case still requires two rounds so a reviewer
     that simply found nothing twice is what produces the clean signal.
+
+    Note what is deliberately **not** required: that every census item be
+    covered by a true-positive finding. The judge censuses bugs *no reviewer
+    caught* — that is its job, and those items are exactly the recall signal
+    replay exists to measure. Gating on full coverage made convergence
+    unreachable on any diff with a low/nit defect the reviewers skip, so a
+    saturated run would burn its whole round budget and still freeze as
+    "unconverged". Coverage is reported (:func:`census_uncovered`, surfaced
+    as ``uncovered_census_items``) but does not gate.
     """
     if cumulative.rounds_run < 2:
         return False
     last = cumulative.per_round_diff[-1] if cumulative.per_round_diff else {}
-    if not last.get("census_unchanged_vs_prev"):
+    if last.get("new_census_items"):
         return False
     if unresolved_contested(cumulative):
         return False
-    return not census_uncovered(cumulative)
+    return True
 
 
 # ===========================================================================
@@ -790,6 +940,47 @@ def load_ground_truth(dataset: dict) -> Optional[dict]:
 _MIN_AGREEMENT_RATE = 0.6
 
 
+def unchanged_file_true_positives(dataset: dict) -> list[dict]:
+    """Frozen true positives in files the PR did not modify.
+
+    These are overwhelmingly **incomplete-change** defects: the PR starts a
+    migration and leaves sibling sites behind. Read the corpus topics and
+    the shape is unmistakable — "callbacks *still* use raw tenant
+    comparison", "callsites *still* missing protect=True", "docstrings
+    *still* claim PDFs are converted", "env vars not wired into the
+    deploy-worker pod". kernel-8276's entry is the same shape: the judge
+    recorded it as "the same missing invariant as archive_cascade.py:87,
+    anchored at a sibling writer".
+
+    **The fix for these is to change the unmodified file**, so catching
+    them is among the most valuable things a reviewer does. They are *not*
+    unreachable: the whole worktree is on disk and the reviewer can open
+    any file. What makes them go unreported is a prompt instruction —
+    "reporting issues in code outside this diff is not [expected]" — not a
+    property of the data.
+
+    Reported so the split between "the reviewer missed a defect in changed
+    code" and "the reviewer missed an unfixed sibling site" is visible.
+    Do **not** subtract these from the recall denominator: that would score
+    a reviewer as perfect while it silently ships half-finished migrations.
+
+    Returns ``[]`` when the record carries no ``files_changed`` — an empty
+    scope means "unknown", and guessing would reclassify every entry.
+    """
+    gt = dataset.get("ground_truth_v3") or {}
+    rounds = dataset.get("harvested_rounds") or []
+    if not rounds:
+        return []
+    changed = set(rounds[0].get("files_changed") or [])
+    if not changed:
+        return []
+    return [
+        e
+        for e in (gt.get("true_positives") or [])
+        if isinstance(e, dict) and e.get("file") and e["file"] not in changed
+    ]
+
+
 def validate_dataset(
     dataset: dict, *, round_budget: int = 10
 ) -> tuple[list[str], list[str]]:
@@ -809,8 +1000,20 @@ def validate_dataset(
     sv = dataset.get("schema_version")
     if sv is None:
         errors.append("missing top-level schema_version")
-    elif sv not in (2,):  # the harvested per-PR schema
+    elif sv not in (2, 3):  # the harvested per-PR schema
         warnings.append(f"unexpected dataset schema_version={sv}")
+
+    # Schema 3 added harvest provenance. A missing key is schema-2 data and
+    # reads as "pr-polish"; a present-but-unknown value is malformed, since
+    # consumers branch on it (replay filters/splits scores by source).
+    if "harvest_source" in dataset and dataset["harvest_source"] not in (
+        "pr-polish",
+        "github",
+    ):
+        errors.append(
+            f"unknown harvest_source={dataset['harvest_source']!r} "
+            "(expected 'pr-polish' or 'github')"
+        )
 
     gt = load_ground_truth(dataset)
     if gt is None:
@@ -868,6 +1071,29 @@ def validate_dataset(
         warnings.append(
             f"{len(unresolved)} contested finding(s) unresolved — judges "
             "disagreed and no round re-ruled them"
+        )
+    # True positives in files the PR did not modify are, on this corpus,
+    # incomplete-change defects: sibling sites a migration left behind.
+    # Measured 2026-08-06: 14 of 196 true positives (7.1%) across 11 of 48
+    # records; kernel-3860's three entries are all of this shape.
+    #
+    # Surfaced so the miss can be attributed — "missed a defect in changed
+    # code" and "missed an unfixed sibling site" call for different fixes.
+    # NOT a licence to shrink the denominator: the fix for these is to
+    # change the unmodified file, so excluding them would score a reviewer
+    # as perfect while it waves through half-finished migrations.
+    oos = unchanged_file_true_positives(dataset)
+    if oos:
+        n_tp = len(gt.get("true_positives") or [])
+        detail = ", ".join(
+            f"{e.get('file', '?').split('/')[-1]}:{e.get('line')}"
+            for e in oos[:3]
+        )
+        warnings.append(
+            f"{len(oos)} of {n_tp} true positive(s) sit in files this PR did "
+            f"not modify ({detail}{', …' if len(oos) > 3 else ''}) — usually "
+            "sibling sites an incomplete change left behind; the reviewer is "
+            "expected to catch these, so do not exclude them from recall"
         )
     rate = (gt.get("dataset_xref") or {}).get("comment_action_agreement_rate")
     if rate is not None and rate < _MIN_AGREEMENT_RATE:

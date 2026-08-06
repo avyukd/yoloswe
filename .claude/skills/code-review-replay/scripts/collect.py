@@ -10,6 +10,10 @@ stateless mechanical glue, with one sub-command per step:
   build-prompt    write a round's judge prompt-input JSON.
   fold            merge a round's judge verdict; report convergence.
   freeze          write the ground_truth_v3 block; tear down the worktree.
+  apply-human-review <pr>
+                  fold a human review overlay (staged by reviewui.py) into a
+                  frozen ground truth. NOT a judge round — see the function
+                  docstring for why this does not reuse `fold`.
   validate [pr]   structural + quality check of a frozen dataset.
 
 Repo checkouts are auto-discovered (no ``--repos-root``). Collection state
@@ -27,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import subprocess
 import sys
 from dataclasses import asdict
@@ -39,6 +44,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import collect_lib as cl  # noqa: E402
 import harvest_lib as hl  # noqa: E402
+import humanreview_lib as hr  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 EVAL_ROOT = Path.home() / ".bramble" / "code-review-eval"
@@ -203,12 +209,28 @@ def _findings_from_envelope(path: Path, backend: str) -> list[dict]:
 
     Each finding is tagged with ``surfaced_by`` so the judge — and the
     cumulative accumulator — can record which backend(s) caught it.
+
+    A backend that stalled or failed to start still writes an envelope, but
+    with ``status: "error"`` and an empty ``review``. Folding that in would
+    read to the judge as "this reviewer looked and found nothing", making a
+    backend outage indistinguishable from a clean review and inflating the
+    apparent false-negative rate. Such an envelope is refused outright: the
+    round should re-run the backend or record it as unavailable.
     """
     try:
         env = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as e:
         print(f"  warning: unreadable envelope {path}: {e}", file=sys.stderr)
         return []
+    status = env.get("status")
+    if status is not None and status != "ok":
+        err = env.get("error") or "no error message"
+        raise SystemExit(
+            f"error: {backend} envelope {path} has status={status!r} "
+            f"({err}). A failed review is not a finding-free review — "
+            f"re-run the backend, or drop it from this round's --envelope "
+            f"list and record it as unavailable."
+        )
     return [_finding_dict(f, backend) for f in hl.envelope_issues(env)]
 
 
@@ -274,18 +296,25 @@ def _meta_path(session: Path) -> Path:
 
 
 def save_session_meta(
-    session: Path, *, source_repo: Path, target: str
+    session: Path,
+    *,
+    source_repo: Path,
+    target: str,
+    canonical_round: Optional[dict] = None,
 ) -> None:
     """Record session facts so later sub-commands need only ``--session``.
 
     ``source_repo`` lets ``freeze`` prune the worktree; ``target`` is the
     ``<repo>-<pr>`` id so ``build-prompt`` / ``freeze`` resolve the dataset
-    without re-passing it.
+    without re-passing it. ``canonical_round`` is the round the worktree is
+    pinned at — the round loop needs its ``goal_text`` and ``head_before``
+    on every iteration, so persist it rather than making each step
+    re-derive it from the dataset.
     """
-    hl.atomic_write_json(
-        _meta_path(session),
-        {"source_repo": str(source_repo), "target": target},
-    )
+    meta = {"source_repo": str(source_repo), "target": target}
+    if canonical_round is not None:
+        meta["canonical_round"] = canonical_round
+    hl.atomic_write_json(_meta_path(session), meta)
 
 
 def load_session_meta(session: Path) -> dict:
@@ -297,6 +326,38 @@ def load_session_meta(session: Path) -> dict:
         return json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def ensure_commit_present(
+    source_repo: Path, sha: str, pr_number: str
+) -> None:
+    """Make ``sha`` resolvable in ``source_repo``, fetching the PR if needed.
+
+    A GitHub-sourced record names a commit the local checkout may never
+    have fetched. ``pull/N/head`` is the ref to fetch rather than the
+    branch: GitHub keeps it after the branch is deleted, which is the
+    normal state for a merged PR.
+
+    Fetching belongs here, not in harvest: ``setup`` is already the step
+    that mutates the checkout (it adds a worktree), while harvest stays
+    network-light and never touches the user's repo.
+    """
+    if hl.git(
+        source_repo, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"
+    ).returncode == 0:
+        return
+    res = hl.git(source_repo, "fetch", "origin", f"pull/{pr_number}/head")
+    if hl.git(
+        source_repo, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"
+    ).returncode != 0:
+        raise SystemExit(
+            f"error: commit {sha[:12]} for PR #{pr_number} is not in "
+            f"{source_repo}, and `git fetch origin pull/{pr_number}/head` "
+            f"did not produce it "
+            f"({res.stderr.strip() or 'fetch failed'}). The PR branch may "
+            "have been force-pushed after merge, or the fork deleted — the "
+            "recorded diff can no longer be reconstructed."
+        )
 
 
 def ensure_worktree(
@@ -366,6 +427,7 @@ def setup(
     rnd = _canonical_round(dataset)
     pr = dataset.get("pr") or {}
     repo_name = pr.get("repo_name") or ""
+    pr_number = str(pr.get("pr_number") or "")
 
     head_before = rnd.get("head_before")
     if not head_before:
@@ -391,23 +453,31 @@ def setup(
             f"(need ~/worktrees/{repo_name}/main or ~/g/{repo_name})"
         )
 
+    canonical_round = {
+        "round": rnd.get("round"),
+        "head_before": head_before,
+        "merge_base_sha": rnd.get("merge_base_sha"),
+        "base_branch": rnd.get("base_branch"),
+        "goal_text": rnd.get("goal_text") or "",
+        "files_changed": rnd.get("files_changed") or [],
+    }
+
     session = _new_session(session_root, target)
     session.mkdir(parents=True, exist_ok=True)
-    save_session_meta(session, source_repo=source_repo, target=target)
+    save_session_meta(
+        session,
+        source_repo=source_repo,
+        target=target,
+        canonical_round=canonical_round,
+    )
+    ensure_commit_present(source_repo, head_before, pr_number)
     worktree = ensure_worktree(session, source_repo, head_before)
 
     return {
         "target": target,
         "session": str(session),
         "worktree": str(worktree),
-        "canonical_round": {
-            "round": rnd.get("round"),
-            "head_before": head_before,
-            "merge_base_sha": rnd.get("merge_base_sha"),
-            "base_branch": rnd.get("base_branch"),
-            "goal_text": rnd.get("goal_text") or "",
-            "files_changed": rnd.get("files_changed") or [],
-        },
+        "canonical_round": canonical_round,
     }
 
 
@@ -428,6 +498,47 @@ _JUDGE_INSTRUCTIONS = (
 )
 
 
+_SEED_NOISE = re.compile(
+    r"review started|reviewed —|Helm Deploy|finished @|View job|"
+    r"^<!--|actionable comments posted",
+    re.I,
+)
+
+
+def seed_candidates(round_data: dict, limit: int = 40) -> list[dict]:
+    """Inline external-reviewer comments, as *candidates* for the judge.
+
+    These are locations a real reviewer already flagged on this diff. They
+    are deliberately NOT reviewer findings and NOT ground truth: bots are
+    wrong often, and the harvested triage on kernel-8276 was wrong in both
+    directions. The judge verdicts each one against the code like anything
+    else.
+
+    Their value is cost: the census saturates in fewer rounds when the
+    judge starts from real candidate locations instead of rediscovering
+    them from the diff alone. Collection over a large corpus is otherwise
+    unaffordable.
+    """
+    out: list[dict] = []
+    for a in round_data.get("raw_comment_actions") or []:
+        if a.get("source") != "github-inline":
+            continue
+        path, body = a.get("path"), (a.get("body") or "").strip()
+        if not path or not body or _SEED_NOISE.search(body):
+            continue
+        out.append(
+            {
+                "file": path,
+                "line": a.get("line"),
+                "author": a.get("author"),
+                "claim": body[:1200],
+            }
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
 def build_prompt(
     *,
     session: Path,
@@ -435,6 +546,7 @@ def build_prompt(
     envelopes: list[tuple[str, Path]],
     include_harvested: bool,
     dataset_dir: Path,
+    include_seeds: bool = False,
 ) -> Path:
     """Write the round's judge prompt-input JSON. Returns its path.
 
@@ -526,6 +638,7 @@ def build_prompt(
         "cumulative_census": cumulative.census,
         "contested_findings": contested,
         "harvested_comment_actions": rnd.get("raw_comment_actions") or [],
+        "seed_candidates": seed_candidates(rnd) if include_seeds else [],
         "verdict_output_path": str(round_dir / "judge-verdict.json"),
     }
     return hl.atomic_write_json(round_dir / "judge-prompt.json", payload)
@@ -693,6 +806,142 @@ def _validate_one(
     return 0, lines
 
 
+# ---------------------------------------------------------------------------
+# Sub-command: apply-human-review — fold a human second pass into a frozen GT
+# ---------------------------------------------------------------------------
+
+
+def apply_human_review_command(
+    *, target: str, dataset_dir: Path, eval_root: Path, dry_run: bool,
+    strip: bool, force: bool,
+) -> int:
+    """Apply (or strip) a human review overlay against a frozen GT block.
+
+    Deliberately NOT a variant of `fold`. A human pass is not a judge round:
+    folding one would take `_route_finding_verdict`'s flip branch on every
+    rejection, recording human-vs-machine disagreement in `contested` as if
+    two judges disagreed, and would bump `rounds_run` so `census_converged`
+    became partly a function of human agreement. This path rewrites the frozen
+    block additively and leaves all round accounting alone.
+    """
+    # `target` is concatenated into dataset/ and human-review/ paths below, so
+    # reject a traversal slug before any path is built.
+    try:
+        hr.validate_target(target)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    dataset_path, dataset = _load_dataset(dataset_dir, target)
+
+    # Defense in depth. `_load_dataset` also accepts a literal `*.json` path
+    # (pre-existing behaviour `validate --all` depends on), which the slug
+    # check above already forecloses for this command. Assert containment
+    # anyway: this is the one code path that WRITES the benchmark, so it
+    # should not depend on a caller-side guard staying where it is.
+    try:
+        dataset_path.resolve().relative_to(dataset_dir.resolve())
+    except ValueError:
+        print(f"error: {dataset_path} resolves outside {dataset_dir}",
+              file=sys.stderr)
+        return 2
+
+    gt = cl.load_ground_truth(dataset)
+    if gt is None:
+        print(f"error: {target} has no frozen ground_truth_v3 block",
+              file=sys.stderr)
+        return 2
+
+    if strip:
+        new_gt, removed = hr.strip_human_review(gt)
+        if dry_run:
+            print(json.dumps({"target": target, "dry_run": True,
+                              "would_remove": removed}, indent=2))
+            return 0
+        dataset[cl.GROUND_TRUTH_KEY] = new_gt
+        hl.atomic_write_json(dataset_path, dataset)
+        cl.refresh_index_entry(dataset_path.parent, dataset_path.stem)
+        print(json.dumps({"target": target, "stripped": removed,
+                          "dataset": str(dataset_path)}, indent=2))
+        return 0
+
+    overlay_path = hr.overlay_path(eval_root, target)
+    overlay = hr.load_overlay(overlay_path)
+    if overlay is None:
+        print(f"error: no human-review overlay at {overlay_path}",
+              file=sys.stderr)
+        return 2
+
+    err = hr.validate_overlay(overlay)
+    if err:
+        print(f"error: malformed overlay: {err}", file=sys.stderr)
+        return 2
+
+    # The census must not have moved under the reviewer. Re-collecting a PR
+    # rewrites its findings, and verdicts cast against the old set may name
+    # defects that no longer exist or miss ones that now do.
+    current = hr.gt_fingerprint(gt)
+    recorded = overlay.get("gt_fingerprint")
+    if recorded and recorded != current and not force:
+        print(
+            f"error: ground truth changed since this review was staged\n"
+            f"  overlay fingerprint: {recorded}\n"
+            f"  current fingerprint: {current}\n"
+            "The record was re-collected after the human reviewed it. "
+            "Re-review it, or pass --force to apply anyway.",
+            file=sys.stderr)
+        return 2
+
+    # Unconverged is a warning, not a gate: those records are exactly where
+    # the census is most likely incomplete, so they need the human pass most.
+    if not gt.get("census_converged"):
+        print(
+            f"warning: {target} census did not converge — its true-positive "
+            "set is a lower bound, so treat additions as expected rather "
+            "than exceptional.",
+            file=sys.stderr)
+
+    new_gt, notes = hr.apply_human_review(gt, overlay)
+
+    candidate = dict(dataset)
+    candidate[cl.GROUND_TRUTH_KEY] = new_gt
+    errors, warnings = cl.validate_dataset(candidate)
+    if errors:
+        print("error: applying this overlay would produce an invalid record:",
+              file=sys.stderr)
+        for e in errors:
+            print(f"  {e}", file=sys.stderr)
+        return 2
+
+    before = hr.human_review_stats(gt)
+    after = hr.human_review_stats(new_gt)
+    result = {
+        "target": target,
+        "dry_run": dry_run,
+        "verdicts": len(overlay.get("verdicts") or []),
+        "notes": notes,
+        "true_positives": len(new_gt.get("true_positives") or []),
+        "false_positives": len(new_gt.get("false_positives") or []),
+        "adjudicated_before": before["adjudicated"],
+        "adjudicated_after": after["adjudicated"],
+        "human_added": after["human_added"],
+        "census_converged": new_gt.get("census_converged"),
+        "warnings": warnings,
+    }
+    if dry_run:
+        print(json.dumps(result, indent=2))
+        return 0
+
+    # Same write discipline as `cl.freeze`: atomic temp+rename, then patch
+    # the index entry so a consumer sees the change without opening the file.
+    dataset[cl.GROUND_TRUTH_KEY] = new_gt
+    hl.atomic_write_json(dataset_path, dataset)
+    cl.refresh_index_entry(dataset_path.parent, dataset_path.stem)
+    result["dataset"] = str(dataset_path)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def validate_command(
     *, target: Optional[str], dataset_dir: Path, validate_all: bool,
     round_budget: int,
@@ -796,6 +1045,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         dest="repo_root",
         help="Override repo-root auto-discovery for one repo. Rarely needed.")
 
+    # session-info --session ... [--field goal_text]
+    sp_si = sub.add_parser(
+        "session-info",
+        help="Print the session's canonical_round (goal_text, head_before, "
+        "…) recorded by setup.")
+    sp_si.add_argument("--session", type=Path, required=True)
+    sp_si.add_argument(
+        "--field",
+        help="Print just this canonical_round field as raw text (e.g. "
+        "goal_text) instead of the whole JSON block. Lets the round loop "
+        "do --goal \"$(... --field goal_text)\" without a JSON parser.")
+
     # build-prompt --session ... --round N --envelope ...
     sp_bp = sub.add_parser(
         "build-prompt", help="Write a round's judge prompt-input JSON.")
@@ -808,6 +1069,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--include-harvested", action="store_true",
         help="Fold the harvested pr-polish review into this round's "
         "findings (the round loop passes this every round).")
+    sp_bp.add_argument(
+        "--include-seeds", action="store_true",
+        help="Pass inline external-reviewer comments as candidate defect "
+        "locations for the judge to verdict independently. Not findings "
+        "and not ground truth — they cut rounds-to-saturation, which is "
+        "what makes large-corpus collection affordable.")
 
     # fold --session ... --round N
     sp_fold = sub.add_parser(
@@ -820,6 +1087,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     sp_fr = sub.add_parser(
         "freeze", help="Write the ground_truth_v3 block; tear down worktree.")
     sp_fr.add_argument("--session", type=Path, required=True)
+
+    # apply-human-review <repo>-<pr>
+    sp_hr = sub.add_parser(
+        "apply-human-review",
+        help="Fold a human review overlay into a frozen ground truth.")
+    sp_hr.add_argument("target")
+    sp_hr.add_argument(
+        "--eval-root", type=Path, default=EVAL_ROOT,
+        help="Where human-review/<target>.json lives.")
+    sp_hr.add_argument(
+        "--dry-run", action="store_true",
+        help="Report what would change without writing the dataset.")
+    sp_hr.add_argument(
+        "--strip", action="store_true", dest="strip",
+        help="Inverse: remove every human annotation, restoring the "
+             "pre-human block. Makes a bad pass undoable.")
+    sp_hr.add_argument(
+        "--force", action="store_true",
+        help="Apply even if the ground truth changed since the review was "
+             "staged. Rarely right — prefer re-reviewing.")
 
     # validate [<repo>-<pr>] [--all]
     sp_val = sub.add_parser(
@@ -856,11 +1143,43 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(json.dumps(result, indent=2))
         return 0
 
+    if cmd == "session-info":
+        meta = load_session_meta(args.session)
+        if not meta:
+            print(
+                f"error: no session-meta.json under {args.session}",
+                file=sys.stderr,
+            )
+            return 2
+        rnd = meta.get("canonical_round")
+        if rnd is None:
+            print(
+                "error: this session predates canonical_round persistence; "
+                "re-run `setup` to record it",
+                file=sys.stderr,
+            )
+            return 2
+        if args.field:
+            if args.field not in rnd:
+                print(
+                    f"error: no canonical_round field {args.field!r} "
+                    f"(have: {', '.join(sorted(rnd))})",
+                    file=sys.stderr,
+                )
+                return 2
+            value = rnd[args.field]
+            # Raw, unquoted, so `--goal "$(… --field goal_text)"` works.
+            print(value if isinstance(value, str) else json.dumps(value))
+            return 0
+        print(json.dumps(rnd, indent=2))
+        return 0
+
     if cmd == "build-prompt":
         prompt = build_prompt(
             session=args.session, round_n=args.round,
             envelopes=_parse_envelope_flags(args.envelope),
             include_harvested=args.include_harvested,
+            include_seeds=args.include_seeds,
             dataset_dir=args.dataset_dir)
         print(json.dumps({"judge_prompt": str(prompt)}, indent=2))
         return 0
@@ -877,6 +1196,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             dataset_dir=args.dataset_dir, session=args.session)
         print(json.dumps(status, indent=2))
         return 0
+
+    if cmd == "apply-human-review":
+        return apply_human_review_command(
+            target=args.target, dataset_dir=args.dataset_dir,
+            eval_root=args.eval_root, dry_run=args.dry_run,
+            strip=args.strip, force=args.force)
 
     if cmd == "validate":
         return validate_command(

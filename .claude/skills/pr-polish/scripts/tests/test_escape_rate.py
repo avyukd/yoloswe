@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Tests for escape_rate.py — pr-polish's local-review miss rate."""
+
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+SCRIPTS = Path(__file__).resolve().parents[1]
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+import escape_rate as er  # noqa: E402
+
+
+def _comment(**kw):
+    base = {
+        "source": "github-inline",
+        "author": "coderabbitai[bot]",
+        "is_bot": True,
+        "path": "a.py",
+        "line": 10,
+        "body": "This leaks a file handle on the error path.",
+        "created_at": "2026-07-30T12:00:00Z",
+    }
+    base.update(kw)
+    return base
+
+
+def _state(**kw):
+    base = {
+        "pr_number": 1,
+        "completed": True,
+        "exit_reason": "converged",
+        "completed_at": "2026-07-30T10:00:00Z",
+        "rounds": [],
+    }
+    base.update(kw)
+    return base
+
+
+def _record(comments, *, files=("a.py", "b.py"), gt=None):
+    rec = {
+        "harvested_rounds": [
+            {"files_changed": list(files), "raw_comment_actions": comments}
+        ]
+    }
+    if gt is not None:
+        rec["ground_truth_v3"] = gt
+    return rec
+
+
+class JudgedTruePositivesTests(unittest.TestCase):
+    def test_no_ground_truth_is_none_not_empty(self):
+        # "Not collected" and "nothing real here" are different claims;
+        # only the second licenses calling an escape spurious.
+        self.assertIsNone(er.judged_true_positives(None))
+        self.assertIsNone(er.judged_true_positives({}))
+
+    def test_empty_true_positives_is_a_real_empty_list(self):
+        self.assertEqual(
+            er.judged_true_positives({"ground_truth_v3": {"true_positives": []}}),
+            [],
+        )
+
+    def test_extracts_locations(self):
+        got = er.judged_true_positives(
+            {"ground_truth_v3": {"true_positives": [
+                {"file": "a.py", "line": 10},
+                {"file": "b.py", "line": None},
+            ]}}
+        )
+        self.assertEqual(got, [("a.py", 10), ("b.py", None)])
+
+
+class ScopeSourceTests(unittest.TestCase):
+    def test_files_changed_comes_from_the_record_not_state(self):
+        # pr-polish state never persists files_changed. Reading only it
+        # would report every escape as out-of-scope, inverting the
+        # depth-vs-scope signal.
+        state = _state()
+        self.assertEqual(er.in_scope_files(state), set())
+        rec = _record([], files=("svc/a.py",))
+        self.assertEqual(er.in_scope_files(state, rec), {"a.py"})
+
+
+class CommentSourceTests(unittest.TestCase):
+    def test_prefers_the_harvested_record_over_the_in_run_snapshot(self):
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            # The in-run snapshot cannot contain post-completion comments.
+            (sd / "pp-comments.json").write_text(
+                json.dumps({"comments": [_comment(body="stale")]})
+            )
+            rec = _record([_comment(body="fresh")])
+            got = er.load_comments(sd, rec)
+            self.assertEqual(len(got), 1)
+            self.assertEqual(got[0]["body"], "fresh")
+
+    def test_falls_back_to_snapshot_when_no_record(self):
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            (sd / "pp-comments.json").write_text(
+                json.dumps({"comments": [_comment(body="only")]})
+            )
+            self.assertEqual(len(er.load_comments(sd, None)), 1)
+
+
+class ComputeEscapeRateTests(unittest.TestCase):
+    def _run(self, state, record):
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td) / "kernel-1"
+            sd.mkdir()
+            (sd / "pr-polish-state.json").write_text(json.dumps(state))
+            ds = Path(td) / "dataset"
+            ds.mkdir()
+            (ds / "kernel-1.json").write_text(json.dumps(record))
+            return er.compute_escape_rate(sd, ds)
+
+    def test_comment_before_completion_is_not_an_escape(self):
+        # It was available as round input, so missing it is not an escape.
+        rec = _record([_comment(created_at="2026-07-30T09:00:00Z")])
+        out = self._run(_state(), rec)
+        self.assertIsNone(out["escape_rate"])
+        self.assertEqual(out["bot_findings_substantive"], 0)
+
+    def test_locationless_comment_is_not_counted(self):
+        # A review-level summary has no location to match on, and its
+        # findings already appear as inline rows.
+        rec = _record([_comment(path=None, source="github-review")])
+        out = self._run(_state(), rec)
+        self.assertEqual(out["bot_findings_substantive"], 0)
+
+    def test_uncaught_comment_is_an_escape(self):
+        out = self._run(_state(), _record([_comment()]))
+        self.assertEqual(out["escaped"], 1)
+        self.assertEqual(out["escape_rate"], 1.0)
+        self.assertTrue(out["escapes"][0]["in_scope"])
+
+    def test_locally_found_comment_is_not_an_escape(self):
+        state = _state(rounds=[
+            {"n": 1, "codex_findings": [{"file": "a.py", "line": 10}]},
+        ])
+        out = self._run(state, _record([_comment()]))
+        self.assertEqual(out["escaped"], 0)
+        self.assertEqual(out["caught_locally"], 1)
+
+    def test_triaged_comment_is_not_an_escape(self):
+        state = _state(rounds=[
+            {"n": 1, "comment_actions": [
+                {"action": "wont_fix", "path": "a.py", "line": 10}]},
+        ])
+        self.assertEqual(self._run(state, _record([_comment()]))["escaped"], 0)
+
+    def test_judged_subset_excludes_bot_false_positives(self):
+        # The correction that matters: bots ran ~9% precision, so the raw
+        # rate mostly counts noise.
+        rec = _record(
+            [_comment(line=10), _comment(line=50, body="Spurious claim.")],
+            gt={"true_positives": [{"file": "a.py", "line": 10}]},
+        )
+        out = self._run(_state(), rec)
+        self.assertEqual(out["escaped"], 2)
+        self.assertEqual(out["escaped_judged"], 1)
+        self.assertTrue(out["has_ground_truth"])
+
+    def test_without_ground_truth_judged_is_none_not_zero(self):
+        out = self._run(_state(), _record([_comment()]))
+        self.assertIsNone(out["escaped_judged"])
+        self.assertFalse(out["has_ground_truth"])
+
+    def test_p1_detection(self):
+        rec = _record([_comment(body="**P1 (blocking)** · races on shutdown")])
+        self.assertEqual(self._run(_state(), rec)["escaped_p1"], 1)
+
+    def test_out_of_scope_escape_flagged(self):
+        rec = _record([_comment(path="other/z.py")], files=("a.py",))
+        out = self._run(_state(), rec)
+        self.assertFalse(out["escapes"][0]["in_scope"])
+        self.assertEqual(out["escaped_in_scope"], 0)
+
+
+class AggregateTests(unittest.TestCase):
+    def test_judged_block_only_counts_gt_runs(self):
+        rows = [
+            {"bot_findings_substantive": 10, "escaped": 5, "escaped_p1": 1,
+             "escaped_in_scope": 4, "escape_rate": 0.5, "exit_reason": "converged",
+             "has_ground_truth": True, "escaped_judged": 1},
+            {"bot_findings_substantive": 10, "escaped": 5, "escaped_p1": 0,
+             "escaped_in_scope": 3, "escape_rate": 0.5, "exit_reason": "converged",
+             "has_ground_truth": False, "escaped_judged": None},
+        ]
+        agg = er.aggregate(rows)
+        self.assertEqual(agg["escape_rate"], 0.5)
+        self.assertEqual(agg["judged"]["runs"], 1)
+        self.assertEqual(agg["judged"]["escaped_judged"], 1)
+        self.assertAlmostEqual(agg["judged"]["escape_rate_judged"], 0.1)
+
+    def test_by_exit_reason_split(self):
+        rows = [
+            {"bot_findings_substantive": 4, "escaped": 1, "escaped_p1": 0,
+             "escaped_in_scope": 1, "escape_rate": 0.25,
+             "exit_reason": "converged", "has_ground_truth": False,
+             "escaped_judged": None},
+            {"bot_findings_substantive": 4, "escaped": 3, "escaped_p1": 0,
+             "escaped_in_scope": 2, "escape_rate": 0.75,
+             "exit_reason": "capped-at-max", "has_ground_truth": False,
+             "escaped_judged": None},
+        ]
+        agg = er.aggregate(rows)
+        self.assertEqual(agg["by_exit_reason"]["converged"]["escape_rate"], 0.25)
+        self.assertEqual(
+            agg["by_exit_reason"]["capped-at-max"]["escape_rate"], 0.75)
+
+
+if __name__ == "__main__":
+    unittest.main()

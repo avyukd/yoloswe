@@ -31,11 +31,14 @@ var (
 	protocolLogDir    string
 	envelopeFile      string
 	skipTestExecution bool
+	diffBase          string
+	diffHead          string
 	scopeHintsFile    string
 	resumeSessionID   string
 	resumePromptStyle string
 	reviewMode        string
 	rubricFile        string
+	reviewPromptFile  string
 )
 
 type promptStyle string
@@ -84,10 +87,16 @@ func init() {
 	Cmd.Flags().StringVar(&protocolLogDir, "protocol-log-dir", "", "Directory for protocol session logs (Codex only; also supports $BRAMBLE_PROTOCOL_LOG_DIR)")
 	Cmd.Flags().StringVar(&envelopeFile, "envelope-file", "", "Write the JSON ResultEnvelope to this file instead of stdout (stdout then carries only progress events)")
 	Cmd.Flags().BoolVar(&skipTestExecution, "skip-test-execution", false, "Instruct the reviewer not to run tests/build commands (caller runs them separately)")
+	// No backticks in this help string: cobra reads a backticked span as the
+	// flag's type name, so "`git diff <base>..<head>`" would render as the
+	// argument placeholder instead of "string".
+	Cmd.Flags().StringVar(&diffBase, "diff-base", "", "Commit the reviewed diff is measured against (the change's merge base). When set, the prompt states 'git diff BASE..HEAD' explicitly instead of letting the agent guess — a guess of 'main...HEAD' silently widens the diff whenever the local base branch has advanced past the merge base. Code mode only.")
+	Cmd.Flags().StringVar(&diffHead, "diff-head", "", "Other end of the reviewed diff range (default: HEAD). Only meaningful with --diff-base.")
 	Cmd.Flags().StringVar(&scopeHintsFile, "scope-hints-file", "", "JSON file with co-located test paths and cross-service packages to widen review scope; see reviewer.ScopeHints. Missing/malformed files log a warning and fall back to today's narrow review.")
 	Cmd.Flags().StringVar(&resumeSessionID, "resume-session-id", "", "Resume an existing backend session/thread id")
 	Cmd.Flags().StringVar(&resumePromptStyle, "resume-prompt-style", "fresh", "Prompt style when resuming: follow-up or fresh. Auto-promotes to follow-up when --resume-session-id is set without an explicit style.")
 	Cmd.Flags().StringVar(&reviewMode, "review-mode", "code", "Review mode: code (default; reviewer.ReviewModeCode) or design-doc (reviewer.ReviewModeDesignDoc).")
+	Cmd.Flags().StringVar(&reviewPromptFile, "review-prompt-file", "", "Path to a file whose contents replace the built-in code-review persona and focus areas. The JSON output contract and scope clauses are never overridable. Missing/empty file warns and falls back. Code mode only; use --review-rubric-file for design-doc.")
 	Cmd.Flags().StringVar(&rubricFile, "review-rubric-file", "", "Path to a rubric file (one grilling question per non-blank line). Required for --review-mode design-doc; rejected for --review-mode code.")
 }
 
@@ -193,7 +202,9 @@ func runCodeReview(cmd *cobra.Command, args []string) (retErr error) {
 		return emitEarlyFailure(err, "", requestedMode, emitEnvelope)
 	}
 
-	mode, err := validateModeFlags(reviewMode, scopeHintsFile, rubricFile, skipTestExecution)
+	mode, err := validateModeFlags(reviewMode, scopeHintsFile, rubricFile,
+		reviewPromptFile, skipTestExecution,
+		diffScope{base: diffBase, head: diffHead})
 	if err != nil {
 		// Tag the failure envelope with the operator's *requested*
 		// mode when it's a known literal. Without this, an orchestrator
@@ -282,7 +293,9 @@ func runCodeReview(cmd *cobra.Command, args []string) (retErr error) {
 	}
 	defer r.Stop()
 
-	prompt, err := buildPromptForRun(mode, goal, scopeHintsFile, rubricFile, skipTestExecution, style)
+	prompt, err := buildPromptForRun(mode, goal, scopeHintsFile, rubricFile,
+		reviewPromptFile, skipTestExecution, style,
+		diffScope{base: diffBase, head: diffHead})
 	if err != nil {
 		return emitEarlyFailure(err, r.EffectiveModel(), mode, emitEnvelope)
 	}
@@ -533,8 +546,8 @@ func reportEnvelopePrintError(printErr error) {
 // scope-hints path does) matters for design-doc mode: the rubric IS the
 // review for that mode, so a missing/malformed rubric file must abort,
 // not silently degrade.
-func buildPromptForRun(mode reviewer.ReviewMode, goal, hintsPath, rubricPath string, skipTestExecution bool, style promptStyle) (string, error) {
-	opts, err := loadPromptOptions(mode, hintsPath, rubricPath, skipTestExecution)
+func buildPromptForRun(mode reviewer.ReviewMode, goal, hintsPath, rubricPath, personaPath string, skipTestExecution bool, style promptStyle, scope diffScope) (string, error) {
+	opts, err := loadPromptOptions(mode, hintsPath, rubricPath, personaPath, skipTestExecution, scope)
 	if err != nil {
 		return "", err
 	}
@@ -585,7 +598,15 @@ func normalizePromptStyle(resumeSessionID, rawStyle string, styleExplicit bool) 
 // (see redactPath). LoadScopeHints itself also identifies the file by
 // basename in its error text, so the slog "error" attribute is
 // already path-clean.
-func loadPromptOptions(mode reviewer.ReviewMode, hintsPath, rubricPath string, skipTestExecution bool) (reviewer.PromptOptions, error) {
+// diffScope carries the reviewed diff's endpoints from the flags to the
+// prompt builder. Grouped rather than threaded as two more positional
+// params, which would push buildPromptForRun past the readable arity.
+type diffScope struct {
+	base string
+	head string
+}
+
+func loadPromptOptions(mode reviewer.ReviewMode, hintsPath, rubricPath, personaPath string, skipTestExecution bool, scope diffScope) (reviewer.PromptOptions, error) {
 	switch mode {
 	case reviewer.ReviewModeDesignDoc:
 		rubric, err := loadRubricFile(rubricPath)
@@ -597,18 +618,51 @@ func loadPromptOptions(mode reviewer.ReviewMode, hintsPath, rubricPath string, s
 			Rubric: rubric,
 		}, nil
 	default:
+		// A missing/unreadable persona file degrades to the built-in
+		// prompt rather than aborting, matching --scope-hints-file. The
+		// review is still valid without it; only the experiment is lost,
+		// and the warning says so.
+		persona := loadPersonaFile(personaPath)
+		var opts reviewer.PromptOptions
 		if hintsPath == "" {
-			return reviewer.PromptOptions{SkipTestExecution: skipTestExecution}, nil
-		}
-		hints, err := reviewer.LoadScopeHints(hintsPath)
-		if err != nil {
+			opts = reviewer.PromptOptions{SkipTestExecution: skipTestExecution}
+		} else if hints, err := reviewer.LoadScopeHints(hintsPath); err != nil {
 			slog.Warn("scope-hints file ignored, using narrow review",
 				"file", filepath.Base(hintsPath),
 				"error", err.Error())
-			return reviewer.PromptOptions{SkipTestExecution: skipTestExecution}, nil
+			opts = reviewer.PromptOptions{SkipTestExecution: skipTestExecution}
+		} else {
+			opts = hints.ToPromptOptions(skipTestExecution)
 		}
-		return hints.ToPromptOptions(skipTestExecution), nil
+		opts.PersonaOverride = persona
+		// Set after the hints branch so it survives either path. A
+		// design-doc review has no diff, so this is code-mode only.
+		opts.DiffBase = scope.base
+		opts.DiffHead = scope.head
+		return opts, nil
 	}
+}
+
+// loadPersonaFile reads a code-review persona override, or returns "" to
+// keep the built-in prompt. Warns rather than fails: losing the variant is
+// better than losing the review.
+func loadPersonaFile(path string) string {
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		slog.Warn("review-prompt-file ignored, using built-in persona",
+			"file", filepath.Base(path), "error", err.Error())
+		return ""
+	}
+	persona := strings.TrimSpace(string(data))
+	if persona == "" {
+		slog.Warn("review-prompt-file is empty, using built-in persona",
+			"file", filepath.Base(path))
+		return ""
+	}
+	return persona
 }
 
 // rubricLineMaxLen bounds the length of one rubric entry. 500 chars is
@@ -686,16 +740,42 @@ func requestedModeOrCode(modeStr string) reviewer.ReviewMode {
 	return reviewer.ReviewModeCode
 }
 
-func validateModeFlags(modeStr, hintsPath, rubricPath string, skipTestExec bool) (reviewer.ReviewMode, error) {
+func validateModeFlags(modeStr, hintsPath, rubricPath, personaPath string, skipTestExec bool, scope diffScope) (reviewer.ReviewMode, error) {
 	switch reviewer.ReviewMode(modeStr) {
 	case reviewer.ReviewModeCode, "":
 		if rubricPath != "" {
 			return "", fmt.Errorf("--review-rubric-file requires --review-mode design-doc")
 		}
+		// Reject a malformed revision here rather than letting the prompt
+		// builder drop the clause: a silently-omitted diff scope leaves
+		// the agent guessing again, which is the bug this flag fixes,
+		// and the run would look correct while measuring the wrong diff.
+		if scope.base != "" && !reviewer.ValidGitRevision(scope.base) {
+			return "", fmt.Errorf("--diff-base %q is not a valid git revision", scope.base)
+		}
+		if scope.head != "" && !reviewer.ValidGitRevision(scope.head) {
+			return "", fmt.Errorf("--diff-head %q is not a valid git revision", scope.head)
+		}
+		if scope.head != "" && scope.base == "" {
+			return "", fmt.Errorf("--diff-head requires --diff-base")
+		}
 		return reviewer.ReviewModeCode, nil
 	case reviewer.ReviewModeDesignDoc:
 		if rubricPath == "" {
 			return "", fmt.Errorf("--review-mode design-doc requires --review-rubric-file")
+		}
+		// Mirror of the rubric rule above: the persona override is a
+		// code-mode knob, and the design-doc persona is rubric-driven.
+		// Erroring (rather than warning) keeps the two file flags
+		// symmetric, so neither can be silently ignored.
+		if personaPath != "" {
+			return "", fmt.Errorf("--review-prompt-file requires --review-mode code")
+		}
+		// Same reasoning: a design-doc review has no diff, and silently
+		// ignoring a diff scope the caller took the trouble to compute
+		// is exactly the failure this flag exists to prevent.
+		if scope.base != "" || scope.head != "" {
+			return "", fmt.Errorf("--diff-base/--diff-head require --review-mode code")
 		}
 		if hintsPath != "" {
 			slog.Warn("--scope-hints-file ignored in design-doc mode",
