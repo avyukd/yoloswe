@@ -81,6 +81,16 @@ needs it) and `worktree` (the cwd for bramble re-runs and the judge's
 canonical round has no resolved merge base — collection cannot judge a diff
 it cannot scope; re-harvest with the repo checked out.
 
+`canonical_round` is also persisted into the session, so the round loop can
+re-read it instead of holding it across turns:
+
+```bash
+python3 .claude/skills/code-review-replay/scripts/collect.py session-info \
+  --session <SESSION>                      # whole canonical_round block
+python3 .claude/skills/code-review-replay/scripts/collect.py session-info \
+  --session <SESSION> --field goal_text    # raw text, for --goal "$(…)"
+```
+
 ## Step 2 — the ground-truth round loop
 
 Collection establishes ground truth for **one diff** — the PR's original
@@ -107,7 +117,15 @@ Monitor({
 })
 ```
 
-`GOAL` is `canonical_round.goal_text` from `setup`. Mirror the Monitor for
+Set `GOAL` from the session rather than pasting a multi-KB PR body into the
+command line:
+
+```bash
+GOAL="$(python3 .claude/skills/code-review-replay/scripts/collect.py \
+  session-info --session <SESSION> --field goal_text)"
+```
+
+Mirror the Monitor for
 `cursor` (`--backend cursor --model composer-2`) and optionally `gemini`
 (`--backend gemini --model gemini-3.1-flash-lite-preview`). `bramble
 code-review` is read-only, so all backends share the one worktree safely.
@@ -121,9 +139,26 @@ python3 .claude/skills/code-review-replay/scripts/collect.py build-prompt \
   --envelope cursor=/tmp/crr-r<round>/cursor-envelope.json
 ```
 
-Pass each backend's envelope from this round. `--include-harvested` folds
+Pass each backend's envelope from this round. **Only pass envelopes whose
+`status` is `ok`.** A backend that stalled or failed to start still writes
+an envelope, but with `status: "error"` and an empty `review` — folding that
+in tells the judge "this reviewer looked and found nothing," which silently
+inflates the apparent false-negative rate of a reviewer that never ran.
+Check `status` before passing, retry the backend, and if it keeps failing,
+record it as unavailable for the round rather than as a silent zero.
+
+`--include-harvested` folds
 the original pr-polish review in as an extra data point — pass it every
-round; it is not a special case. The call prints the `judge_prompt` path.
+round; it is not a special case. It contributes nothing on a
+`harvest_source: "github"` record (those have no local envelopes).
+
+**`--include-seeds`** passes inline external-reviewer comments as *candidate
+defect locations* for the judge to verdict independently. They are neither
+findings nor ground truth — bots are frequently wrong — but starting from
+real candidates rather than rediscovering them from the diff cuts
+rounds-to-saturation, which is what makes large-corpus collection
+affordable. Use it for corpus collection; omit it when you specifically
+want to measure unaided judge discovery. The call prints the `judge_prompt` path.
 The prompt carries the *cumulative* union of reviewer findings (this round +
 all prior), the running census, and any contested findings.
 
@@ -198,7 +233,16 @@ judge-prompt path:
 > `census_merges` member must carry `file` (and `line`, which may be `null`
 > for a file-level finding) — an entry with no location is rejected, since
 > it would freeze into the ground truth keyed on an empty location.
-> `census_merges` is optional. Judge on the code, not the labels.
+> **Anchor every finding to the line it concerns. At most one
+> `line: null` finding per file is allowed** — defect identity is
+> `(file, line)`, so a second file-level finding on the same path collapses
+> into the first and the two flip each other into a contested state no later
+> round can resolve. Reserve the one `null` slot for a defect that genuinely
+> has no line (e.g. "this file has no test for X").
+> `census_merges` is optional, but when used each `members` entry must be an
+> **object** — `{"file": "a/b.py", "line": 12}` — never a `"a/b.py:12"` string.
+> Two judges in one batch emitted strings and had the whole file rejected.
+> Judge on the code, not the labels.
 
 ### 2d — fold the verdict and test convergence
 
@@ -209,9 +253,15 @@ python3 .claude/skills/code-review-replay/scripts/collect.py fold \
 
 (`--round-budget` defaults to 10.) `fold` prints `census_converged`,
 `uncovered_census_items`, `contested`, `unresolved_contested`, and a
-`should_continue` hint. Convergence requires the census stable + covered
-**and** zero `unresolved_contested`. If `should_continue` is `true`,
-increment `round` and loop to **2a**; otherwise go to Step 3.
+`should_continue` hint. Convergence requires the round to have censused
+**no new defect** *and* zero `unresolved_contested`. If `should_continue` is
+`true`, increment `round` and loop to **2a**; otherwise go to Step 3.
+
+`uncovered_census_items` is reported but does **not** gate: the judge
+censuses real bugs no reviewer caught, and those are precisely the recall
+signal replay measures. A converged run routinely carries uncovered low/nit
+items — that means the reviewers were quiet, not that the ground truth is
+incomplete.
 
 ## Step 3 — freeze the ground truth
 
@@ -238,6 +288,52 @@ contested, low harvest agreement, budget-forced, empty TP set). Exit 0 =
 clean, 1 = quality warnings, 2 = malformed. `--all` checks every PR in the
 index and prints a tally.
 
+## Step 5 — human review pass (optional, but this is how the census ratchets up)
+
+`validate` checks a record is **well-formed**, never that it is **right**. The
+frozen census is a lower bound and is known to miss defects: on kernel-8276,
+recurrent unmatched replay findings outnumbered the 10-entry census. A human
+second pass is the correction path.
+
+```bash
+# Read-only by default — browse every record, no risk to the dataset.
+python3 .claude/skills/code-review-replay/scripts/reviewui.py
+
+# Stage verdicts (writes an overlay, never the dataset).
+python3 .claude/skills/code-review-replay/scripts/reviewui.py --allow-write
+```
+
+The UI lists all GT-carrying records and, per PR, renders the diff
+(`merge_base..head_before`) with every judged finding anchored to its line.
+Findings are grouped by **anchor class**, because only ~71% land inside a
+rendered diff hunk — the rest sit off-hunk, in a file the PR never touched, or
+are file-level, and a diff-only view would hide roughly a quarter of the set.
+Unmatched replay findings appear as ranked suggestions to adjudicate.
+
+Verdicts stage to `~/.bramble/code-review-eval/human-review/<target>.json`.
+Applying them is a **separate, deliberate command**:
+
+```bash
+python3 .claude/skills/code-review-replay/scripts/collect.py \
+    apply-human-review <repo>-<pr> --dry-run     # inspect first
+python3 .claude/skills/code-review-replay/scripts/collect.py \
+    apply-human-review <repo>-<pr>
+python3 .claude/skills/code-review-replay/scripts/collect.py \
+    apply-human-review <repo>-<pr> --strip       # undo the whole pass
+```
+
+`apply-human-review` is deliberately **not** a `fold`. Folding a human verdict
+as a judge round would take the flip branch on every rejection — recording
+human-vs-machine disagreement in `contested` as if two judges disagreed — and
+would bump `rounds_run`, making `census_converged` partly a function of human
+agreement. Instead it rewrites the frozen block additively, leaves all round
+accounting untouched, is idempotent, and refuses if the ground truth changed
+since the review was staged (re-collection invalidates the verdicts). Every
+mutation is stamped, so `--strip` restores the pre-human block exactly.
+
+An unconverged census **warns but does not block** — those records are exactly
+where the census is most likely incomplete, so they need the pass most.
+
 ---
 
 # Replay mode
@@ -245,7 +341,16 @@ index and prints a tally.
 `/code-review-replay [<repo>-<pr>]` — score a reviewer-under-test.
 
 With no PR id, replay **randomly samples** PRs that have a frozen ground
-truth. Pass a `<repo>-<pr>` id to score one specific PR.
+truth **and were harvested from local `/pr-polish` history**. Pass a
+`<repo>-<pr>` id to score one specific PR.
+
+GitHub-sourced records (`harvest_source: "github"`) are excluded from the
+sampling pool. They have no local review state, so their ground truth rests
+on external bot comments alone — measured **~9-14% precision**, yielding 40
+true positives against 201 false positives across 10 such PRs, versus 107/41
+from 19 pr-polish PRs. Scoring against that set rewards a reviewer for
+reproducing bot noise. They remain on disk; `--source github` includes them
+for auditing, and naming one explicitly runs it with a warning.
 
 ## Step 1 — build bramble
 
@@ -270,9 +375,11 @@ python3 .claude/skills/code-review-replay/scripts/replay.py <repo>-<pr> \
   --print-markdown
 ```
 
-`--sample N` sets how many PRs the no-target form draws (default 5).
+`--sample N` sets how many PRs the no-target form draws (default 5), and
+`--source {pr-polish,github}` (repeatable) overrides which harvest tiers the
+pool is drawn from.
 `replay.py` runs `bramble code-review` per config (default `codex-5.4-mini`
-+ `cursor-composer2`; add `--config gemini-3.1-flash-lite-preview`) at the
++ `cursor-composer2`; add `--config codex-5.6-luna`) at the
 frozen diff's `head_before`, matches each finding to the frozen
 `ground_truth_v3`, and writes a scored result to
 `~/.bramble/code-review-eval/replays/`. Filter rounds with `--tier r1` or
@@ -313,6 +420,19 @@ All metrics come from matching the reviewer's findings to the **frozen**
 - **`census_converged: false` in the GT** — the recall denominator may be
   incomplete; treat recall as a lower bound.
 
+## One run is not a measurement
+
+Reviewer output is substantially nondeterministic. Measured on kernel-8276,
+four runs of `cursor-composer2` against a byte-identical diff and goal gave
+four different outcomes — `accepted`(0 issues), `rejected`(1 high),
+`accepted`(0), `rejected`(1 medium) — including *which* defect it found. It
+caught the diff's top defect in roughly one run of three.
+
+So a single run per config measures the draw as much as the reviewer. Before
+concluding one config beats another, run each **at least 3 times** and
+compare the distribution, not the sample. A config that finds nothing once
+has not been shown to miss anything.
+
 ## Key files
 
 | Area | File |
@@ -321,7 +441,14 @@ All metrics come from matching the reviewer's findings to the **frozen**
 | Collection: glue + GT model | `.claude/skills/code-review-replay/scripts/collect.py`, `collect_lib.py` |
 | Replay: scorer | `.claude/skills/code-review-replay/scripts/replay.py` |
 | Parsing / goal / scoring lib | `.claude/skills/code-review-replay/scripts/replay_lib.py` |
+| Human review: web UI | `.claude/skills/code-review-replay/scripts/reviewui.py`, `reviewui_lib.py` |
+| Human review: overlay + apply | `.claude/skills/code-review-replay/scripts/humanreview_lib.py` |
+| Staged human verdicts | `~/.bramble/code-review-eval/human-review/` (outside the repo) |
 | Dataset schema + CLI reference | `.claude/skills/code-review-replay/scripts/README.md` |
 | Dataset records (frozen GT) | `~/.bramble/code-review-eval/dataset/` (outside the repo) |
 | Scored replay results | `~/.bramble/code-review-eval/replays/` (outside the repo) |
 | Collection session state | `~/.bramble/code-review-eval/collect/` (outside the repo) |
+| **Recurring benchmark process** | `docs/design/code-review-benchmark-process.md` |
+
+The process doc is the operating procedure — cadence, runbooks, promotion checklist,
+and known failure modes — for running this benchmark regularly rather than once.

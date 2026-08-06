@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""Tests for verdict.py — the computed, persisted pr-polish verdict."""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+SCRIPTS = Path(__file__).resolve().parents[1]
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+import verdict as v  # noqa: E402
+
+
+def _state(**kw):
+    base = {
+        "pr_number": 1,
+        "completed": True,
+        "exit_reason": "converged",
+        "completed_at": "2026-07-30T00:00:00Z",
+        "rounds": [],
+    }
+    base.update(kw)
+    return base
+
+
+class ReasonSubstanceTests(unittest.TestCase):
+    """The wont_fix escape hatch: any non-empty string used to clear it."""
+
+    def test_placeholder_reasons_rejected(self):
+        for text in ("", " ", "n/a", "by design", "wontfix", "later", "no"):
+            self.assertFalse(v.reason_is_substantive(text), text)
+
+    def test_short_reason_rejected(self):
+        self.assertFalse(v.reason_is_substantive("too short to argue"))
+
+    def test_real_rationale_accepted(self):
+        self.assertTrue(v.reason_is_substantive(
+            "This path is unreachable because the caller validates the "
+            "artifact id before dispatch, so the branch cannot execute."
+        ))
+
+    def test_long_but_contentless_still_rejected(self):
+        # Padding a stock phrase to length must not buy a pass.
+        self.assertFalse(v.reason_is_substantive("out of scope"))
+
+
+class FilePathHeuristicTests(unittest.TestCase):
+    """`ci` rows put a workflow run id in `path`; it is not a file."""
+
+    def test_workflow_run_id_is_not_a_path(self):
+        self.assertFalse(v._is_file_path("90720812688"))
+
+    def test_real_paths_accepted(self):
+        self.assertTrue(v._is_file_path("services/api/routes.py"))
+        self.assertTrue(v._is_file_path("main.go"))
+
+    def test_empty_is_not_a_path(self):
+        self.assertFalse(v._is_file_path(""))
+        self.assertFalse(v._is_file_path(None))
+
+
+class OpenHighDeferralTests(unittest.TestCase):
+    def test_bare_ack_on_high_blocks(self):
+        st = _state(rounds=[{"n": 1, "comment_actions": [
+            {"action": "ack", "severity": "high", "path": "a.py", "line": 1},
+        ]}])
+        self.assertEqual(len(v.open_high_deferrals(st)), 1)
+
+    def test_wont_fix_with_real_reason_resolves(self):
+        st = _state(rounds=[{"n": 1, "comment_actions": [
+            {"action": "wont_fix", "severity": "high", "path": "a.py",
+             "line": 1,
+             "reason": "The value is validated upstream in the dispatcher, "
+                       "so this branch cannot be reached at runtime."},
+        ]}])
+        self.assertEqual(v.open_high_deferrals(st), [])
+
+    def test_wont_fix_with_placeholder_reason_blocks(self):
+        st = _state(rounds=[{"n": 1, "comment_actions": [
+            {"action": "wont_fix", "severity": "high", "path": "a.py",
+             "line": 1, "reason": "n/a"},
+        ]}])
+        self.assertEqual(len(v.open_high_deferrals(st)), 1)
+
+    def test_low_severity_deferral_does_not_block(self):
+        st = _state(rounds=[{"n": 1, "comment_actions": [
+            {"action": "ack", "severity": "low", "path": "a.py", "line": 1},
+        ]}])
+        self.assertEqual(v.open_high_deferrals(st), [])
+
+    def test_later_fixed_supersedes_earlier_ack(self):
+        row = {"severity": "high", "path": "a.py", "line": 1, "topic": "t",
+               "source": "codex"}
+        st = _state(rounds=[
+            {"n": 1, "comment_actions": [dict(row, action="ack")]},
+            {"n": 2, "comment_actions": [dict(row, action="fixed")]},
+        ])
+        self.assertEqual(v.open_high_deferrals(st), [])
+
+
+class VerdictTests(unittest.TestCase):
+    def test_capped_at_max_can_never_be_ready(self):
+        # The headline conflation: budget exhaustion previously reached the
+        # same summary as genuine convergence.
+        out = v.compute_verdict(_state(exit_reason="capped-at-max"))
+        self.assertEqual(out["verdict"], "not_ready")
+        self.assertIn("abnormal_exit", [b["code"] for b in out["blockers"]])
+
+    def test_clean_converged_run_is_ready(self):
+        self.assertEqual(v.compute_verdict(_state())["verdict"], "ready")
+
+    def test_incomplete_run_is_inconclusive_not_not_ready(self):
+        # "Couldn't check" must stay distinct from "it's broken".
+        out = v.compute_verdict(_state(completed=False, exit_reason=None))
+        self.assertEqual(out["verdict"], "inconclusive")
+
+    def test_sufficiency_dissent_is_advisory_never_blocking(self):
+        st = _state(rounds=[{
+            "n": 1,
+            "sufficiency_claims": {"codex": {"is_confident_complete": False}},
+        }])
+        out = v.compute_verdict(st)
+        self.assertEqual(out["verdict"], "ready")
+        self.assertIn("sufficiency_dissent",
+                      [a["code"] for a in out["advisories"]])
+
+    def test_silent_reviewer_is_advisory(self):
+        st = _state(rounds=[{"n": 1, "codex_findings": [],
+                             "cursor_findings": [{"x": 1}]}])
+        out = v.compute_verdict(st)
+        self.assertIn("silent_reviewer",
+                      [a["code"] for a in out["advisories"]])
+        self.assertEqual(out["verdict"], "ready")
+
+
+class FixClaimVerificationTests(unittest.TestCase):
+    def _repo(self, td):
+        repo = Path(td)
+        run = lambda *a: subprocess.run(
+            ["git", "-C", str(repo), *a], capture_output=True, text=True)
+        run("init", "-q")
+        run("config", "user.email", "t@t")
+        run("config", "user.name", "t")
+        (repo / "a.py").write_text("one\n")
+        (repo / "b.py").write_text("one\n")
+        run("add", "-A")
+        run("commit", "-qm", "one")
+        before = run("rev-parse", "HEAD").stdout.strip()
+        (repo / "a.py").write_text("two\n")
+        run("add", "-A")
+        run("commit", "-qm", "two")
+        after = run("rev-parse", "HEAD").stdout.strip()
+        return repo, before, after
+
+    def test_claim_on_touched_file_verifies(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo, before, after = self._repo(td)
+            st = _state(rounds=[{
+                "n": 1, "head_before": before, "head_after": after,
+                "comment_actions": [
+                    {"action": "fixed", "severity": "high", "path": "a.py"},
+                ]}])
+            res = v.verify_fix_claims(st, repo)
+            self.assertEqual((res["total"], res["verified"]), (1, 1))
+
+    def test_claim_on_untouched_file_is_unverified_and_blocks(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo, before, after = self._repo(td)
+            st = _state(rounds=[{
+                "n": 1, "head_before": before, "head_after": after,
+                "comment_actions": [
+                    {"action": "fixed", "severity": "high", "path": "b.py"},
+                ]}])
+            self.assertEqual(v.verify_fix_claims(st, repo)["unverified"], 1)
+            out = v.compute_verdict(st, repo_root=repo)
+            self.assertEqual(out["verdict"], "not_ready")
+            self.assertIn("unverified_fix_claim",
+                          [b["code"] for b in out["blockers"]])
+
+    def test_round_that_committed_nothing_but_claims_fixed(self):
+        # The sharpest fabrication signal.
+        with tempfile.TemporaryDirectory() as td:
+            repo, before, _ = self._repo(td)
+            st = _state(rounds=[{
+                "n": 1, "head_before": before, "head_after": before,
+                "comment_actions": [
+                    {"action": "fixed", "severity": "high", "path": "a.py"},
+                ]}])
+            res = v.verify_fix_claims(st, repo)
+            self.assertEqual(res["unverified"], 1)
+            self.assertTrue(res["unverified_rows"][0]["no_commit"])
+
+    def test_absent_commits_are_unknown_not_unverified(self):
+        # An old PR whose branch was deleted: we cannot check, and saying
+        # "unverified" would be indistinguishable from real fabrication.
+        with tempfile.TemporaryDirectory() as td:
+            repo, _, _ = self._repo(td)
+            st = _state(rounds=[{
+                "n": 1, "head_before": "0" * 40, "head_after": "1" * 40,
+                "comment_actions": [
+                    {"action": "fixed", "severity": "high", "path": "a.py"},
+                ]}])
+            res = v.verify_fix_claims(st, repo)
+            self.assertEqual(res["unverified"], 0)
+            self.assertEqual(res["unknown"], 1)
+            self.assertEqual(v.compute_verdict(st, repo_root=repo)["verdict"],
+                             "ready")
+
+    def test_ci_workflow_id_is_not_counted(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo, before, after = self._repo(td)
+            st = _state(rounds=[{
+                "n": 1, "head_before": before, "head_after": after,
+                "comment_actions": [
+                    {"action": "fixed", "severity": "high",
+                     "source": "ci", "path": "90720812688"},
+                ]}])
+            res = v.verify_fix_claims(st, repo)
+            self.assertEqual((res["total"], res["unverified"]), (0, 0))
+
+    def test_fix_landing_in_a_later_round_is_not_a_false_positive(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo, before, after = self._repo(td)
+            st = _state(rounds=[
+                {"n": 1, "head_before": before, "head_after": before,
+                 "comment_actions": [
+                     {"action": "fixed", "severity": "high", "path": "a.py"}]},
+                {"n": 2, "head_before": before, "head_after": after,
+                 "comment_actions": []},
+            ])
+            self.assertEqual(v.verify_fix_claims(st, repo)["unverified"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

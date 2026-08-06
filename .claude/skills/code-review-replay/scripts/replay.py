@@ -47,6 +47,7 @@ if str(SCRIPT_DIR) not in sys.path:
 import collect_lib as cl  # noqa: E402
 import harvest_lib as hl  # noqa: E402
 import replay_lib as rl  # noqa: E402
+import unmatched_lib as ul  # noqa: E402
 
 # Dataset + scored results live OUTSIDE the repo — they are derived from
 # real private PRs and must never be committed. See harvest.py.
@@ -54,6 +55,13 @@ EVAL_ROOT = Path.home() / ".bramble" / "code-review-eval"
 DEFAULT_DATASET_DIR = EVAL_ROOT / "dataset"
 DEFAULT_OUT_DIR = EVAL_ROOT / "replays"
 DEFAULT_BRAMBLE_BIN = "bramble"
+# Which harvest_source tiers are scoreable by default. GitHub-sourced
+# records have no local pr-polish state, so their ground truth rests on bot
+# comments alone — measured ~9-14% precision on the kernel corpus. They stay
+# on disk (nothing is deleted) but are out of the scoring pool unless
+# --source asks for them explicitly.
+DEFAULT_REPLAY_SOURCES = frozenset({"pr-polish"})
+KNOWN_HARVEST_SOURCES = ("pr-polish", "github")
 CODE_REVIEW_LOG_DIR = Path.home() / ".bramble" / "logs" / "code-review"
 BRAMBLE_OPS_PATH = (
     SCRIPT_DIR.parents[1] / "pr-polish" / "scripts" / "bramble_ops.py"
@@ -73,6 +81,25 @@ class BackendConfig:
     extra_args: list[str] = field(default_factory=list)
 
 
+# Persona variants for --review-prompt-file. bramble runs with cwd set to
+# the PR's worktree, so these must be absolute or the path resolves against
+# the wrong tree; loadPersonaFile only *warns* on a missing file and falls
+# back to the built-in persona, so a relative path would silently score the
+# baseline under a variant's name.
+PERSONA_DIR = SCRIPT_DIR.parent / "personas"
+
+
+def _persona_args(stem: str) -> list[str]:
+    path = PERSONA_DIR / f"{stem}.md"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"persona variant {stem!r} not found at {path}. Replay would "
+            "silently fall back to the built-in persona and report the "
+            "baseline under the variant's name."
+        )
+    return ["--review-prompt-file", str(path.resolve())]
+
+
 # Mirrors the configs in the existing code-review-eval SKILL.md.
 CONFIGS: dict[str, BackendConfig] = {
     "codex-5.4-mini": BackendConfig(
@@ -86,6 +113,227 @@ CONFIGS: dict[str, BackendConfig] = {
         backend="cursor",
         model="composer-2",
     ),
+    "codex-5.6-luna": BackendConfig(
+        name="codex-5.6-luna",
+        backend="codex",
+        model="gpt-5.6-luna",
+        extra_args=["--effort", "medium"],
+    ),
+    # Effort variants. /pr-polish passes no --effort at all today, so
+    # "default" is the incumbent the others must beat — without it in the
+    # roster the bake-off would compare medium against high and never
+    # measure the change that production would actually see.
+    "codex-5.4-mini-default-effort": BackendConfig(
+        name="codex-5.4-mini-default-effort",
+        backend="codex",
+        model="gpt-5.4-mini",
+        extra_args=[],
+    ),
+    "codex-5.4-mini-high": BackendConfig(
+        name="codex-5.4-mini-high",
+        backend="codex",
+        model="gpt-5.4-mini",
+        extra_args=["--effort", "high"],
+    ),
+    "codex-5.6-luna-high": BackendConfig(
+        name="codex-5.6-luna-high",
+        backend="codex",
+        model="gpt-5.6-luna",
+        extra_args=["--effort", "high"],
+    ),
+    # Persona variants, all on codex-5.6-luna. Luna is the control backend
+    # for prompt work because it was the only config to complete 3/3 runs in
+    # the 2026-07-30 pilot — pairing a prompt variant with a backend that
+    # stalls ~30% of the time confounds the prompt effect with the stall
+    # rate. Each variant replaces only the persona/focus body; the JSON
+    # output contract, goal text, and scope clauses stay machine-owned.
+    #
+    # NOTE: two of the three suppression clauses these variants drop are
+    # persona-only ("Prioritize systemic problems over local ones" and
+    # "avoid nit-level comments"), so dropping them has real effect. The
+    # third ("do not strain to find something to flag") is ALSO present in
+    # the non-overridable codeJSONOutputRules, so no variant can remove it
+    # and no variant should be read as testing its absence.
+    "luna-no-suppression": BackendConfig(
+        name="luna-no-suppression",
+        backend="codex",
+        model="gpt-5.6-luna",
+        extra_args=["--effort", "medium", *_persona_args("no-suppression")],
+    ),
+    "luna-coverage-ledger": BackendConfig(
+        name="luna-coverage-ledger",
+        backend="codex",
+        model="gpt-5.6-luna",
+        extra_args=["--effort", "medium", *_persona_args("coverage-ledger")],
+    ),
+    # Overfitting risk is real here: the defect archetypes were written
+    # against a summary of kernel-8276's ground truth. A lift on kernel-8276
+    # alone does NOT promote this variant — it must transfer to a PR that
+    # was not consulted while writing it.
+    "luna-defect-class-priming": BackendConfig(
+        name="luna-defect-class-priming",
+        backend="codex",
+        model="gpt-5.6-luna",
+        extra_args=[
+            "--effort",
+            "medium",
+            *_persona_args("defect-class-priming"),
+        ],
+    ),
+    # Recall-first variants (2026-08-05). The user asked for recall even at
+    # some precision cost. These do NOT work by removing the suppression
+    # clauses: `luna-no-suppression` already tested that and it held recall
+    # flat while halving precision. Permission without procedure just raises
+    # temperature. Each of these instead gives an uncertain-but-real defect
+    # somewhere to go other than silence.
+    "luna-confidence-band": BackendConfig(
+        name="luna-confidence-band",
+        backend="codex",
+        model="gpt-5.6-luna",
+        extra_args=["--effort", "medium", *_persona_args("confidence-band")],
+    ),
+    "luna-adversarial-successor": BackendConfig(
+        name="luna-adversarial-successor",
+        backend="codex",
+        model="gpt-5.6-luna",
+        extra_args=[
+            "--effort",
+            "medium",
+            *_persona_args("adversarial-successor"),
+        ],
+    ),
+    "luna-severity-floor": BackendConfig(
+        name="luna-severity-floor",
+        backend="codex",
+        model="gpt-5.6-luna",
+        extra_args=["--effort", "medium", *_persona_args("severity-floor")],
+    ),
+    # Localization variants (2026-08-05). These target a *measured* failure
+    # mode, not a guessed one. On kernel-8276, 6 of 10 GT defects were found
+    # by 0 of 24 runs — yet 23 of 23 sessions read the exact lines holding
+    # them, and 17 of 24 runs *described* the stale-terminal-marker defect
+    # in prose while only 2 filed it at a scoreable location. The reviewer
+    # was not blind and was not quiet; it attributed the problem to the
+    # wrong site. Every never-found defect also sat under a confident
+    # docstring asserting the invariant held.
+    "luna-file-at-the-read": BackendConfig(
+        name="luna-file-at-the-read",
+        backend="codex",
+        model="gpt-5.6-luna",
+        extra_args=["--effort", "medium", *_persona_args("file-at-the-read")],
+    ),
+    # Ablation: localization discipline WITHOUT the docstring-skepticism
+    # section, so a win can be attributed to one half rather than the pair.
+    "luna-localize-only": BackendConfig(
+        name="luna-localize-only",
+        backend="codex",
+        model="gpt-5.6-luna",
+        extra_args=["--effort", "medium", *_persona_args("localize-only")],
+    ),
+    # localize-only + a both-directions field sweep. Manual adjudication of
+    # the misses (not the scorer) found the reviewer cited ALL THREE sites
+    # that CLEAR artifact_id and ZERO sites that WRITE it — 0 citations
+    # anywhere in sandbox.py across 36 runs, where GT holds a high-severity
+    # writer-site defect at sandbox.py:2422. It traces a field one direction.
+    "luna-localize-sweep": BackendConfig(
+        name="luna-localize-sweep",
+        backend="codex",
+        model="gpt-5.6-luna",
+        extra_args=[
+            "--effort", "medium", *_persona_args("localize-plus-sweep"),
+        ],
+    ),
+    # Round 3: localize + field sweep + caller-already-had-it. Manual
+    # adjudication found preview_desired.py:118 (a redundant SELECT on a hot
+    # poll path) is mentioned in 0 of 24 runs' prose — genuinely undetected,
+    # not mislocalized. The helper reads correctly in isolation; the waste is
+    # only visible from the call site, which the reviewer never checks.
+    "luna-localize-sweep-reuse": BackendConfig(
+        name="luna-localize-sweep-reuse",
+        backend="codex",
+        model="gpt-5.6-luna",
+        extra_args=[
+            "--effort", "medium", *_persona_args("localize-sweep-reuse"),
+        ],
+    ),
+    # Round 3: localize-only + a writer-site clause folded INTO the
+    # localization step, rather than added as a competing section. Rounds 1-2
+    # both showed that stacking a second top-level principle costs hits
+    # (file-at-the-read: no new TP, worst noise profile; localize-sweep:
+    # HIT 5 -> 3 while volume rose to 12.3/run). The target is still
+    # sandbox.py:2422, which 36 runs never cited.
+    "luna-localize-writers": BackendConfig(
+        name="luna-localize-writers",
+        backend="codex",
+        model="gpt-5.6-luna",
+        extra_args=[
+            "--effort", "medium", *_persona_args("localize-writers"),
+        ],
+    ),
+    # Round 4: the winning localize-only base plus ONE SENTENCE in the
+    # existing focus list (not a new section — every round that added a
+    # section regressed). Targets preview_desired.py:118, an efficiency
+    # defect 0 of 24 runs mentioned even in prose.
+    "luna-localize-reuse": BackendConfig(
+        name="luna-localize-reuse",
+        backend="codex",
+        model="gpt-5.6-luna",
+        extra_args=["--effort", "medium", *_persona_args("localize-reuse")],
+    ),
+    # Gemini via the CURSOR backend, not the gemini backend — the gemini
+    # CLI is rejected at the account level, but cursor proxies Gemini models
+    # and works. Note there is no gemini-3.5-pro in `cursor-agent models`
+    # (193 models, one Pro tier); these are the two nearest available.
+    #
+    # Cross-model check: every localization result so far is single-model
+    # (gpt-5.6-luna). If the localization lift is a luna quirk rather than a
+    # real principle, it will not transfer here.
+    # --idle-timeout 8m is REQUIRED, not tuning. Gemini thinks silently for
+    # >3 minutes before its first event on a review-sized prompt, so
+    # bramble's 3m default kills it mid-thought and the envelope comes back
+    # status=error with 0 input / 0 output tokens — indistinguishable from a
+    # dead backend. Verified: the same run at 8m returns ok with 4 issues.
+    "cursor-gemini-3.1-pro": BackendConfig(
+        name="cursor-gemini-3.1-pro",
+        backend="cursor",
+        model="gemini-3.1-pro",
+        extra_args=["--idle-timeout", "8m"],
+    ),
+    "cursor-gemini-3.5-flash": BackendConfig(
+        name="cursor-gemini-3.5-flash",
+        backend="cursor",
+        model="gemini-3.5-flash",
+        extra_args=["--idle-timeout", "8m"],
+    ),
+    # Cross-model validation of the localization persona (task #24). Every
+    # localization result so far is gpt-5.6-luna on kernel-8276, and the
+    # persona was written from that PR's own misses — so it could be a luna
+    # quirk rather than a transferable principle. These pair the SAME persona
+    # with two different model families. Gemini cannot serve here: both
+    # gemini models make zero tool calls under the review prompt, and a
+    # prompt effect cannot be measured on a model that never reads the code.
+    "mini-localize-only": BackendConfig(
+        name="mini-localize-only",
+        backend="codex",
+        model="gpt-5.4-mini",
+        extra_args=["--effort", "medium", *_persona_args("localize-only")],
+    ),
+    "composer-localize-only": BackendConfig(
+        name="composer-localize-only",
+        backend="cursor",
+        model="composer-2.5",
+        extra_args=_persona_args("localize-only"),
+    ),
+    "composer-baseline": BackendConfig(
+        name="composer-baseline",
+        backend="cursor",
+        model="composer-2.5",
+    ),
+    # Opt-in only. As of 2026-07-30 the gemini CLI client is rejected at the
+    # account level ("This client is no longer supported for Gemini Code
+    # Assist for individuals"), so this config fails to create a session on
+    # an individual account. Kept for workspace accounts and for when the
+    # wrapper migrates.
     "gemini-3.1-flash-lite-preview": BackendConfig(
         name="gemini-3.1-flash-lite-preview",
         backend="gemini",
@@ -109,6 +357,7 @@ def run_bramble_code_review(
     protocol_log_dir: Path,
     log_dir: Path,
     run_tag: str,
+    diff_base: Optional[str] = None,
     timeout_seconds: int = 900,
     verbose: bool = False,
 ) -> tuple[int, str, float]:
@@ -134,8 +383,17 @@ def run_bramble_code_review(
         str(envelope_file),
         "--protocol-log-dir",
         str(protocol_log_dir),
-        *cfg.extra_args,
     ]
+    # State the reviewed range explicitly. The worktree is detached at
+    # head_before, so without this the agent guesses — and the natural
+    # guess, `git diff main...HEAD`, three-dots against a local base
+    # branch that has long since advanced past this PR's merge base.
+    # Measured on kernel-8276: 336 files instead of 22, and the guess
+    # varied run to run, making diff scope an uncontrolled variable
+    # underneath every score.
+    if diff_base:
+        args += ["--diff-base", diff_base]
+    args += [*cfg.extra_args]
     env = os.environ.copy()
     env["BRAMBLE_RUN_TAG"] = run_tag
     env["WORK_DIR"] = str(cwd)
@@ -287,9 +545,36 @@ class TempWorktree:
         )
         if res.returncode != 0:
             raise RuntimeError(
-                f"git worktree add failed: {res.stderr.strip() or '(no stderr)'}"
+                f"git worktree add failed: "
+                f"{res.stderr.strip() or '(no stderr)'}"
+                f"{self._missing_commit_hint()}"
             )
         return self.path
+
+    def _missing_commit_hint(self) -> str:
+        """Turn "invalid reference" into the command that fixes it.
+
+        The usual cause is an older dataset record whose head_before was
+        never fetched into this checkout — the branch is merged and gone,
+        so only refs/pull/N/head still names the commit. Raw git output
+        ("fatal: invalid reference: <sha>") reads like a corrupt dataset
+        and sends you auditing the record instead of running one fetch.
+        collect.py setup already recovers this on the collection side;
+        replay only needed to say so.
+        """
+        probe = hl.git(
+            self.repo_path, "cat-file", "-e", f"{self.sha}^{{commit}}"
+        )
+        if probe.returncode == 0:
+            return ""  # commit exists; the failure is something else
+        return (
+            f"\n  commit {self.sha[:12]} is not in {self.repo_path}. "
+            "If the PR branch was merged and deleted, fetch its pull ref:\n"
+            f"    git -C {self.repo_path} fetch origin "
+            "refs/pull/<PR>/head\n"
+            "  If it was force-pushed away, the commit is unrecoverable "
+            "and the record cannot be replayed."
+        )
 
     def __exit__(self, *exc):
         # Best-effort cleanup: --force in case bramble left dirty files.
@@ -374,6 +659,7 @@ def run_replay(
     log_root: Path,
     verbose: bool,
     strict: bool = False,
+    stall_retries: int = 2,
 ) -> tuple[ReplayResult, Path]:
     """Run the reviewer-under-test and score it against the frozen GT.
 
@@ -469,6 +755,10 @@ def run_replay(
         round_label = f"{repo_pr}-r{round_n}"
         round_log = log_root / f"r{round_n}"
         files_changed = list(dr.get("files_changed") or [])
+        # The frozen record's merge base is the authoritative diff scope —
+        # the same range the collection judge was given. Passing it to the
+        # reviewer is what makes the two agree on "the diff".
+        merge_base = dr.get("merge_base_sha") or None
 
         if verbose:
             print(
@@ -487,19 +777,39 @@ def run_replay(
                 )
                 if verbose:
                     print(f"   config {cfg.name}...", file=sys.stderr)
-                rc, stderr_tail, started_at = run_bramble_code_review(
-                    bramble_bin=bramble_bin,
-                    cfg=cfg,
-                    goal=goal.text,
-                    cwd=wt,
-                    envelope_file=envelope_path,
-                    protocol_log_dir=round_log,
-                    log_dir=round_log,
-                    run_tag=run_tag,
-                    timeout_seconds=timeout_seconds,
-                    verbose=verbose,
-                )
-                env = parse_envelope_file(envelope_path)
+                # A stalled backend is not a zero-recall review — it is a
+                # review that never ran. Scoring it as "found nothing" both
+                # understates the config and, across a matrix, computes
+                # medians over uneven run counts. Measured on a 3-config
+                # pilot: 27% of attempts stalled, unevenly (one config lost
+                # 2 of 4 runs, another 0 of 3). So retry in-place rather
+                # than leaving the caller to notice and patch by hand.
+                for attempt in range(stall_retries + 1):
+                    rc, stderr_tail, started_at = run_bramble_code_review(
+                        bramble_bin=bramble_bin,
+                        cfg=cfg,
+                        goal=goal.text,
+                        cwd=wt,
+                        envelope_file=envelope_path,
+                        protocol_log_dir=round_log,
+                        log_dir=round_log,
+                        run_tag=(
+                            run_tag if not attempt
+                            else f"{run_tag}:retry{attempt}"
+                        ),
+                        diff_base=merge_base,
+                        timeout_seconds=timeout_seconds,
+                        verbose=verbose,
+                    )
+                    env = parse_envelope_file(envelope_path)
+                    if not _is_stalled_run(env):
+                        break
+                    if attempt < stall_retries:
+                        print(
+                            f"   {cfg.name}: stalled backend, retrying "
+                            f"({attempt + 1}/{stall_retries})",
+                            file=sys.stderr,
+                        )
                 if env is None:
                     scored = rl.ScoredRunV3(
                         backend=cfg.backend,
@@ -527,11 +837,9 @@ def run_replay(
                     continue
 
                 review = env.get("review") or {}
-                replay_findings = [
-                    f
-                    for f in (review.get("issues") or [])
-                    if isinstance(f, dict)
-                ]
+                replay_findings = rl.expand_finding_sites(
+                    review.get("issues") or []
+                )
                 env_status = env.get("status") or (
                     "ok" if review else "error"
                 )
@@ -740,29 +1048,91 @@ def diagnose_missing_dataset(dataset_path: Path, target: str) -> str:
     return "\n".join(lines)
 
 
+def _is_stalled_run(env: Optional[dict]) -> bool:
+    """Whether an envelope represents a backend that never produced a review.
+
+    Distinguishes "the reviewer ran and found nothing" (a real zero-recall
+    result that belongs in the score) from "the backend stalled" (no result
+    at all). Only the latter is retried — retrying a genuine empty review
+    would bias the sample toward configs that happen to be chatty.
+    """
+    if env is None:
+        return True  # no envelope written at all
+    if (env.get("status") or "") != "ok":
+        return True
+    return False
+
+
+def _target_harvest_source(dataset_dir: Path, target: str) -> Optional[str]:
+    """``harvest_source`` for one target, or None if it can't be determined.
+
+    Best-effort: a target may be a path, may not be in the index yet, or may
+    predate schema 3. None means "don't warn" — never a hard failure, since
+    this only decorates an explicitly requested run.
+    """
+    name = Path(target).name
+    stem = name[:-5] if name.endswith(".json") else name
+    index_path = dataset_dir / "index.json"
+    if not index_path.is_file():
+        return None
+    try:
+        index = json.loads(index_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    for e in index.get("prs") or []:
+        f = e.get("file") or ""
+        if f == f"{stem}.json":
+            return e.get("harvest_source") or "pr-polish"
+    return None
+
+
 def select_replay_targets(
-    *, dataset_dir: Path, sample: int
+    *, dataset_dir: Path, sample: int, sources: Optional[set] = None
 ) -> list[str]:
     """Randomly sample ``sample`` PRs that have a frozen ground truth.
 
     The pool is ``index.json``'s ``ground_truth_collected`` flag — no
     per-file scan. Used when ``replay.py`` is given no positional target.
+
+    ``sources`` restricts the pool by ``harvest_source``; it defaults to
+    ``DEFAULT_REPLAY_SOURCES`` (pr-polish only). GitHub-sourced records are
+    excluded because their ground truth is built from bot comments alone,
+    which measured ~9-14% precision on this corpus: 10 such PRs contributed
+    40 true positives against 201 false positives, versus 107/41 from 19
+    pr-polish PRs. Scoring against that inverted ratio rewards a reviewer
+    for reproducing bot noise. Pass ``--source github`` to include them
+    anyway (e.g. to audit the excluded tier); records stay on disk either
+    way, so this is a scoring filter, not a deletion.
     """
     index_path = dataset_dir / "index.json"
     if not index_path.is_file():
         raise SystemExit(f"error: no index.json under {dataset_dir}")
     index = json.loads(index_path.read_text())
-    pool = [
-        e["file"][:-5]  # strip ".json"
+    allowed = DEFAULT_REPLAY_SOURCES if sources is None else sources
+    entries = [
+        e
         for e in index.get("prs") or []
         if e.get("ground_truth_collected") and e.get("file", "").endswith(
             ".json"
         )
     ]
+    # Records written before schema 3 carry no harvest_source; they predate
+    # the GitHub source entirely, so they are pr-polish by construction.
+    pool = [
+        e["file"][:-5]  # strip ".json"
+        for e in entries
+        if (e.get("harvest_source") or "pr-polish") in allowed
+    ]
     if not pool:
+        excluded = len(entries) - len(pool)
         raise SystemExit(
-            "error: no PR in the dataset has a frozen ground truth — run "
-            "`/code-review-replay collect` first"
+            "error: no PR in the dataset has a frozen ground truth from "
+            f"source(s) {sorted(allowed)}"
+            + (
+                f" ({excluded} GT'd PR(s) excluded by --source)"
+                if excluded
+                else " — run `/code-review-replay collect` first"
+            )
         )
     return sorted(random.sample(pool, min(sample, len(pool))))
 
@@ -839,19 +1209,71 @@ def main(argv: Optional[list[str]] = None) -> int:
         "Structural errors always abort regardless of this flag.",
     )
     p.add_argument(
+        "--unmatched-report",
+        action="store_true",
+        help=(
+            "After scoring, triage the unmatched bucket by cross-run "
+            "recurrence. Precision ignores unmatched findings, so this is "
+            "the only view that distinguishes a recall-first variant "
+            "finding real defects the census missed from one generating "
+            "noise. Recurrent hits are re-collection candidates, not "
+            "recall credit."
+        ),
+    )
+    p.add_argument(
         "--print-markdown",
         action="store_true",
         help="Print a Markdown summary to stdout.",
     )
+    p.add_argument(
+        "--stall-retries",
+        type=int,
+        default=2,
+        help="Retries when a backend stalls and writes no usable envelope "
+        "(default 2). A stalled run is not a zero-recall review — scoring it "
+        "as one both understates the config and, across a matrix, computes "
+        "medians over uneven run counts. Measured at 27%% of attempts on a "
+        "3-config pilot, unevenly distributed. Set 0 to disable.",
+    )
+    p.add_argument(
+        "--source",
+        action="append",
+        default=[],
+        choices=KNOWN_HARVEST_SOURCES,
+        help="Which harvest_source tiers to draw sampled PRs from "
+        f"(default: {sorted(DEFAULT_REPLAY_SOURCES)}). GitHub-sourced GT is "
+        # argparse runs help strings through %-formatting, so a literal
+        # percent must be doubled or --help raises ValueError.
+        "built from bot comments alone (~9-14%% precision) and is excluded "
+        "from scoring by default; pass --source github to audit it. "
+        "Repeatable.",
+    )
     args = p.parse_args(argv)
 
     # ---- resolve which PR(s) to score ------------------------------------
+    sources = set(args.source) if args.source else set(DEFAULT_REPLAY_SOURCES)
     if args.target:
+        # An explicit target is honored even when its source is outside the
+        # scoring pool — but say so, so a number never lands in a writeup
+        # without the caveat attached.
         targets = [args.target]
+        src = _target_harvest_source(args.dataset_dir, args.target)
+        if src is not None and src not in sources:
+            print(
+                f"warning: {args.target} has harvest_source={src!r}, which is "
+                "outside the default scoring pool "
+                f"({sorted(DEFAULT_REPLAY_SOURCES)}). Its ground truth comes "
+                "from bot comments with no pr-polish triage; precision and "
+                "recall against it are not comparable to pr-polish-sourced "
+                "scores.",
+                file=sys.stderr,
+            )
     else:
         try:
             targets = select_replay_targets(
-                dataset_dir=args.dataset_dir, sample=args.sample
+                dataset_dir=args.dataset_dir,
+                sample=args.sample,
+                sources=sources,
             )
         except SystemExit as e:
             print(e, file=sys.stderr)
@@ -900,6 +1322,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 log_root=args.log_root,
                 verbose=args.verbose,
                 strict=args.strict,
+                stall_retries=args.stall_retries,
             )
         except RuntimeError as e:
             print(f"error scoring {target}: {e}", file=sys.stderr)
@@ -917,7 +1340,47 @@ def main(argv: Optional[list[str]] = None) -> int:
         for result in results:
             print(render_replay_markdown(result))
             print()
+
+    # Unmatched triage. Precision ignores this bucket entirely, so without
+    # it a recall-first variant's extra output is invisible: a real defect
+    # the census missed and a plausible hallucination score identically.
+    # Recurrence across independent runs separates them cheaply.
+    if args.unmatched_report:
+        _print_unmatched_report(results)
     return worst
+
+
+def _unmatched_observations(results: list) -> list[tuple]:
+    """Flatten scored results into (run_id, config, file, line) tuples."""
+    obs = []
+    for result in results:
+        for rnd in result.rounds:
+            run_id = f"{result.pr.get('pr_number')}-r{rnd.round}"
+            for run in rnd.runs:
+                cfg = run.get("config") or run.get("backend") or "?"
+                # A run id must be unique per *run*, not per round, or two
+                # runs of one config would look like self-corroboration.
+                rid = f"{run_id}-{run.get('started_at') or id(run)}"
+                for fs in run.get("finding_scores") or []:
+                    if fs.get("outcome") != "unmatched":
+                        continue
+                    obs.append((rid, cfg, fs.get("file"), fs.get("line")))
+    return obs
+
+
+def _print_unmatched_report(results: list) -> None:
+    gts = [r.ground_truth for r in results if getattr(r, "ground_truth", None)]
+    if not gts:
+        return
+    merged = {
+        "true_positives": [e for g in gts for e in g.get("true_positives", [])],
+        "false_positives": [
+            e for g in gts for e in g.get("false_positives", [])
+        ],
+    }
+    locs = ul.collect_unmatched(_unmatched_observations(results), merged)
+    print()
+    print(ul.format_report(locs))
 
 
 if __name__ == "__main__":

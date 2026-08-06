@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""Compute a machine-checkable verdict for one /pr-polish run.
+
+Today the "ready/not-ready verdict" is free-form prose the orchestrating
+agent writes about its own work, and it is never persisted. That makes it
+unusable by any downstream consumer and impossible to audit: a run that
+exhausted its round budget with work still outstanding
+(``exit_reason: capped-at-max``) reaches the same summary as one that
+genuinely converged.
+
+This module computes a verdict from the state file and git, persists it,
+and exits non-zero when the run is not ready — so a non-LLM caller can gate
+on it.
+
+Two lists, deliberately:
+
+* **blockers** force ``not_ready``. Each is a fact that can be checked.
+* **advisories** never block. They carry signals worth surfacing that are
+  too soft to gate on (e.g. a reviewer's own "am I confident" claim, which
+  is self-reported by the same class of model whose blind spots we are
+  trying to measure).
+
+``inconclusive`` is a third state, distinct from ``not_ready``: it means
+the evidence needed to decide was unavailable, not that the run was bad.
+Conflating the two would train users to ignore the verdict on any repo
+where a check cannot run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any, Optional
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from _common import severity_rank  # noqa: E402
+
+VERDICT_SCHEMA_VERSION = 1
+
+# Exit reasons that can never be "ready": the loop stopped for a reason
+# other than finishing its work.
+_ABNORMAL_EXITS = {
+    "capped-at-max",
+    "spiral-escalated",
+    "pr-mismatch-abort",
+    "sync-conflict",
+    "dirty-tree-preflight",
+    "user-paused",
+    "abandoned",
+}
+
+# A high/critical wont_fix currently clears its block on ANY non-empty
+# reason string — a one-character escape hatch. Require enough substance
+# that a reason is at least an argument. Deliberately a shape heuristic,
+# not an LLM grader: grading rationales with a model would reinsert an
+# unverified model at exactly the point being hardened.
+_MIN_REASON_CHARS = 40
+_MIN_REASON_WORDS = 6
+_CONTENTLESS_REASONS = {
+    "n/a",
+    "na",
+    "not applicable",
+    "by design",
+    "wontfix",
+    "won't fix",
+    "out of scope",
+    "no",
+    "skip",
+    "later",
+}
+
+
+def reason_is_substantive(reason: Optional[str]) -> bool:
+    """True if a deferral reason is an argument rather than a placeholder."""
+    text = (reason or "").strip()
+    if len(text) < _MIN_REASON_CHARS:
+        return False
+    if len(text.split()) < _MIN_REASON_WORDS:
+        return False
+    return text.lower().rstrip(".") not in _CONTENTLESS_REASONS
+
+
+def _is_file_path(path: Any) -> bool:
+    """True if this looks like a repo path rather than an opaque id.
+
+    ``ci``-sourced action rows carry a workflow run id (e.g. "90720812688")
+    in ``path``. It is not a file, so a diff can never "touch" it.
+    """
+    text = str(path or "").strip()
+    if not text or text.isdigit():
+        return False
+    return "/" in text or "." in text
+
+
+def _action_key(action: dict[str, Any]) -> tuple:
+    """Identity of a finding across rounds — mirrors pr_ops._action_key."""
+    cid = action.get("comment_id")
+    if cid:
+        return ("id", cid)
+    return (
+        "loc",
+        action.get("source"),
+        action.get("path"),
+        action.get("line"),
+        action.get("topic"),
+    )
+
+
+def latest_actions(state: dict) -> dict[tuple, dict]:
+    """Each finding's terminal action — the highest-round write wins.
+
+    A round-1 bare ``ack`` that a later round records as ``fixed`` is
+    resolved; only the last word counts.
+    """
+    latest: dict[tuple, dict] = {}
+    for rnd in sorted(state.get("rounds") or [], key=lambda r: r.get("n") or 0):
+        for a in rnd.get("comment_actions") or []:
+            latest[_action_key(a)] = a
+    return latest
+
+
+def open_high_deferrals(state: dict) -> list[dict]:
+    """High/critical findings left deferred without a real rationale."""
+    out = []
+    for a in latest_actions(state).values():
+        if severity_rank(a.get("severity")) < severity_rank("high"):
+            continue
+        verb = a.get("action")
+        if verb == "ack":
+            out.append(a)
+        elif verb == "wont_fix" and not reason_is_substantive(a.get("reason")):
+            out.append(a)
+    return out
+
+
+def verify_fix_claims(state: dict, repo_root: Optional[Path]) -> dict:
+    """Check each ``fixed`` claim against what the round actually changed.
+
+    The cheapest credible check: a round that claims to have fixed
+    something at ``path`` must have touched ``path``. It is a *necessary*
+    condition, not a sufficient one — touching a file is not fixing a bug —
+    and that is the right trade. Re-reading the cited line is ambiguous
+    (a real fix usually moves it), and demanding a regression test per
+    finding would block on findings that are untestable by construction.
+
+    The sharpest case this catches: a round whose ``head_before ==
+    head_after`` (it committed nothing) still claiming ``fixed``.
+
+    Paths are checked against the union of touched files from the claiming
+    round onward, so a fix that actually landed a round later is not a
+    false positive.
+    """
+    rounds = sorted(state.get("rounds") or [], key=lambda r: r.get("n") or 0)
+    touched_from: dict[int, set[str]] = {}
+    # Rounds whose commits are absent from the checkout: their claims are
+    # unknowable, not false.
+    unresolvable: set[int] = set()
+    if repo_root is not None:
+        import subprocess
+
+        per_round: dict[int, set[str]] = {}
+        for rnd in rounds:
+            n = rnd.get("n") or 0
+            before, after = rnd.get("head_before"), rnd.get("head_after")
+            files: set[str] = set()
+            if before and after and before != after:
+                res = subprocess.run(
+                    ["git", "-C", str(repo_root), "diff", "--name-only",
+                     f"{before}..{after}"],
+                    capture_output=True, text=True, check=False,
+                )
+                if res.returncode == 0:
+                    files = {
+                        Path(ln.strip()).name
+                        for ln in res.stdout.splitlines()
+                        if ln.strip()
+                    }
+                else:
+                    # The commits are not in this checkout — normal for an
+                    # older PR whose branch was deleted after merge. We
+                    # cannot tell whether the claim is true, and reporting
+                    # "unverified" would be indistinguishable from a real
+                    # fabrication. Mark the round unknown and skip it.
+                    unresolvable.add(n)
+            per_round[n] = files
+        # Suffix union: everything touched at round n or later.
+        acc: set[str] = set()
+        for n in sorted(per_round, reverse=True):
+            acc = acc | per_round[n]
+            touched_from[n] = set(acc)
+
+    total = verified = unverified = unknown = 0
+    unverified_rows: list[dict] = []
+    for rnd in rounds:
+        n = rnd.get("n") or 0
+        for a in rnd.get("comment_actions") or []:
+            if a.get("action") != "fixed":
+                continue
+            path = a.get("path")
+            if not path or not _is_file_path(path):
+                # Nothing checkable: a PR-level/doc finding has no path, and
+                # a `ci` row's "path" is a workflow run id, not a file. Both
+                # are excluded rather than counted as unverified — flagging
+                # them would be a guaranteed false positive on every run
+                # that had a CI failure.
+                continue
+            if repo_root is None or n in unresolvable:
+                unknown += 1
+                continue
+            total += 1
+            if Path(str(path)).name in touched_from.get(n, set()):
+                verified += 1
+            else:
+                unverified += 1
+                unverified_rows.append(
+                    {
+                        "round": n,
+                        "path": path,
+                        "line": a.get("line"),
+                        "severity": a.get("severity"),
+                        "no_commit": rnd.get("head_before") == rnd.get("head_after"),
+                    }
+                )
+    return {
+        # `total` counts only claims we could actually check, so the
+        # verified/unverified split is meaningful. `unknown` is claims whose
+        # round commits are missing from the checkout.
+        "total": total,
+        "verified": verified,
+        "unverified": unverified,
+        "unknown": unknown,
+        "checked": repo_root is not None,
+        "unverified_rows": unverified_rows,
+    }
+
+
+def compute_verdict(state: dict, *, repo_root: Optional[Path] = None) -> dict:
+    """The verdict for one run. Pure over state + git; no network."""
+    blockers: list[dict] = []
+    advisories: list[dict] = []
+
+    exit_reason = state.get("exit_reason")
+    if not state.get("completed"):
+        advisories.append(
+            {"code": "run_incomplete", "detail": "run has no completed_at"}
+        )
+    if exit_reason in _ABNORMAL_EXITS:
+        blockers.append(
+            {
+                "code": "abnormal_exit",
+                "detail": f"exit_reason={exit_reason} — the loop stopped "
+                "without finishing its work",
+                "severity": "high",
+            }
+        )
+
+    for a in open_high_deferrals(state):
+        blockers.append(
+            {
+                "code": "open_high_deferral",
+                "detail": f"{a.get('path')}:{a.get('line')} "
+                f"[{a.get('severity')}] {a.get('action')} with no "
+                "substantive reason",
+                "severity": "high",
+            }
+        )
+
+    fix_claims = verify_fix_claims(state, repo_root)
+    for row in fix_claims["unverified_rows"]:
+        if severity_rank(row.get("severity")) >= severity_rank("high"):
+            blockers.append(
+                {
+                    "code": "unverified_fix_claim",
+                    "detail": f"round {row['round']} claims fixed at "
+                    f"{row['path']} but did not touch it"
+                    + (" (round committed nothing)" if row["no_commit"] else ""),
+                    "severity": "high",
+                }
+            )
+        else:
+            advisories.append(
+                {
+                    "code": "unverified_fix_claim",
+                    "detail": f"round {row['round']}: {row['path']}",
+                }
+            )
+    if not fix_claims["checked"] and fix_claims["total"]:
+        advisories.append(
+            {
+                "code": "fix_claims_unchecked",
+                "detail": "no repo root supplied; fixed-claims not verified",
+            }
+        )
+
+    # Reviewer self-assessment: surfaced, never gating.
+    for rnd in state.get("rounds") or []:
+        for backend, claim in (rnd.get("sufficiency_claims") or {}).items():
+            if isinstance(claim, dict) and claim.get("is_confident_complete") is False:
+                advisories.append(
+                    {
+                        "code": "sufficiency_dissent",
+                        "detail": f"round {rnd.get('n')}: {backend} reported "
+                        "is_confident_complete=false",
+                    }
+                )
+
+    streams = reviewer_stream_health(state)
+    for backend, count in streams.items():
+        if count == 0:
+            advisories.append(
+                {
+                    "code": "silent_reviewer",
+                    "detail": f"{backend} produced zero findings in every "
+                    "round — consensus was structurally impossible",
+                }
+            )
+
+    if blockers:
+        verdict = "not_ready"
+    elif not state.get("completed"):
+        verdict = "inconclusive"
+    else:
+        verdict = "ready"
+
+    return {
+        "schema_version": VERDICT_SCHEMA_VERSION,
+        "verdict": verdict,
+        "pr": state.get("pr_number"),
+        "exit_reason": exit_reason,
+        "completed_at": state.get("completed_at"),
+        "blockers": blockers,
+        "advisories": advisories,
+        "evidence": {
+            "rounds_run": len(state.get("rounds") or []),
+            "fix_claims": {
+                k: v for k, v in fix_claims.items() if k != "unverified_rows"
+            },
+            "reviewer_streams": streams,
+            "open_high_deferrals": len(open_high_deferrals(state)),
+        },
+    }
+
+
+def reviewer_stream_health(state: dict) -> dict[str, int]:
+    """Findings per backend across all rounds.
+
+    A backend at zero for the whole run is not necessarily broken — the PR
+    may be clean — but it means ``>=2 sources`` consensus was unreachable,
+    which is invisible in the state file today and looks identical to two
+    reviewers agreeing.
+    """
+    keys = {
+        "codex": "codex_findings",
+        "cursor": "cursor_findings",
+        "gemini": "gemini_findings",
+        "lint": "lint_findings",
+    }
+    out: dict[str, int] = {}
+    for backend, key in keys.items():
+        seen = False
+        count = 0
+        for rnd in state.get("rounds") or []:
+            if key in rnd:
+                seen = True
+                count += len(rnd.get(key) or [])
+        if seen:
+            out[backend] = count
+    return out
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("state_dir", type=Path)
+    p.add_argument(
+        "--repo-root",
+        type=Path,
+        help="Checkout used to verify fixed-claims. Omitted = unchecked.",
+    )
+    p.add_argument(
+        "--write",
+        action="store_true",
+        help="Persist to <state_dir>/verdict.json.",
+    )
+    args = p.parse_args(argv)
+
+    path = args.state_dir / "pr-polish-state.json"
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"error: cannot read {path}: {e}", file=sys.stderr)
+        return 2
+
+    result = compute_verdict(state, repo_root=args.repo_root)
+    if args.write:
+        (args.state_dir / "verdict.json").write_text(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2))
+    # Non-zero on anything but a clean bill: this is what makes the verdict
+    # usable from a script rather than only readable by a human.
+    return 0 if result["verdict"] == "ready" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

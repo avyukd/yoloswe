@@ -24,13 +24,36 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Literal, Optional
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+# How a record was sourced. ``pr-polish`` records are full fidelity: they
+# carry the local reviewer envelopes (``review_runs``) and the engineer's
+# triage. ``github`` records are built from the GitHub API alone, for PRs
+# that were never polished locally — they have the same diff scope, goal,
+# and comment census, but no ``review_runs`` and no harvest-time labels.
+# Both are fully collectable and replayable: ``ground_truth_v3`` is
+# judge-produced from the diff and consumes neither.
+HarvestSource = Literal["pr-polish", "github"]
+DEFAULT_HARVEST_SOURCE: HarvestSource = "pr-polish"
+
+# Where a round's diff scope came from. ``git`` is a local checkout;
+# ``github`` is the compare/files API, used when the commit is absent
+# locally (a PR never fetched, or a stale checkout).
+ScopeResolver = Literal["git", "github"]
+
+# Stands in for a GitHub-sourced record's absent pr-polish directory. Every
+# read under a state dir (envelopes, scope hints) already handles "not
+# there", so pointing at a path that cannot exist reuses those paths
+# instead of threading `if state_dir is None` through the round builder.
+_NO_STATE_DIR = Path("/nonexistent/code-review-replay/no-local-state")
 
 # The judged ground-truth block collection mode adds to a per-PR dataset.
 # Defined here (the lowest layer) so collect_lib and the harvester share one
@@ -170,6 +193,11 @@ class HarvestedRound:
     scope_hints_present: bool
     raw_comment_actions: list[dict]
     review_runs: list[ReviewRun] = field(default_factory=list)
+    # Which resolver produced merge_base_sha / files_changed. A pr-polish
+    # record whose local checkout went stale can legitimately carry
+    # "github" here, so this is per-round rather than per-record.
+    merge_base_resolved_by: ScopeResolver = "git"
+    files_changed_resolved_by: ScopeResolver = "git"
 
 
 @dataclass
@@ -181,6 +209,7 @@ class PRRecord:
     pr_comments_attribution_basis: AttributionBasis
     pr_comments_fetch_error: Optional[str]
     harvested_rounds: list[HarvestedRound] = field(default_factory=list)
+    harvest_source: HarvestSource = DEFAULT_HARVEST_SOURCE
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +267,146 @@ def parse_state_file(path: Path) -> dict:
     return state
 
 
+def record_harvest_source(dataset: dict) -> HarvestSource:
+    """The harvest source of an on-disk record, defaulting to pr-polish.
+
+    Records written before schema 3 have no ``harvest_source`` key, and all
+    of them came from local pr-polish state — so a missing field reads as
+    ``"pr-polish"`` rather than as an error. Consumers should call this
+    instead of indexing the key directly.
+    """
+    value = dataset.get("harvest_source")
+    return value if value in ("pr-polish", "github") else DEFAULT_HARVEST_SOURCE
+
+
+def _ancestry_rank(repo_path: Optional[Path], sha: str) -> int:
+    """Commits-since-root, as a tie-break when two commits share a timestamp.
+
+    ``git rev-list --count`` gives a monotonic depth along a single history,
+    so an ancestor always sorts before its descendant even when both carry
+    the same second.
+    """
+    if repo_path is None:
+        return 0
+    res = git(repo_path, "rev-list", "--count", sha)
+    try:
+        return int(res.stdout.strip())
+    except (ValueError, AttributeError):
+        return 0
+
+
+def commit_scoped_rounds(
+    gh: dict,
+    comments: list[dict],
+    *,
+    repo_path: Optional[Path] = None,
+) -> list[dict]:
+    """One synthesized round per commit an inline comment actually reviewed.
+
+    GitHub records every inline comment's ``original_commit_id`` — the SHA the
+    reviewer was looking at. Pinning every comment to the PR's final head
+    instead (see :func:`github_only_state`) does not merely lose coverage: it
+    inverts the ground truth. A bot correctly reports a bug, the author fixes
+    it, and a judge reading the post-fix code records the claim as a false
+    positive. Measured on kernel-8227, *none* of its 107 inline comments were
+    written against the head they were being judged at.
+
+    Rounds are ordered oldest-first by commit time so round 1 is the earliest
+    reviewed state. Comments whose SHA is unreachable — force-pushed away, ~8%
+    on the pilot corpus — are folded into a final round pinned at the PR head
+    and flagged ``head_unreachable``, so they degrade visibly instead of
+    silently masquerading as same-state review.
+    """
+    by_sha: dict[str, list[dict]] = {}
+    orphans: list[dict] = []
+    for c in comments:
+        sha = c.get("original_commit_id")
+        if not sha:
+            orphans.append(c)
+            continue
+        by_sha.setdefault(sha, []).append(c)
+
+    resolvable: list[tuple[str, Optional[str], list[dict]]] = []
+    for sha, rows in by_sha.items():
+        t = git_commit_time(repo_path, sha) if repo_path else None
+        if t is None:
+            orphans.extend(rows)
+        else:
+            resolvable.append((sha, t, rows))
+    # Commit time first, then ancestry, then sha. Rebased or scripted commits
+    # can share a timestamp to the second, and a wrong order would mislabel
+    # which state was reviewed "first" — so ties fall back to whether one
+    # commit is an ancestor of the other.
+    resolvable.sort(key=lambda x: (x[1] or "", _ancestry_rank(repo_path, x[0]), x[0]))
+
+    rounds: list[dict] = []
+    for i, (sha, _t, rows) in enumerate(resolvable, start=1):
+        rounds.append({
+            "n": i,
+            "head_before": sha,
+            "head_after": None,
+            "comment_actions": rows,
+            "head_unreachable": False,
+        })
+    if orphans or not rounds:
+        rounds.append({
+            "n": len(rounds) + 1,
+            "head_before": gh.get("head_sha"),
+            "head_after": None,
+            "comment_actions": orphans,
+            # These comments reviewed a commit that no longer exists, so the
+            # diff they are judged against is NOT the one they were written
+            # about. Consumers must treat their verdicts as lower confidence.
+            "head_unreachable": bool(orphans),
+        })
+    return rounds
+
+
+def github_only_state(
+    gh: dict,
+    comments: Optional[list[dict]] = None,
+    *,
+    repo_path: Optional[Path] = None,
+) -> dict:
+    """A pr-polish-state-shaped dict for a PR with no local state.
+
+    ``gh`` is a :func:`discover_github_prs` row. With no ``comments`` the
+    synthesized state has exactly one round, so
+    :func:`select_rounds_to_harvest` yields
+    ``[(1, "r1_only")]`` — the same canonical round collection already picks
+    — and every downstream reader (``get_round``,
+    ``index_comment_verdicts``, ``reconstruct_goal_text``) works unchanged.
+
+    ``completed`` is True because the PR merged: leaving it False would make
+    ``--no-include-incomplete`` silently drop every GitHub record. The
+    lower fidelity is carried by ``exit_reason`` and by the record's
+    ``harvest_source``, not by pretending the PR is unfinished.
+
+    ``comments`` + ``repo_path`` opt into per-commit scoping: each inline
+    comment is grouped under the SHA it actually reviewed
+    (:func:`commit_scoped_rounds`) instead of all of them being pinned to the
+    final head. Without them the single-round shape is preserved for
+    backwards compatibility.
+    """
+    rounds = (
+        commit_scoped_rounds(gh, comments, repo_path=repo_path)
+        if comments
+        else [{
+            "n": 1,
+            "head_before": gh.get("head_sha"),
+            "head_after": None,
+            "comment_actions": [],
+        }]
+    )
+    return {
+        "rounds": rounds,
+        "completed": True,
+        "exit_reason": "github_only",
+        "branch": gh.get("head_ref"),
+        "started_at": gh.get("merged_at"),
+    }
+
+
 def parse_envelope(path: Path) -> tuple[Optional[dict], Optional[str]]:
     """Return ``(envelope_dict, error_message)``.
 
@@ -289,6 +458,14 @@ def select_rounds_to_harvest(state: dict) -> list[tuple[int, SignalTier]]:
     if not ns:
         return []
     completed = bool(state.get("completed"))
+    # Commit-scoped rounds are not pr-polish iterations — each one is a
+    # distinct reviewed diff with its own comments. Dropping the middle would
+    # discard most of the review states the SHAs were recovered for, so every
+    # round is kept.
+    if any(r.get("head_unreachable") is not None for r in rounds):
+        if len(ns) == 1:
+            return [(ns[0], "r1_only")]
+        return [(n, "r1" if n == ns[0] else "final") for n in ns]
     if len(ns) == 1:
         return [(ns[0], "r1_only")]
     first, last = ns[0], ns[-1]
@@ -659,6 +836,200 @@ def compute_files_changed(
     return [ln.strip() for ln in res.stdout.splitlines() if ln.strip()], None
 
 
+def already_harvested(out_dir: Path) -> set[str]:
+    """``{"kernel-3945", ...}`` for every record already in the dataset.
+
+    The dataset dir is the cache: a written record is the memoized result,
+    so an incremental re-harvest is a set-difference rather than a second
+    caching layer with its own invalidation story.
+    """
+    out: set[str] = set()
+    if not out_dir.is_dir():
+        return out
+    for path in out_dir.glob("*.json"):
+        if path.name != "index.json":
+            out.add(path.stem)
+    return out
+
+
+def discover_github_prs(
+    slug: str,
+    *,
+    merged_since: Optional[str] = None,
+    limit: int = 100,
+    exclude: Optional[set[str]] = None,
+) -> tuple[list[dict], Optional[str]]:
+    """Merged PRs from GitHub as candidate harvest rows.
+
+    This is the second discovery source alongside
+    :func:`discover_project_dirs`: it reaches PRs that were never polished
+    locally, which is the difference between harvesting ~3% of a busy repo
+    and harvesting most of it.
+
+    Returns ``(rows, error)``; a failure yields ``([], message)`` so the
+    caller degrades to local-only discovery rather than crashing.
+
+    Note ``baseRefOid`` is the base branch tip *now*, not the PR's merge
+    base — :func:`resolve_diff_scope` still calls the compare API to get
+    the real merge base.
+    """
+    repo_name = slug.rsplit("/", 1)[-1]
+    cmd = [
+        "gh", "pr", "list", "-R", slug,
+        "--state", "merged",
+        "--limit", str(limit),
+        "--json", "number,mergedAt,headRefOid,baseRefOid,title,headRefName",
+    ]
+    if merged_since:
+        cmd += ["--search", f"merged:>={merged_since}"]
+    try:
+        res = subprocess.run(
+            cmd, capture_output=True, text=True, check=False, timeout=60
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        return [], f"gh pr list failed: {e}"
+    if res.returncode != 0:
+        return [], f"gh pr list exit {res.returncode}: {res.stderr.strip()}"
+    try:
+        rows = json.loads(res.stdout or "[]")
+    except json.JSONDecodeError as e:
+        return [], f"gh pr list JSON parse error: {e}"
+    if not isinstance(rows, list):
+        return [], "gh pr list did not return a list"
+
+    exclude = exclude or set()
+    out: list[dict] = []
+    for r in rows:
+        number = r.get("number")
+        if number is None:
+            continue
+        pr_number = str(number)
+        if f"{repo_name}-{pr_number}" in exclude:
+            continue
+        out.append(
+            {
+                "repo_name": repo_name,
+                "pr_number": pr_number,
+                "slug": slug,
+                "head_sha": r.get("headRefOid"),
+                "base_sha": r.get("baseRefOid"),
+                "head_ref": r.get("headRefName"),
+                "merged_at": r.get("mergedAt"),
+                "title": r.get("title"),
+            }
+        )
+    return out, None
+
+
+def repo_slug_from_url(repo_url: Optional[str]) -> Optional[str]:
+    """Extract ``org/repo`` from a normalized https GitHub URL, or None."""
+    if not repo_url or "github.com/" not in repo_url:
+        return None
+    return repo_url.split("github.com/", 1)[1] or None
+
+
+def gh_merge_base(
+    slug: str, base_sha: str, head_sha: str
+) -> tuple[Optional[str], Optional[str]]:
+    """Merge base via the compare API. Returns ``(sha, error)``."""
+    obj, err = _gh_api_object(slug, f"compare/{base_sha}...{head_sha}")
+    if obj is None:
+        return None, err
+    sha = ((obj.get("merge_base_commit") or {}).get("sha")) or None
+    return sha, None if sha else "compare returned no merge_base_commit"
+
+
+def gh_files_changed(
+    slug: str, pr_number: str
+) -> tuple[list[str], Optional[str]]:
+    """Changed paths via the PR files API. Returns ``(paths, error)``."""
+    rows, err = _gh_api(slug, f"pulls/{pr_number}/files?per_page=100")
+    if err:
+        return [], err
+    return [r["filename"] for r in rows if r.get("filename")], None
+
+
+@dataclass
+class DiffScope:
+    """One round's resolved diff scope, and which resolver produced it."""
+
+    head_before: Optional[str]
+    merge_base_sha: Optional[str]
+    merge_base_resolved: bool
+    merge_base_error: Optional[str]
+    files_changed: list[str]
+    merge_base_resolved_by: ScopeResolver = "git"
+    files_changed_resolved_by: ScopeResolver = "git"
+
+
+def resolve_diff_scope(
+    round_data: dict,
+    *,
+    repo_path: Optional[Path],
+    base_branch: str = "origin/main",
+    gh: Optional[dict] = None,
+    slug: Optional[str] = None,
+    pr_number: Optional[str] = None,
+) -> DiffScope:
+    """Resolve a round's diff scope, local git first, GitHub as fallback.
+
+    Local git is preferred: it is free, offline, and authoritative for a
+    checkout that has the commit. The GitHub fallback covers two cases —
+    a PR that was never polished locally (no state, no fetch), and a
+    pr-polish record whose checkout has since gone stale ("head commit not
+    in local repo"), which previously made the record unusable for
+    collection.
+
+    ``gh``/``slug``/``pr_number`` are optional; without them this is exactly
+    the old local-only behavior.
+    """
+    head_before = round_data.get("head_before") or (
+        gh.get("head_sha") if gh else None
+    )
+    if not head_before:
+        return DiffScope(None, None, False, "no head_before", [])
+
+    mb_sha, mb_resolved, mb_err = compute_merge_base(
+        repo_path, head_before, base_branch
+    )
+    mb_by: ScopeResolver = "git"
+    if not mb_resolved and slug and gh:
+        base_sha = gh.get("base_sha")
+        if base_sha:
+            api_sha, api_err = gh_merge_base(slug, base_sha, head_before)
+            if api_sha:
+                mb_sha, mb_resolved, mb_err, mb_by = api_sha, True, None, "github"
+            else:
+                # Keep the git error too — it says why the local path failed,
+                # which is the actionable half (e.g. "fetch this commit").
+                mb_err = f"{mb_err}; github: {api_err}"
+
+    files_changed: list[str] = []
+    files_by: ScopeResolver = "git"
+    files_err: Optional[str] = "merge base unresolved"
+    if mb_resolved and mb_sha:
+        files_changed, files_err = compute_files_changed(
+            repo_path, mb_sha, head_before
+        )
+    # Branch on the *error*, not on emptiness: a diff with no changed files
+    # is a valid answer, and treating it as failure would spend an API call
+    # on every such round.
+    if files_err and slug and pr_number:
+        api_files, _ = gh_files_changed(slug, pr_number)
+        if api_files:
+            files_changed, files_by = api_files, "github"
+
+    return DiffScope(
+        head_before=head_before,
+        merge_base_sha=mb_sha,
+        merge_base_resolved=mb_resolved,
+        merge_base_error=mb_err,
+        files_changed=files_changed,
+        merge_base_resolved_by=mb_by,
+        files_changed_resolved_by=files_by,
+    )
+
+
 def harvester_git_sha(repo_path: Path) -> str:
     """SHA of the harvester repo at run time (yoloswe). Best-effort."""
     res = git(repo_path, "rev-parse", "HEAD")
@@ -715,6 +1086,55 @@ def git_commit_time(repo_path: Optional[Path], sha: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+RATE_LIMIT_MARKER = "rate limit exceeded"
+# Bulk harvests reliably trip GitHub's *secondary* rate limit, which fires
+# while the core quota still shows thousands remaining. Retrying immediately
+# just burns the rest of the run: every subsequent PR fails the same way and
+# silently degrades to the state-recorded comment set.
+_RATE_LIMIT_BACKOFF_S = (30, 90, 240)
+
+
+def is_rate_limit_error(msg: Optional[str]) -> bool:
+    """True when a gh error message is a rate-limit refusal (primary or secondary)."""
+    return bool(msg) and RATE_LIMIT_MARKER in msg.lower()
+
+
+def _run_gh(
+    args: list[str], endpoint: str, *, sleep=time.sleep
+) -> tuple[Optional[subprocess.CompletedProcess], Optional[str]]:
+    """Run a ``gh`` command, backing off through a rate limit.
+
+    Returns ``(completed_process, error)``. A rate-limit refusal is retried
+    on the fixed backoff schedule; anything else returns immediately. When
+    the retries are exhausted the error is still returned, so callers keep
+    their existing degrade-or-fail behavior.
+    """
+    last_err: Optional[str] = None
+    for attempt in range(len(_RATE_LIMIT_BACKOFF_S) + 1):
+        try:
+            res = subprocess.run(
+                args, capture_output=True, text=True, check=False, timeout=30
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            return None, f"gh api {endpoint} failed: {e}"
+        if res.returncode == 0:
+            return res, None
+        last_err = (
+            f"gh api {endpoint} exit {res.returncode}: {res.stderr.strip()}"
+        )
+        if not is_rate_limit_error(res.stderr):
+            return res, last_err
+        if attempt < len(_RATE_LIMIT_BACKOFF_S):
+            delay = _RATE_LIMIT_BACKOFF_S[attempt]
+            print(
+                f"   rate limited on {endpoint}; sleeping {delay}s "
+                f"(attempt {attempt + 1}/{len(_RATE_LIMIT_BACKOFF_S)})",
+                file=sys.stderr,
+            )
+            sleep(delay)
+    return None, last_err
+
+
 def _gh_api(slug: str, endpoint: str) -> tuple[list[dict], Optional[str]]:
     """Run ``gh api --paginate repos/<slug>/<endpoint>``; best-effort.
 
@@ -722,18 +1142,11 @@ def _gh_api(slug: str, endpoint: str) -> tuple[list[dict], Optional[str]]:
     exit, bad JSON) returns ``([], <message>)`` — the harvester degrades to
     the state-recorded comment set rather than crashing.
     """
-    try:
-        res = subprocess.run(
-            ["gh", "api", "--paginate", f"repos/{slug}/{endpoint}"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        return [], f"gh api {endpoint} failed: {e}"
-    if res.returncode != 0:
-        return [], f"gh api {endpoint} exit {res.returncode}: {res.stderr.strip()}"
+    res, err = _run_gh(
+        ["gh", "api", "--paginate", f"repos/{slug}/{endpoint}"], endpoint
+    )
+    if err:
+        return [], err
     out = res.stdout.strip()
     if not out:
         return [], None
@@ -743,6 +1156,28 @@ def _gh_api(slug: str, endpoint: str) -> tuple[list[dict], Optional[str]]:
         return [], f"gh api {endpoint} JSON parse error: {e}"
     if not isinstance(obj, list):
         return [], f"gh api {endpoint} did not return a list"
+    return obj, None
+
+
+def _gh_api_object(slug: str, endpoint: str) -> tuple[Optional[dict], Optional[str]]:
+    """``gh api repos/<slug>/<endpoint>`` for an endpoint returning an object.
+
+    Separate from :func:`_gh_api` because that one paginates and demands a
+    list; ``compare/{base}...{head}`` returns a single object. Same
+    best-effort contract: any failure returns ``(None, <message>)``.
+    """
+    res, err = _run_gh(["gh", "api", f"repos/{slug}/{endpoint}"], endpoint)
+    if err:
+        return None, err
+    out = res.stdout.strip()
+    if not out:
+        return None, f"gh api {endpoint} returned nothing"
+    try:
+        obj = json.loads(out)
+    except json.JSONDecodeError as e:
+        return None, f"gh api {endpoint} JSON parse error: {e}"
+    if not isinstance(obj, dict):
+        return None, f"gh api {endpoint} did not return an object"
     return obj, None
 
 
@@ -1212,13 +1647,45 @@ def reconstruct_goal_text(
 # ---------------------------------------------------------------------------
 
 
+def _attempt_dirs(round_dir: Path) -> list[Path]:
+    """Attempt subdirs (``a1``, ``a2``, …) newest last, or [] if flat.
+
+    pr-polish used to write envelopes straight into ``rN/``; it now writes
+    them into a per-attempt ``rN/aM/``. Both layouts are still on disk, so
+    the harvester has to read either one.
+    """
+    if not round_dir.is_dir():
+        return []
+    attempts = []
+    for child in round_dir.iterdir():
+        if not child.is_dir():
+            continue
+        m = re.fullmatch(r"a(\d+)", child.name)
+        if m:
+            attempts.append((int(m.group(1)), child))
+    return [d for _, d in sorted(attempts)]
+
+
 def _envelope_path(state_dir: Path, round_n: int, backend: str) -> Path:
-    return state_dir / f"r{round_n}" / f"{backend}-envelope.json"
+    """Envelope for a backend, preferring the last attempt that has one.
+
+    A retried round leaves an envelope in each attempt it got that far; the
+    last one is the outcome pr-polish acted on, so that is the one the
+    dataset should carry.
+    """
+    round_dir = state_dir / f"r{round_n}"
+    name = f"{backend}-envelope.json"
+    for attempt_dir in reversed(_attempt_dirs(round_dir)):
+        candidate = attempt_dir / name
+        if candidate.exists():
+            return candidate
+    return round_dir / name
 
 
 def _scope_hints_present(state_dir: Path, round_n: int) -> bool:
     # pr-polish writes scope-hints.json into the round dir when scope
-    # exploration produced hints. Absence = single-package PR.
+    # exploration produced hints. Absence = single-package PR. It stays at
+    # the round level in both the flat and per-attempt layouts.
     return (state_dir / f"r{round_n}" / "scope-hints.json").exists()
 
 
@@ -1308,7 +1775,7 @@ def _build_review_run(
 
 def build_harvested_round(
     state: dict,
-    state_dir: Path,
+    state_dir: Optional[Path],
     round_n: int,
     signal_tier: SignalTier,
     *,
@@ -1317,6 +1784,9 @@ def build_harvested_round(
     bramble_ops_path: Path,
     pr_comments_for_round: list[dict],
     base_branch: str = "origin/main",
+    gh: Optional[dict] = None,
+    slug: Optional[str] = None,
+    pr_number: Optional[str] = None,
 ) -> HarvestedRound:
     """Assemble one harvested round.
 
@@ -1325,20 +1795,28 @@ def build_harvested_round(
     this harvested round. They replace the github-* rows that used to be copied
     verbatim from ``comment_actions`` — non-github sources still come straight
     from this round's ``comment_actions``.
+
+    ``state_dir`` is None for a GitHub-sourced record (no local pr-polish
+    directory exists). Rather than branching every read, it is coerced to a
+    path that cannot exist: the envelope and scope-hint lookups then take
+    their already-tested "missing" paths and yield ``review_runs=[]`` /
+    ``scope_hints_present=False``.
     """
+    if state_dir is None:
+        state_dir = _NO_STATE_DIR
     round_data = get_round(state, round_n) or {}
     head_before = round_data.get("head_before")
     head_after = round_data.get("head_after")
 
-    mb_sha, mb_resolved, mb_err = (None, False, "no head_before")
-    files_changed: list[str] = []
-    if head_before:
-        mb_sha, mb_resolved, mb_err = compute_merge_base(
-            repo_path, head_before, base_branch
-        )
-        if mb_resolved and mb_sha:
-            files, _ = compute_files_changed(repo_path, mb_sha, head_before)
-            files_changed = files
+    scope = resolve_diff_scope(
+        round_data,
+        repo_path=repo_path,
+        base_branch=base_branch,
+        gh=gh,
+        slug=slug,
+        pr_number=pr_number,
+    )
+    head_before = scope.head_before
 
     goal_text, goal_recoverable = reconstruct_goal_text(
         state,
@@ -1371,15 +1849,17 @@ def build_harvested_round(
         head_before=head_before,
         head_after=head_after,
         base_branch=base_branch,
-        merge_base_sha=mb_sha,
-        merge_base_resolved=mb_resolved,
-        merge_base_error=mb_err,
-        files_changed=files_changed,
+        merge_base_sha=scope.merge_base_sha,
+        merge_base_resolved=scope.merge_base_resolved,
+        merge_base_error=scope.merge_base_error,
+        files_changed=scope.files_changed,
         goal_text=goal_text,
         goal_recoverable=goal_recoverable,
         scope_hints_present=_scope_hints_present(state_dir, round_n),
         raw_comment_actions=non_github + list(pr_comments_for_round),
         review_runs=review_runs,
+        merge_base_resolved_by=scope.merge_base_resolved_by,
+        files_changed_resolved_by=scope.files_changed_resolved_by,
     )
 
 
@@ -1389,7 +1869,7 @@ def build_harvested_round(
 
 
 def build_pr_record(
-    state_dir: Path,
+    state_dir: Optional[Path],
     repo_name: str,
     pr_number: str,
     *,
@@ -1402,6 +1882,9 @@ def build_pr_record(
     fetched_pr_comments: Optional[list[dict]] = None,
     pr_comments_fetch_error: Optional[str] = None,
     fetch_attempted: bool = True,
+    harvest_source: HarvestSource = DEFAULT_HARVEST_SOURCE,
+    gh: Optional[dict] = None,
+    commit_scoped: bool = False,
 ) -> Optional[PRRecord]:
     """Build a per-PR record. Returns None if the PR should be skipped.
 
@@ -1410,9 +1893,27 @@ def build_pr_record(
     verdict-joined + round-attributed once here, then folded onto the harvested
     rounds. When the fetch was skipped or failed, the github comments recorded
     in the state's ``comment_actions`` are used as a degraded fallback.
+
+    ``harvest_source="github"`` builds a record for a PR that was never
+    polished locally: ``gh`` (a :func:`discover_github_prs` row) stands in
+    for the state file via :func:`github_only_state`, and ``state_dir`` may
+    be None. The resulting record has ``review_runs=[]`` — there are no
+    local envelopes — but the same diff scope, goal, and comment census.
     """
-    state_path = state_dir / "pr-polish-state.json"
-    state = parse_state_file(state_path)
+    # Resolved before state synthesis: per-commit scoping needs the checkout
+    # to order reviewed SHAs by commit time and to spot unreachable ones.
+    repo_path = repo_map.lookup(repo_name)
+
+    if harvest_source == "github":
+        if gh is None:
+            raise ValueError("harvest_source='github' requires gh")
+        inline = [
+            c for c in (fetched_pr_comments or [])
+            if c.get("source") == "github-inline" and c.get("original_commit_id")
+        ] if commit_scoped else []
+        state = github_only_state(gh, inline, repo_path=repo_path)
+    else:
+        state = parse_state_file(state_dir / "pr-polish-state.json")
 
     completed = bool(state.get("completed"))
     if not completed and not include_incomplete:
@@ -1422,9 +1923,13 @@ def build_pr_record(
     if not rounds_to_harvest:
         return None
 
-    repo_path = repo_map.lookup(repo_name)
     repo_url = get_repo_url(repo_path)
+    # A GitHub-sourced PR may have no local checkout at all, so fall back to
+    # the slug discovery already gave us rather than losing the URLs.
+    if not repo_url and gh and gh.get("slug"):
+        repo_url = f"https://github.com/{gh['slug']}"
     pr_url = f"{repo_url}/pull/{pr_number}" if repo_url else None
+    slug = repo_slug_from_url(repo_url)
 
     pr_comments, attribution_basis = build_pr_comments(
         state,
@@ -1452,6 +1957,9 @@ def build_pr_record(
             pr_summary=pr_summary,
             bramble_ops_path=bramble_ops_path,
             pr_comments_for_round=comments_by_harvested_round.get(n, []),
+            gh=gh,
+            slug=slug,
+            pr_number=pr_number,
         )
         for n, tier in rounds_to_harvest
     ]
@@ -1474,6 +1982,7 @@ def build_pr_record(
         pr_comments_attribution_basis=attribution_basis,
         pr_comments_fetch_error=pr_comments_fetch_error,
         harvested_rounds=harvested_rounds,
+        harvest_source=harvest_source,
     )
 
 
@@ -1531,6 +2040,40 @@ def _index_gt_fields(out_dir: Path, file_name: str) -> dict:
     }
 
 
+def _pr_sort_key(entry: dict) -> tuple:
+    """Sort PR numbers numerically when they are numeric, else lexically."""
+    num = str(entry.get("pr_number") or "")
+    return (0, int(num), "") if num.isdigit() else (1, 0, num)
+
+
+def _index_entry_from_record_file(path: Path) -> Optional[dict]:
+    """Rebuild one index entry from an already-written dataset file.
+
+    Used for PRs this run did not harvest, so a filtered run still emits a
+    complete manifest. Returns None for anything that is not a readable PR
+    record (a stray file in the dataset dir must not abort the harvest).
+    """
+    try:
+        rec = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    pr = rec.get("pr")
+    if not isinstance(pr, dict) or not pr.get("pr_number"):
+        return None
+    return {
+        "repo_name": pr.get("repo_name"),
+        "repo_url": pr.get("repo_url"),
+        "pr_number": pr.get("pr_number"),
+        "pr_url": pr.get("pr_url"),
+        "file": path.name,
+        "completed": pr.get("completed"),
+        "total_rounds": pr.get("total_rounds"),
+        "harvested_rounds": len(rec.get("harvested_rounds") or []),
+        "harvest_source": record_harvest_source(rec),
+        **_index_gt_fields(path.parent, path.name),
+    }
+
+
 def build_index(
     records: list[PRRecord],
     *,
@@ -1544,10 +2087,20 @@ def build_index(
     per-PR file) so each entry can carry ``ground_truth_collected`` /
     ``census_converged`` — letting a consumer find collected, converged PRs
     without opening every per-PR file.
+
+    The index covers **every** dataset file in ``out_dir``, not just this
+    run's ``records``. A filtered harvest (``--only``) would otherwise
+    rewrite the manifest down to the PRs it touched, dropping every
+    previously collected PR — and ``replay.py`` samples its targets from
+    this file's ``ground_truth_collected`` flag, so those frozen ground
+    truths would silently stop being replayable while still sitting on disk.
+    Entries are rebuilt from the on-disk records, so the index self-heals.
     """
     prs = []
+    seen: set[str] = set()
     for r in records:
         file_name = f"{r.pr['repo_name']}-{r.pr['pr_number']}.json"
+        seen.add(file_name)
         prs.append(
             {
                 "repo_name": r.pr["repo_name"],
@@ -1558,9 +2111,19 @@ def build_index(
                 "completed": r.pr["completed"],
                 "total_rounds": r.pr["total_rounds"],
                 "harvested_rounds": len(r.harvested_rounds),
+                "harvest_source": r.harvest_source,
                 **_index_gt_fields(out_dir, file_name),
             }
         )
+
+    for path in sorted(out_dir.glob("*.json")):
+        if path.name == "index.json" or path.name in seen:
+            continue
+        entry = _index_entry_from_record_file(path)
+        if entry is not None:
+            prs.append(entry)
+
+    prs.sort(key=lambda e: (e.get("repo_name") or "", _pr_sort_key(e)))
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": generated_at,

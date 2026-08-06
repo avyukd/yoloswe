@@ -17,6 +17,7 @@ import collect_lib as cl  # noqa: E402
 import harvest_lib as hl  # noqa: E402
 import replay  # noqa: E402
 import replay_lib as rl  # noqa: E402
+import unmatched_lib as ul  # noqa: E402
 
 
 # A realistic klogfmt run-log fragment (cursor backend logs every tool call).
@@ -568,6 +569,155 @@ class SelectDatasetRoundsTests(unittest.TestCase):
         self.assertEqual([r["round"] for r in rounds], [3])
 
 
+class UnmatchedRecurrenceTests(unittest.TestCase):
+    """Cross-run recurrence triages the metric-invisible `unmatched` bucket.
+
+    Regression intent: precision ignores unmatched findings entirely, so a
+    recall-first variant's extra output is invisible to the headline
+    numbers — "found a real bug the census missed" and "generated plausible
+    noise" score identically. Recurrence across independent runs (and
+    especially across configs) is the cheap mechanical discriminator.
+    """
+
+    GT = {
+        "true_positives": [{"file": "a.py", "line": 10}],
+        "false_positives": [{"file": "b.py", "line": 5}],
+    }
+
+    def test_judged_locations_excluded(self):
+        obs = [("r1","c1","a.py",10), ("r2","c1","b.py",5), ("r3","c1","z.py",1)]
+        got = ul.collect_unmatched(obs, self.GT)
+        self.assertEqual([(g.file,g.line) for g in got], [("z.py",1)])
+
+    def test_line_slack_merges_near_misses(self):
+        # Same defect drifting by 2 lines must count as recurrence, not
+        # two singletons -- the GT tolerates the same drift.
+        obs = [("r1","c1","z.py",100), ("r2","c2","z.py",102)]
+        got = ul.collect_unmatched(obs, self.GT)
+        self.assertEqual(len(got), 1)
+        self.assertTrue(got[0].recurrent)
+        self.assertTrue(got[0].cross_config)
+
+    def test_same_run_twice_is_not_recurrence(self):
+        obs = [("r1","c1","z.py",1), ("r1","c1","z.py",1)]
+        got = ul.collect_unmatched(obs, self.GT)
+        self.assertFalse(got[0].recurrent, "one run cannot corroborate itself")
+
+    def test_summary_counts(self):
+        obs = [("r1","c1","z.py",1), ("r2","c2","z.py",1), ("r1","c1","q.py",7)]
+        s = ul.summarize(ul.collect_unmatched(obs, self.GT))
+        self.assertEqual(s["unmatched_distinct"], 2)
+        self.assertEqual(s["unmatched_recurrent"], 1)
+        self.assertEqual(s["unmatched_cross_config"], 1)
+        self.assertEqual(s["unmatched_singleton"], 1)
+
+    def test_cross_config_requires_two_configs(self):
+        obs = [("r1","c1","z.py",1), ("r2","c1","z.py",1)]
+        got = ul.collect_unmatched(obs, self.GT)
+        self.assertTrue(got[0].recurrent)
+        self.assertFalse(got[0].cross_config)
+
+    def test_missing_file_ignored(self):
+        self.assertEqual(ul.collect_unmatched([("r","c",None,1)], self.GT), [])
+
+
+class ExpandFindingSitesTests(unittest.TestCase):
+    """Class-level findings must be scored at every site they report.
+
+    Regression intent: the reviewer prompt instructs collapsing N sibling
+    violations into ONE issue with a ``sites`` array, top-level file/line
+    naming one representative. Scoring only the representative credited a
+    reviewer with 1 of N *for obeying the contract*. Measured on
+    kernel-8276: 46 of 73 issues carried sites and 90 defect locations were
+    discarded, including a frozen true positive scored as missed.
+    """
+
+    def test_sites_expand_to_one_finding_each(self):
+        out = rl.expand_finding_sites([
+            {
+                "file": "a.py", "line": 10, "severity": "high",
+                "invariant": "stale marker",
+                "sites": [
+                    {"file": "a.py", "line": 10},
+                    {"file": "b.py", "line": 42},
+                    {"file": "c.py", "line": 7},
+                ],
+            }
+        ])
+        self.assertEqual(len(out), 3)
+        self.assertEqual(
+            {(f["file"], f["line"]) for f in out},
+            {("a.py", 10), ("b.py", 42), ("c.py", 7)},
+        )
+        # Parent metadata rides along to each site.
+        self.assertTrue(all(f["severity"] == "high" for f in out))
+
+    def test_finding_without_sites_passes_through(self):
+        out = rl.expand_finding_sites([{"file": "a.py", "line": 1}])
+        self.assertEqual(out, [{"file": "a.py", "line": 1}])
+
+    def test_non_dict_entries_dropped(self):
+        out = rl.expand_finding_sites(["junk", None, {"file": "a.py"}])
+        self.assertEqual(out, [{"file": "a.py"}])
+
+    def test_malformed_sites_ignored(self):
+        # A sites array of strings must not crash or silently blank the
+        # finding's own location.
+        out = rl.expand_finding_sites([
+            {"file": "a.py", "line": 3, "sites": ["nope", 7]}
+        ])
+        self.assertEqual(out, [{"file": "a.py", "line": 3, "sites": ["nope", 7]}])
+
+    def test_expanded_sites_reach_the_ground_truth(self):
+        # End-to-end: a class-level finding whose *non-representative*
+        # site is the real defect must now score as a TP.
+        gt = {
+            "true_positives": [
+                {"file": "b.py", "line": 42, "severity": "high",
+                 "topic": "the real one"},
+            ],
+            "false_positives": [],
+        }
+        issues = [{
+            "file": "a.py", "line": 10, "severity": "high",
+            "invariant": "shared rule",
+            "sites": [{"file": "a.py", "line": 10},
+                      {"file": "b.py", "line": 42}],
+        }]
+        scored = rl.score_against_frozen_gt(
+            backend="codex", model="m", config="c",
+            envelope_status="ok", verdict="rejected", duration_ms=1,
+            replay_findings=rl.expand_finding_sites(issues),
+            ground_truth=gt,
+        )
+        self.assertEqual(scored.matched_tp, 1)
+        self.assertEqual(scored.recall, 1.0)
+
+    def test_sites_collapsing_on_one_gt_entry_does_not_inflate_recall(self):
+        # Recall counts DISTINCT ground-truth entries, so three sites that
+        # all land on one defect must not read as three catches.
+        gt = {
+            "true_positives": [
+                {"file": "a.py", "line": 10, "severity": "high", "topic": "x"},
+                {"file": "z.py", "line": 1, "severity": "high", "topic": "y"},
+            ],
+            "false_positives": [],
+        }
+        issues = [{
+            "file": "a.py", "line": 10, "severity": "high",
+            "sites": [{"file": "a.py", "line": 10},
+                      {"file": "a.py", "line": 11},
+                      {"file": "a.py", "line": 12}],
+        }]
+        scored = rl.score_against_frozen_gt(
+            backend="codex", model="m", config="c",
+            envelope_status="ok", verdict="rejected", duration_ms=1,
+            replay_findings=rl.expand_finding_sites(issues),
+            ground_truth=gt,
+        )
+        self.assertEqual(scored.recall, 0.5, "1 of 2 distinct GT defects")
+
+
 class ScoreAgainstFrozenGtTests(unittest.TestCase):
     """Replay mode's mechanical scoring against a frozen ground_truth_v3."""
 
@@ -757,6 +907,334 @@ class SelectReplayTargetsTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 replay.select_replay_targets(
                     dataset_dir=Path(d), sample=5)
+
+    def test_legacy_entries_without_harvest_source_count_as_pr_polish(self):
+        # Pre-schema-3 records predate the GitHub source entirely, so a
+        # missing harvest_source must not silently drop them from scoring.
+        with tempfile.TemporaryDirectory() as d:
+            ds = self._index(Path(d))
+            picked = replay.select_replay_targets(dataset_dir=ds, sample=5)
+            self.assertEqual(sorted(picked), ["kernel-1", "kernel-2"])
+
+
+class StalledRunDetectionTests(unittest.TestCase):
+    """A stalled backend is retried; a genuine empty review is not.
+
+    Regression intent: scoring a stalled run as zero-recall both understates
+    the config and, across a bake-off matrix, computes medians over uneven
+    run counts. Measured at 27% of attempts on a 3-config pilot — and
+    unevenly: one config lost 2 of 4 runs while another lost 0 of 3, which
+    would have made the stall-prone config look worse than it is.
+
+    The converse matters just as much: a reviewer that ran and honestly
+    found nothing must NOT be retried, or the sample skews toward configs
+    that happen to be chatty.
+    """
+
+    def test_missing_envelope_is_stalled(self):
+        self.assertTrue(replay._is_stalled_run(None))
+
+    def test_error_status_is_stalled(self):
+        self.assertTrue(replay._is_stalled_run({"status": "error"}))
+
+    def test_absent_status_is_stalled(self):
+        self.assertTrue(replay._is_stalled_run({}))
+
+    def test_ok_with_zero_findings_is_NOT_stalled(self):
+        # The reviewer ran and found nothing. That is a real result and
+        # belongs in the score — retrying it would bias the sample.
+        env = {"status": "ok",
+               "review": {"verdict": "accepted", "issues": []}}
+        self.assertFalse(replay._is_stalled_run(env))
+
+    def test_ok_with_findings_is_NOT_stalled(self):
+        env = {"status": "ok",
+               "review": {"verdict": "rejected",
+                          "issues": [{"file": "a.py", "line": 1}]}}
+        self.assertFalse(replay._is_stalled_run(env))
+
+
+class ArgparseHelpTests(unittest.TestCase):
+    """`--help` must render.
+
+    Regression intent: argparse runs help strings through %-formatting, so a
+    literal `%` in one (e.g. "~9-14% precision") raises ValueError and takes
+    down `--help` entirely — while every other invocation keeps working, so
+    it is easy to ship unnoticed.
+    """
+
+    def test_help_renders_without_format_error(self):
+        import argparse
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as cm:
+                replay.main(["--help"])
+        self.assertEqual(cm.exception.code, 0)
+        self.assertIn("--source", buf.getvalue())
+
+
+class DiffBaseArgTests(unittest.TestCase):
+    """The reviewer must be told the exact diff range.
+
+    Regression intent: replay checks out a detached worktree at
+    head_before, so with no --diff-base the agent guesses. The natural
+    guess, `git diff main...HEAD`, three-dots against a local base branch
+    that has advanced past the PR's merge base — measured on kernel-8276
+    as 336 files instead of 22, varying run to run. That made diff scope
+    an uncontrolled variable underneath every benchmark score.
+    """
+
+    def _capture_args(self, **kw):
+        seen = {}
+
+        def fake_run(args, **kwargs):
+            seen["args"] = args
+
+            class R:
+                returncode = 0
+
+            return R()
+
+        orig = replay.subprocess.run
+        replay.subprocess.run = fake_run
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                replay.run_bramble_code_review(
+                    bramble_bin="/bin/true",
+                    cfg=replay.CONFIGS["codex-5.4-mini"],
+                    goal="g",
+                    cwd=Path(tmp),
+                    envelope_file=Path(tmp) / "env.json",
+                    protocol_log_dir=Path(tmp) / "plog",
+                    log_dir=Path(tmp) / "log",
+                    run_tag="t",
+                    **kw,
+                )
+        finally:
+            replay.subprocess.run = orig
+        return seen["args"]
+
+    def test_diff_base_is_passed_through(self):
+        args = self._capture_args(diff_base="deadbeef" * 5)
+        self.assertIn("--diff-base", args)
+        self.assertEqual(args[args.index("--diff-base") + 1], "deadbeef" * 5)
+
+    def test_omitted_when_no_base(self):
+        # A record with no merge_base must not pass an empty flag value.
+        args = self._capture_args(diff_base=None)
+        self.assertNotIn("--diff-base", args)
+
+    def test_extra_args_survive_diff_base(self):
+        # The persona flag lives in extra_args; appending --diff-base must
+        # not displace it.
+        seen = {}
+
+        def fake_run(args, **kwargs):
+            seen["args"] = args
+
+            class R:
+                returncode = 0
+
+            return R()
+
+        orig = replay.subprocess.run
+        replay.subprocess.run = fake_run
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                replay.run_bramble_code_review(
+                    bramble_bin="/bin/true",
+                    cfg=replay.CONFIGS["luna-coverage-ledger"],
+                    goal="g",
+                    cwd=Path(tmp),
+                    envelope_file=Path(tmp) / "env.json",
+                    protocol_log_dir=Path(tmp) / "plog",
+                    log_dir=Path(tmp) / "log",
+                    run_tag="t",
+                    diff_base="abc123",
+                )
+        finally:
+            replay.subprocess.run = orig
+        args = seen["args"]
+        self.assertIn("--diff-base", args)
+        self.assertIn("--review-prompt-file", args)
+        self.assertIn("--effort", args)
+
+
+class MissingCommitHintTests(unittest.TestCase):
+    """An absent head_before must name the fix, not just fail.
+
+    Regression intent: older records whose PR branch was merged and
+    deleted fail with a bare "fatal: invalid reference: <sha>", which
+    reads like dataset corruption and sends you auditing the record
+    instead of running one `git fetch refs/pull/N/head`.
+    """
+
+    def _repo(self, tmp: str) -> Path:
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        hl.git(repo, "init", "-q")
+        hl.git(repo, "config", "user.email", "t@example.com")
+        hl.git(repo, "config", "user.name", "t")
+        (repo / "f.txt").write_text("hello\n")
+        hl.git(repo, "add", "f.txt")
+        hl.git(repo, "commit", "-q", "-m", "init")
+        return repo
+
+    def test_absent_commit_gets_fetch_hint(self):
+        absent = "0" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo(tmp)
+            with self.assertRaises(RuntimeError) as cm:
+                with replay.TempWorktree(repo, absent, "x"):
+                    pass
+            msg = str(cm.exception)
+            self.assertIn("is not in", msg)
+            self.assertIn("refs/pull/<PR>/head", msg)
+            self.assertIn("force-pushed", msg)
+
+    def test_present_commit_adds_no_hint(self):
+        # A worktree failure for any *other* reason must not be
+        # mislabelled as a missing commit.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo(tmp)
+            sha = hl.git(repo, "rev-parse", "HEAD").stdout.strip()
+            wt = replay.TempWorktree(repo, sha, "y")
+            with wt:
+                pass
+            self.assertEqual(wt._missing_commit_hint(), "")
+
+
+class PersonaVariantConfigTests(unittest.TestCase):
+    """Persona-variant configs must point at a real file, absolutely.
+
+    Regression intent: bramble's `loadPersonaFile` only *warns* when the
+    `--review-prompt-file` path is missing or empty, then silently falls
+    back to the built-in persona. A variant with a bad path therefore
+    reviews with the baseline prompt and reports the baseline's score
+    under the variant's name — a wrong benchmark number that looks like a
+    valid null result. `_persona_args` raises instead, and the paths must
+    be absolute because bramble runs with cwd set to the PR worktree.
+    """
+
+    PERSONA_CONFIGS = (
+        "luna-no-suppression",
+        "luna-coverage-ledger",
+        "luna-defect-class-priming",
+        "luna-confidence-band",
+        "luna-adversarial-successor",
+        "luna-severity-floor",
+        "luna-file-at-the-read",
+        "luna-localize-only",
+        "luna-localize-sweep",
+        "luna-localize-sweep-reuse",
+        "luna-localize-writers",
+        "luna-localize-reuse",
+        "mini-localize-only",
+        "composer-localize-only",
+    )
+
+    def test_persona_configs_resolve_to_existing_absolute_files(self):
+        for name in self.PERSONA_CONFIGS:
+            with self.subTest(config=name):
+                args = replay.CONFIGS[name].extra_args
+                self.assertIn("--review-prompt-file", args)
+                path = Path(args[args.index("--review-prompt-file") + 1])
+                self.assertTrue(path.is_absolute(), f"{name}: not absolute")
+                self.assertTrue(path.is_file(), f"{name}: missing {path}")
+                self.assertTrue(
+                    path.read_text().strip(),
+                    f"{name}: empty persona would silently fall back",
+                )
+
+    def test_missing_persona_raises_rather_than_falling_back(self):
+        with self.assertRaises(FileNotFoundError):
+            replay._persona_args("no-such-persona-variant")
+
+
+class ReplaySourceFilterTests(unittest.TestCase):
+    """GitHub-sourced GT is out of the scoring pool by default.
+
+    Its ground truth rests on bot comments with no pr-polish triage — ~9-14%
+    precision on the kernel corpus — so scoring against it rewards a
+    reviewer for reproducing bot noise.
+    """
+
+    def _index(self, d: Path) -> Path:
+        (d / "index.json").write_text(json.dumps({
+            "schema_version": 3,
+            "prs": [
+                {"file": "kernel-1.json", "ground_truth_collected": True,
+                 "harvest_source": "pr-polish"},
+                {"file": "kernel-2.json", "ground_truth_collected": True,
+                 "harvest_source": "github"},
+                {"file": "kernel-3.json", "ground_truth_collected": True},
+            ],
+        }))
+        return d
+
+    def test_github_excluded_by_default(self):
+        with tempfile.TemporaryDirectory() as d:
+            ds = self._index(Path(d))
+            picked = replay.select_replay_targets(dataset_dir=ds, sample=9)
+            self.assertEqual(sorted(picked), ["kernel-1", "kernel-3"])
+
+    def test_explicit_github_source_includes_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            ds = self._index(Path(d))
+            picked = replay.select_replay_targets(
+                dataset_dir=ds, sample=9, sources={"github"})
+            self.assertEqual(sorted(picked), ["kernel-2"])
+
+    def test_both_sources_yields_everything(self):
+        with tempfile.TemporaryDirectory() as d:
+            ds = self._index(Path(d))
+            picked = replay.select_replay_targets(
+                dataset_dir=ds, sample=9,
+                sources={"github", "pr-polish"})
+            self.assertEqual(
+                sorted(picked), ["kernel-1", "kernel-2", "kernel-3"])
+
+    def test_all_excluded_reports_the_exclusion(self):
+        # "no GT anywhere" and "GT exists but you filtered it out" are
+        # different problems; the message must not conflate them.
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "index.json").write_text(json.dumps({
+                "schema_version": 3,
+                "prs": [{"file": "kernel-2.json",
+                         "ground_truth_collected": True,
+                         "harvest_source": "github"}],
+            }))
+            with self.assertRaises(SystemExit) as cm:
+                replay.select_replay_targets(dataset_dir=Path(d), sample=5)
+            self.assertIn("excluded by --source", str(cm.exception))
+
+    def test_target_harvest_source_lookup(self):
+        with tempfile.TemporaryDirectory() as d:
+            ds = self._index(Path(d))
+            self.assertEqual(
+                replay._target_harvest_source(ds, "kernel-2"), "github")
+            self.assertEqual(
+                replay._target_harvest_source(ds, "kernel-1"), "pr-polish")
+            # Legacy entry with no harvest_source -> pr-polish.
+            self.assertEqual(
+                replay._target_harvest_source(ds, "kernel-3"), "pr-polish")
+            # Unknown target must not raise; it only decorates a warning.
+            self.assertIsNone(
+                replay._target_harvest_source(ds, "kernel-404"))
+
+    def test_target_harvest_source_accepts_json_filename(self):
+        with tempfile.TemporaryDirectory() as d:
+            ds = self._index(Path(d))
+            self.assertEqual(
+                replay._target_harvest_source(ds, "kernel-2.json"), "github")
+
+    def test_target_harvest_source_missing_index_is_none(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(
+                replay._target_harvest_source(Path(d), "kernel-1"))
 
 
 class RunReplayValidationTests(unittest.TestCase):

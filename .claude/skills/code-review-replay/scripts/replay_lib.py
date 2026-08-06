@@ -748,6 +748,49 @@ class ScoredRunV3:
     score_error: Optional[str] = None
 
 
+def expand_finding_sites(issues: list) -> list[dict]:
+    """Expand class-level findings into one entry per reported site.
+
+    The reviewer prompt *instructs* collapsing N sibling violations of one
+    invariant into a single issue carrying a ``sites`` array, with the
+    top-level ``file``/``line`` naming just one representative. Scoring only
+    that representative therefore credits a reviewer with 1 of N defects
+    *for obeying the contract* — a mechanical recall cap that no prompt
+    change can lift.
+
+    Measured on kernel-8276 (2026-08-05): 46 of 73 issues carried a
+    ``sites`` array and 90 reported defect locations were discarded before
+    scoring. Among them was a frozen true positive the run was recorded as
+    having missed.
+
+    Measured effect of turning this on, re-scoring the archived kernel-8276
+    envelopes: visible findings 20 -> 41, but **recall did not move at all**
+    (the same 5 distinct GT entries), while precision fell 1.00 -> 0.67.
+    Every additional site either re-hit an already-caught defect or landed
+    on a known false positive. So this is a correctness and honesty fix,
+    not a recall lever — do not expect it to raise recall, and treat the
+    lower precision as the previously-hidden truth rather than a
+    regression.
+
+    It is deliberately not a free recall gift: a class-level finding that
+    sprays wrong sites now accrues those as false positives too, which is
+    the correct incentive.
+    """
+    out: list[dict] = []
+    for f in issues:
+        if not isinstance(f, dict):
+            continue
+        sites = [s for s in (f.get("sites") or []) if isinstance(s, dict)]
+        if not sites:
+            out.append(f)
+            continue
+        for s in sites:
+            # Keep the parent's severity/message/confidence; only the
+            # location differs per site.
+            out.append({**f, "file": s.get("file"), "line": s.get("line")})
+    return out
+
+
 def score_against_frozen_gt(
     *,
     backend: str,
