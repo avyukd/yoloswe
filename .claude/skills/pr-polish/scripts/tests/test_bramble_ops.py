@@ -1243,6 +1243,65 @@ class TestSpiralEvidencePresent(unittest.TestCase):
         self.assertTrue(bramble_ops._spiral_evidence_present(finding, head=self.root))
 
 
+class TestActionPlanSummary(unittest.TestCase):
+    """The stderr census exists to make a false convergence impossible to
+    miss: the buckets live under ``action_plan``, and a caller reading them
+    off the top level sees an empty plan, which Step 3.g treats as
+    convergence.
+    """
+
+    def test_counts_every_bucket(self) -> None:
+        result = {
+            "total": 13,
+            "action_plan": {
+                "must_fix": [{"a": 1}],
+                "consider_fix": [{"a": 1}, {"a": 2}],
+                "batch_ack": [{"a": 1}, {"a": 2}, {"a": 3}],
+                "batch_stale": [],
+                "escalate": [],
+            },
+        }
+        line = bramble_ops._action_plan_summary(result)
+        self.assertIn("must_fix=1", line)
+        self.assertIn("consider_fix=2", line)
+        self.assertIn("batch_ack=3", line)
+        self.assertIn("escalate=0", line)
+        self.assertIn("total=13", line)
+
+    def test_distinguishes_empty_plan_from_missing_key(self) -> None:
+        # A genuinely empty plan and a malformed result must not render
+        # identically to the reader — the first is convergence, the second
+        # is a bug. Both print, and the `total` field separates them.
+        empty = bramble_ops._action_plan_summary(
+            {"total": 0, "action_plan": {k: [] for k in bramble_ops.ACTION_PLAN_BUCKETS}}
+        )
+        self.assertIn("must_fix=0", empty)
+        self.assertIn("total=0", empty)
+
+        # Findings present but buckets unreadable: total betrays the mismatch.
+        malformed = bramble_ops._action_plan_summary({"total": 13})
+        self.assertIn("must_fix=0", malformed)
+        self.assertIn("total=13", malformed)
+        self.assertNotEqual(empty, malformed)
+
+    def test_covers_all_buckets_triage_produces(self) -> None:
+        # Guard against a new bucket being added to triage's action_plan
+        # without being counted here — an uncounted bucket is invisible in
+        # the log, which is the failure this summary exists to prevent.
+        #
+        # cluster_hint is deliberately excluded: it is co-located metadata
+        # (file / count / topics groupings), not a list of findings awaiting
+        # an action, so counting it in a bucket census would inflate the
+        # apparent workload.
+        non_buckets = {"cluster_hint"}
+        result = bramble_ops.triage([], set())
+        self.assertEqual(
+            set(result["action_plan"]) - set(bramble_ops.ACTION_PLAN_BUCKETS) - non_buckets,
+            set(),
+            "triage produced an action_plan bucket the summary does not count",
+        )
+
+
 class TestTriageSpiralAutoDemote(unittest.TestCase):
     """Single-source spirals whose cited evidence isn't at HEAD are auto-
     demoted to batch_stale; multi-source spirals always escalate; the

@@ -25,8 +25,8 @@ Missing/error review streams → log as findings with stderr path cited.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--rounds N` | `5` | Up to N additional rounds this invocation. Budget resets on re-invoke. `--rounds 0` = no-op. |
-| `--gemini` | off | Extra reviewer (`gemini-3-flash-preview`). ≥2 sources = consensus. |
-| `--claude` | off | Extra reviewer (`claude` backend, `opus`). Highest per-round cost of the four — reach for it on a diff where codex+cursor disagree or keep missing the same class of bug. |
+| `--gemini` | off | Extra reviewer (`gemini-3-flash-preview`). ≥2 sources = consensus. Sets `USE_GEMINI=1`. |
+| `--claude` | off | Extra reviewer (`claude` backend, `opus`). Highest per-round cost of the four — reach for it on a diff where codex+cursor disagree or keep missing the same class of bug. Sets `USE_CLAUDE=1`. |
 | `--ask` / `--interactive` | off | Enable `AskUserQuestion` at gates (Step 3.g). Default: never block. |
 
 ## State tracking
@@ -149,6 +149,15 @@ If dirty: `git add -A && git commit -m "pr-polish: round N snapshot"`. Bramble s
 Always use `round-bundle` for `$LOG_DIR`, `$GOAL`, resume ids — do not hand-roll attempt index.
 
 ```bash
+# Opt-in reviewer toggles. These are read in three places below (launch,
+# --stream, --envelope) and nothing else sets them, so bind them from the
+# invocation flags here — substituting 1/0 as literals like every other
+# orchestrator var. Leaving one unset is not neutral: `[ "$USE_CLAUDE" = "1" ]`
+# is false, so the reviewer silently never launches and its absence looks
+# identical to "you didn't ask for it".
+USE_GEMINI=0   # 1 when --gemini was passed
+USE_CLAUDE=0   # 1 when --claude was passed
+
 BUNDLE=$(python3 $SKILL_DIR/scripts/pr_ops.py round-bundle "$CTX" {ROUND})
 LOG_DIR=$(echo "$BUNDLE" | jq -r .log_dir)
 GOAL=$(echo "$BUNDLE" | jq -r .goal_text)
@@ -287,7 +296,29 @@ python3 $SKILL_DIR/scripts/bramble_ops.py triage $STATE_FILE \
      echo --pr-comments $STATE_DIR/pp-comments.json --ci-failures $STATE_DIR/pp-ci.json )
 ```
 
-Buckets → `must_fix` / `consider_fix` / `batch_ack` / `escalate` (`spiral_matches`).
+Buckets → `must_fix` / `consider_fix` / `batch_ack` / `batch_stale` / `escalate`.
+
+**They are nested under `.action_plan`, not top-level.** The top level carries
+`total`, `unique`, `consensus`, `single_critical`, `single_medium`, `low_acks`,
+`spiral_matches`. Reading `.must_fix` instead of `.action_plan.must_fix` yields
+`null` for every bucket, which looks exactly like an empty plan — and Step 3.g
+treats an empty plan as convergence, so the loop exits reporting success with
+every finding unread.
+
+`triage` prints a census to stderr for this reason; check it against the JSON
+before concluding anything is empty:
+
+```
+[triage] action_plan: must_fix=0 consider_fix=10 batch_ack=3 batch_stale=0 escalate=0 total=13
+```
+
+`total=13` with all buckets `0` means you read the wrong key, not that there is
+nothing to do. To read the plan:
+
+```bash
+jq '.action_plan | {must_fix: (.must_fix|length), consider_fix: (.consider_fix|length),
+                    batch_ack: (.batch_ack|length), escalate: (.escalate|length)}' triage.json
+```
 
 **Ownership:** own pre-existing code in touched files. `must_fix` unless false positive (cite file:line). Low/nit → fix if trivial else `ack`. Skips: `false_positive`, `wont_fix`, `stale`.
 
@@ -305,7 +336,10 @@ When you decline on scope, record it as `wont_fix` with the reason — a decline
 
 **Spirals:** single-source may auto-demote to stale if evidence gone (±10 lines) or cited line was in prior round's diff. Multi-source → escalate. Default (no `--ask`): re-fix once (`spiral_refix: true`), stop on 2nd recurrence.
 
-Empty plan (`must_fix`/`consider_fix` empty) → converged, Step 3.g.
+Empty plan (`.action_plan.must_fix` and `.action_plan.consider_fix` both empty,
+**and** the stderr census agrees — `total=0`, or every finding accounted for in
+`batch_ack`/`batch_stale`) → converged, Step 3.g. A non-zero `total` with empty
+buckets is a misread, not convergence.
 
 ### d) Apply fixes
 
