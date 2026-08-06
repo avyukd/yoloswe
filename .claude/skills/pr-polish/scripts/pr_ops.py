@@ -565,8 +565,10 @@ def build_pr_summary(pr: dict[str, Any] | None = None) -> dict[str, Any]:
     body_raw = pr.get("body") or ""
     cleaned, dropped = strip_pr_body(body_raw)
 
-    fallback = _commit_diffstat_summary(base)
     if not cleaned or len(cleaned) < _MIN_USABLE_BODY_CHARS:
+        # Only shell out for the fallback when it's actually needed — on the
+        # common path (usable body) these two git calls would be discarded.
+        fallback = _commit_diffstat_summary(base)
         text = fallback
         source = "commits-diffstat"
         if cleaned:

@@ -112,8 +112,9 @@ Conflict (exit 2) → `state-mark-complete <ctx> sync-conflict`, Final Summary, 
 Build `$PR_SUMMARY` with the helper — do not hand-roll it:
 
 ```bash
-PR_SUMMARY=$(python3 $SKILL_DIR/scripts/pr_ops.py pr-summary --text-only)
-python3 $SKILL_DIR/scripts/pr_ops.py pr-summary | jq '{source, dropped}'   # log what it used
+SUMMARY_JSON=$(python3 $SKILL_DIR/scripts/pr_ops.py pr-summary)   # one call
+PR_SUMMARY=$(echo "$SUMMARY_JSON" | jq -r .pr_summary)
+echo "$SUMMARY_JSON" | jq '{source, dropped}'                     # log what it used
 ```
 
 When the PR has a usable description, **that description is the summary** — the author's own statement of intent beats a generated commit list for telling a reviewer what the change is FOR, and therefore what is out of scope. The helper strips only machine-emitted additions: bot-appended blocks (`<!-- CURSOR_SUMMARY -->` and friends) and `Generated with`/`Co-Authored-By`/bot-review-footer trailers. A review bot's restatement of the diff is the *worst* possible goal text — it anchors the reviewer on a summary of the code instead of the intent behind it.
@@ -242,7 +243,12 @@ PIDS+=($!)
 
 The `${VAR:+…}` idiom is load-bearing: an empty resume id must drop the flag entirely, not pass an empty string. Keep the per-reviewer `BRAMBLE_RUN_TAG` — it is how runs are attributed.
 
-Assembled, the job is:
+**This is not copy-pasteable as-is** — expand the template once per row above
+before running. A `#` marker left unexpanded is inert shell: the reviewer never
+launches, and because `wait` returns 0 for whatever *did* start, the round then
+triages a near-empty reviewer set that looks perfectly healthy. Codex is shown
+fully expanded below; cursor is the same with the row's substitutions applied,
+and the two optional launches go inside their `if` guards.
 
 ```bash
 # INVARIANT: every reviewer launch ends with `PIDS+=($!)`; nothing else touches
@@ -252,22 +258,34 @@ Assembled, the job is:
 # `set -o pipefail` keeps each subshell's status the reviewer's, not `sed`'s 0.
 PIDS=()
 
-<codex launch from template>            # always
-<cursor launch from template>           # always
+( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:codex:r{ROUND} \
+  timeout 1200 $BRAMBLE_BIN code-review --backend codex --model gpt-5.6-luna --effort medium \
+    --skip-test-execution --verbose --idle-timeout 5m \
+    --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
+    ${CODEX_RESUME:+--resume-session-id "$CODEX_RESUME"} \
+    --envelope-file "$LOG_DIR/codex-envelope.json" \
+  2>&1 | tee "$LOG_DIR/codex-stderr.txt" | sed 's/^/[codex] /' ) &
+PIDS+=($!)
+
+# cursor: same block, substituting the `cursor` row (no --effort flag).
+PIDS+=($!)
 
 ( set -o pipefail; timeout 120 python3 $SKILL_DIR/scripts/lint_gate.py \
     --state-dir "$STATE_DIR" --round {ROUND} --log-dir "$LOG_DIR" \
   2>&1 | tee "$LOG_DIR/lint-stderr.txt" | sed 's/^/[lint] /' ) &
 PIDS+=($!)
 
-if [ "$USE_GEMINI" = "1" ]; then <gemini launch from template>; fi
-if [ "$USE_CLAUDE" = "1" ]; then <claude launch from template>; fi
+# gemini: wrap the `gemini` row's block in `if [ "$USE_GEMINI" = "1" ]; then … fi`
+# claude: wrap the `claude` row's block in `if [ "$USE_CLAUDE" = "1" ]; then … fi`
 
 # Join on EVERY launched reviewer so triage never starts while one is still
 # running or has yet to write its envelope. A skipped reviewer is simply one
 # fewer element — the wait can't desync from the launches.
 wait "${PIDS[@]}"
 ```
+
+Before running the job, check that it contains one `( set -o pipefail; …` launch
+per reviewer you intend and that each is followed by `PIDS+=($!)`.
 
 Before triage: `recover-envelope` on each stream path (idempotent). A reviewer that exited without a valid envelope → `stream-missing` finding, not a deadlock.
 

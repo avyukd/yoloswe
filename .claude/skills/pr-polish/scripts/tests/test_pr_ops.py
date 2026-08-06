@@ -2836,6 +2836,24 @@ class TestBuildPRSummary(unittest.TestCase):
         # A usable body does not drag the commit list along.
         self.assertNotIn("COMMITS", out["pr_summary"])
 
+    def test_usable_body_does_not_shell_out_for_fallback(self) -> None:
+        """The git fallback is lazy — two subprocesses per call, discarded."""
+        calls: list[str] = []
+
+        def spy(base, **kw):
+            calls.append(base)
+            return "COMMITS"
+
+        with patch.object(pr_ops, "_commit_diffstat_summary", side_effect=spy):
+            out = pr_ops.build_pr_summary(self._pr(body=_REAL_BODY))
+        self.assertEqual(out["source"], "pr-body")
+        self.assertEqual(calls, [], "fallback must not run when the body is usable")
+
+        # ...but it still runs on the paths that need it.
+        with patch.object(pr_ops, "_commit_diffstat_summary", side_effect=spy):
+            pr_ops.build_pr_summary(self._pr(body=""))
+        self.assertEqual(len(calls), 1)
+
     def test_falls_back_to_commits_when_no_body(self) -> None:
         with patch.object(pr_ops, "_commit_diffstat_summary", return_value="COMMITS"):
             out = pr_ops.build_pr_summary(self._pr(body=""))
