@@ -824,6 +824,14 @@ def apply_human_review_command(
     became partly a function of human agreement. This path rewrites the frozen
     block additively and leaves all round accounting alone.
     """
+    # `target` is concatenated into dataset/ and human-review/ paths below, so
+    # reject a traversal slug before any path is built.
+    try:
+        hr.validate_target(target)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
     dataset_path, dataset = _load_dataset(dataset_dir, target)
     gt = cl.load_ground_truth(dataset)
     if gt is None:

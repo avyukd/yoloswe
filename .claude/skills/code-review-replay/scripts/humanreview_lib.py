@@ -35,6 +35,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -63,6 +64,37 @@ VALID_OPS = frozenset({OP_CONFIRM, OP_REJECT, OP_RESEVERITY, OP_ADD})
 # audit record, not a live queue (measured: 0 unresolved contested entries
 # corpus-wide), so ops never move an entry *into* it.
 _BUCKETS = ("true_positives", "false_positives")
+
+
+# ===========================================================================
+# Entry provenance
+# ===========================================================================
+
+
+def is_human_added(entry: dict) -> bool:
+    """Whether this entry was created by a human ``add``, not by a judge.
+
+    The distinction matters wherever code asks "was this part of the judged
+    census?" — :func:`gt_fingerprint` excludes human additions so applying an
+    overlay does not invalidate it, and :func:`strip_human_review` deletes
+    them outright.
+
+    **The op name alone is not the marker**, and assuming it was caused a real
+    bug. When an ``add`` lands within ``_LINE_SLACK`` rows of an existing
+    entry, :func:`apply_human_review` annotates *that pre-existing judged
+    entry* rather than creating a duplicate — stamping ``human_verdict.verdict
+    = "add"`` onto a row the judge created. Keying only on that stamp dropped
+    a judged entry out of the fingerprint, so the next idempotent re-apply
+    aborted with a false "ground truth changed" error.
+
+    ``first_seen_round is None`` is the load-bearing half: a judge-created
+    entry always records the round that first surfaced it, and only a human
+    addition has no round. Both conditions must hold.
+    """
+    if not isinstance(entry, dict):
+        return False
+    stamped_add = (entry.get("human_verdict") or {}).get("verdict") == OP_ADD
+    return stamped_add and entry.get("first_seen_round") is None
 
 
 # ===========================================================================
@@ -102,7 +134,7 @@ def gt_fingerprint(gt: dict) -> str:
         for e in gt.get(bucket) or []:
             if not isinstance(e, dict):
                 continue
-            if (e.get("human_verdict") or {}).get("verdict") == OP_ADD:
+            if is_human_added(e):
                 continue  # not part of the judged set this review was cast against
             rows.append([
                 cl.normalize_finding_path(e.get("file")),
@@ -135,6 +167,16 @@ def validate_overlay(obj: object) -> Optional[str]:
         )
     if not obj.get("target"):
         return "overlay missing 'target'"
+    # The fingerprint is what stops verdicts cast against one census from
+    # being applied to a re-collected one. Treating it as optional meant a
+    # hand-written or legacy overlay silently skipped the drift guard, since
+    # `apply-human-review` only compares when the field is present.
+    if not obj.get("gt_fingerprint"):
+        return (
+            "overlay missing 'gt_fingerprint' — it pins the ground truth "
+            "this review was cast against; without it the staleness guard "
+            "cannot run. Re-stage the review, or pass --force deliberately."
+        )
     verdicts = obj.get("verdicts")
     if not isinstance(verdicts, list):
         return "overlay missing 'verdicts' list"
@@ -223,14 +265,53 @@ def new_overlay(target: str, gt: dict) -> dict:
     }
 
 
+# A dataset target is `<repo>-<pr>`: repo names are lowercase words (kernel,
+# yoloswe, nebula) and the suffix is a PR number or a `branch-<slug>` label.
+# Anchored, and deliberately excluding `/`, `.` and `\` so no traversal
+# sequence can be expressed at all.
+_TARGET_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
+
+
+def validate_target(target: object) -> str:
+    """Return ``target`` if it is a safe dataset slug, else raise ``ValueError``.
+
+    Targets arrive from a URL path (`/api/pr/<target>`) and from argv, and are
+    then concatenated into filesystem paths under `dataset/` and
+    `human-review/`. Without this, a crafted `../../../tmp/x` escapes the
+    intended root: `overlay_path` resolved such a slug to
+    `/home/ubuntu/tmp/x.json`, outside `human-review/` entirely — an arbitrary
+    read on the UI's GET path and an arbitrary *overwrite* on its POST path.
+
+    Validating the slug itself, rather than checking the resolved path against
+    a root, keeps one rule for every caller and rejects the input before any
+    path is built.
+    """
+    if not isinstance(target, str) or not _TARGET_RE.match(target):
+        raise ValueError(
+            f"invalid target {target!r} — expected a <repo>-<pr> slug of "
+            "letters, digits, '_' and '-' (no path separators or '..')"
+        )
+    return target
+
+
 def overlay_path(eval_root: Path, target: str) -> Path:
-    return eval_root / OVERLAY_DIRNAME / f"{target}.json"
+    return eval_root / OVERLAY_DIRNAME / f"{validate_target(target)}.json"
 
 
 def load_overlay(path: Path) -> Optional[dict]:
+    """Read an overlay, or ``None`` if absent.
+
+    A corrupt overlay raises ``ValueError`` rather than propagating a raw
+    ``JSONDecodeError``: the UI catches ValueError and returns 400, so a
+    half-written file surfaces as a readable error instead of a traceback
+    that makes every subsequent request to that PR fail.
+    """
     if not path.is_file():
         return None
-    return json.loads(path.read_text())
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        raise ValueError(f"corrupt human-review overlay at {path}: {e}")
 
 
 def save_overlay(path: Path, overlay: dict) -> Path:
@@ -255,7 +336,7 @@ def upsert_verdict(overlay: dict, verdict: dict) -> dict:
     return overlay
 
 
-def _same_identity(a: dict, b: dict) -> bool:
+def same_identity(a: dict, b: dict) -> bool:
     """Strict ``(file, line)`` identity — ``None`` matches only ``None``.
 
     Uses ``collect_lib._entry_matches``' rule rather than the looser
@@ -263,11 +344,19 @@ def _same_identity(a: dict, b: dict) -> bool:
     file-level location subsume every line-level one in the file, which would
     make a single file-level human verdict silently re-rule unrelated entries
     — the kernel-8229 collision, in a new costume.
+
+    Public because the UI's pre-add collision warning must predict exactly
+    what :func:`apply_human_review` will do. A warning computed with a
+    different rule than the write it describes is worse than no warning.
     """
     a_line, b_line = a.get("line"), b.get("line")
     if (a_line is None) != (b_line is None):
         return False
     return cl.same_defect(a.get("file"), a_line, b.get("file"), b_line)
+
+
+# Back-compat alias for in-module callers written against the private name.
+_same_identity = same_identity
 
 
 # ===========================================================================
@@ -418,9 +507,7 @@ def strip_human_review(gt: dict) -> tuple[dict, int]:
         rows = out.get(bucket) or []
         kept = []
         for e in rows:
-            if isinstance(e, dict) and (e.get("human_verdict") or {}).get(
-                "verdict"
-            ) == OP_ADD and e.get("first_seen_round") is None:
+            if is_human_added(e):
                 removed += 1
                 continue
             kept.append(e)
@@ -453,10 +540,13 @@ def human_review_stats(gt: dict) -> dict:
             if not isinstance(e, dict):
                 continue
             total += 1
-            hv = e.get("human_verdict") or {}
-            if hv:
+            if e.get("human_verdict"):
                 adjudicated += 1
-                if hv.get("verdict") == OP_ADD:
+                # Only a genuinely new entry counts as "added" — an `add` that
+                # collided with an existing judged entry annotated that entry
+                # instead, and reporting it as an addition would overstate what
+                # the human contributed.
+                if is_human_added(e):
                     added += 1
     return {
         "entries": total,

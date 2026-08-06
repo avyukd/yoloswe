@@ -81,7 +81,9 @@ async function renderList() {
                                   text: String(r.suggestions)}) : ''),
     el('td', {text: r.census_converged ? 'yes' : 'no'}),
     el('td', {class: 'num',
-              text: `${r.adjudicated}/${r.entries}`}),
+              title: r.staged ? `${r.staged} staged, not yet applied` : '',
+              text: `${r.adjudicated}/${r.entries}` +
+                    (r.staged ? ` (+${r.staged})` : '')}),
     el('td', {}, el('span', {class: 'state-' + r.render_state,
                              title: r.render_detail || '',
                              text: r.render_state})),
@@ -260,8 +262,7 @@ function actionRow(row, staged) {
   if (isSugg) {
     btns.push(el('button', {
       text: 'promote to true positive',
-      onclick: () => stage(row, {op: 'add', severity: 'medium',
-                                 topic: row.topic}),
+      onclick: () => promote(row),
     }));
   } else {
     btns.push(
@@ -275,6 +276,25 @@ function actionRow(row, staged) {
                             onclick: () => stage(row, {op: '_clear'})}));
   }
   return el('div', {class: 'actions'}, btns);
+}
+
+// A suggestion row's `topic` is a provenance label ("unmatched in 3 run(s) /
+// 2 config(s)"), not a description of the defect. Staging it verbatim would
+// write that label into the ground truth as the finding's topic, where every
+// later consumer reads it as the defect description. Promotion therefore asks
+// for a real topic and severity, exactly as adding a finding by hand does.
+async function promote(row) {
+  const topic = prompt(
+    `Promoting ${row.file}:${row.line}\n` +
+    `(seen in ${row.n_runs} run(s) / ${row.n_configs} config(s))\n\n` +
+    'Describe the defect — this becomes its topic in the ground truth:', '');
+  if (!topic) return;
+  const severity = prompt('Severity (high, medium, low, nit)', 'medium');
+  if (!['high', 'medium', 'low', 'nit'].includes(severity || '')) {
+    alert('severity must be one of: high, medium, low, nit');
+    return;
+  }
+  stage(row, {op: 'add', severity, topic});
 }
 
 async function reseverity(row) {

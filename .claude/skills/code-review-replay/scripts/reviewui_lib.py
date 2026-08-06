@@ -403,9 +403,34 @@ def context_window(
 DEFAULT_REPLAY_WINDOW = 12
 
 
+def index_replays(replay_dir: Path = REPLAY_DIR) -> dict[str, list[tuple]]:
+    """One pass over the replay dir, grouping archives by dataset target.
+
+    `/api/records` needs suggestion counts for every record. Calling
+    :func:`load_suggestions` per record re-globs and re-parses the whole
+    replay dir each time — 48 records x 153 archives today (~2s), and the dir
+    is append-only, so the cost climbs with every bake-off. Building the index
+    once and passing it in keeps the list endpoint linear in archives rather
+    than quadratic.
+    """
+    index: dict[str, list[tuple]] = {}
+    for path in sorted(replay_dir.glob("*-scored.json")):
+        try:
+            doc = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        target = (doc.get("dataset_file") or "")[:-5]
+        if not target:
+            continue
+        index.setdefault(target, []).append(
+            (doc.get("generated_at") or "", path.stem, doc))
+    return index
+
+
 def load_suggestions(
     target: str, gt: dict, replay_dir: Path = REPLAY_DIR, *,
     window: int = DEFAULT_REPLAY_WINDOW,
+    index: Optional[dict[str, list[tuple]]] = None,
 ) -> list[dict]:
     """Unmatched replay findings for one PR, ranked by cross-run recurrence.
 
@@ -419,15 +444,18 @@ def load_suggestions(
     :data:`DEFAULT_REPLAY_WINDOW` for why aggregating all history is wrong.
     Pass ``window=0`` to read every archive.
     """
-    docs: list[tuple[str, str, dict]] = []
-    for path in sorted(replay_dir.glob("*-scored.json")):
-        try:
-            doc = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
-            continue
-        if (doc.get("dataset_file") or "")[:-5] != target:
-            continue
-        docs.append((doc.get("generated_at") or "", path.stem, doc))
+    if index is not None:
+        docs = list(index.get(target) or [])
+    else:
+        docs = []
+        for path in sorted(replay_dir.glob("*-scored.json")):
+            try:
+                doc = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if (doc.get("dataset_file") or "")[:-5] != target:
+                continue
+            docs.append((doc.get("generated_at") or "", path.stem, doc))
 
     total = len(docs)
     docs.sort(key=lambda d: d[0])
@@ -468,6 +496,7 @@ def load_suggestions(
 def summarize_record(
     target: str, record: dict, repo: Optional[Path], *,
     suggestion_counts: Optional[dict] = None,
+    staged_counts: Optional[dict] = None,
 ) -> dict:
     gt = cl.load_ground_truth(record) or {}
     revs = resolve_revs(record, repo)
@@ -491,7 +520,12 @@ def summarize_record(
         "base_source": revs.get("base_source"),
         "adjudicated": stats["adjudicated"],
         "entries": stats["entries"],
-        "pending": stats["pending"],
+        # Staged-but-unapplied verdicts count as progress: a review left
+        # half-finished in the overlay is not untouched work, and treating it
+        # as such sorts it back to the top of the queue every session.
+        "staged": (staged_counts or {}).get(target, 0),
+        "pending": max(
+            0, stats["pending"] - (staged_counts or {}).get(target, 0)),
         "human_added": stats["human_added"],
         "suggestions": (suggestion_counts or {}).get(target, 0),
         "goal_text": (rnd.get("goal_text") or "")[:200],

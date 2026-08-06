@@ -323,6 +323,41 @@ class LoadSuggestionsTests(unittest.TestCase):
         self.assertEqual(got[0]["archives_read"], 2)
         self.assertEqual(got[0]["archives_total"], 5)
 
+    def test_index_matches_unindexed_results(self):
+        """The index is a speed-up, so it must not change what is returned.
+
+        `/api/records` calls this once per record; scanning the replay dir
+        each time re-parses every archive (48 records x 153 archives, ~2s
+        today, growing with every bake-off). `index_replays` hoists that into
+        one pass — but only if both paths agree.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            for i in (1, 2, 3):
+                (d / f"kernel-1-2026010{i}-scored.json").write_text(json.dumps({
+                    "dataset_file": "kernel-1.json",
+                    "generated_at": f"2026-01-0{i}T00:00:00Z",
+                    "rounds": [{"runs": [{"config": f"cfg{i}",
+                                          "finding_scores": [
+                        {"file": "src/x.py", "line": 10,
+                         "outcome": "unmatched"}]}]}],
+                }))
+            (d / "kernel-9-scored.json").write_text(json.dumps({
+                "dataset_file": "kernel-9.json",
+                "generated_at": "2026-01-01T00:00:00Z",
+                "rounds": [{"runs": [{"config": "c", "finding_scores": [
+                    {"file": "z.py", "line": 1, "outcome": "unmatched"}]}]}],
+            }))
+            plain = rl.load_suggestions("kernel-1", {}, d)
+            idx = rl.index_replays(d)
+            indexed = rl.load_suggestions("kernel-1", {}, d, index=idx)
+
+        self.assertEqual(plain, indexed)
+        self.assertEqual(indexed[0]["n_runs"], 3)
+        # The index must not leak another PR's archives into this one.
+        self.assertEqual(len(idx["kernel-1"]), 3)
+        self.assertEqual(len(idx["kernel-9"]), 1)
+
     def test_window_zero_reads_everything(self):
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)

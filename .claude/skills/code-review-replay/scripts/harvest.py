@@ -367,7 +367,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if not records:
         return 2
-    return 1 if partial else 0
+    # `discovery_degraded` must reach the exit status. A GitHub discovery that
+    # failed yields zero candidates from that slug, so a run with healthy
+    # local state would otherwise exit 0 having silently omitted every GitHub
+    # PR — indistinguishable from "there were none to harvest". Same
+    # non-zero-but-not-fatal tier as `partial`.
+    return 1 if (partial or discovery_degraded) else 0
 
 
 if __name__ == "__main__":

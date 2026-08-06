@@ -244,6 +244,36 @@ class OverlayValidationTests(unittest.TestCase):
         del v["reviewer"]
         self.assertIn("reviewer", hr.validate_overlay(_overlay(v)) or "")
 
+    def test_rejects_missing_fingerprint(self):
+        """A fingerprint-less overlay would skip the staleness guard entirely.
+
+        Regression (codex, PR #309): `apply-human-review` only compares
+        fingerprints when the field is present, so a hand-written or legacy
+        overlay could be applied to a re-collected census without --force.
+        """
+        ov = _overlay(_v(hr.OP_CONFIRM, "a/b.py", 10))
+        del ov["gt_fingerprint"]
+        self.assertIn("gt_fingerprint", hr.validate_overlay(ov) or "")
+
+    def test_new_overlay_is_valid_out_of_the_box(self):
+        gt = _gt(tps=[_entry("a/b.py", 10)])
+        ov = hr.new_overlay("kernel-1", gt)
+        ov["verdicts"].append(_v(hr.OP_CONFIRM, "a/b.py", 10))
+        self.assertIsNone(hr.validate_overlay(ov))
+
+
+class LoadOverlayTests(unittest.TestCase):
+
+    def test_corrupt_overlay_raises_value_error(self):
+        """A half-written overlay must not 500 every request for that PR."""
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "human-review" / "kernel-1.json"
+            p.parent.mkdir(parents=True)
+            p.write_text('{"schema_version": 1, "verdi')
+            with self.assertRaises(ValueError) as cm:
+                hr.load_overlay(p)
+            self.assertIn("corrupt", str(cm.exception))
+
     def test_rejects_conflicting_ops_within_line_slack(self):
         """Two ops 2 rows apart target ONE entry — the later would win silently."""
         err = hr.validate_overlay(_overlay(
@@ -310,6 +340,49 @@ class FingerprintTests(unittest.TestCase):
             hr.gt_fingerprint(out), before,
             "applying an overlay must not change the fingerprint it pinned")
 
+    def test_colliding_add_does_not_drop_a_judged_entry(self):
+        """An `add` onto an existing entry must not change the fingerprint.
+
+        Regression (cursor bugbot, PR #309): a colliding `add` annotates the
+        pre-existing judged entry rather than creating a duplicate, stamping
+        `human_verdict.verdict = "add"` on a row the JUDGE created. The
+        fingerprint skipped anything carrying that stamp, so the judged entry
+        dropped out of the hash and the next idempotent re-apply aborted with
+        a false "ground truth changed" error. The stamp alone is not the
+        marker — `first_seen_round is None` must hold too.
+        """
+        gt = _gt(tps=[_entry("a/b.py", 10)])
+        before = hr.gt_fingerprint(gt)
+        ov = _overlay(_v(hr.OP_ADD, "a/b.py", 11, severity="low",
+                         topic="near miss"), fingerprint=before)
+        out, notes = hr.apply_human_review(gt, ov)
+
+        self.assertTrue(any("annotated it instead" in n for n in notes))
+        self.assertEqual(
+            hr.gt_fingerprint(out), before,
+            "a colliding add must not drop the judged entry from the hash")
+        # And the whole point: a second apply still proceeds.
+        again, _ = hr.apply_human_review(out, ov)
+        self.assertEqual(hr.gt_fingerprint(again), before)
+
+    def test_colliding_add_is_not_counted_as_a_human_addition(self):
+        gt = _gt(tps=[_entry("a/b.py", 10)])
+        ov = _overlay(_v(hr.OP_ADD, "a/b.py", 11, severity="low", topic="x"))
+        out, _ = hr.apply_human_review(gt, ov)
+        stats = hr.human_review_stats(out)
+        self.assertEqual(stats["entries"], 1)
+        self.assertEqual(stats["adjudicated"], 1)
+        self.assertEqual(stats["human_added"], 0)
+
+    def test_colliding_add_survives_strip(self):
+        """Strip must not delete the judged entry a colliding add annotated."""
+        gt = _gt(tps=[_entry("a/b.py", 10)])
+        ov = _overlay(_v(hr.OP_ADD, "a/b.py", 11, severity="low", topic="x"))
+        out, _ = hr.apply_human_review(gt, ov)
+        stripped, _ = hr.strip_human_review(out)
+        self.assertEqual(len(stripped["true_positives"]), 1)
+        self.assertEqual(stripped["true_positives"][0]["line"], 10)
+
     def test_still_detects_a_genuine_recollection(self):
         """The guard must not be so loose it stops catching real drift."""
         gt = _gt(tps=[_entry("a/b.py", 10)])
@@ -370,6 +443,81 @@ class ValidatorCompatibilityTests(unittest.TestCase):
                    "ground_truth_v3": applied, "harvested_rounds": []}
         errors, _ = cl.validate_dataset(dataset)
         self.assertEqual(errors, [])
+
+
+class ValidateTargetTests(unittest.TestCase):
+    """Target slugs reach the filesystem, so they are validated at the door.
+
+    Regression (codex, PR #309): `target` arrives from a URL path and from
+    argv, then is concatenated into `dataset/<target>.json` and
+    `human-review/<target>.json`. A crafted `../../../tmp/x` resolved to
+    `/home/ubuntu/tmp/x.json` — outside the intended root — giving an
+    arbitrary read on the UI's GET path and an arbitrary overwrite on POST.
+    """
+
+    def test_accepts_ordinary_slugs(self):
+        for ok in ("kernel-8276", "yoloswe-309", "kernel-branch-feature-x",
+                   "nebula_1", "k1"):
+            self.assertEqual(hr.validate_target(ok), ok)
+
+    def test_rejects_parent_traversal(self):
+        for bad in ("../../../tmp/pwned", "..", "../x",
+                    "kernel-8276/../../etc/passwd"):
+            with self.assertRaises(ValueError, msg=bad):
+                hr.validate_target(bad)
+
+    def test_rejects_path_separators_and_dots(self):
+        for bad in ("a/b", "a\\b", "a.b", "/abs", "./x"):
+            with self.assertRaises(ValueError, msg=bad):
+                hr.validate_target(bad)
+
+    def test_rejects_empty_and_non_string(self):
+        for bad in ("", None, 12, ["kernel-1"]):
+            with self.assertRaises(ValueError):
+                hr.validate_target(bad)
+
+    def test_overlay_path_cannot_escape_its_root(self):
+        root = Path("/tmp/eval-root")
+        with self.assertRaises(ValueError):
+            hr.overlay_path(root, "../../../tmp/pwned")
+        good = hr.overlay_path(root, "kernel-8276")
+        self.assertEqual(good.parent, root / hr.OVERLAY_DIRNAME)
+
+
+class SameIdentityTests(unittest.TestCase):
+    """The rule the UI's pre-add warning must share with the write path.
+
+    Regression (cursor bugbot, PR #309): `_api_check_identity` warned using
+    the looser `same_defect`, under which a file-level entry subsumes every
+    line in its file. The UI would claim "this edits an existing entry" for a
+    line that `apply_human_review` would in fact add as a distinct one. A
+    warning that mispredicts the write it describes is worse than none.
+    """
+
+    def test_file_level_entry_does_not_subsume_a_line(self):
+        entry = {"file": "a/b.py", "line": None}
+        probe = {"file": "a/b.py", "line": 58}
+        self.assertFalse(hr.same_identity(entry, probe))
+        # ...whereas the loose rule (wrongly, for this purpose) would match.
+        self.assertTrue(cl.same_defect("a/b.py", None, "a/b.py", 58))
+
+    def test_matches_within_line_slack(self):
+        self.assertTrue(
+            hr.same_identity({"file": "a/b.py", "line": 10},
+                             {"file": "a/b.py", "line": 12}))
+
+    def test_does_not_match_beyond_line_slack(self):
+        self.assertFalse(
+            hr.same_identity({"file": "a/b.py", "line": 10},
+                             {"file": "a/b.py", "line": 20}))
+
+    def test_null_matches_null(self):
+        self.assertTrue(
+            hr.same_identity({"file": "a/b.py", "line": None},
+                             {"file": "a/b.py", "line": None}))
+
+    def test_private_alias_still_resolves(self):
+        self.assertIs(hr._same_identity, hr.same_identity)
 
 
 class UpsertTests(unittest.TestCase):

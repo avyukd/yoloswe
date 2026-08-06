@@ -61,7 +61,12 @@ class _State:
         return self.repo_map.lookup((record.get("pr") or {}).get("repo_name"))
 
     def load(self, target: str) -> Optional[tuple[Path, dict]]:
-        path = self.dataset_dir / f"{target}.json"
+        # `target` comes straight off the URL path, so it must be validated
+        # before it is concatenated into a filesystem path — otherwise a
+        # crafted `../../..` slug reads (and, on the POST path, overwrites)
+        # files outside `dataset/`. Raises ValueError; callers turn that into
+        # a 400 rather than a traceback.
+        path = self.dataset_dir / f"{hr.validate_target(target)}.json"
         if not path.is_file():
             return None
         return path, json.loads(path.read_text())
@@ -80,13 +85,26 @@ def _api_records() -> dict:
     records = rl.load_records(STATE.dataset_dir)
     # Suggestion counts drive the default sort — the whole point of the human
     # pass is to spend attention where the census is most likely incomplete.
+    # Index the replay dir ONCE: per-record scanning re-parses every archive
+    # for every record, and that dir only ever grows.
+    replay_dir = STATE.eval_root / "replays"
+    replay_index = rl.index_replays(replay_dir)
     counts: dict[str, int] = {}
+    staged: dict[str, int] = {}
     for target, rec in records:
         gt = cl.load_ground_truth(rec) or {}
-        sugg = rl.load_suggestions(target, gt, STATE.eval_root / "replays")
+        sugg = rl.load_suggestions(target, gt, replay_dir, index=replay_index)
         counts[target] = sum(1 for s in sugg if s.get("recurrent"))
+        # Progress must count verdicts staged but not yet applied, or a
+        # half-finished review reads as untouched and sorts back to the top.
+        try:
+            ov = hr.load_overlay(hr.overlay_path(STATE.eval_root, target))
+        except ValueError:
+            ov = None  # corrupt overlay: surfaced on the PR page, not here
+        staged[target] = len((ov or {}).get("verdicts") or [])
     rows = [
-        rl.summarize_record(t, r, STATE.repo_for(r), suggestion_counts=counts)
+        rl.summarize_record(t, r, STATE.repo_for(r), suggestion_counts=counts,
+                            staged_counts=staged)
         for t, r in records
     ]
     rows.sort(key=lambda r: (
@@ -203,7 +221,7 @@ def _api_verdict(target: str, body: dict) -> dict:
         probe = {"file": body.get("file"), "line": body.get("line")}
         overlay["verdicts"] = [
             v for v in overlay.get("verdicts") or []
-            if not hr._same_identity(v, probe)
+            if not hr.same_identity(v, probe)
         ]
         hr.save_overlay(path, overlay)
         return {"ok": True, "overlay": overlay}
@@ -244,9 +262,16 @@ def _api_check_identity(target: str, body: dict) -> dict:
     _, record = loaded
     gt = cl.load_ground_truth(record) or {}
     file, line = body.get("file"), body.get("line")
+    probe = {"file": file, "line": line}
     for bucket in ("true_positives", "false_positives"):
         for e in gt.get(bucket) or []:
-            if cl.same_defect(e.get("file"), e.get("line"), file, line):
+            # Must use the SAME rule `apply_human_review` will use, not the
+            # looser `same_defect`. Under `same_defect` a file-level entry
+            # subsumes every line in its file, so the UI would warn "this
+            # edits an existing entry" for a line the apply step would in
+            # fact add as a distinct one — a warning that mispredicts the
+            # write is worse than none.
+            if hr.same_identity(e, probe):
                 return {
                     "collision": True, "bucket": bucket,
                     "file": e.get("file"), "line": e.get("line"),
@@ -291,6 +316,18 @@ def _asset(start_response, name: str, content_type: str):
 
 
 def application(environ, start_response):
+    # Every target-bearing endpoint validates its slug (see
+    # `hr.validate_target`) and signals a bad one with ValueError. Catching it
+    # here keeps one rejection path for all of them, so a traversal attempt
+    # gets a clean 400 instead of a 500 with a traceback.
+    try:
+        return _dispatch(environ, start_response)
+    except ValueError as e:
+        return _json_response(start_response, {"error": str(e)},
+                              "400 Bad Request")
+
+
+def _dispatch(environ, start_response):
     path = urlparse(environ.get("PATH_INFO", "/")).path
     method = environ.get("REQUEST_METHOD", "GET")
 
