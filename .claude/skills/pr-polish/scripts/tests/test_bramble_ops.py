@@ -1732,6 +1732,117 @@ class TestGoalCLI(unittest.TestCase):
         self.assertIn("Round 2", out)
         self.assertIn("a.go:5", out)
 
+    def _goal_cli_ranges(self, *argv) -> list[str]:
+        """Run the goal CLI and return every `git diff --name-only` range it executed.
+
+        Asserting on the range actually handed to git is the only way to catch a
+        base that is silently dropped between the CLI and _files_changed_in_pr:
+        the goal text still renders a plausible "Files in this PR" line when the
+        base is wrong, so output-shape assertions pass either way.
+        """
+        seen: list[list[str]] = []
+        real_run = _common.run
+
+        def spy(cmd, *a, **kw):
+            if cmd[:3] == ["git", "diff", "--name-only"]:
+                seen.append(cmd)
+            return real_run(cmd, *a, **kw)
+
+        with patch.object(_common, "run", spy):
+            self._run(*argv)
+        return [c[3] for c in seen if len(c) > 3]
+
+    def test_goal_cli_uses_base_branch_frozen_in_state(self) -> None:
+        """The consumer hop the round_bundle path already pins, on its sibling.
+
+        `round_bundle` threads state['base_branch'] into goal_for_round, but the
+        standalone `goal` CLI is a second entry point to the same goal text. When
+        it drops the frozen base, the file list falls back to the repo default —
+        the same "wrong ancestor" defect this PR exists to fix, one call site over.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            sf = Path(d) / "state.json"
+            sf.write_text(json.dumps({
+                "base_branch": "release/v2",
+                "rounds": [{
+                    "n": 1,
+                    "comment_actions": [
+                        {"action": "fixed", "path": "a.go", "line": 5, "source": "codex"},
+                    ],
+                }],
+            }))
+            ranges = self._goal_cli_ranges(
+                "goal", "2", "--pr-summary", "PR_SUM", "--state-file", str(sf),
+                "--head-before", "HEAD",
+            )
+        self.assertTrue(
+            any(r.startswith("origin/release/v2...") for r in ranges),
+            "the goal CLI must measure the file set against the FROZEN base "
+            f"(origin/release/v2...), not the repo default; ranges: {ranges}",
+        )
+
+    def test_goal_cli_base_branch_flag_overrides_state(self) -> None:
+        """--base-branch wins over state, and is dispatched rather than merely declared.
+
+        A flag that parses but never reaches goal_for_round is exactly how
+        --pr-summary shipped dead; assert on the executed git range so a
+        declared-but-undispatched flag fails here.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            sf = Path(d) / "state.json"
+            sf.write_text(json.dumps({
+                "base_branch": "release/v2",
+                "rounds": [{
+                    "n": 1,
+                    "comment_actions": [
+                        {"action": "fixed", "path": "a.go", "line": 5, "source": "codex"},
+                    ],
+                }],
+            }))
+            ranges = self._goal_cli_ranges(
+                "goal", "2", "--pr-summary", "PR_SUM", "--state-file", str(sf),
+                "--base-branch", "release/v9", "--head-before", "HEAD",
+            )
+        self.assertTrue(
+            any(r.startswith("origin/release/v9...") for r in ranges),
+            f"--base-branch must override state['base_branch']; ranges: {ranges}",
+        )
+        self.assertFalse(
+            any(r.startswith("origin/release/v2...") for r in ranges),
+            f"the state base must not also be measured; ranges: {ranges}",
+        )
+
+    def test_goal_cli_range_control_discriminates(self) -> None:
+        """Control: the assertions above must be capable of failing.
+
+        With no base anywhere, the range must NOT be origin/release/v2 — proving
+        the two tests above track the base they were given rather than passing on
+        any range at all.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            sf = Path(d) / "state.json"
+            sf.write_text(json.dumps({
+                "rounds": [{
+                    "n": 1,
+                    "comment_actions": [
+                        {"action": "fixed", "path": "a.go", "line": 5, "source": "codex"},
+                    ],
+                }],
+            }))
+            ranges = self._goal_cli_ranges(
+                "goal", "2", "--pr-summary", "PR_SUM", "--state-file", str(sf),
+                "--head-before", "HEAD",
+            )
+        self.assertTrue(
+            ranges,
+            "the control must actually reach _files_changed_in_pr — an empty "
+            "range list would make the assertion below vacuous",
+        )
+        self.assertFalse(
+            any(r.startswith("origin/release/v2...") for r in ranges),
+            f"no base was frozen, so the frozen-base range must be absent; ranges: {ranges}",
+        )
+
     def test_is_new_series_flag_returns_pr_summary(self) -> None:
         """--is-new-series 1 must short-circuit to PR_SUMMARY even when the
         state file has a converged prior round whose head_after is set."""

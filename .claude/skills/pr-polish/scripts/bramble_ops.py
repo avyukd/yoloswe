@@ -1839,6 +1839,15 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--pr-summary", required=True)
     sp.add_argument("--state-file")
     sp.add_argument(
+        "--base-branch",
+        help=(
+            "The PR's own base ref (GitHub's baseRefName), used to anchor the "
+            "'Files in this PR' range to origin/<base>...HEAD. Overrides "
+            "state['base_branch']; when neither is given, the file list falls "
+            "back to the repo default, which is wrong for a stacked PR."
+        ),
+    )
+    sp.add_argument(
         "--head-before",
         help="This round's HEAD; used to compute the files-changed-since-prior-round line.",
     )
@@ -1957,6 +1966,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "goal":
             state = read_json(Path(args.state_file), default=None) if args.state_file else None
             is_new = (args.is_new_series == "1") if args.is_new_series is not None else None
+            # Explicit --base-branch wins; otherwise fall back to the base frozen
+            # in state at round 1, the same source round_bundle threads. Without
+            # this the goal's file list is measured against the repo default,
+            # which is a different ancestor than the PR's own base.
+            base_branch = args.base_branch or (state or {}).get("base_branch") or None
             print(
                 goal_for_round(
                     args.round_,
@@ -1964,6 +1978,7 @@ def main(argv: list[str] | None = None) -> int:
                     state,
                     head_before=args.head_before,
                     is_new_series=is_new,
+                    base_branch=base_branch,
                 )
             )
         elif args.cmd == "prior-session-id":
