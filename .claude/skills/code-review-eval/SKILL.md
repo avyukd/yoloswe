@@ -1,6 +1,6 @@
 ---
 name: code-review-eval
-description: "Compare bramble code-review output across reviewer configs (cursor with composer-2, codex with gpt-5.4-mini, gemini with gemini-3.1-flash-lite-preview). Runs each config three times against the same branch — turn 1 fresh, turn 2 resumed with default follow-up prompt, turn 3 resumed with fresh prompt — to also characterize backend resume behavior, then compares findings side-by-side and logs results."
+description: "Compare bramble code-review output across reviewer configs (cursor with composer-2, codex with gpt-5.4-mini, gemini with gemini-3.1-flash-lite-preview, claude with opus). Runs each config three times against the same branch — turn 1 fresh, turn 2 resumed with default follow-up prompt, turn 3 resumed with fresh prompt — to also characterize backend resume behavior, then compares findings side-by-side and logs results."
 argument-hint: "[branch]"
 ---
 
@@ -17,6 +17,12 @@ also characterizes the resume path that `/pr-polish` uses across rounds.
 | codex-5.4-mini | codex | gpt-5.4-mini | `--backend codex --model gpt-5.4-mini --effort medium` |
 | cursor-composer2 | cursor | composer-2 | `--backend cursor --model composer-2` |
 | gemini-3.1-flash-lite-preview | gemini | gemini-3.1-flash-lite-preview | `--backend gemini --model gemini-3.1-flash-lite-preview` |
+| claude-opus | claude | opus | `--backend claude --model opus` |
+
+The four are not cost-comparable: three run cheap/fast models while `claude-opus`
+runs a frontier model, so read a claude-only finding as "a stronger model caught
+it", not as "the claude backend is better wired". When judging whether the extra
+spend is worth it, weigh unique-finding rate against the Time and Tokens columns.
 
 ## Three-turn flow per config
 
@@ -33,7 +39,9 @@ A turn-2/turn-3 envelope's `resume_status` field tells us whether the backend
 actually resumed (`"ok"`) or silently degraded to a cold start (`"fallback"`). The
 status is finalized only after the backend's `ReadyEvent` confirms the session id,
 so `ok` is trustworthy. Cursor and codex are expected to always report `ok`; gemini
-may legitimately report `fallback` depending on session lifetime.
+and claude may legitimately report `fallback` depending on session lifetime — for
+claude, a stale `--resume` id is detected from the CLI's "No conversation found"
+error and degrades to a fresh session rather than failing the turn.
 
 ## Step 1: Build and identify target
 
@@ -45,15 +53,36 @@ Identify the branch to review. If an argument is given, `git checkout` that bran
 first. Otherwise use the current branch. Get the diff summary:
 
 ```bash
-git diff $(git merge-base origin/main HEAD)..HEAD --stat
+DIFF_BASE=$(git merge-base origin/main HEAD 2>/dev/null || true)
+if [ -z "$DIFF_BASE" ]; then
+  echo "[code-review-eval] ABORT: no merge-base for origin/main..HEAD — every config would run on inferred scope and the comparison table would be meaningless" >&2
+  exit 1
+fi
+git diff $DIFF_BASE..HEAD --stat
 ```
+
+Abort rather than warn-and-continue, unlike `/pr-polish`. pr-polish still
+reviews usefully on an inferred range, so it degrades loudly and records the
+fact; an eval whose whole output is a like-for-like table across configs has
+nothing to salvage from an uncontrolled range, and its rows persist into
+`data/eval-runs.log` where later runs are compared against them.
+
+Keep `$DIFF_BASE` for the launches below and pass it to **every** config as
+`--diff-base`. Without the flag each backend infers its own range, and the
+natural inference (`main...HEAD`) silently widens whenever the local base
+branch has advanced past the merge base — measured at 336 files instead of
+22, varying run to run. That makes diff scope an uncontrolled variable
+underneath a table whose entire purpose is like-for-like comparison: a
+config could look thorough only because it was handed more code. Pin it once
+and every row is scored on the same range.
 
 ## Step 2a: Run each config — turn 1 (fresh)
 
 Use the **Monitor tool** for each config. `--envelope-file` writes the final
 ResultEnvelope to a file; stdout carries plain-text progress lines for Monitor to
-stream. Codex defaults to `--read-only`. Cursor and Gemini have no read-only mode,
-so they run with default permissions.
+stream. Codex and Claude default to `--read-only` (codex denies writes via its
+approval handler, claude simply is not granted the write tools). Cursor and Gemini
+have no read-only mode, so they run with default permissions.
 
 Create a fresh `$LOG_DIR` under `/tmp/code-review-eval-{timestamp}/`. For each config:
 
@@ -61,7 +90,8 @@ Create a fresh `$LOG_DIR` under `/tmp/code-review-eval-{timestamp}/`. For each c
 ENVELOPE_FILE="$LOG_DIR/{NAME}-envelope-r1.json"
 BRAMBLE_RUN_TAG="code-review-eval:$(git branch --show-current):{NAME}:r1" \
 WORK_DIR=$(pwd) bazel-bin/bramble/bramble_/bramble code-review \
-  {FLAGS} --verbose --timeout 10m --envelope-file "$ENVELOPE_FILE" \
+  {FLAGS} --diff-base "$DIFF_BASE" \
+  --verbose --timeout 10m --envelope-file "$ENVELOPE_FILE" \
   2>"$LOG_DIR/{NAME}-stderr-r1.txt"
 ```
 
@@ -70,7 +100,7 @@ WORK_DIR=$(pwd) bazel-bin/bramble/bramble_/bramble code-review \
 so eval runs are greppable later. The tag format is
 `code-review-eval:{branch}:{name}:r{turn}`.
 
-Arm all three Monitors in the same turn so configs run in parallel. Set Monitor
+Arm all four Monitors in the same turn so configs run in parallel. Set Monitor
 `timeout_ms=600000`. After all Monitors complete, extract each turn's `session_id`
 into shell variables before arming turn 2:
 
@@ -78,6 +108,7 @@ into shell variables before arming turn 2:
 SESSION_CODEX=$(jq -r '.session_id // empty'   "$LOG_DIR/codex-5.4-mini-envelope-r1.json"  2>/dev/null || true)
 SESSION_CURSOR=$(jq -r '.session_id // empty'  "$LOG_DIR/cursor-composer2-envelope-r1.json" 2>/dev/null || true)
 SESSION_GEMINI=$(jq -r '.session_id // empty'  "$LOG_DIR/gemini-3.1-flash-lite-preview-envelope-r1.json" 2>/dev/null || true)
+SESSION_CLAUDE=$(jq -r '.session_id // empty'  "$LOG_DIR/claude-opus-envelope-r1.json" 2>/dev/null || true)
 ```
 
 If any `SESSION_*` is empty (no envelope, malformed envelope, or backend never
@@ -99,7 +130,7 @@ in Monitor stdout:
 bazel build //bramble:bramble  # cheap when up-to-date
 ```
 
-Then arm three Monitors in the same turn, mirroring Step 2a but with two changes:
+Then arm four Monitors in the same turn, mirroring Step 2a but with two changes:
 
 - add `--resume-session-id "$SESSION_<NAME>"` to each command
 - write to `$LOG_DIR/{NAME}-envelope-r2.json` and `{NAME}-stderr-r2.txt`
@@ -108,8 +139,8 @@ Skip a backend whose `$SESSION_<NAME>` is empty.
 
 Do **not** pass `--resume-prompt-style`. The CLI defaults to `follow-up` when a
 resume id is set, which matches the path `/pr-polish` uses — the production caller
-this eval most needs to characterize. Canonical command (codex; cursor and gemini
-mirror it with backend/model swapped):
+this eval most needs to characterize. Canonical command (codex; cursor, gemini and
+claude mirror it with backend/model swapped):
 
 > **Prompt shape note (2026-05-06, updated round 10):** the follow-up
 > prompt was rewritten to drop the redundant **persona and full JSON
@@ -139,7 +170,7 @@ ENVELOPE_FILE="$LOG_DIR/codex-5.4-mini-envelope-r2.json"
 BRAMBLE_RUN_TAG="code-review-eval:$(git branch --show-current):codex-5.4-mini:r2" \
 WORK_DIR=$(pwd) bazel-bin/bramble/bramble_/bramble code-review \
   --backend codex --model gpt-5.4-mini --effort medium \
-  --resume-session-id "$SESSION_CODEX" \
+  --resume-session-id "$SESSION_CODEX" --diff-base "$DIFF_BASE" \
   --verbose --timeout 10m --envelope-file "$ENVELOPE_FILE" \
   2>"$LOG_DIR/codex-5.4-mini-stderr-r2.txt"
 ```
@@ -161,6 +192,7 @@ BRAMBLE_RUN_TAG="code-review-eval:$(git branch --show-current):codex-5.4-mini:r3
 WORK_DIR=$(pwd) bazel-bin/bramble/bramble_/bramble code-review \
   --backend codex --model gpt-5.4-mini --effort medium \
   --resume-session-id "$SESSION_CODEX" --resume-prompt-style fresh \
+  --diff-base "$DIFF_BASE" \
   --verbose --timeout 10m --envelope-file "$ENVELOPE_FILE" \
   2>"$LOG_DIR/codex-5.4-mini-stderr-r3.txt"
 ```
@@ -203,15 +235,16 @@ Then produce two tables.
 
 **Comparison of turn-1 findings (the canonical review):**
 
-| Finding | cursor-composer2 | codex-5.4-mini | gemini-3.1-flash-lite-preview |
-|---------|-----------------|----------------|----------------|
-| Issue X | found (medium) | missed | found (high) |
-| Issue Y | missed | found (low) | missed |
-| FP: ... | flagged | — | flagged |
+| Finding | cursor-composer2 | codex-5.4-mini | gemini-3.1-flash-lite-preview | claude-opus |
+|---------|-----------------|----------------|----------------|-------------|
+| Issue X | found (medium) | missed | found (high) | found (high) |
+| Issue Y | missed | found (low) | missed | found (medium) |
+| FP: ... | flagged | — | flagged | — |
 
 Identify:
-- **Consensus findings**: flagged by all three configs (high confidence these are real)
-- **Majority findings**: flagged by two of three configs (likely real)
+- **Consensus findings**: flagged by all four configs (high confidence these are real)
+- **Majority findings**: flagged by three of four configs (likely real)
+- **Split findings**: flagged by two of four — weaker than majority; check whether the two agreeing configs share a backend family before treating it as corroboration
 - **Unique findings**: only one config caught it (investigate — real issue or FP?)
 - **False positives**: findings that are clearly not issues
 - **Disagreements**: findings where configs differ on severity or applicability
@@ -227,6 +260,8 @@ turn N against turn 1 on `(file, line, severity, message)` keys:
 | codex-5.4-mini | 3 | ok | N | N | N |
 | gemini-3.1-flash-lite-preview | 2 | fallback | N | N | N |
 | gemini-3.1-flash-lite-preview | 3 | missing | — | — | — |
+| claude-opus | 2 | ok | N | N | N |
+| claude-opus | 3 | ok | N | N | N |
 
 Then a short prose section per backend listing notable deltas — does the resumed
 follow-up meaningfully refine, contradict, or just restate? Does the explicit
@@ -255,21 +290,27 @@ Diff: {N} files, {+/-} lines
 | gemini-3.1-flash-lite-preview | 1 | — | N | N | ... | ... | ...s | — |
 | gemini-3.1-flash-lite-preview | 2 | fallback | N | N | ... | ... | ...s | — |
 | gemini-3.1-flash-lite-preview | 3 | missing | — | — | ... | ... | ...s | — |
+| claude-opus | 1 | — | N | N | ... | ... | ...s | N/N |
+| claude-opus | 2 | ok | N | N | ... | ... | ...s | N/N |
+| claude-opus | 3 | ok | N | N | ... | ... | ...s | N/N |
 
 Resume incidents: gemini reported "fallback" on turn 2 (cold-restarted instead of
 resuming session id <id>); turn 3 was skipped because the prior session id was empty.
 
-Consensus (all 3, turn 1): ...
-Majority (2 of 3, turn 1): ...
+Consensus (all 4, turn 1): ...
+Majority (3 of 4, turn 1): ...
+Split (2 of 4, turn 1): ...
 Unique to cursor (turn 1): ...
 Unique to codex-5.4-mini (turn 1): ...
 Unique to gemini-3.1-flash-lite-preview (turn 1): ...
+Unique to claude-opus (turn 1): ...
 Disagreements: ...
 
 Follow-up deltas:
 - cursor-composer2: turn 2 +N new, -N dropped, N severity changes; turn 3 ...
 - codex-5.4-mini: ...
 - gemini-3.1-flash-lite-preview: ...
+- claude-opus: ...
 ```
 
 Only emit the "Resume incidents" line when at least one backend reported
@@ -282,6 +323,10 @@ Schema notes:
 - The `Turn` and `Resume` columns and the Follow-up Deltas block were added
   2026-05-06 to capture three-turn resume behavior. Historical rows have one row
   per config (implicitly turn 1) and no resume column; treat missing as `—`.
+- The `claude-opus` config was added 2026-08-06, widening consensus from
+  three-way to four-way. Rows logged before that date have no claude line and
+  their "Consensus (all 3…)" counts are not comparable to later four-way runs —
+  compare like with like, or recompute consensus over the three shared configs.
 
 ## Final Summary
 
@@ -293,8 +338,9 @@ Schema notes:
 | cursor-composer2 | 1 | | | | |
 | codex-5.4-mini | 1 | | | | |
 | gemini-3.1-flash-lite-preview | 1 | | | | |
+| claude-opus | 1 | | | | |
 
-Resume health: cursor=<status>, codex=<status>, gemini=<status>
+Resume health: cursor=<status>, codex=<status>, gemini=<status>, claude=<status>
 
 Best config: ...
 Recommendation: ...
@@ -316,6 +362,7 @@ matters for `/pr-polish`). If turn 3 disagrees with turn 2 in an interesting way
 | Cursor backend | `yoloswe/reviewer/backend_cursor.go` |
 | Codex backend | `yoloswe/reviewer/backend_codex.go` |
 | Gemini backend | `yoloswe/reviewer/backend_gemini.go` |
+| Claude backend | `yoloswe/reviewer/backend_claude.go` |
 | Run history | `.claude/skills/code-review-eval/data/eval-runs.log` |
 
 ## Eval dataset

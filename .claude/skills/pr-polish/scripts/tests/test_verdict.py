@@ -236,5 +236,96 @@ class FixClaimVerificationTests(unittest.TestCase):
             self.assertEqual(v.verify_fix_claims(st, repo)["unverified"], 0)
 
 
+class ClaimPathMatchingTests(unittest.TestCase):
+    """Fix-claim paths must not collapse to basenames.
+
+    In a monorepo the basenames repeat constantly — BUILD.bazel, SKILL.md,
+    __init__.py, tests/test_*.py — so a basename comparison verified a
+    claim on one directory's file against an edit to a completely
+    different one. That silently understates ``unverified``, which is the
+    number the fabrication blocker gates on.
+    """
+
+    def test_same_basename_different_directory_does_not_verify(self):
+        self.assertFalse(
+            v._claim_matches("pkg/a/util.go", {"other/util.go"}))
+
+    def test_exact_path_verifies(self):
+        self.assertTrue(
+            v._claim_matches("pkg/a/util.go", {"pkg/a/util.go", "x/y.go"}))
+
+    def test_partial_path_suffix_verifies(self):
+        # Reviewers cite varying amounts of the path; a component-aligned
+        # suffix is still the same file.
+        self.assertTrue(v._claim_matches("a/util.go", {"pkg/a/util.go"}))
+        self.assertTrue(v._claim_matches("pkg/a/util.go", {"a/util.go"}))
+
+    def test_partial_component_is_not_a_suffix(self):
+        # "autil.go" must not match "pkg/a/util.go" via string suffix.
+        self.assertFalse(v._claim_matches("autil.go", {"pkg/a/util.go"}))
+
+    def test_end_to_end_claim_on_untouched_same_basename_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            run = lambda *a: subprocess.run(
+                ["git", "-C", str(repo), *a], capture_output=True, text=True)
+            run("init", "-q")
+            run("config", "user.email", "t@t")
+            run("config", "user.name", "t")
+            for d in ("pkg", "other"):
+                (repo / d).mkdir()
+                (repo / d / "util.go").write_text("package x\n")
+            run("add", "-A")
+            run("commit", "-qm", "base")
+            before = run("rev-parse", "HEAD").stdout.strip()
+            (repo / "other" / "util.go").write_text("package x // edited\n")
+            run("add", "-A")
+            run("commit", "-qm", "touch other only")
+            after = run("rev-parse", "HEAD").stdout.strip()
+
+            st = _state(rounds=[{
+                "n": 1, "head_before": before, "head_after": after,
+                "comment_actions": [
+                    {"action": "fixed", "severity": "high",
+                     "path": "pkg/util.go"}],
+            }])
+            out = v.verify_fix_claims(st, repo)
+            self.assertEqual(
+                out["unverified"], 1,
+                "claim on pkg/util.go verified against an edit to "
+                "other/util.go — basename collision",
+            )
+
+
+class ReviewerStreamRosterTests(unittest.TestCase):
+    """``reviewer_stream_health`` must know every backend in the roster.
+
+    Its stated job is to distinguish "backend ran and found nothing" from
+    "backend never ran". A backend missing from its key map produces no
+    entry at all — which is the *same* output as never having run, so the
+    function silently reintroduces the ambiguity it exists to remove.
+    """
+
+    def test_reports_every_backend_in_the_roster(self):
+        import bramble_ops
+
+        st = _state(rounds=[{
+            "n": 1,
+            **{f"{b}_findings": [] for b in bramble_ops.BACKENDS},
+        }])
+        self.assertEqual(
+            set(v.reviewer_stream_health(st)), set(bramble_ops.BACKENDS),
+            "reviewer_stream_health omits a backend pr_ops writes; a run "
+            "where it found nothing is indistinguishable from one where it "
+            "never ran",
+        )
+
+    def test_claude_stream_is_counted(self):
+        # The concrete regression: claude joined the roster after this map
+        # was written, so claude rounds reported no claude stream at all.
+        st = _state(rounds=[{"n": 1, "claude_findings": [{"x": 1}, {"y": 2}]}])
+        self.assertEqual(v.reviewer_stream_health(st).get("claude"), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -47,7 +47,7 @@ from _common import (  # noqa: E402
 # it isn't a bramble backend — lint_gate.py emits findings under the same
 # envelope schema and triage treats them as just another source for
 # consensus/spiral matching.
-BACKENDS = ("codex", "cursor", "gemini", "lint")
+BACKENDS = ("claude", "codex", "cursor", "gemini", "lint")
 
 # Review mode constants. Defined up here (rather than down by the
 # per-mode key constructors) so they're available as default-argument
@@ -1048,6 +1048,39 @@ def _cluster_hint(items: list[dict[str, Any]], mode: str = REVIEW_MODE_CODE) -> 
     clusters = [b for b in by_bucket.values() if b["count"] >= 2]
     clusters.sort(key=lambda b: (-b["count"], b[bucket_field]))
     return clusters
+
+
+# Bucket names inside the ``action_plan`` object, in the order the summary
+# prints them. Kept as a tuple so the summary can't silently omit a bucket
+# that gains findings later.
+ACTION_PLAN_BUCKETS = (
+    "must_fix",
+    "consider_fix",
+    "batch_ack",
+    "batch_stale",
+    "escalate",
+)
+
+
+def _action_plan_summary(result: dict[str, Any]) -> str:
+    """Render the one-line bucket census that ``triage`` writes to stderr.
+
+    The buckets live under ``result["action_plan"]``, while the top level
+    carries ``total`` / ``consensus`` / ``single_medium`` / etc. A caller
+    that reads ``result["must_fix"]`` instead of
+    ``result["action_plan"]["must_fix"]`` gets ``None`` for every bucket and
+    concludes the plan is empty — which Step 3.g of SKILL.md treats as
+    convergence. The loop then exits reporting success with every finding
+    unread, and nothing in the output contradicts it.
+
+    This line is the contradiction. It goes to stderr so the stdout JSON
+    contract is untouched, and it is emitted even when everything is zero so
+    "0 findings" and "read the wrong key" look different in the log.
+    """
+    plan = result.get("action_plan") or {}
+    parts = [f"{name}={len(plan.get(name) or [])}" for name in ACTION_PLAN_BUCKETS]
+    parts.append(f"total={result.get('total', 0)}")
+    return "[triage] action_plan: " + " ".join(parts)
 
 
 def triage(
@@ -2097,6 +2130,7 @@ def main(argv: list[str] | None = None) -> int:
                 head_path=head_path,
                 prior_modified_hunks=modified_hunks,
             )
+            print(_action_plan_summary(result), file=sys.stderr)
             print_json(result)
         else:  # pragma: no cover
             raise ValueError(f"unknown cmd: {args.cmd}")

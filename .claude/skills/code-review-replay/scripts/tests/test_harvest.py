@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import sys
@@ -20,6 +21,41 @@ KERNEL_3945_DIR = Path.home() / ".bramble" / "projects" / "kernel-3945"
 BRAMBLE_OPS_PATH = (
     SCRIPT_DIR.parents[1] / "pr-polish" / "scripts" / "bramble_ops.py"
 )
+
+
+class BackendRosterParityTests(unittest.TestCase):
+    """harvest_lib.BACKENDS is the consumer side of pr-polish's roster.
+
+    The two are duplicated on purpose (code-review-replay must work when the
+    pr-polish scripts dir is absent), which means nothing but this test stops
+    them diverging. Divergence is silent in production: the harvester treats a
+    missing envelope as "that backend didn't run", so a whole reviewer's
+    findings vanish from the dataset with no error. That is exactly what
+    happened when ``claude`` was added to bramble_ops and not here.
+    """
+
+    def _bramble_ops_backends(self):
+        if not BRAMBLE_OPS_PATH.exists():
+            self.skipTest(f"pr-polish scripts not present at {BRAMBLE_OPS_PATH}")
+        spec = importlib.util.spec_from_file_location(
+            "bramble_ops_for_parity", BRAMBLE_OPS_PATH
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except Exception as e:  # pragma: no cover - import-time breakage
+            self.skipTest(f"could not import bramble_ops: {e}")
+        return mod.BACKENDS
+
+    def test_matches_bramble_ops_roster(self):
+        self.assertEqual(
+            tuple(sorted(hl.BACKENDS)),
+            tuple(sorted(self._bramble_ops_backends())),
+            "harvest_lib.BACKENDS and bramble_ops.BACKENDS have diverged; a "
+            "backend missing from harvest_lib is silently dropped from the "
+            "ground-truth dataset",
+        )
 
 
 class ParseProjectDirNameTests(unittest.TestCase):

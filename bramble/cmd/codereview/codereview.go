@@ -55,7 +55,7 @@ var Cmd = &cobra.Command{
 	Short:        "Run a one-shot code review using an agent backend",
 	Long: `Run a one-shot code review using an agent backend.
 
-Supported backends: cursor, codex, gemini.
+Supported backends: claude, cursor, codex, gemini.
 
 Output:
   Default:         NDJSON progress events on stdout, final envelope also on stdout
@@ -68,6 +68,7 @@ Every run also writes a structured klogfmt log to
 ~/.bramble/logs/code-review/code-review-{timestamp}-{pid}.log for later
 analysis. Set $BRAMBLE_RUN_TAG to tag the log with an external run id.`,
 	Example: `  bramble code-review --backend cursor
+  bramble code-review --backend claude --model opus
   bramble code-review --backend codex --model gpt-5.4-mini --effort medium
   bramble code-review --backend codex --envelope-file /tmp/envelope.json --skip-test-execution --goal "review auth changes"`,
 	Args: cobra.NoArgs,
@@ -75,11 +76,11 @@ analysis. Set $BRAMBLE_RUN_TAG to tag the log with an external run id.`,
 }
 
 func init() {
-	Cmd.Flags().StringVar(&backend, "backend", "cursor", "Backend: cursor, codex, or gemini")
+	Cmd.Flags().StringVar(&backend, "backend", "cursor", "Backend: claude, cursor, codex, or gemini")
 	Cmd.Flags().StringVar(&model, "model", "", "Model override (default: backend-specific)")
-	Cmd.Flags().StringVar(&effort, "effort", "", "Reasoning effort level for codex (low, medium, high)")
+	Cmd.Flags().StringVar(&effort, "effort", "", "Reasoning effort level for codex (low, medium, high) and claude (low, medium, high, max)")
 	Cmd.Flags().StringVar(&sandbox, "sandbox", "", "Codex sandbox mode: read-only, workspace-write, danger-full-access (default: danger-full-access)")
-	Cmd.Flags().BoolVar(&readOnly, "read-only", true, "Deny file writes via approval handler (Codex only; default true)")
+	Cmd.Flags().BoolVar(&readOnly, "read-only", true, "Withhold the write tools from the reviewer (Codex: approval handler; Claude: tools not granted). Not a filesystem guarantee — neither backend blocks shell writes. Default true.")
 	Cmd.Flags().BoolVar(&verbose, "verbose", false, "Show tool call details")
 	Cmd.Flags().StringVar(&goal, "goal", "", "Review goal (default: infer from branch)")
 	Cmd.Flags().DurationVar(&timeout, "timeout", 0, "Absolute hard cap on the whole review (0 = none; rely on --idle-timeout). A review making steady progress is bounded only by --idle-timeout.")
@@ -204,7 +205,7 @@ func runCodeReview(cmd *cobra.Command, args []string) (retErr error) {
 
 	mode, err := validateModeFlags(reviewMode, scopeHintsFile, rubricFile,
 		reviewPromptFile, skipTestExecution,
-		diffScope{base: diffBase, head: diffHead})
+		diffScopeFromFlags(cmd))
 	if err != nil {
 		// Tag the failure envelope with the operator's *requested*
 		// mode when it's a known literal. Without this, an orchestrator
@@ -295,7 +296,7 @@ func runCodeReview(cmd *cobra.Command, args []string) (retErr error) {
 
 	prompt, err := buildPromptForRun(mode, goal, scopeHintsFile, rubricFile,
 		reviewPromptFile, skipTestExecution, style,
-		diffScope{base: diffBase, head: diffHead})
+		diffScopeFromFlags(cmd))
 	if err != nil {
 		return emitEarlyFailure(err, r.EffectiveModel(), mode, emitEnvelope)
 	}
@@ -604,6 +605,30 @@ func normalizePromptStyle(resumeSessionID, rawStyle string, styleExplicit bool) 
 type diffScope struct {
 	base string
 	head string
+	// baseSet records that --diff-base was passed on the command line,
+	// distinguishing "caller did not pin the range" from "caller tried to
+	// pin it and computed an empty value". The second is the more
+	// dangerous of the two and is invisible without this: an empty base
+	// skips the ValidGitRevision check below and diffScopeClause then
+	// drops the clause, so the run reverts to the inferred scope this
+	// flag exists to replace while looking to the operator like a pinned
+	// one. Callers hit it by interpolating an unguarded
+	// `$(git merge-base ...)` that failed.
+	baseSet bool
+}
+
+// diffScopeFromFlags builds the scope from the parsed command. It exists
+// as a named function, rather than a struct literal at each call site, so
+// the wiring is testable: constructing diffScope inline meant nothing
+// pinned that baseSet was populated at all, and dropping it left the whole
+// suite green while an empty --diff-base went back to being silently
+// accepted.
+func diffScopeFromFlags(cmd *cobra.Command) diffScope {
+	return diffScope{
+		base:    diffBase,
+		head:    diffHead,
+		baseSet: cmd.Flags().Changed("diff-base"),
+	}
 }
 
 func loadPromptOptions(mode reviewer.ReviewMode, hintsPath, rubricPath, personaPath string, skipTestExecution bool, scope diffScope) (reviewer.PromptOptions, error) {
@@ -745,6 +770,15 @@ func validateModeFlags(modeStr, hintsPath, rubricPath, personaPath string, skipT
 	case reviewer.ReviewModeCode, "":
 		if rubricPath != "" {
 			return "", fmt.Errorf("--review-rubric-file requires --review-mode design-doc")
+		}
+		// Same reasoning as the malformed-revision check below, for the
+		// case that check cannot see: `--diff-base ""` passes the
+		// scope.base != "" guard and is dropped silently. A caller that
+		// named the flag asked for a pinned range, so failing to
+		// resolve one is an error, not a fallback.
+		if scope.baseSet && scope.base == "" {
+			return "", fmt.Errorf("--diff-base was given an empty value; " +
+				"resolve the merge base or omit the flag")
 		}
 		// Reject a malformed revision here rather than letting the prompt
 		// builder drop the clause: a silently-omitted diff scope leaves

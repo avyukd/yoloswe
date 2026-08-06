@@ -113,7 +113,23 @@ AttributionBasis = Literal[
 # Backends pr-polish runs. ``lint`` writes its findings through the same
 # envelope schema even though it isn't a bramble model backend, so we
 # treat it as a first-class review_run source here.
-BACKENDS = ("codex", "cursor", "gemini", "lint")
+#
+# MUST equal ``bramble_ops.BACKENDS``. This is the consumer side of the same
+# roster: the harvester reads ``state_dir/r{n}/{backend}-envelope.json`` for
+# each entry, which is exactly the path pr-polish's ``round_bundle`` hands each
+# reviewer launch. A backend present there but missing here is dropped
+# *silently* — ``_build_review_run`` returns None for an absent envelope and
+# the caller skips it — so the round harvests as though that reviewer never
+# ran: its findings never enter ``review_runs``, ``surfaced_by`` under-counts,
+# and ``comment_actions`` carrying that source can never match a run. Nothing
+# in the collection output contradicts it. ``claude`` was added to
+# bramble_ops in Aug 2026 and this copy was missed; the equality test in
+# tests/test_harvest.py exists so the next backend cannot repeat it.
+#
+# The list is duplicated rather than imported because code-review-replay is a
+# separate skill that must keep working when the pr-polish scripts directory
+# is absent (the dataset lives outside the repo and is replayed standalone).
+BACKENDS = ("claude", "codex", "cursor", "gemini", "lint")
 
 # GitHub PR-comment sources. These are the comments authored on the PR by
 # humans and review bots — distinct from bramble's own reviewer findings.

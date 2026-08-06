@@ -57,6 +57,11 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
 is_substantive = _mod.is_substantive
 
+# The producer-side backend roster. ``local_findings`` derives its state
+# keys from this rather than restating them, so a backend added to
+# pr-polish cannot be silently dropped from the escape-rate denominator.
+import bramble_ops  # noqa: E402
+
 # The replay skill's location matcher — the same authority the ground-truth
 # scorer uses, so "did the reviewer catch this" means the same thing in both
 # places. Imported, never reimplemented: path+topic matching is subtle.
@@ -89,15 +94,21 @@ def _load(path: Path) -> Optional[dict]:
 
 
 def local_findings(state: dict) -> list[dict]:
-    """Every finding pr-polish's own reviewers surfaced, across all rounds."""
+    """Every finding pr-polish's own reviewers surfaced, across all rounds.
+
+    The per-backend keys are derived from ``bramble_ops.BACKENDS`` rather
+    than restated. ``pr_ops._persist_round_findings`` writes
+    ``f"{backend}_findings"`` for every entry in that roster, so a
+    hand-written list here silently drops any backend added since it was
+    typed — and a dropped backend does not look like an error, it looks
+    like a clean run. ``compute_escape_rate`` scores an external comment as
+    an *escape* when it finds no local finding matching it, so a backend
+    missing from this list inflates the escape rate on exactly the runs
+    that used it.
+    """
     out: list[dict] = []
     for rnd in state.get("rounds") or []:
-        for key in (
-            "codex_findings",
-            "cursor_findings",
-            "gemini_findings",
-            "lint_findings",
-        ):
+        for key in (f"{b}_findings" for b in bramble_ops.BACKENDS):
             for f in rnd.get(key) or []:
                 if isinstance(f, dict):
                     out.append(f)

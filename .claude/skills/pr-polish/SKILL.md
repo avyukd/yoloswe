@@ -1,7 +1,7 @@
 ---
 name: pr-polish
-description: Fully autonomous PR polish loop. Runs N rounds of local bramble review (codex + cursor, optionally + gemini), folds in any existing PR comments and CI failures as round-1 input, fixes findings locally, pushes once at the end.
-argument-hint: "[--rounds N] [--gemini] [--ask]"
+description: Fully autonomous PR polish loop. Runs N rounds of local bramble review (codex + cursor, optionally + gemini and/or claude), folds in any existing PR comments and CI failures as round-1 input, fixes findings locally, pushes once at the end.
+argument-hint: "[--rounds N] [--gemini] [--claude] [--ask]"
 disable-model-invocation: true
 ---
 
@@ -25,7 +25,8 @@ Missing/error review streams → log as findings with stderr path cited.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--rounds N` | `5` | Up to N additional rounds this invocation. Budget resets on re-invoke. `--rounds 0` = no-op. |
-| `--gemini` | off | Third reviewer (`gemini-3-flash-preview`). ≥2 sources = consensus. |
+| `--gemini` | off | Extra reviewer (`gemini-3-flash-preview`). ≥2 sources = consensus. Sets `USE_GEMINI=1`. |
+| `--claude` | off | Extra reviewer (`claude` backend, `opus`). Highest per-round cost of the four — reach for it on a diff where codex+cursor disagree or keep missing the same class of bug. Sets `USE_CLAUDE=1`. |
 | `--ask` / `--interactive` | off | Enable `AskUserQuestion` at gates (Step 3.g). Default: never block. |
 
 ## State tracking
@@ -46,7 +47,7 @@ Key fields: `rounds[n].comment_actions` (audit trail), `low_only_streak` (conver
 **Actions file** (the `<actions.json>` arg to `state-finalize-round` / `finalize-and-report`): a JSON **array** of action entries, or an object `{"comment_actions": [...]}` — both are accepted. Per entry:
 - `action`: one of `fixed`, `false_positive`, `wont_fix`, `ack`, `stale`, `pre_existing`/`flake` (CI only) — validated; an unknown verb is a loud error naming the entry index.
 - `severity`: `high`/`medium`/`low`/`nit` or null (lint advisory) — validated.
-- `source`: `codex`/`cursor`/`gemini`/`lint`/`github-inline`/`github-issue`/`ci`/`sweep`.
+- `source`: `claude`/`codex`/`cursor`/`gemini`/`lint`/`github-inline`/`github-issue`/`ci`/`sweep`.
 - `path` + `line` (code mode) or `section`/`dimension` (design-doc mode); `notes`/`reason`, `comment_id` (for inline replies).
 - Optional v2: `spiral_refix`, `invariant` — and any other key passes through untouched.
 
@@ -126,7 +127,7 @@ Triage reads these only when `IS_NEW_SERIES=1`. Still run bramble every round.
 additional_rounds_run = 0
 while additional_rounds_run < --rounds:
   a) WIP commit if dirty
-  b) scope_gate → round-bundle → one bg join: launch reviewers (codex+cursor+lint[+gemini]), wait on exit
+  b) scope_gate → round-bundle → one bg join: launch reviewers (codex+cursor+lint[+gemini][+claude]), wait on exit
   c) triage → action plan
   d) apply fixes
   e) quality gates + local commit if changed (NO push)
@@ -148,12 +149,22 @@ If dirty: `git add -A && git commit -m "pr-polish: round N snapshot"`. Bramble s
 Always use `round-bundle` for `$LOG_DIR`, `$GOAL`, resume ids — do not hand-roll attempt index.
 
 ```bash
+# Opt-in reviewer toggles. These are read in three places below (launch,
+# --stream, --envelope) and nothing else sets them, so bind them from the
+# invocation flags here — substituting 1/0 as literals like every other
+# orchestrator var. Leaving one unset is not neutral: `[ "$USE_CLAUDE" = "1" ]`
+# is false, so the reviewer silently never launches and its absence looks
+# identical to "you didn't ask for it".
+USE_GEMINI=0   # 1 when --gemini was passed
+USE_CLAUDE=0   # 1 when --claude was passed
+
 BUNDLE=$(python3 $SKILL_DIR/scripts/pr_ops.py round-bundle "$CTX" {ROUND})
 LOG_DIR=$(echo "$BUNDLE" | jq -r .log_dir)
 GOAL=$(echo "$BUNDLE" | jq -r .goal_text)
 CODEX_RESUME=$(echo "$BUNDLE" | jq -r '.resume_ids.codex')
 CURSOR_RESUME=$(echo "$BUNDLE" | jq -r '.resume_ids.cursor')
 GEMINI_RESUME=$(echo "$BUNDLE" | jq -r '.resume_ids.gemini')   # used by the --gemini launch
+CLAUDE_RESUME=$(echo "$BUNDLE" | jq -r '.resume_ids.claude')   # used by the --claude launch
 [ "{ROUND}" = "1" ] && GOAL="$PR_SUMMARY"
 mkdir -p "$LOG_DIR"
 
@@ -164,11 +175,28 @@ SCOPE_HINTS=$(python3 $SKILL_DIR/scripts/scope_gate.py --state-dir "$STATE_DIR" 
 # base branch has drifted: a stale main narrows the diff (the reviewer never
 # sees code the PR touched), an advanced main widens it with unrelated
 # commits. Measured on a replayed PR: 336 files instead of 22, and the guess
-# varied run to run. Empty (detached HEAD, missing origin/main) simply omits
-# the flag and restores the previous inferred-scope behaviour.
+# varied run to run.
+#
+# The pin is best-effort — a detached HEAD or a missing origin/main leaves it
+# empty and every reviewer falls back to inferred scope. That fallback must be
+# LOUD. Silently omitting the flag restores the exact failure mode it exists to
+# prevent, and an unpinned round is indistinguishable from a pinned one in the
+# log, so its findings get compared against pinned rounds as if the ranges
+# matched. Do not hard-fail instead: branch contexts (`pr_number: null`,
+# `branch:<name>`) legitimately run without a resolvable base, and aborting
+# there would break the loop for a case that still reviews usefully.
+#
+# The block below only warns; it writes no state. When it fires, YOU must add
+# an `ack` entry (source `sweep`, notes naming the unpinned scope) to this
+# round's actions file in step (f), so the state file says which rounds were
+# scoped by inference. Nothing else records it.
 DIFF_BASE=$(git merge-base "origin/${BASE:-main}" HEAD 2>/dev/null || true)
 DIFF_BASE_ARG=""
-[ -n "$DIFF_BASE" ] && DIFF_BASE_ARG="--diff-base $DIFF_BASE"
+if [ -n "$DIFF_BASE" ]; then
+  DIFF_BASE_ARG="--diff-base $DIFF_BASE"
+else
+  echo "[pr-polish] WARNING: no merge-base for origin/${BASE:-main}..HEAD — reviewers run on INFERRED diff scope this round; findings are not range-comparable with pinned rounds" | tee "$LOG_DIR/diff-base-unpinned.txt" >&2
+fi
 
 [ "$IS_NEW_SERIES" = "1" ] && [ "$PR_NUMBER" != "null" ] && {
   python3 $SKILL_DIR/scripts/pr_ops.py fetch-comments > $STATE_DIR/pp-comments.json
@@ -214,7 +242,7 @@ Substitute the concrete `$LOG_DIR`/`$GOAL`/`$SCOPE_HINTS`/`$REPO`/`$PR_NUMBER`/r
 PIDS=()
 
 ( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:codex:r{ROUND} \
-  timeout 1200 $BRAMBLE_BIN code-review --backend codex --model gpt-5.4-mini \
+  timeout 1200 $BRAMBLE_BIN code-review --backend codex --model gpt-5.6-luna --effort medium \
     --skip-test-execution --verbose --idle-timeout 5m \
     --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
     ${CODEX_RESUME:+--resume-session-id "$CODEX_RESUME"} \
@@ -236,8 +264,9 @@ PIDS+=($!)
   2>&1 | tee "$LOG_DIR/lint-stderr.txt" | sed 's/^/[lint] /' ) &
 PIDS+=($!)
 
-# --gemini only: a 4th reviewer launched the same way; it appends to PIDS like
-# any other, so when --gemini is off it's simply absent — the wait can't break.
+# --gemini only: an extra reviewer launched the same way; it appends to PIDS
+# like any other, so when --gemini is off it's simply absent — the wait can't
+# break.
 if [ "$USE_GEMINI" = "1" ]; then
   ( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:gemini:r{ROUND} \
     timeout 1200 $BRAMBLE_BIN code-review --backend gemini --model gemini-3-flash-preview \
@@ -249,12 +278,25 @@ if [ "$USE_GEMINI" = "1" ]; then
   PIDS+=($!)
 fi
 
+# --claude only: same shape again. Opus is the slowest and priciest of the
+# four, so it stays opt-in rather than joining the default codex+cursor pair.
+if [ "$USE_CLAUDE" = "1" ]; then
+  ( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:claude:r{ROUND} \
+    timeout 1200 $BRAMBLE_BIN code-review --backend claude --model opus \
+      --skip-test-execution --verbose --idle-timeout 5m \
+      --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
+      ${CLAUDE_RESUME:+--resume-session-id "$CLAUDE_RESUME"} \
+      --envelope-file "$LOG_DIR/claude-envelope.json" \
+    2>&1 | tee "$LOG_DIR/claude-stderr.txt" | sed 's/^/[claude] /' ) &
+  PIDS+=($!)
+fi
+
 # Join on EVERY launched reviewer so triage never starts while a reviewer is
 # still running or has yet to write its envelope.
 wait "${PIDS[@]}"
 ```
 
-The single completion notification = every reviewer has exited (each bounded by `--idle-timeout 5m` for stalls and a `timeout 1200` absolute backstop; lint by `timeout 120`). The `wait` returns once all PIDs exit, and a crashed reviewer exits immediately, so a dead process never hangs the round. All resume ids (`CODEX_RESUME`/`CURSOR_RESUME`/`GEMINI_RESUME`) come from the round-prep `round-bundle` block above.
+The single completion notification = every reviewer has exited (each bounded by `--idle-timeout 5m` for stalls and a `timeout 1200` absolute backstop; lint by `timeout 120`). The `wait` returns once all PIDs exit, and a crashed reviewer exits immediately, so a dead process never hangs the round. All resume ids (`CODEX_RESUME`/`CURSOR_RESUME`/`GEMINI_RESUME`/`CLAUDE_RESUME`) come from the round-prep `round-bundle` block above.
 
 Before triage: `recover-envelope` on each stream path (idempotent). A reviewer that exited without a valid envelope → `stream-missing` finding, not a deadlock.
 
@@ -266,11 +308,34 @@ python3 $SKILL_DIR/scripts/bramble_ops.py triage $STATE_FILE \
   --stream cursor=$LOG_DIR/cursor-envelope.json \
   --stream lint=$LOG_DIR/lint-envelope.json \
   $( [ "$USE_GEMINI" = "1" ] && echo --stream gemini=$LOG_DIR/gemini-envelope.json ) \
+  $( [ "$USE_CLAUDE" = "1" ] && echo --stream claude=$LOG_DIR/claude-envelope.json ) \
   $( [ "$IS_NEW_SERIES" = "1" ] && [ "$PR_NUMBER" != "null" ] && \
      echo --pr-comments $STATE_DIR/pp-comments.json --ci-failures $STATE_DIR/pp-ci.json )
 ```
 
-Buckets → `must_fix` / `consider_fix` / `batch_ack` / `escalate` (`spiral_matches`).
+Buckets → `must_fix` / `consider_fix` / `batch_ack` / `batch_stale` / `escalate`.
+
+**They are nested under `.action_plan`, not top-level.** The top level carries
+`total`, `unique`, `consensus`, `single_critical`, `single_medium`, `low_acks`,
+`spiral_matches`. Reading `.must_fix` instead of `.action_plan.must_fix` yields
+`null` for every bucket, which looks exactly like an empty plan — and Step 3.g
+treats an empty plan as convergence, so the loop exits reporting success with
+every finding unread.
+
+`triage` prints a census to stderr for this reason; check it against the JSON
+before concluding anything is empty:
+
+```
+[triage] action_plan: must_fix=0 consider_fix=10 batch_ack=3 batch_stale=0 escalate=0 total=13
+```
+
+`total=13` with all buckets `0` means you read the wrong key, not that there is
+nothing to do. To read the plan:
+
+```bash
+jq '.action_plan | {must_fix: (.must_fix|length), consider_fix: (.consider_fix|length),
+                    batch_ack: (.batch_ack|length), escalate: (.escalate|length)}' triage.json
+```
 
 **Ownership:** own pre-existing code in touched files. `must_fix` unless false positive (cite file:line). Low/nit → fix if trivial else `ack`. Skips: `false_positive`, `wont_fix`, `stale`.
 
@@ -288,7 +353,10 @@ When you decline on scope, record it as `wont_fix` with the reason — a decline
 
 **Spirals:** single-source may auto-demote to stale if evidence gone (±10 lines) or cited line was in prior round's diff. Multi-source → escalate. Default (no `--ask`): re-fix once (`spiral_refix: true`), stop on 2nd recurrence.
 
-Empty plan (`must_fix`/`consider_fix` empty) → converged, Step 3.g.
+Empty plan (`.action_plan.must_fix` and `.action_plan.consider_fix` both empty,
+**and** the stderr census agrees — `total=0`, or every finding accounted for in
+`batch_ack`/`batch_stale`) → converged, Step 3.g. A non-zero `total` with empty
+buckets is a misread, not convergence.
 
 ### d) Apply fixes
 
@@ -306,7 +374,8 @@ python3 $SKILL_DIR/scripts/pr_ops.py finalize-and-report $CTX $ROUND $(git rev-p
   --envelope codex=$LOG_DIR/codex-envelope.json \
   --envelope cursor=$LOG_DIR/cursor-envelope.json \
   --envelope lint=$LOG_DIR/lint-envelope.json \
-  $( [ "$USE_GEMINI" = "1" ] && echo --envelope gemini=$LOG_DIR/gemini-envelope.json )
+  $( [ "$USE_GEMINI" = "1" ] && echo --envelope gemini=$LOG_DIR/gemini-envelope.json ) \
+  $( [ "$USE_CLAUDE" = "1" ] && echo --envelope claude=$LOG_DIR/claude-envelope.json )
 ```
 
 (`state-finalize-round` works too; `finalize-and-report` adds round summary hints.)
