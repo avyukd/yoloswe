@@ -22,6 +22,7 @@ for p in (str(PARENT), str(HERE)):
         sys.path.insert(0, p)
 
 import _common  # noqa: E402
+import bramble_ops  # noqa: E402
 import pr_ops  # noqa: E402
 
 
@@ -2162,7 +2163,7 @@ class TestRoundBundle(unittest.TestCase):
         self.assertTrue(out["log_dir"].endswith("/r1/a1"))
         self.assertEqual(out["head_before"], "head-sha")
         self.assertIn("envelope_paths", out)
-        for backend in ("codex", "cursor", "gemini", "lint"):
+        for backend in bramble_ops.BACKENDS:
             self.assertIn(backend, out["envelope_paths"])
             # Envelope paths inherit the attempt-scoped log dir.
             self.assertTrue(
@@ -2188,7 +2189,7 @@ class TestRoundBundle(unittest.TestCase):
             Path(out1["log_dir"]).mkdir(parents=True, exist_ok=True)
             out2 = pr_ops.round_bundle(99, 1)
         self.assertTrue(out2["log_dir"].endswith("/r1/a2"))
-        for backend in ("codex", "cursor", "gemini", "lint"):
+        for backend in bramble_ops.BACKENDS:
             self.assertTrue(
                 out2["envelope_paths"][backend].endswith(
                     f"/r1/a2/{backend}-envelope.json"

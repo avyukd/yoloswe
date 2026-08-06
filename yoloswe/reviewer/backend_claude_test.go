@@ -385,18 +385,165 @@ func TestClaudeStderrTail_ForwardsToOperator(t *testing.T) {
 	}
 }
 
-// TestClaudeBackend_ResumeOptionAppended asserts RunPrompt's first attempt
-// carries --resume while the base options do not, without spawning a CLI.
-func TestClaudeBackend_ResumeOptionAppended(t *testing.T) {
-	t.Parallel()
-	b := newClaudeBackend(Config{BackendType: BackendClaude, ResumeSessionID: "sess-prior"})
-	base := b.baseSessionOptions()
-	baseArgs := claudeArgs(t, base...)
-	if strings.Contains(strings.Join(baseArgs, " "), "--resume") {
-		t.Errorf("base options must not carry --resume; args: %v", baseArgs)
+// stubClaudeQueryStream replaces the claudeQueryStream seam for one test,
+// recording the flags each attempt was launched with and replaying a scripted
+// outcome per attempt. Restores the real seam on cleanup.
+//
+// attempts[i] drives attempt i: when stderr is non-empty it is pushed through
+// the session's stderr handler (that is how the CLI reports a resume miss);
+// when err is non-nil the attempt fails; otherwise the events are delivered.
+type claudeAttempt struct {
+	err    error
+	stderr string
+	events []claude.Event
+}
+
+func stubClaudeQueryStream(t *testing.T, attempts ...claudeAttempt) *[][]string {
+	t.Helper()
+	var argsPerAttempt [][]string
+	n := 0
+	orig := claudeQueryStream
+	t.Cleanup(func() { claudeQueryStream = orig })
+	claudeQueryStream = func(_ context.Context, _ string, opts ...claude.SessionOption) (<-chan claude.Event, error) {
+		args, err := claude.NewSession(opts...).CLIArgs()
+		if err != nil {
+			return nil, err
+		}
+		argsPerAttempt = append(argsPerAttempt, args)
+
+		cfg := claude.SessionConfig{}
+		for _, o := range opts {
+			o(&cfg)
+		}
+		var a claudeAttempt
+		if n < len(attempts) {
+			a = attempts[n]
+		}
+		n++
+		if a.stderr != "" && cfg.StderrHandler != nil {
+			cfg.StderrHandler([]byte(a.stderr))
+		}
+		if a.err != nil {
+			return nil, a.err
+		}
+		ch := make(chan claude.Event, len(a.events))
+		for _, e := range a.events {
+			ch <- e
+		}
+		close(ch)
+		return ch, nil
 	}
-	resumeArgs := claudeArgs(t, append(append([]claude.SessionOption{}, base...), claude.WithResume("sess-prior"))...)
-	if !hasFlagValue(resumeArgs, "--resume", "sess-prior") {
-		t.Errorf("expected --resume sess-prior; args: %v", resumeArgs)
+	return &argsPerAttempt
+}
+
+// TestClaudeBackend_ResumeFallbackLadder drives the real RunPrompt through the
+// live failure shape: attempt 1 asks to resume, the CLI reports the miss on
+// stderr and dies with an unrelated-looking handshake timeout, and attempt 2
+// must run fresh and report ResumeStatusFallback.
+//
+// The prior version of this test built the option slice itself and asserted it
+// rendered --resume — true by construction, and equally true if RunPrompt had
+// stopped appending WithResume altogether. This one calls RunPrompt.
+func TestClaudeBackend_ResumeFallbackLadder(t *testing.T) {
+	args := stubClaudeQueryStream(t,
+		claudeAttempt{
+			err:    errors.New("SDK initialize handshake failed: control request timed out"),
+			stderr: "No conversation found with session ID: sess-prior\n",
+		},
+		claudeAttempt{events: []claude.Event{
+			claude.ReadyEvent{Info: claude.SessionInfo{SessionID: "sess-fresh", Model: "opus"}},
+			claude.TextEvent{Text: `{"verdict":"accepted"}`},
+			claude.TurnCompleteEvent{Success: true, DurationMs: 7, Usage: claude.TurnUsage{
+				InputTokens: 10, CacheReadTokens: 90, OutputTokens: 5,
+			}},
+		}},
+	)
+
+	b := newClaudeBackend(Config{BackendType: BackendClaude, ResumeSessionID: "sess-prior"})
+	result, err := b.RunPrompt(context.Background(), "review", nil)
+	if err != nil {
+		t.Fatalf("expected fallback to succeed, got error: %v", err)
+	}
+	if result.ResumeStatus != ResumeStatusFallback {
+		t.Errorf("resume status = %q, want %q", result.ResumeStatus, ResumeStatusFallback)
+	}
+	if result.ResponseText != `{"verdict":"accepted"}` {
+		t.Errorf("response text = %q, want the second attempt's output", result.ResponseText)
+	}
+	if len(*args) != 2 {
+		t.Fatalf("expected 2 attempts, got %d", len(*args))
+	}
+	if !hasFlagValue((*args)[0], "--resume", "sess-prior") {
+		t.Errorf("attempt 1 must carry --resume sess-prior; args: %v", (*args)[0])
+	}
+	for _, a := range (*args)[1] {
+		if a == "--resume" {
+			t.Errorf("attempt 2 must not carry --resume; args: %v", (*args)[1])
+		}
+	}
+	// Cache-inclusive: 10 fresh + 90 cache-read.
+	if result.InputTokens != 100 {
+		t.Errorf("input tokens = %d, want 100 (fresh + cache)", result.InputTokens)
+	}
+}
+
+// TestClaudeBackend_ResumeSucceedsWithoutRetry pins the other half of the
+// ladder: when the requested session is live, there must be exactly one
+// attempt and the status must be ok — a backend that always retried would pass
+// the fallback test above while silently doubling every resumed round.
+func TestClaudeBackend_ResumeSucceedsWithoutRetry(t *testing.T) {
+	args := stubClaudeQueryStream(t, claudeAttempt{events: []claude.Event{
+		claude.ReadyEvent{Info: claude.SessionInfo{SessionID: "sess-prior", Model: "opus"}},
+		claude.TurnCompleteEvent{Success: true},
+	}})
+
+	b := newClaudeBackend(Config{BackendType: BackendClaude, ResumeSessionID: "sess-prior"})
+	result, err := b.RunPrompt(context.Background(), "review", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.ResumeStatus != ResumeStatusOK {
+		t.Errorf("resume status = %q, want %q", result.ResumeStatus, ResumeStatusOK)
+	}
+	if len(*args) != 1 {
+		t.Errorf("a live resume must not retry; attempts = %d", len(*args))
+	}
+}
+
+// TestClaudeBackend_GenuineFailureDoesNotRetry guards the inverse of the
+// fallback: a wedged CLI with no resume-miss evidence must surface its error
+// rather than silently re-running the whole review on a fresh session.
+func TestClaudeBackend_GenuineFailureDoesNotRetry(t *testing.T) {
+	args := stubClaudeQueryStream(t, claudeAttempt{
+		err:    errors.New("SDK initialize handshake failed: control request timed out"),
+		stderr: "Loaded cached credentials.\n",
+	})
+
+	b := newClaudeBackend(Config{BackendType: BackendClaude, ResumeSessionID: "sess-prior"})
+	_, err := b.RunPrompt(context.Background(), "review", nil)
+	if err == nil {
+		t.Fatal("expected the genuine failure to surface")
+	}
+	if len(*args) != 1 {
+		t.Errorf("must not retry without resume-miss evidence; attempts = %d", len(*args))
+	}
+}
+
+func TestClaudeUsageTokens_IncludesCacheTokens(t *testing.T) {
+	t.Parallel()
+	in, out := claudeUsageTokens(claude.TurnUsage{
+		InputTokens:         7,
+		CacheCreationTokens: 300,
+		CacheReadTokens:     1200,
+		OutputTokens:        42,
+	})
+	// Reporting only the 7 fresh tokens is the regression this guards: on a
+	// resumed turn nearly the whole context is cache-served, so claude would
+	// look ~200x cheaper than it is in the cross-backend comparison.
+	if in != 1507 {
+		t.Errorf("input = %d, want 1507 (7 + 300 + 1200)", in)
+	}
+	if out != 42 {
+		t.Errorf("output = %d, want 42", out)
 	}
 }

@@ -23,8 +23,21 @@ import (
 // Unlike Codex, Claude needs no approval-handler gymnastics: the permission
 // mode stays on bypass (so automation never blocks on a prompt) and
 // Config.ReadOnly is enforced by refusing to hand the model the write tools at
-// all. Shell remains reachable, so — exactly as with Codex — the prompt is the
-// last line of defence against a destructive command.
+// all.
+//
+// The two settings do compose — verified live 2026-08-06 by running the CLI
+// with --permission-mode bypassPermissions --disallowed-tools Write and asking
+// it to write a file: the model reported "the Write tool isn't available in
+// this session". Worth pinning explicitly, because SDK_PROTOCOL.md describes
+// bypassPermissions as "bypass all checks", which reads as though the deny list
+// would lose.
+//
+// What that same run also showed: told it could not use Write, the model
+// reached for Bash and created the file anyway. ReadOnly withholds the write
+// *tools*; it is not a filesystem guarantee. Bash is deliberately still granted
+// (a reviewer needs git log/diff/show), so — exactly as with Codex — the prompt
+// is the last line of defence against a destructive command. Callers that need
+// a real filesystem boundary must sandbox the process.
 //
 // # Settings isolation
 //
@@ -39,6 +52,11 @@ type claudeBackend struct {
 func newClaudeBackend(config Config) *claudeBackend {
 	return &claudeBackend{config: config}
 }
+
+// claudeQueryStream is the seam tests substitute to drive RunPrompt's
+// two-attempt resume ladder without a live CLI. Production always uses
+// claude.QueryStream.
+var claudeQueryStream = claude.QueryStream
 
 // Start is a no-op for claude (one-shot per prompt).
 func (b *claudeBackend) Start(_ context.Context) error {
@@ -90,6 +108,19 @@ func isClaudeResumeUnavailable(err error, stderrTail string) bool {
 		return false
 	}
 	return isResumeUnavailableMessage(err.Error()) || isResumeUnavailableMessage(stderrTail)
+}
+
+// claudeUsageTokens maps a claude turn's usage onto the reviewer's
+// (input, output) token pair.
+//
+// TotalInputTokens, not Usage.InputTokens: under Anthropic's accounting the
+// latter counts only *fresh* prompt tokens, with cache-creation and cache-read
+// reported separately. Codex's same-named field is already the full prompt
+// total, so reporting the fresh count here would make claude look artificially
+// cheap in the cross-backend token comparison — most of all on resumed turns,
+// where nearly the whole context is served from cache.
+func claudeUsageTokens(u claude.TurnUsage) (input, output int64) {
+	return int64(u.TotalInputTokens()), int64(u.OutputTokens)
 }
 
 // claudeStderrTailLimit bounds the retained stderr tail. Only the last few KiB
@@ -205,16 +236,27 @@ func (b *claudeBackend) runPromptWithOptions(ctx context.Context, prompt string,
 	// Appended here, not in baseSessionOptions, so each attempt gets its own
 	// tail (see RunPrompt).
 	opts = append(append([]claude.SessionOption{}, opts...), claude.WithStderrHandler(tail.handle))
-	events, err := claude.QueryStream(ctx, prompt, opts...)
+
+	// One derived context drives both QueryStream and the adapter, and is
+	// cancelled on every return path.
+	//
+	// The adapter goroutine needs it so an early return (idle timeout,
+	// fallback retry) doesn't leak it. QueryStream needs it for a second
+	// reason: its proxy goroutine forwards events with `case out <- evt` and
+	// only gives up on ctx.Done. Once the bridge stops reading, an
+	// attempt-scoped context is the only thing that unblocks that send and
+	// lets the deferred session.Stop run — passing the caller's ctx instead
+	// would keep the CLI session alive until the whole review ends, which on
+	// the resume-fallback path means both attempts' sessions running at once.
+	queryCtx, cancelQuery := context.WithCancel(ctx)
+	defer cancelQuery()
+
+	events, err := claudeQueryStream(queryCtx, prompt, opts...)
 	if err != nil {
 		return reviewErrorResult(resumeStatus, fmt.Errorf("claude query failed: %w", err))
 	}
 
-	// Derived context so the adapter goroutine is unblocked when RunPrompt
-	// returns early (e.g. on an idle timeout), preventing a goroutine leak
-	// even while the parent context is still active.
-	adapterCtx, adapterCancel := context.WithCancel(ctx)
-	defer adapterCancel()
+	adapterCtx := queryCtx
 
 	var sessionMu sync.Mutex
 	var actualSessionID string
@@ -247,15 +289,7 @@ func (b *claudeBackend) runPromptWithOptions(ctx context.Context, prompt string,
 
 	// Token usage and turn-level errors live on the raw turn event.
 	if tc, ok := bridged.turnEvent.(claude.TurnCompleteEvent); ok {
-		// TotalInputTokens, not Usage.InputTokens: under Anthropic's
-		// accounting the latter counts only *fresh* prompt tokens, with
-		// cache-creation and cache-read reported separately. Codex's
-		// same-named field is already the full prompt total, so reporting
-		// the fresh count here would make claude look artificially cheap in
-		// the cross-backend token comparison — most of all on resumed turns,
-		// where nearly the whole context is served from cache.
-		result.InputTokens = int64(tc.Usage.TotalInputTokens())
-		result.OutputTokens = int64(tc.Usage.OutputTokens)
+		result.InputTokens, result.OutputTokens = claudeUsageTokens(tc.Usage)
 		if tc.Error != nil {
 			if handler != nil {
 				handler.OnError(tc.Error, "turn_complete")

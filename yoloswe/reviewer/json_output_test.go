@@ -424,6 +424,15 @@ func TestBuildEnvelope_ClaudeBackend(t *testing.T) {
 	if env.Review.Verdict != "accepted" {
 		t.Errorf("verdict = %q, want accepted", env.Review.Verdict)
 	}
+	// Claude is the second backend (after codex) to report real token counts,
+	// and the eval's cross-backend cost comparison reads them straight off the
+	// envelope — assert they survive BuildEnvelope rather than only setting them.
+	if env.InputTokens != 1234 {
+		t.Errorf("input_tokens = %d, want 1234", env.InputTokens)
+	}
+	if env.OutputTokens != 567 {
+		t.Errorf("output_tokens = %d, want 567", env.OutputTokens)
+	}
 	if env.SchemaVersion != JSONSchemaVersion {
 		t.Errorf("schema_version = %d, want %d", env.SchemaVersion, JSONSchemaVersion)
 	}
