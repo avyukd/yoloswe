@@ -281,6 +281,32 @@ class SummarizeRecordTests(unittest.TestCase):
         self.assertEqual(got["entries"], 2)
         self.assertEqual(got["pending"], 2)
 
+    def test_staged_count_cannot_drive_pending_below_zero(self):
+        """Staged progress must never make a PR look finished.
+
+        Regression (cursor, PR #309 round 3): round 2 subtracted
+        `len(overlay.verdicts)` from `pending`, but an `add` targets a
+        location the census does not yet hold — it is new work, not a pending
+        entry resolved. Staging promotions alone could drain `pending` to 0
+        and sort a wholly unreviewed PR out of the queue. The caller now
+        counts only verdicts matching an existing entry; this clamp is the
+        second line of defence.
+        """
+        rec = {"pr": {}, "harvested_rounds": [],
+               "ground_truth_v3": _gt(tps=[("a.py", 1), ("b.py", 2)])}
+        got = rl.summarize_record("k-1", rec, None,
+                                  staged_counts={"k-1": 99})
+        self.assertEqual(got["entries"], 2)
+        self.assertEqual(got["pending"], 0)
+        self.assertEqual(got["staged"], 2, "staged is clamped to pending")
+
+    def test_staged_count_reduces_pending_normally(self):
+        rec = {"pr": {}, "harvested_rounds": [],
+               "ground_truth_v3": _gt(tps=[("a.py", 1), ("b.py", 2)])}
+        got = rl.summarize_record("k-1", rec, None, staged_counts={"k-1": 1})
+        self.assertEqual(got["pending"], 1)
+        self.assertEqual(got["staged"], 1)
+
     def test_defaults_missing_harvest_source_to_pr_polish(self):
         """Schema-2 records predate the field and read as pr-polish."""
         rec = {"pr": {}, "harvested_rounds": [],

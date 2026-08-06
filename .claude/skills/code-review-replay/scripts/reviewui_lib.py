@@ -532,9 +532,15 @@ def summarize_record(
         # Staged-but-unapplied verdicts count as progress: a review left
         # half-finished in the overlay is not untouched work, and treating it
         # as such sorts it back to the top of the queue every session.
-        "staged": (staged_counts or {}).get(target, 0),
+        #
+        # The caller must pass only verdicts that resolve an EXISTING entry —
+        # an `add` creates new work rather than closing pending work. Clamped
+        # to `stats["pending"]` as well as to 0 so a miscount can never make a
+        # PR look finished; the sort key depends on this.
+        "staged": min((staged_counts or {}).get(target, 0), stats["pending"]),
         "pending": max(
-            0, stats["pending"] - (staged_counts or {}).get(target, 0)),
+            0, stats["pending"] - min((staged_counts or {}).get(target, 0),
+                                      stats["pending"])),
         "human_added": stats["human_added"],
         "suggestions": (suggestion_counts or {}).get(target, 0),
         "goal_text": (rnd.get("goal_text") or "")[:200],

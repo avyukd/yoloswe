@@ -97,11 +97,25 @@ def _api_records() -> dict:
         counts[target] = sum(1 for s in sugg if s.get("recurrent"))
         # Progress must count verdicts staged but not yet applied, or a
         # half-finished review reads as untouched and sorts back to the top.
+        #
+        # Count ONLY verdicts that adjudicate an entry already in the frozen
+        # block. An `add` targets a location the census does not yet hold, so
+        # it is new work rather than a pending entry resolved — counting it
+        # would drain `pending` below the number of unreviewed entries and let
+        # a PR reach `pending == 0` purely by promoting suggestions.
         try:
             ov = hr.load_overlay(hr.overlay_path(STATE.eval_root, target))
         except ValueError:
             ov = None  # corrupt overlay: surfaced on the PR page, not here
-        staged[target] = len((ov or {}).get("verdicts") or [])
+        resolved = 0
+        for v in (ov or {}).get("verdicts") or []:
+            if any(
+                hr.same_identity(e, v)
+                for bucket in ("true_positives", "false_positives")
+                for e in gt.get(bucket) or []
+            ):
+                resolved += 1
+        staged[target] = resolved
     rows = [
         rl.summarize_record(t, r, STATE.repo_for(r), suggestion_counts=counts,
                             staged_counts=staged)
