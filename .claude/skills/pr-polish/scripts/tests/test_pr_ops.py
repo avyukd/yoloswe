@@ -2748,6 +2748,24 @@ class TestStripPRBody(unittest.TestCase):
         self.assertIn("co-authored-by", dropped)
         self.assertEqual(cleaned, "Fixes the parser.")
 
+    def test_strips_generated_with_without_emoji(self) -> None:
+        """The trailer ships both with and without the robot emoji."""
+        for trailer in (
+            "Generated with [Claude Code](https://claude.com/claude-code)",
+            "Generated with Claude Code",
+        ):
+            with self.subTest(trailer=trailer):
+                cleaned, dropped = pr_ops.strip_pr_body(f"Fixes the parser.\n\n{trailer}\n")
+                self.assertIn("generated-with", dropped)
+                self.assertEqual(cleaned, "Fixes the parser.")
+
+    def test_generated_with_mid_sentence_survives(self) -> None:
+        """Anchored to line start: prose mentioning the phrase is not a trailer."""
+        body = "## What\n\nThe fixture was generated with the old script, so it drifted.\n"
+        cleaned, dropped = pr_ops.strip_pr_body(body)
+        self.assertEqual(dropped, [])
+        self.assertIn("generated with the old script", cleaned)
+
     def test_author_written_sections_are_never_stripped(self) -> None:
         """Regression: a heading name must not decide what a reviewer sees.
 
@@ -2784,6 +2802,18 @@ class TestStripPRBody(unittest.TestCase):
 
 
 class TestBuildPRSummary(unittest.TestCase):
+    def _with_state(self, body):
+        with tempfile.TemporaryDirectory() as d:
+            tmp_root = Path(d)
+
+            def fake_state_paths(pr, branch=None):
+                key = pr if pr is not None else f"branch-{branch}"
+                pr_dir = tmp_root / f"proj-{key}"
+                return pr_dir, pr_dir / "pr-polish-state.json"
+
+            with patch.object(pr_ops, "state_paths", side_effect=fake_state_paths):
+                return body()
+
     def _pr(self, **kw):
         base = {
             "pr_number": 311,
@@ -2827,6 +2857,58 @@ class TestBuildPRSummary(unittest.TestCase):
         self.assertEqual(out["source"], "pr-body+diffstat")
         self.assertIn("fix typo", out["pr_summary"])
         self.assertIn("COMMITS", out["pr_summary"])
+
+    def test_gh_body_reaches_summary_end_to_end(self) -> None:
+        """Boundary test: gh pr view's body must survive identify -> summary.
+
+        The unit tests above build the pr dict by hand, so a regression in
+        identify's --json/--jq projection (dropping `body`) would silently
+        fall back to commits with every other test still green.
+        """
+        body = (
+            "## What\n\nThis PR rewires the widget cache so stale entries "
+            "cannot outlive a deploy, which is the actual bug.\n"
+        )
+        pr_json = json.dumps(
+            {
+                "pr_number": 77,
+                "title": "fix(widget): expire stale cache",
+                "url": "https://example.invalid/pull/77",
+                "body": body,
+                "base": "main",
+                "head": "fix/widget",
+                "head_sha": "deadbeef",
+            }
+        )
+        seen_args: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["git", "rev-parse"]:
+                return _common.RunResult(stdout="fix/widget\n", stderr="", returncode=0)
+            if cmd[:3] == ["gh", "pr", "view"]:
+                seen_args.append(cmd)
+                return _common.RunResult(stdout=pr_json, stderr="", returncode=0)
+            if cmd[:3] == ["gh", "repo", "view"]:
+                return _common.RunResult(stdout='"acme/widgets"', stderr="", returncode=0)
+            if cmd[:2] == ["git", "log"] or cmd[:2] == ["git", "diff"]:
+                return _common.RunResult(stdout="FALLBACK", stderr="", returncode=0)
+            raise AssertionError(f"unexpected cmd: {cmd}")
+
+        with (
+            patch.object(pr_ops, "run", side_effect=fake_run),
+            patch.object(_common, "run", side_effect=fake_run),
+        ):
+            pr = self._with_state(lambda: pr_ops.identify_pr())
+            out = pr_ops.build_pr_summary(pr)
+
+        # The projection must actually request and keep `body`.
+        joined = " ".join(seen_args[0])
+        self.assertIn("body", joined)
+        self.assertEqual(pr["body"], body)
+        # ...and the summary must use it rather than the commit fallback.
+        self.assertEqual(out["source"], "pr-body")
+        self.assertIn("rewires the widget cache", out["pr_summary"])
+        self.assertNotIn("FALLBACK", out["pr_summary"])
 
     def test_branch_only_mode_uses_commits(self) -> None:
         with patch.object(pr_ops, "_commit_diffstat_summary", return_value="COMMITS"):

@@ -451,7 +451,8 @@ _BODY_BLOCK_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 # Trailing attribution / process lines that carry no review signal. Anchored
 # to the start of a line so prose that merely mentions them survives.
 _BODY_LINE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"^\s*🤖 Generated with .*$", re.MULTILINE), "generated-with"),
+    # Emoji prefix optional — the trailer is emitted both ways.
+    (re.compile(r"^\s*(?:🤖\s*)?Generated with .*$", re.MULTILINE), "generated-with"),
     (re.compile(r"^\s*Co-Authored-By:.*$", re.MULTILINE | re.IGNORECASE), "co-authored-by"),
     (
         re.compile(r"^\s*<sup>\s*Reviewed by \[.*?</sup>\s*$", re.MULTILINE | re.DOTALL),
