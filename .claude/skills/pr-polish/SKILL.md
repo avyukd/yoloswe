@@ -223,32 +223,9 @@ Two non-obvious properties: `wait` returns as soon as every child has *exited*, 
 
 Substitute the concrete `{ROUND}`/`$REPO`/`$PR_NUMBER`/`$GOAL`/`$SCOPE_HINTS`/`$LOG_DIR`/resume-id/`$BRAMBLE_BIN`/`$SKILL_DIR` values in, then run the **whole script as one call**. No `bash -c` wrapper, no nested quoting. Every reviewer uses this template, differing only in the four substitutions tabled below:
 
-```bash
-( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:<tag>:r{ROUND} \
-  timeout 1200 $BRAMBLE_BIN code-review --backend <backend> --model <model> <extra> \
-    --skip-test-execution --verbose --idle-timeout 5m \
-    --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
-    ${<RESUME>:+--resume-session-id "$<RESUME>"} \
-    --envelope-file "$LOG_DIR/<tag>-envelope.json" \
-  2>&1 | tee "$LOG_DIR/<tag>-stderr.txt" | sed 's/^/[<tag>] /' ) &
-PIDS+=($!)
-```
-
-| `<tag>` | `<backend>` | `<model>` | `<extra>` | `<RESUME>` | Launched |
-|---|---|---|---|---|---|
-| `codex` | `codex` | `gpt-5.6-luna` | `--effort medium` | `CODEX_RESUME` | always |
-| `cursor` | `cursor` | `composer-2.5` | — | `CURSOR_RESUME` | always |
-| `gemini` | `gemini` | `gemini-3-flash-preview` | — | `GEMINI_RESUME` | `if [ "$USE_GEMINI" = "1" ]` |
-| `claude` | `claude` | `opus` | — | `CLAUDE_RESUME` | `if [ "$USE_CLAUDE" = "1" ]` |
-
-The `${VAR:+…}` idiom is load-bearing: an empty resume id must drop the flag entirely, not pass an empty string. Keep the per-reviewer `BRAMBLE_RUN_TAG` — it is how runs are attributed.
-
-**This is not copy-pasteable as-is** — expand the template once per row above
-before running. A `#` marker left unexpanded is inert shell: the reviewer never
-launches, and because `wait` returns 0 for whatever *did* start, the round then
-triages a near-empty reviewer set that looks perfectly healthy. Codex is shown
-fully expanded below; cursor is the same with the row's substitutions applied,
-and the two optional launches go inside their `if` guards.
+Every launch is literal below. The `${VAR:+…}` idiom is load-bearing — an empty
+resume id must drop the flag entirely, not pass an empty string — and the
+per-reviewer `BRAMBLE_RUN_TAG` is how runs are attributed.
 
 ```bash
 # INVARIANT: every reviewer launch ends with `PIDS+=($!)`; nothing else touches
@@ -267,7 +244,13 @@ PIDS=()
   2>&1 | tee "$LOG_DIR/codex-stderr.txt" | sed 's/^/[codex] /' ) &
 PIDS+=($!)
 
-# cursor: same block, substituting the `cursor` row (no --effort flag).
+( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:cursor:r{ROUND} \
+  timeout 1200 $BRAMBLE_BIN code-review --backend cursor --model composer-2.5 \
+    --skip-test-execution --verbose --idle-timeout 5m \
+    --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
+    ${CURSOR_RESUME:+--resume-session-id "$CURSOR_RESUME"} \
+    --envelope-file "$LOG_DIR/cursor-envelope.json" \
+  2>&1 | tee "$LOG_DIR/cursor-stderr.txt" | sed 's/^/[cursor] /' ) &
 PIDS+=($!)
 
 ( set -o pipefail; timeout 120 python3 $SKILL_DIR/scripts/lint_gate.py \
@@ -275,17 +258,33 @@ PIDS+=($!)
   2>&1 | tee "$LOG_DIR/lint-stderr.txt" | sed 's/^/[lint] /' ) &
 PIDS+=($!)
 
-# gemini: wrap the `gemini` row's block in `if [ "$USE_GEMINI" = "1" ]; then … fi`
-# claude: wrap the `claude` row's block in `if [ "$USE_CLAUDE" = "1" ]; then … fi`
+if [ "$USE_GEMINI" = "1" ]; then
+  ( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:gemini:r{ROUND} \
+    timeout 1200 $BRAMBLE_BIN code-review --backend gemini --model gemini-3-flash-preview \
+      --skip-test-execution --verbose --idle-timeout 5m \
+      --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
+      ${GEMINI_RESUME:+--resume-session-id "$GEMINI_RESUME"} \
+      --envelope-file "$LOG_DIR/gemini-envelope.json" \
+    2>&1 | tee "$LOG_DIR/gemini-stderr.txt" | sed 's/^/[gemini] /' ) &
+  PIDS+=($!)
+fi
+
+if [ "$USE_CLAUDE" = "1" ]; then
+  ( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:claude:r{ROUND} \
+    timeout 1200 $BRAMBLE_BIN code-review --backend claude --model opus \
+      --skip-test-execution --verbose --idle-timeout 5m \
+      --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
+      ${CLAUDE_RESUME:+--resume-session-id "$CLAUDE_RESUME"} \
+      --envelope-file "$LOG_DIR/claude-envelope.json" \
+    2>&1 | tee "$LOG_DIR/claude-stderr.txt" | sed 's/^/[claude] /' ) &
+  PIDS+=($!)
+fi
 
 # Join on EVERY launched reviewer so triage never starts while one is still
 # running or has yet to write its envelope. A skipped reviewer is simply one
 # fewer element — the wait can't desync from the launches.
 wait "${PIDS[@]}"
 ```
-
-Before running the job, check that it contains one `( set -o pipefail; …` launch
-per reviewer you intend and that each is followed by `PIDS+=($!)`.
 
 Before triage: `recover-envelope` on each stream path (idempotent). A reviewer that exited without a valid envelope → `stream-missing` finding, not a deadlock.
 
