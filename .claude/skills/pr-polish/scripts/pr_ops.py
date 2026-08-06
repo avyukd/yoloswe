@@ -783,6 +783,13 @@ def state_append_round(
     pr_number, branch = _resolve_ctx(ctx)
     _, path = state_paths(pr_number, branch=branch)
     state = read_json(path, default=None)
+    # Decide the series boundary HERE, while `completed` is still readable.
+    # This function is about to clear that flag (below), which destroys the
+    # only evidence that a new loop started — so every later consumer in this
+    # round would see a restarted series as a continuation and drag the prior
+    # series' goal and bramble sessions into a review of different code. The
+    # decision is persisted on the round entry so it survives the clear.
+    is_new_series = _is_first_round_of_series(state, n)
     if state is None:
         state = {
             "pr_number": pr_number,
@@ -812,10 +819,16 @@ def state_append_round(
                 "comment_actions": [],
                 "noise_filtered": noise_filtered,
                 "noise_samples": samples,
+                "is_new_series": is_new_series,
             }
         )
     else:
         existing["head_before"] = head_before
+        # Sticky: the first append of this round made the call while
+        # `completed` was still readable. A resumed round re-appends after
+        # the flag was already cleared, so re-deriving now would always say
+        # "continuation" and silently downgrade a genuine series boundary.
+        existing.setdefault("is_new_series", is_new_series)
         # Preserve the max noise count across resumes — re-fetching may
         # re-count zero if bot posts have been resolved in the meantime.
         existing["noise_filtered"] = max(existing.get("noise_filtered", 0) or 0, noise_filtered)
@@ -1554,7 +1567,24 @@ def round_bundle(ctx: int | str, n: int) -> dict[str, Any]:
     state_dir, state_file = state_paths(pr_number, branch=branch)
     log_dir = state_dir / f"r{n}" / f"a{_next_attempt(state_dir, n)}"
     state = read_json(state_file, default=None)
+    # Prefer the boundary decision state_append_round recorded on this round.
+    # Re-deriving it here would read a state whose `completed` flag that same
+    # append already cleared, so every restarted series would look like a
+    # continuation — inheriting the prior series' goal and bramble sessions.
+    # Fall back to deriving only when the round predates the recorded field
+    # (older state files) or hasn't been appended yet.
     is_new_series = 1 if _is_first_round_of_series(state, n) else 0
+    if state is not None:
+        recorded = next(
+            (
+                r.get("is_new_series")
+                for r in (state.get("rounds") or [])
+                if r.get("n") == n and r.get("is_new_series") is not None
+            ),
+            None,
+        )
+        if recorded is not None:
+            is_new_series = 1 if recorded else 0
 
     head_res = run(["git", "rev-parse", "HEAD"], check=False)
     head_before = head_res.stdout.strip() if head_res.returncode == 0 else ""

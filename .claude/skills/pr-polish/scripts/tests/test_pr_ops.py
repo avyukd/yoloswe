@@ -2236,6 +2236,47 @@ class TestRoundBundle(unittest.TestCase):
         self.assertIn("Round 2", out["goal_text"])
         self.assertIn("a.go:5", out["goal_text"])
 
+    def test_restarted_series_gets_fresh_goal_and_resume_ids(self) -> None:
+        # A converged loop that is re-invoked starts a NEW series, and a new
+        # series must not inherit the prior one's goal or bramble sessions.
+        # The boundary signal is only readable BEFORE state_append_round
+        # clears `completed`, so round_bundle cannot re-derive it from the
+        # post-append state — by then every new series looks like a
+        # continuation. Symptom in production: round N's goal opens with
+        # "Files changed since round N-1" computed across the prior series'
+        # head, dragging unrelated files into the review scope.
+        pr_ops.state_append_round(99, 1, "sha1", verify_head=False,
+                                  pr_summary="PR #99: the frozen purpose")
+        pr_ops.state_finalize_round(
+            99, 1, "sha1f",
+            [{"comment_id": 1, "action": "fixed", "severity": "high",
+              "path": "a.go", "line": 5, "source": "codex", "topic": "bug"}],
+            auto_reply=False,
+        )
+        # Seed the prior series' bramble session so a leaked resume is visible.
+        _, state_file = pr_ops.state_paths(99)
+        seeded = _common.read_json(state_file, default={})
+        seeded["rounds"][0]["session_ids"] = {"codex": "prior-series-session"}
+        _common.atomic_write_json(state_file, seeded)
+        pr_ops.state_mark_complete(99, "converged")
+
+        # New loop, new series: round 2 is the first round after completion.
+        pr_ops.state_append_round(99, 2, "sha1f", verify_head=False)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["git", "rev-parse"]:
+                return _common.RunResult(stdout="sha1f\n", stderr="", returncode=0)
+            return _common.RunResult(stdout="", stderr="", returncode=1)
+        with patch.object(pr_ops, "run", side_effect=fake_run):
+            out = pr_ops.round_bundle(99, 2)
+
+        # Fresh session, not the prior series' conversation.
+        self.assertEqual(out["resume_ids"].get("codex", ""), "")
+        # The goal is the PR's frozen purpose, not an inter-round delta
+        # measured against the prior series' head.
+        self.assertIn("the frozen purpose", out["goal_text"])
+        self.assertNotIn("Files changed since round 1", out["goal_text"])
+
 
 class TestFinalizeAndReport(unittest.TestCase):
     """finalize-and-report wraps state_finalize_round and emits the
