@@ -1,5 +1,5 @@
 // Package reviewer provides a multi-backend wrapper for code review using
-// agent CLIs (Codex, Cursor, Gemini).
+// agent CLIs (Claude, Codex, Cursor, Gemini).
 package reviewer
 
 import (
@@ -45,9 +45,15 @@ const (
 )
 
 const (
+	BackendClaude BackendType = "claude"
 	BackendCodex  BackendType = "codex"
 	BackendCursor BackendType = "cursor"
 	BackendGemini BackendType = "gemini"
+
+	// DefaultClaudeModel is the model used when BackendClaude is selected and
+	// no --model flag is provided. Matches the default `yoloswe codetalk`
+	// applies to its claude backend.
+	DefaultClaudeModel = "opus"
 
 	// DefaultGeminiModel is the model used when BackendGemini is selected and
 	// no --model flag is provided.
@@ -111,14 +117,20 @@ type Config struct {
 	WorkDir         string
 	Goal            string
 	SessionLogPath  string
-	Effort          string // Reasoning effort level for codex (low, medium, high)
+	Effort          string // Reasoning effort: codex (low, medium, high), claude (low, medium, high, max)
 	Sandbox         string // Codex sandbox: "read-only", "workspace-write", "danger-full-access"
 	Model           string
 	BackendType     BackendType
 	ResumeSessionID string // Prior reviewer session/thread id to resume when supported.
-	ReadOnly        bool   // Deny file writes via approval handler (Codex only; CLI entrypoints default this to true)
-	Verbose         bool
-	NoColor         bool
+	// ReadOnly withholds the file-mutation surface from the reviewer. Codex
+	// enforces it with an approval handler that denies Write tool calls;
+	// Claude enforces it by not granting the write tools at all (see
+	// claudeReadOnlyDisallowedTools). Cursor and Gemini ignore it. CLI
+	// entrypoints default this to true. Neither backend can block a
+	// destructive shell command — the prompt is the remaining constraint.
+	ReadOnly bool
+	Verbose  bool
+	NoColor  bool
 	// SkipTestExecution instructs the reviewer not to run test/build commands
 	// (bazel, go test, etc.). Callers that already run tests in a separate step
 	// (e.g. /pr-polish quality gates) should enable this to avoid duplicate work.
@@ -1095,6 +1107,13 @@ func New(config Config) *Reviewer {
 	if config.BackendType == "" {
 		config.BackendType = BackendCodex
 	}
+	// Apply Claude-specific defaults.
+	if config.BackendType == BackendClaude {
+		if config.Model == "" {
+			config.Model = DefaultClaudeModel
+		}
+	}
+
 	// Apply Gemini-specific defaults.
 	if config.BackendType == BackendGemini {
 		if config.Model == "" {
@@ -1138,6 +1157,8 @@ func New(config Config) *Reviewer {
 
 	var backend Backend
 	switch config.BackendType {
+	case BackendClaude:
+		backend = newClaudeBackend(config)
 	case BackendCursor:
 		backend = newCursorBackend(config)
 	case BackendGemini:
@@ -1261,10 +1282,10 @@ func (r *Reviewer) LastSessionID() string { return r.lastSessionID }
 // ValidateBackend returns an error if the given backend string is not supported.
 func ValidateBackend(backend string) error {
 	switch BackendType(backend) {
-	case BackendCursor, BackendCodex, BackendGemini:
+	case BackendClaude, BackendCursor, BackendCodex, BackendGemini:
 		return nil
 	default:
-		return fmt.Errorf("unknown backend %q (supported: cursor, codex, gemini)", backend)
+		return fmt.Errorf("unknown backend %q (supported: claude, cursor, codex, gemini)", backend)
 	}
 }
 
@@ -1287,7 +1308,8 @@ func ResolveWorkDir() (string, error) {
 // collisions between concurrent runs. Returns "" if no log dir is configured.
 //
 // Note: protocol session logging is currently only supported by the Codex
-// backend; Cursor and Gemini backends silently ignore SessionLogPath.
+// backend; the Claude, Cursor, and Gemini backends silently ignore
+// SessionLogPath.
 func ResolveProtocolLogPath(flagValue string) (string, error) {
 	dir := flagValue
 	if dir == "" {

@@ -644,19 +644,22 @@ class TestParseStreamArgs(unittest.TestCase):
 
     def test_rejects_unknown_backend(self) -> None:
         with self.assertRaises(ValueError):
-            bramble_ops._parse_stream_args(["claude=/a.log"])
+            bramble_ops._parse_stream_args(["copilot=/a.log"])
 
-    def test_accepts_gemini_and_lint(self) -> None:
-        # Regression guard for two related shifts:
+    def test_accepts_claude_gemini_and_lint(self) -> None:
+        # Regression guard for three related shifts:
         #  * gemini envelopes exist on disk for old runs (e.g.
         #    ~/.bramble/projects/kernel-2755/r1/gemini-envelope.json) and the
         #    SKILL.md --gemini flag depends on this --stream path.
-        #  * lint is a new source (deterministic linter findings via
+        #  * lint is a source (deterministic linter findings via
         #    lint_gate.py) flowing through the same triage pipeline.
-        # Both must round-trip through _parse_stream_args without rejection.
+        #  * claude is the fourth bramble backend, opt-in via SKILL.md's
+        #    --claude flag on the same --stream path as --gemini.
+        # All must round-trip through _parse_stream_args without rejection.
         out = bramble_ops._parse_stream_args(
-            ["codex=/a.log", "cursor=/b.log", "gemini=/c.log", "lint=/d.json"]
+            ["claude=/z.log", "codex=/a.log", "cursor=/b.log", "gemini=/c.log", "lint=/d.json"]
         )
+        self.assertEqual(out["claude"], Path("/z.log"))
         self.assertEqual(out["gemini"], Path("/c.log"))
         self.assertEqual(out["lint"], Path("/d.json"))
 

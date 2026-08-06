@@ -4,6 +4,7 @@ go_library(
     name = "reviewer",
     srcs = [
         "backend.go",
+        "backend_claude.go",
         "backend_codex.go",
         "backend_cursor.go",
         "backend_gemini.go",
@@ -19,6 +20,7 @@ go_library(
     deps = [
         "//agent-cli-wrapper/acp",
         "//agent-cli-wrapper/agentstream",
+        "//agent-cli-wrapper/claude",
         "//agent-cli-wrapper/claude/render",
         "//agent-cli-wrapper/codex",
         "//agent-cli-wrapper/cursor",
@@ -29,6 +31,7 @@ go_library(
 go_test(
     name = "reviewer_test",
     srcs = [
+        "backend_claude_test.go",
         "backend_cursor_test.go",
         "backend_gemini_test.go",
         "backend_test.go",
@@ -45,6 +48,7 @@ go_test(
     deps = [
         "//agent-cli-wrapper/acp",
         "//agent-cli-wrapper/agentstream",
+        "//agent-cli-wrapper/claude",
         "//agent-cli-wrapper/claude/render",
         "//agent-cli-wrapper/codex",
     ],

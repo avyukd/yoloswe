@@ -519,6 +519,7 @@ func TestValidateBackend(t *testing.T) {
 		backend string
 		wantErr bool
 	}{
+		{"claude", false},
 		{"cursor", false},
 		{"codex", false},
 		{"gemini", false},
@@ -582,6 +583,71 @@ func TestValidateBackend_GeminiErrorMessage(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "gemini") {
 		t.Errorf("error message should mention gemini: %q", err.Error())
+	}
+}
+
+func TestNew_ClaudeBackend(t *testing.T) {
+	r := New(Config{
+		BackendType: BackendClaude,
+	})
+
+	if r.config.BackendType != BackendClaude {
+		t.Errorf("expected claude backend, got %s", r.config.BackendType)
+	}
+	if r.config.Model != DefaultClaudeModel {
+		t.Errorf("expected default model %s, got %s", DefaultClaudeModel, r.config.Model)
+	}
+	if _, ok := r.backend.(*claudeBackend); !ok {
+		t.Errorf("expected *claudeBackend, got %T", r.backend)
+	}
+}
+
+func TestNew_ClaudeBackend_CustomModel(t *testing.T) {
+	r := New(Config{
+		BackendType: BackendClaude,
+		Model:       "sonnet",
+	})
+	if r.config.Model != "sonnet" {
+		t.Errorf("expected custom model sonnet, got %s", r.config.Model)
+	}
+}
+
+// TestNew_ApprovalPolicyNotOverriddenForClaude guards the codex-only scope of
+// the approval-policy defaulting block. Claude has no approval policy — it
+// enforces read-only by withholding write tools — so leaking codex's default
+// here would be a silent no-op today and a confusing config value in any
+// future dispatch on ApprovalPolicy.
+func TestNew_ApprovalPolicyNotOverriddenForClaude(t *testing.T) {
+	r := New(Config{BackendType: BackendClaude, ReadOnly: true})
+	if r.config.ApprovalPolicy != "" {
+		t.Errorf("expected claude approval policy to remain empty, got %q", r.config.ApprovalPolicy)
+	}
+}
+
+// TestNew_ClaudeSandboxNotDefaulted guards that the codex sandbox default
+// ("danger-full-access") does not leak onto the claude backend, where the
+// field is meaningless.
+func TestNew_ClaudeSandboxNotDefaulted(t *testing.T) {
+	r := New(Config{BackendType: BackendClaude})
+	if r.config.Sandbox != "" {
+		t.Errorf("expected claude sandbox to remain empty, got %q", r.config.Sandbox)
+	}
+}
+
+func TestEffectiveModel_ClaudeDefault(t *testing.T) {
+	r := New(Config{BackendType: BackendClaude})
+	if got := r.EffectiveModel(); got != DefaultClaudeModel {
+		t.Errorf("EffectiveModel() = %q, want %q", got, DefaultClaudeModel)
+	}
+}
+
+func TestValidateBackend_ClaudeErrorMessage(t *testing.T) {
+	err := ValidateBackend("unknown")
+	if err == nil {
+		t.Fatal("expected error for unknown backend")
+	}
+	if !strings.Contains(err.Error(), "claude") {
+		t.Errorf("error message should mention claude: %q", err.Error())
 	}
 }
 

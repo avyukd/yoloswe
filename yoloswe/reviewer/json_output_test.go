@@ -400,6 +400,52 @@ func TestBuildEnvelope_GeminiBackendError(t *testing.T) {
 	}
 }
 
+func TestBuildEnvelope_ClaudeBackend(t *testing.T) {
+	result := &ReviewResult{
+		ResponseText: `{"verdict":"accepted","summary":"lgtm","issues":[]}`,
+		Success:      true,
+		DurationMs:   5000,
+		InputTokens:  1234,
+		OutputTokens: 567,
+	}
+	env := BuildEnvelope(result, BackendClaude, "opus", "sess-claude-1", "")
+	if env.Status != StatusOK {
+		t.Errorf("status = %s, want ok", env.Status)
+	}
+	if env.Backend != "claude" {
+		t.Errorf("backend = %q, want claude", env.Backend)
+	}
+	if env.Model != "opus" {
+		t.Errorf("model = %q, want opus", env.Model)
+	}
+	if env.SessionID != "sess-claude-1" {
+		t.Errorf("session_id = %q, want sess-claude-1", env.SessionID)
+	}
+	if env.Review.Verdict != "accepted" {
+		t.Errorf("verdict = %q, want accepted", env.Review.Verdict)
+	}
+	if env.SchemaVersion != JSONSchemaVersion {
+		t.Errorf("schema_version = %d, want %d", env.SchemaVersion, JSONSchemaVersion)
+	}
+}
+
+func TestBuildEnvelope_ClaudeBackendError(t *testing.T) {
+	result := &ReviewResult{
+		ErrorMessage: "claude query failed: claude CLI not found",
+		Success:      false,
+	}
+	env := BuildEnvelope(result, BackendClaude, "opus", "", "")
+	if env.Status != StatusError {
+		t.Errorf("status = %s, want error", env.Status)
+	}
+	if env.Backend != "claude" {
+		t.Errorf("backend = %q, want claude", env.Backend)
+	}
+	if env.Error != "claude query failed: claude CLI not found" {
+		t.Errorf("error = %q, want claude error", env.Error)
+	}
+}
+
 func TestPrintJSONResult_RoundTrip(t *testing.T) {
 	env := ResultEnvelope{
 		SchemaVersion: JSONSchemaVersion,

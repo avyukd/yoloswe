@@ -55,7 +55,7 @@ var Cmd = &cobra.Command{
 	Short:        "Run a one-shot code review using an agent backend",
 	Long: `Run a one-shot code review using an agent backend.
 
-Supported backends: cursor, codex, gemini.
+Supported backends: claude, cursor, codex, gemini.
 
 Output:
   Default:         NDJSON progress events on stdout, final envelope also on stdout
@@ -68,6 +68,7 @@ Every run also writes a structured klogfmt log to
 ~/.bramble/logs/code-review/code-review-{timestamp}-{pid}.log for later
 analysis. Set $BRAMBLE_RUN_TAG to tag the log with an external run id.`,
 	Example: `  bramble code-review --backend cursor
+  bramble code-review --backend claude --model opus
   bramble code-review --backend codex --model gpt-5.4-mini --effort medium
   bramble code-review --backend codex --envelope-file /tmp/envelope.json --skip-test-execution --goal "review auth changes"`,
 	Args: cobra.NoArgs,
@@ -75,11 +76,11 @@ analysis. Set $BRAMBLE_RUN_TAG to tag the log with an external run id.`,
 }
 
 func init() {
-	Cmd.Flags().StringVar(&backend, "backend", "cursor", "Backend: cursor, codex, or gemini")
+	Cmd.Flags().StringVar(&backend, "backend", "cursor", "Backend: claude, cursor, codex, or gemini")
 	Cmd.Flags().StringVar(&model, "model", "", "Model override (default: backend-specific)")
-	Cmd.Flags().StringVar(&effort, "effort", "", "Reasoning effort level for codex (low, medium, high)")
+	Cmd.Flags().StringVar(&effort, "effort", "", "Reasoning effort level for codex (low, medium, high) and claude (low, medium, high, max)")
 	Cmd.Flags().StringVar(&sandbox, "sandbox", "", "Codex sandbox mode: read-only, workspace-write, danger-full-access (default: danger-full-access)")
-	Cmd.Flags().BoolVar(&readOnly, "read-only", true, "Deny file writes via approval handler (Codex only; default true)")
+	Cmd.Flags().BoolVar(&readOnly, "read-only", true, "Withhold file writes from the reviewer (Codex: approval handler; Claude: write tools not granted; default true)")
 	Cmd.Flags().BoolVar(&verbose, "verbose", false, "Show tool call details")
 	Cmd.Flags().StringVar(&goal, "goal", "", "Review goal (default: infer from branch)")
 	Cmd.Flags().DurationVar(&timeout, "timeout", 0, "Absolute hard cap on the whole review (0 = none; rely on --idle-timeout). A review making steady progress is bounded only by --idle-timeout.")

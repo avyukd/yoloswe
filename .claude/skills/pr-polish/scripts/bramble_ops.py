@@ -47,7 +47,7 @@ from _common import (  # noqa: E402
 # it isn't a bramble backend — lint_gate.py emits findings under the same
 # envelope schema and triage treats them as just another source for
 # consensus/spiral matching.
-BACKENDS = ("codex", "cursor", "gemini", "lint")
+BACKENDS = ("claude", "codex", "cursor", "gemini", "lint")
 
 # Review mode constants. Defined up here (rather than down by the
 # per-mode key constructors) so they're available as default-argument
