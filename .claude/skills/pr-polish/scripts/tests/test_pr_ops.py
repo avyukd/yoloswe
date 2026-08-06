@@ -2572,6 +2572,61 @@ class TestPRSummaryReachesStateViaCLI(unittest.TestCase):
                          "frozen means round 1 wins; re-deriving would let a "
                          "ratcheting PR re-authorize its own growth")
 
+    def test_new_series_re_anchors_the_frozen_summary(self):
+        """A completed series is a fresh look; the old summary may be stale.
+
+        Observed on this PR: after a squash + force-push, round 2 opened a new
+        series but kept a summary describing half the PR and citing a commit
+        that no longer existed, so reviewers judged scope against stale intent.
+        Re-anchoring is safe exactly here — the prior series' action history is
+        already unreachable, so there is no ratchet to re-authorize.
+        """
+        pr_ops.main(["state-append-round", "branch:x", "1", "aaa",
+                     "--no-verify-head", "--pr-summary", "ORIGINAL"])
+        pr_ops.main(["state-finalize-round", "branch:x", "1", "aaa",
+                     self._actions_file()])
+        pr_ops.main(["state-mark-complete", "branch:x", "converged"])
+        # New series: prior loop completed.
+        pr_ops.main(["state-append-round", "branch:x", "2", "bbb",
+                     "--no-verify-head", "--pr-summary", "REWRITTEN"])
+        _, path = pr_ops.state_paths(None, branch="x")
+        state = json.loads(Path(path).read_text())
+        self.assertEqual(state.get("pr_summary"), "REWRITTEN",
+                         "a new series must re-anchor; the old summary can "
+                         "describe a branch that no longer exists")
+
+    def test_new_series_re_anchors_base_branch(self):
+        """Same boundary: a PR retargeted between series must re-measure."""
+        pr_ops.main(["state-append-round", "branch:x", "1", "aaa",
+                     "--no-verify-head", "--base-branch", "release/v1"])
+        pr_ops.main(["state-finalize-round", "branch:x", "1", "aaa",
+                     self._actions_file()])
+        pr_ops.main(["state-mark-complete", "branch:x", "converged"])
+        pr_ops.main(["state-append-round", "branch:x", "2", "bbb",
+                     "--no-verify-head", "--base-branch", "main"])
+        _, path = pr_ops.state_paths(None, branch="x")
+        state = json.loads(Path(path).read_text())
+        self.assertEqual(state.get("base_branch"), "main")
+
+    def test_mid_series_still_frozen_after_new_series_change(self):
+        """The anti-ratchet freeze must survive the re-anchoring change.
+
+        Guard against 'fix staleness' quietly becoming 'refresh every round',
+        which is the drift the scope contract exists to prevent.
+        """
+        pr_ops.main(["state-append-round", "branch:x", "1", "aaa",
+                     "--no-verify-head", "--pr-summary", "ORIGINAL",
+                     "--base-branch", "release/v1"])
+        # No mark-complete: rounds 2 and 3 are the SAME series.
+        for n, head in (("2", "bbb"), ("3", "ccc")):
+            pr_ops.main(["state-append-round", "branch:x", n, head,
+                         "--no-verify-head", "--pr-summary", "DRIFTED",
+                         "--base-branch", "main"])
+        _, path = pr_ops.state_paths(None, branch="x")
+        state = json.loads(Path(path).read_text())
+        self.assertEqual(state.get("pr_summary"), "ORIGINAL")
+        self.assertEqual(state.get("base_branch"), "release/v1")
+
     def test_frozen_summary_reaches_round_bundle_goal_text(self):
         """The consumer hop, not just the write.
 
@@ -2656,6 +2711,401 @@ class TestPRSummaryReachesStateViaCLI(unittest.TestCase):
         p = Path(self.tmp.name) / "actions.json"
         p.write_text(json.dumps([]))
         return str(p)
+
+
+# Shape of a real PR body: authored prose, then a bot block after a rule.
+_REAL_BODY = """## Core
+
+Adds `claude` as a fourth `bramble code-review` backend (default model opus).
+
+## Verification
+
+- Resume: `[resume=ok]` against a live session id.
+
+<!-- CURSOR_SUMMARY -->
+---
+
+> [!NOTE]
+> **Medium Risk**
+> New review backend and pr-polish orchestration affect automation.
+>
+> **Overview**
+> Adds **`claude`** as a fourth backend, wired through `backend_claude.go`.
+>
+> <sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) for commit 608d8a6.</sup>
+<!-- /CURSOR_SUMMARY -->"""
+
+
+class TestStripPRBody(unittest.TestCase):
+    """Pure function: no gh/git."""
+
+    def test_strips_cursor_summary_block(self) -> None:
+        cleaned, dropped = pr_ops.strip_pr_body(_REAL_BODY)
+        self.assertIn("cursor-summary", dropped)
+        self.assertNotIn("CURSOR_SUMMARY", cleaned)
+        self.assertNotIn("Cursor Bugbot", cleaned)
+        self.assertNotIn("Medium Risk", cleaned)
+
+    def test_preserves_author_intent_verbatim(self) -> None:
+        cleaned, _ = pr_ops.strip_pr_body(_REAL_BODY)
+        self.assertIn("## Core", cleaned)
+        self.assertIn("Adds `claude` as a fourth", cleaned)
+        self.assertIn("## Verification", cleaned)
+        self.assertIn("[resume=ok]", cleaned)
+
+    def test_revert_to_prove_block_pattern_is_load_bearing(self) -> None:
+        """Without the block pattern the bot text survives — proves reachability."""
+        with patch.object(pr_ops, "_BODY_BLOCK_PATTERNS", ()):
+            cleaned, dropped = pr_ops.strip_pr_body(_REAL_BODY)
+        self.assertIn("Cursor Bugbot", cleaned)
+        self.assertNotIn("cursor-summary", dropped)
+
+    def test_strips_coderabbit_release_notes(self) -> None:
+        """A separate marker shape from the Cursor block, which misses it."""
+        body = (
+            "## What\n\nReal intent.\n\n"
+            "<!-- This is an auto-generated comment: release notes by coderabbit.ai -->\n"
+            "## Summary by CodeRabbit\n\n* **New Features**\n"
+            "  * Added APIs to list, create, update, and delete bindings.\n"
+            "<!-- end of auto-generated comment: release notes by coderabbit.ai -->\n"
+        )
+        cleaned, dropped = pr_ops.strip_pr_body(body)
+        self.assertIn("coderabbit-release-notes", dropped)
+        self.assertNotIn("Summary by CodeRabbit", cleaned)
+        self.assertNotIn("New Features", cleaned)
+        self.assertIn("Real intent.", cleaned)
+
+    def test_author_prose_mentioning_coderabbit_survives(self) -> None:
+        """An author explaining bot behavior is review input, not bot output."""
+        body = (
+            "## What\n\n**A stacked PR cannot pass this gate.** CodeRabbit skips "
+            "non-default bases, so neither gating bot produces a verdict.\n"
+        )
+        cleaned, dropped = pr_ops.strip_pr_body(body)
+        self.assertEqual(dropped, [])
+        self.assertIn("CodeRabbit skips", cleaned)
+
+    def test_unclosed_block_strips_to_end(self) -> None:
+        body = "Real intent here.\n\n<!-- CURSOR_SUMMARY -->\nbot text\nmore bot"
+        cleaned, dropped = pr_ops.strip_pr_body(body)
+        self.assertIn("cursor-summary", dropped)
+        self.assertNotIn("bot text", cleaned)
+        self.assertIn("Real intent here.", cleaned)
+
+    def test_strips_generated_with_and_coauthor_lines(self) -> None:
+        body = (
+            "Fixes the parser.\n\n"
+            "🤖 Generated with [Claude Code](https://claude.com/claude-code)\n"
+            "Co-Authored-By: Claude <noreply@anthropic.com>\n"
+        )
+        cleaned, dropped = pr_ops.strip_pr_body(body)
+        self.assertIn("generated-with", dropped)
+        self.assertIn("co-authored-by", dropped)
+        self.assertEqual(cleaned, "Fixes the parser.")
+
+    def test_strips_generated_with_without_emoji(self) -> None:
+        """The trailer ships both with and without the robot emoji."""
+        for trailer in (
+            "Generated with [Claude Code](https://claude.com/claude-code)",
+            "Generated with Claude Code",
+        ):
+            with self.subTest(trailer=trailer):
+                cleaned, dropped = pr_ops.strip_pr_body(f"Fixes the parser.\n\n{trailer}\n")
+                self.assertIn("generated-with", dropped)
+                self.assertEqual(cleaned, "Fixes the parser.")
+
+    def test_generated_with_mid_sentence_survives(self) -> None:
+        """Anchored to line start: prose mentioning the phrase is not a trailer."""
+        body = "## What\n\nThe fixture was generated with the old script, so it drifted.\n"
+        cleaned, dropped = pr_ops.strip_pr_body(body)
+        self.assertEqual(dropped, [])
+        self.assertIn("generated with the old script", cleaned)
+
+    def test_prose_opening_with_trailer_words_survives(self) -> None:
+        """Regression: line-start anchoring alone deleted author prose.
+
+        A sentence may legitimately OPEN with these words. Stripping the whole
+        line then eats review context — the same failure that retired the
+        "## Deployment Notes" rule, so the patterns are pinned to the
+        trailer's machine-emitted shape (markdown link / bare tool name;
+        ``Name <email>``) rather than its opening words.
+        """
+        for prose in (
+            "Generated with care by the platform team, this migration backfills rows.",
+            "Co-Authored-By: design review, the retry limit was raised to 5.",
+            "Generated with the old script, so the fixture drifted and needs a rebuild.",
+        ):
+            with self.subTest(prose=prose):
+                cleaned, dropped = pr_ops.strip_pr_body(f"## Notes\n\n{prose}\n")
+                self.assertEqual(dropped, [])
+                self.assertIn(prose, cleaned)
+
+    def test_unpunctuated_prose_opening_with_trailer_words_survives(self) -> None:
+        """Regression: punctuation is not what separates prose from a trailer.
+
+        A first pass allowed any punctuation-free tail after "Generated with",
+        which still ate short unpunctuated author lines. A tool name is 1-3
+        Capitalized words; connectives like "by"/"from" mark prose.
+        """
+        for prose in (
+            "Generated with care by the platform team",
+            "Generated with extensive manual testing before release",
+            "Generated with input from the security review",
+        ):
+            with self.subTest(prose=prose):
+                cleaned, dropped = pr_ops.strip_pr_body(f"## Notes\n\n{prose}\n")
+                self.assertEqual(dropped, [])
+                self.assertIn(prose, cleaned)
+
+    def test_bare_tool_name_trailer_still_strips(self) -> None:
+        """Narrowing the bare form must not cost the real trailers."""
+        for trailer in ("Generated with Claude Code", "Generated with Claude", "Generated with Cursor"):
+            with self.subTest(trailer=trailer):
+                cleaned, dropped = pr_ops.strip_pr_body(f"Fixes the parser.\n\n{trailer}\n")
+                self.assertIn("generated-with", dropped)
+                self.assertEqual(cleaned, "Fixes the parser.")
+
+    def test_linkback_strip_keeps_author_sections_after_it(self) -> None:
+        """Regression: the linkback strip ran to EOF and ate trailing prose.
+
+        The marker says where bot output starts, not that the author wrote
+        nothing below it. Bound the strip to the `<details>` payload.
+        """
+        body = (
+            "## Problem\n\nBroken.\n\n"
+            "<!-- linear-linkback -->\n"
+            "<details>\n<summary><a href=\"https://linear.app/x\">INF-437</a></summary>\n"
+            "bot detail\n</details>\n\n"
+            "## Verification\n\nTests pass.\n"
+        )
+        cleaned, dropped = pr_ops.strip_pr_body(body)
+        self.assertIn("linear-linkback", dropped)
+        self.assertNotIn("bot detail", cleaned)
+        self.assertIn("## Verification", cleaned)
+        self.assertIn("Tests pass.", cleaned)
+
+    def test_coauthor_trailer_requires_an_address(self) -> None:
+        """The real trailer carries ``Name <email>``; bare prose does not."""
+        cleaned, dropped = pr_ops.strip_pr_body(
+            "Fixes the parser.\n\n"
+            "Co-authored-by: jiradozer-builder[bot] "
+            "<283316645+jiradozer-builder[bot]@users.noreply.github.com>\n"
+        )
+        self.assertIn("co-authored-by", dropped)
+        self.assertEqual(cleaned, "Fixes the parser.")
+
+    def test_author_written_sections_are_never_stripped(self) -> None:
+        """Regression: a heading name must not decide what a reviewer sees.
+
+        A "## Deployment Notes" stripper was tried and removed — it had no
+        true positives and ate real review input filed under that heading.
+        The three kinds below are the ones it was measured destroying.
+        """
+        body = (
+            "## What\n\nReal change.\n\n"
+            "## Deployment Notes\n\n"
+            "**Posture change worth its own review:** the job now reads live "
+            "credentials *and* checks out PR code.\n\n"
+            "Stacked on #123; review/merge that first.\n\n"
+            "Migration 227 creates one tenant-scoped table; no backfill.\n\n"
+            "## Verification\n\nTests pass.\n"
+        )
+        cleaned, dropped = pr_ops.strip_pr_body(body)
+        self.assertEqual(dropped, [])
+        self.assertIn("Posture change worth its own review", cleaned)
+        self.assertIn("Stacked on #123", cleaned)
+        self.assertIn("Migration 227", cleaned)
+        self.assertIn("Real change.", cleaned)
+        self.assertIn("Tests pass.", cleaned)
+
+    def test_mentioning_deploy_in_prose_is_not_stripped(self) -> None:
+        body = "## What\n\nThis changes how we deploy the binary, but is not a rollout.\n"
+        cleaned, dropped = pr_ops.strip_pr_body(body)
+        self.assertEqual(dropped, [])
+        self.assertIn("deploy the binary", cleaned)
+
+    def test_empty_body(self) -> None:
+        self.assertEqual(pr_ops.strip_pr_body(""), ("", []))
+        self.assertEqual(pr_ops.strip_pr_body(None), ("", []))
+
+
+class TestBuildPRSummary(unittest.TestCase):
+    def _with_state(self, body):
+        with tempfile.TemporaryDirectory() as d:
+            tmp_root = Path(d)
+
+            def fake_state_paths(pr, branch=None):
+                key = pr if pr is not None else f"branch-{branch}"
+                pr_dir = tmp_root / f"proj-{key}"
+                return pr_dir, pr_dir / "pr-polish-state.json"
+
+            with patch.object(pr_ops, "state_paths", side_effect=fake_state_paths):
+                return body()
+
+    def _pr(self, **kw):
+        base = {
+            "pr_number": 311,
+            "title": "fix(x): do the thing",
+            "body": "",
+            "base": "main",
+        }
+        base.update(kw)
+        return base
+
+    def test_uses_pr_body_when_usable(self) -> None:
+        with patch.object(pr_ops, "_commit_diffstat_summary", return_value="COMMITS"):
+            out = pr_ops.build_pr_summary(self._pr(body=_REAL_BODY))
+        self.assertEqual(out["source"], "pr-body")
+        self.assertIn("cursor-summary", out["dropped"])
+        self.assertIn("Adds `claude` as a fourth", out["pr_summary"])
+        self.assertNotIn("Cursor Bugbot", out["pr_summary"])
+        # Title leads so the reviewer sees the one-line intent first.
+        self.assertTrue(out["pr_summary"].startswith("fix(x): do the thing"))
+        # A usable body does not drag the commit list along.
+        self.assertNotIn("COMMITS", out["pr_summary"])
+
+    def test_usable_body_does_not_shell_out_for_fallback(self) -> None:
+        """The git fallback is lazy — two subprocesses per call, discarded."""
+        calls: list[str] = []
+
+        def spy(base, **kw):
+            calls.append(base)
+            return "COMMITS"
+
+        with patch.object(pr_ops, "_commit_diffstat_summary", side_effect=spy):
+            out = pr_ops.build_pr_summary(self._pr(body=_REAL_BODY))
+        self.assertEqual(out["source"], "pr-body")
+        self.assertEqual(calls, [], "fallback must not run when the body is usable")
+
+        # ...but it still runs on the paths that need it.
+        with patch.object(pr_ops, "_commit_diffstat_summary", side_effect=spy):
+            pr_ops.build_pr_summary(self._pr(body=""))
+        self.assertEqual(len(calls), 1)
+
+    def test_falls_back_to_commits_when_no_body(self) -> None:
+        with patch.object(pr_ops, "_commit_diffstat_summary", return_value="COMMITS"):
+            out = pr_ops.build_pr_summary(self._pr(body=""))
+        self.assertEqual(out["source"], "commits-diffstat")
+        self.assertIn("COMMITS", out["pr_summary"])
+
+    def test_body_that_strips_to_nothing_falls_back(self) -> None:
+        """A body that is ONLY a bot block must not yield an empty goal."""
+        body = "<!-- CURSOR_SUMMARY -->\nall bot, no author\n<!-- /CURSOR_SUMMARY -->"
+        with patch.object(pr_ops, "_commit_diffstat_summary", return_value="COMMITS"):
+            out = pr_ops.build_pr_summary(self._pr(body=body))
+        self.assertEqual(out["source"], "commits-diffstat")
+        self.assertIn("COMMITS", out["pr_summary"])
+        self.assertNotIn("all bot", out["pr_summary"])
+
+    def test_thin_body_keeps_intent_and_appends_diffstat(self) -> None:
+        with patch.object(pr_ops, "_commit_diffstat_summary", return_value="COMMITS"):
+            out = pr_ops.build_pr_summary(self._pr(body="fix typo"))
+        self.assertEqual(out["source"], "pr-body+diffstat")
+        self.assertIn("fix typo", out["pr_summary"])
+        self.assertIn("COMMITS", out["pr_summary"])
+
+    def test_gh_body_reaches_summary_end_to_end(self) -> None:
+        """Boundary test: gh pr view's body must survive identify -> summary.
+
+        The unit tests above build the pr dict by hand, so a regression in
+        identify's --json/--jq projection (dropping `body`) would silently
+        fall back to commits with every other test still green.
+        """
+        body = (
+            "## What\n\nThis PR rewires the widget cache so stale entries "
+            "cannot outlive a deploy, which is the actual bug.\n"
+        )
+        pr_json = json.dumps(
+            {
+                "pr_number": 77,
+                "title": "fix(widget): expire stale cache",
+                "url": "https://example.invalid/pull/77",
+                "body": body,
+                "base": "main",
+                "head": "fix/widget",
+                "head_sha": "deadbeef",
+            }
+        )
+        seen_args: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["git", "rev-parse"]:
+                return _common.RunResult(stdout="fix/widget\n", stderr="", returncode=0)
+            if cmd[:3] == ["gh", "pr", "view"]:
+                seen_args.append(cmd)
+                return _common.RunResult(stdout=pr_json, stderr="", returncode=0)
+            if cmd[:3] == ["gh", "repo", "view"]:
+                return _common.RunResult(stdout='"acme/widgets"', stderr="", returncode=0)
+            if cmd[:2] == ["git", "log"] or cmd[:2] == ["git", "diff"]:
+                return _common.RunResult(stdout="FALLBACK", stderr="", returncode=0)
+            raise AssertionError(f"unexpected cmd: {cmd}")
+
+        with (
+            patch.object(pr_ops, "run", side_effect=fake_run),
+            patch.object(_common, "run", side_effect=fake_run),
+        ):
+            pr = self._with_state(lambda: pr_ops.identify_pr())
+            out = pr_ops.build_pr_summary(pr)
+
+        # The projection must actually request and keep `body`.
+        joined = " ".join(seen_args[0])
+        self.assertIn("body", joined)
+        self.assertEqual(pr["body"], body)
+        # ...and the summary must use it rather than the commit fallback.
+        self.assertEqual(out["source"], "pr-body")
+        self.assertIn("rewires the widget cache", out["pr_summary"])
+        self.assertNotIn("FALLBACK", out["pr_summary"])
+
+    def _run_cli(self, argv: list[str]) -> str:
+        """Invoke pr_ops.main and capture stdout — the SKILL.md entry point."""
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = pr_ops.main(argv)
+        self.assertEqual(rc, 0, f"{argv} exited {rc}")
+        return buf.getvalue()
+
+    def test_cli_pr_summary_emits_json(self) -> None:
+        """CLI boundary: argparse registration + JSON dispatch path."""
+        fake = {
+            "pr_summary": "T\n\nbody",
+            "source": "pr-body",
+            "dropped": ["cursor-summary"],
+            "pr_number": 9,
+            "base": "main",
+        }
+        with patch.object(pr_ops, "build_pr_summary", return_value=fake):
+            out = json.loads(self._run_cli(["pr-summary"]))
+        self.assertEqual(out["source"], "pr-body")
+        self.assertEqual(out["dropped"], ["cursor-summary"])
+        self.assertEqual(out["pr_summary"], "T\n\nbody")
+
+    def test_cli_pr_summary_text_only_emits_plain_text(self) -> None:
+        """--text-only must print the summary alone, parseable as $(...)."""
+        fake = {
+            "pr_summary": "T\n\nbody",
+            "source": "pr-body",
+            "dropped": [],
+            "pr_number": 9,
+            "base": "main",
+        }
+        with patch.object(pr_ops, "build_pr_summary", return_value=fake):
+            out = self._run_cli(["pr-summary", "--text-only"])
+        self.assertEqual(out.strip(), "T\n\nbody")
+        # Must not be JSON — SKILL.md feeds this straight to --goal.
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(out)
+
+    def test_branch_only_mode_uses_commits(self) -> None:
+        with patch.object(pr_ops, "_commit_diffstat_summary", return_value="COMMITS"):
+            out = pr_ops.build_pr_summary(
+                {"pr_number": None, "title": None, "body": None, "base": "main"}
+            )
+        self.assertEqual(out["source"], "commits-diffstat")
+        self.assertEqual(out["pr_summary"], "COMMITS")
+        self.assertIsNone(out["pr_number"])
 
 
 if __name__ == "__main__":

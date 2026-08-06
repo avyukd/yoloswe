@@ -90,10 +90,10 @@ def identify_pr(pr_number: int | None = None) -> dict[str, Any]:
         pr_view_args.append(str(pr_number))
     pr_view_args += [
         "--json",
-        "number,title,url,baseRefName,headRefName,headRefOid",
+        "number,title,url,body,baseRefName,headRefName,headRefOid",
         "--jq",
-        "{pr_number: .number, title: .title, url: .url, base: .baseRefName, "
-        "head: .headRefName, head_sha: .headRefOid}",
+        "{pr_number: .number, title: .title, url: .url, body: .body, "
+        "base: .baseRefName, head: .headRefName, head_sha: .headRefOid}",
     ]
     pr_res = run(pr_view_args, check=False)
     pr_data: dict[str, Any] | None = None
@@ -126,6 +126,7 @@ def identify_pr(pr_number: int | None = None) -> dict[str, Any]:
         "pr_number": None,
         "title": None,
         "url": None,
+        "body": None,
         "base": base,
         "head": branch,
         "head_sha": None,
@@ -398,6 +399,231 @@ def fetch_comments(pr: dict[str, Any]) -> dict[str, Any]:
         "head_sha": head_sha,
         "noise_filtered": len(noise),
         "noise_samples": noise[:_NOISE_SAMPLE_CAP],
+    }
+
+
+# ---------------------------------------------------------------------------
+# PR summary: the goal's frozen spine, built from the PR's own description
+# ---------------------------------------------------------------------------
+
+# Bot-appended blocks, dropped whole. A bot's restatement of the diff is the
+# worst possible goal text: it anchors the reviewer on a summary of the code
+# instead of the author's intent. Bot mixes vary per repo, so add patterns
+# from observed bodies rather than guessing.
+_BODY_BLOCK_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"<!--\s*CURSOR_SUMMARY\s*-->.*?(?:<!--\s*/CURSOR_SUMMARY\s*-->|\Z)",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "cursor-summary",
+    ),
+    (
+        re.compile(
+            r"<!--\s*GREPTILE_SUMMARY\s*-->.*?(?:<!--\s*/GREPTILE_SUMMARY\s*-->|\Z)",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "greptile-summary",
+    ),
+    (
+        re.compile(
+            r"<!--\s*This is an auto-generated comment: release notes by coderabbit\.ai\s*-->"
+            r".*?(?:<!--\s*end of auto-generated comment: release notes by coderabbit\.ai\s*-->|\Z)",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "coderabbit-release-notes",
+    ),
+    (
+        # Fallback: same marker shape, other payloads (walkthrough, tests).
+        re.compile(
+            r"<!--\s*This is an auto-generated comment: [^>]*coderabbit\.ai\s*-->"
+            r".*?(?:<!--\s*end of auto-generated comment: [^>]*coderabbit\.ai\s*-->|\Z)",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "coderabbit-block",
+    ),
+    (
+        # The linkback's payload is the `<details>` block that follows the
+        # marker, so the strip ends there. Running to `\Z` instead deleted
+        # every author section that happened to sit after it (a trailing
+        # `## Verification` is the common one) — the marker says where bot
+        # output STARTS, never that the author wrote nothing below it.
+        # Marker-only (no `<details>`) falls back to the marker itself.
+        re.compile(
+            r"<!--\s*linear-linkback\s*-->\s*(?:<details>.*?(?:</details>|\Z))?",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "linear-linkback",
+    ),
+)
+
+# Trailing attribution / process lines that carry no review signal. Anchored
+# to the start of a line so prose that merely mentions them survives.
+#
+# Line-start anchoring alone is not enough: a sentence may legitimately OPEN
+# with these words ("Generated with care by the platform team, this migration
+# backfills rows."), and stripping the whole line then deletes review context
+# — the same failure that retired the `## Deployment Notes` heading rule. So
+# each pattern is pinned to the trailer's machine-emitted SHAPE, not just its
+# opening words, and must match to end-of-line so a longer prose sentence
+# cannot satisfy it.
+_BODY_LINE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # Emoji prefix optional — the trailer is emitted both ways. Two shapes,
+    # both bounded: a markdown link, or a bare TOOL NAME.
+    #
+    # "Bare tool name" must stay narrow. An earlier attempt allowed any
+    # punctuation-free tail, which still ate author prose ("Generated with
+    # care by the platform team") because a short unpunctuated clause is not
+    # distinguishable from a tool name by length alone. A product name is 1-3
+    # Capitalized/CamelCase words, so require exactly that — connectives like
+    # "by"/"from"/"the" are lowercase and disqualify the line.
+    (
+        re.compile(
+            r"^\s*(?:🤖\s*)?Generated with \[[^\]]+\]\([^)]*\)\s*$"
+            r"|^\s*(?:🤖\s*)?Generated with (?:[A-Z][\w.+-]*)(?: [A-Z][\w.+-]*){0,2}\s*$",
+            re.MULTILINE,
+        ),
+        "generated-with",
+    ),
+    # A git trailer: `Name <email>`. Prose that happens to start with the word
+    # lacks the angle-bracketed address and survives.
+    (
+        re.compile(r"^\s*Co-Authored-By:[^<\n]*<[^>\n]+>\s*$", re.MULTILINE | re.IGNORECASE),
+        "co-authored-by",
+    ),
+    (
+        re.compile(r"^\s*<sup>\s*Reviewed by \[.*?</sup>\s*$", re.MULTILINE | re.DOTALL),
+        "bot-review-footer",
+    ),
+)
+
+# Deliberately empty, and should stay that way: strip bot-appended noise,
+# never author-written sections. A "drop ## Deployment/## Rollout" rule was
+# tried and measured — it had no true positives and deleted real review input
+# (security posture changes, stacked-PR ordering, migration semantics) that
+# authors happened to file under those headings. Heading names are a human
+# choice and don't predict content; only machine-emitted delimiters do.
+_BODY_SECTION_TITLES: tuple[tuple[re.Pattern[str], str], ...] = ()
+
+# A body that reduces to less than this many characters isn't a usable goal
+# spine — fall back to commits + diffstat rather than hand the reviewer a
+# stub like "fixes the thing".
+_MIN_USABLE_BODY_CHARS = 80
+
+
+def _strip_section(text: str, pattern: re.Pattern[str]) -> tuple[str, bool]:
+    """Drop markdown sections whose heading matches ``pattern``.
+
+    A section ends at the next heading of the same or shallower depth (or EOF),
+    so a dropped ``## Deployment`` takes its ``### Steps`` subsection with it
+    but leaves the following ``## Verification`` intact.
+    """
+    lines = text.split("\n")
+    out: list[str] = []
+    dropped = False
+    skip_depth: int | None = None
+    for line in lines:
+        heading = re.match(r"^(#{1,6})\s", line)
+        if skip_depth is not None:
+            # Still inside a dropped section until a heading at <= its depth.
+            if heading and len(heading.group(1)) <= skip_depth:
+                skip_depth = None
+            else:
+                continue
+        m = pattern.match(line)
+        if m:
+            skip_depth = len(m.group(1))
+            dropped = True
+            continue
+        out.append(line)
+    return "\n".join(out), dropped
+
+
+def strip_pr_body(body: str) -> tuple[str, list[str]]:
+    """Return ``(cleaned_body, dropped_tags)`` for a raw PR description.
+
+    Removes bot-appended blocks and attribution trailers; author prose is
+    preserved verbatim. Tags (not just a count) so a surprising goal is
+    traceable to what was stripped.
+    """
+    if not body:
+        return "", []
+    cleaned = body.replace("\r\n", "\n")
+    dropped: list[str] = []
+    for pattern, tag in _BODY_BLOCK_PATTERNS:
+        cleaned, n = pattern.subn("", cleaned)
+        if n:
+            dropped.append(tag)
+    for pattern, tag in _BODY_LINE_PATTERNS:
+        cleaned, n = pattern.subn("", cleaned)
+        if n:
+            dropped.append(tag)
+    for pattern, tag in _BODY_SECTION_TITLES:
+        cleaned, hit = _strip_section(cleaned, pattern)
+        if hit:
+            dropped.append(tag)
+    # A stripped block usually leaves a `---` rule and blank runs behind it.
+    cleaned = re.sub(r"\n\s*---\s*\n\s*\Z", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip(), dropped
+
+
+def _commit_diffstat_summary(base: str, max_commits: int = 10) -> str:
+    """Commits + diffstat for ``origin/<base>...HEAD`` — the fallback spine."""
+    log = run(
+        ["git", "log", "--oneline", f"origin/{base}..HEAD"], check=False
+    ).stdout.strip()
+    commits = "\n".join(log.split("\n")[:max_commits]) if log else ""
+    stat = run(
+        ["git", "diff", "--stat", f"origin/{base}...HEAD"], check=False
+    ).stdout.strip()
+    parts = []
+    if commits:
+        parts.append(f"Commits:\n{commits}")
+    if stat:
+        parts.append(f"Diffstat:\n{stat}")
+    return "\n\n".join(parts)
+
+
+def build_pr_summary(pr: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build the frozen ``--pr-summary`` spine for round 1.
+
+    A usable PR description IS the summary — the author's statement of intent
+    beats a commit list for telling a reviewer what the change is FOR, and so
+    what is out of scope. Falls back to commits + diffstat when there is no
+    PR, no body, or nothing usable survives stripping.
+
+    Returns ``{"pr_summary", "source", "dropped", "pr_number", "base"}``;
+    ``source`` is ``pr-body``, ``pr-body+diffstat``, or ``commits-diffstat``.
+    """
+    pr = pr or identify_pr()
+    base = pr.get("base") or "main"
+    title = (pr.get("title") or "").strip()
+    body_raw = pr.get("body") or ""
+    cleaned, dropped = strip_pr_body(body_raw)
+
+    if not cleaned or len(cleaned) < _MIN_USABLE_BODY_CHARS:
+        # Only shell out for the fallback when it's actually needed — on the
+        # common path (usable body) these two git calls would be discarded.
+        fallback = _commit_diffstat_summary(base)
+        text = fallback
+        source = "commits-diffstat"
+        if cleaned:
+            # Thin body: keep it (it may be the only stated intent) but lead
+            # with it and let the diffstat carry the shape.
+            text = f"{cleaned}\n\n{fallback}".strip()
+            source = "pr-body+diffstat"
+    else:
+        text = cleaned
+        source = "pr-body"
+    if title:
+        text = f"{title}\n\n{text}".strip()
+    return {
+        "pr_summary": text,
+        "source": source,
+        "dropped": dropped,
+        "pr_number": pr.get("pr_number"),
+        "base": base,
     }
 
 
@@ -748,18 +974,23 @@ def state_append_round(
     orchestrator computed the SHA in one message and a commit landed before
     this call — refuse rather than corrupt the round's lineage.
 
-    ``pr_summary`` is the PR's own statement of intent (commit list +
-    diffstat against the base). It is written ONCE, on the first round that
-    supplies it, and never overwritten: it is the frozen definition of what
-    this PR is for. Every later round reads it back from state, because the
-    orchestrator computes it in a shell variable at Step 1 that no longer
-    exists by round 2 — which is why the goal silently lost the PR's purpose
-    after round 1.
+    ``pr_summary`` is the PR's own statement of intent. It is written on the
+    first round of a series that supplies it and not overwritten by later
+    rounds in that series: it is the frozen definition of what this PR is for.
+    Every later round reads it back from state, because the orchestrator
+    computes it in a shell variable at Step 1 that no longer exists by round 2
+    — which is why the goal silently lost the PR's purpose after round 1.
+
+    A new series re-anchors it. Freezing across series was observed keeping a
+    summary that described half the PR and cited a commit destroyed by a
+    squash; ``is_new_series`` is the one boundary where the prior series'
+    history is already unreachable, so re-anchoring cannot re-authorize a
+    ratcheting PR's growth.
 
     ``base_branch`` is the PR's base ref (``identify``'s ``base``, i.e. GitHub's
-    baseRefName). Frozen the same way, and read back by ``round_bundle`` so the
-    "Files in this PR" range is anchored to the PR's real ancestor instead of
-    the repo default. The two must agree: PR_SUMMARY's diffstat and the goal's
+    baseRefName). Frozen and re-anchored the same way, and read back by
+    ``round_bundle`` so the "Files in this PR" range is anchored to the PR's
+    real ancestor instead of the repo default. The two must agree: PR_SUMMARY's diffstat and the goal's
     file list describing different merge bases is the same class of bug as the
     two-dot range this change replaced.
 
@@ -837,11 +1068,19 @@ def state_append_round(
             existing.setdefault("noise_samples", samples)
             if not existing["noise_samples"]:
                 existing["noise_samples"] = samples
-    # Frozen, not refreshed. A PR's remit is fixed when the loop first sees
-    # it; re-deriving it each round would let a ratcheting PR keep
-    # re-authorizing its own growth, which is the drift the scope contract
-    # exists to prevent.
-    if pr_summary and not state.get("pr_summary"):
+    # Frozen within a series, re-anchored at a series boundary. A PR's remit
+    # is fixed when the loop first sees it; re-deriving it every round would
+    # let a ratcheting PR keep re-authorizing its own growth, which is the
+    # drift the scope contract exists to prevent.
+    #
+    # But a NEW series (prior loop completed, or the branch was rewritten) is
+    # a fresh look at a PR that may have changed underneath the old summary.
+    # Observed: after a squash + force-push the frozen summary still described
+    # half the PR and cited a commit that no longer existed, so reviewers were
+    # judging scope against a stale statement of intent. `is_new_series` is
+    # exactly the boundary where re-anchoring is correct and ratcheting is not
+    # possible, because the prior series' action history is already unreachable.
+    if pr_summary and (is_new_series or not state.get("pr_summary")):
         state["pr_summary"] = pr_summary
     # The PR's own base branch, frozen alongside pr_summary and for the same
     # reason: the file-set range must be measured against the SAME ancestor
@@ -850,7 +1089,10 @@ def state_append_round(
     # branch gets its "Files in this PR" line measured against main while its
     # summary describes the stacked diff — reintroducing the out-of-scope
     # files this whole change exists to remove.
-    if base_branch and not state.get("base_branch"):
+    # Same boundary rule as pr_summary above: frozen within a series, but a
+    # PR retargeted to a new base between series must not keep measuring its
+    # file set against the old one.
+    if base_branch and (is_new_series or not state.get("base_branch")):
         state["base_branch"] = base_branch
     state["current_round"] = n
     state["last_commit_at_round_start"] = head_before
@@ -1832,6 +2074,21 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("fetch-comments")
 
+    sp = sub.add_parser(
+        "pr-summary",
+        help=(
+            "Build the frozen --pr-summary spine for round 1. Prefers the "
+            "PR's own description (bot blocks and post-merge sections "
+            "stripped); falls back to commits + diffstat when there is no "
+            "PR or no usable body. Emits {pr_summary, source, dropped}."
+        ),
+    )
+    sp.add_argument(
+        "--text-only",
+        action="store_true",
+        help="Print just the summary text (for direct use as --goal / --pr-summary)",
+    )
+
     sp = sub.add_parser("reply-inline")
     sp.add_argument("comment_id", type=int)
     sp.add_argument("body")
@@ -1894,17 +2151,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "--pr-summary",
         default=None,
         help=(
-            "The PR's own statement of intent (commit list + diffstat). Written "
-            "ONCE and never overwritten — it is the frozen definition of what "
-            "this PR is for, which every later round reads back from state. "
-            "Without it the goal loses the PR's purpose after round 1."
+            "The PR's own statement of intent. Written once per series and not "
+            "overwritten by later rounds in it — the frozen definition of what "
+            "this PR is for, which every later round reads back from state. A "
+            "new series re-anchors it (a squashed or force-pushed branch makes "
+            "the old one stale). Without it the goal loses the PR's purpose "
+            "after round 1."
         ),
     )
     sp.add_argument(
         "--base-branch",
         default=None,
         help=(
-            "The PR's base ref (identify's 'base'). Frozen once, like "
+            "The PR's base ref (identify's 'base'). Frozen per series like "
             "--pr-summary, and used to anchor the 'Files in this PR' range to "
             "the same merge base the PR summary was built against. Omit it and "
             "a PR stacked on a non-default branch is measured against the repo "
@@ -1991,6 +2250,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "identify":
             print_json(identify_pr())
+        elif args.cmd == "pr-summary":
+            result = build_pr_summary()
+            if args.text_only:
+                print(result["pr_summary"])
+            else:
+                print_json(result)
         elif args.cmd == "fetch-comments":
             pr = identify_pr()
             if pr.get("pr_number") is None:
