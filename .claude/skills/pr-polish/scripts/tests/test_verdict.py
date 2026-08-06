@@ -236,5 +236,35 @@ class FixClaimVerificationTests(unittest.TestCase):
             self.assertEqual(v.verify_fix_claims(st, repo)["unverified"], 0)
 
 
+class ReviewerStreamRosterTests(unittest.TestCase):
+    """``reviewer_stream_health`` must know every backend in the roster.
+
+    Its stated job is to distinguish "backend ran and found nothing" from
+    "backend never ran". A backend missing from its key map produces no
+    entry at all — which is the *same* output as never having run, so the
+    function silently reintroduces the ambiguity it exists to remove.
+    """
+
+    def test_reports_every_backend_in_the_roster(self):
+        import bramble_ops
+
+        st = _state(rounds=[{
+            "n": 1,
+            **{f"{b}_findings": [] for b in bramble_ops.BACKENDS},
+        }])
+        self.assertEqual(
+            set(v.reviewer_stream_health(st)), set(bramble_ops.BACKENDS),
+            "reviewer_stream_health omits a backend pr_ops writes; a run "
+            "where it found nothing is indistinguishable from one where it "
+            "never ran",
+        )
+
+    def test_claude_stream_is_counted(self):
+        # The concrete regression: claude joined the roster after this map
+        # was written, so claude rounds reported no claude stream at all.
+        st = _state(rounds=[{"n": 1, "claude_findings": [{"x": 1}, {"y": 2}]}])
+        self.assertEqual(v.reviewer_stream_health(st).get("claude"), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

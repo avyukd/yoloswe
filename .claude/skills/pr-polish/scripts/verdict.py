@@ -40,6 +40,10 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from _common import severity_rank  # noqa: E402
 
+# Producer-side backend roster; ``reviewer_stream_health`` derives its
+# state keys from it so a new backend cannot go unreported.
+import bramble_ops  # noqa: E402
+
 VERDICT_SCHEMA_VERSION = 1
 
 # Exit reasons that can never be "ready": the loop stopped for a reason
@@ -353,13 +357,14 @@ def reviewer_stream_health(state: dict) -> dict[str, int]:
     may be clean — but it means ``>=2 sources`` consensus was unreachable,
     which is invisible in the state file today and looks identical to two
     reviewers agreeing.
+
+    The roster is derived from ``bramble_ops.BACKENDS``, not restated. This
+    function's whole job is to distinguish "backend ran and found nothing"
+    from "backend never ran" — a hand-written list reintroduces exactly
+    that ambiguity for any backend missing from it, since an absent key and
+    an unlisted backend both yield no entry in the output.
     """
-    keys = {
-        "codex": "codex_findings",
-        "cursor": "cursor_findings",
-        "gemini": "gemini_findings",
-        "lint": "lint_findings",
-    }
+    keys = {b: f"{b}_findings" for b in bramble_ops.BACKENDS}
     out: dict[str, int] = {}
     for backend, key in keys.items():
         seen = False

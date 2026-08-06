@@ -216,5 +216,54 @@ class AggregateTests(unittest.TestCase):
             agg["by_exit_reason"]["capped-at-max"]["escape_rate"], 0.75)
 
 
+class BackendRosterTests(unittest.TestCase):
+    """``local_findings`` must read every backend pr-polish writes.
+
+    ``pr_ops._persist_round_findings`` writes ``f"{backend}_findings"`` for
+    each entry in ``bramble_ops.BACKENDS``. A backend this reader misses is
+    dropped silently — its findings never enter ``local_findings``, so every
+    external comment it caught is scored as an *escape*. The failure inflates
+    the metric on exactly the runs that used the missing backend, and nothing
+    in the output contradicts it. These tests fail if the roster is ever
+    restated by hand and drifts.
+    """
+
+    def test_reads_every_backend_in_the_roster(self):
+        import bramble_ops
+
+        rounds = [{
+            "n": 1,
+            **{f"{b}_findings": [{"file": f"{b}.py", "line": 1}]
+               for b in bramble_ops.BACKENDS},
+        }]
+        found = {f["file"] for f in er.local_findings(_state(rounds=rounds))}
+        self.assertEqual(
+            found, {f"{b}.py" for b in bramble_ops.BACKENDS},
+            "local_findings dropped a backend that pr_ops writes; its "
+            "findings would be miscounted as escapes",
+        )
+
+    def test_claude_findings_are_counted(self):
+        # The concrete regression: claude joined the roster after this
+        # reader was written, so its findings were invisible here.
+        state = _state(rounds=[
+            {"n": 1, "claude_findings": [{"file": "a.py", "line": 10}]},
+        ])
+        out = self._run_escape(state)
+        self.assertEqual(out["escaped"], 0)
+        self.assertEqual(out["caught_locally"], 1)
+
+    def _run_escape(self, state):
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td) / "kernel-1"
+            sd.mkdir()
+            (sd / "pr-polish-state.json").write_text(json.dumps(state))
+            ds = Path(td) / "dataset"
+            ds.mkdir()
+            (ds / "kernel-1.json").write_text(
+                json.dumps(_record([_comment()])))
+            return er.compute_escape_rate(sd, ds)
+
+
 if __name__ == "__main__":
     unittest.main()

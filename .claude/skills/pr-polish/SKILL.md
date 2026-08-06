@@ -225,7 +225,7 @@ Substitute the concrete `$LOG_DIR`/`$GOAL`/`$SCOPE_HINTS`/`$REPO`/`$PR_NUMBER`/r
 PIDS=()
 
 ( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:codex:r{ROUND} \
-  timeout 1200 $BRAMBLE_BIN code-review --backend codex --model gpt-5.4-mini \
+  timeout 1200 $BRAMBLE_BIN code-review --backend codex --model gpt-5.6-luna --effort medium \
     --skip-test-execution --verbose --idle-timeout 5m \
     --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
     ${CODEX_RESUME:+--resume-session-id "$CODEX_RESUME"} \
@@ -267,7 +267,7 @@ if [ "$USE_CLAUDE" = "1" ]; then
   ( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:claude:r{ROUND} \
     timeout 1200 $BRAMBLE_BIN code-review --backend claude --model opus \
       --skip-test-execution --verbose --idle-timeout 5m \
-      --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" \
+      --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
       ${CLAUDE_RESUME:+--resume-session-id "$CLAUDE_RESUME"} \
       --envelope-file "$LOG_DIR/claude-envelope.json" \
     2>&1 | tee "$LOG_DIR/claude-stderr.txt" | sed 's/^/[claude] /' ) &

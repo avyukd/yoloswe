@@ -53,8 +53,18 @@ Identify the branch to review. If an argument is given, `git checkout` that bran
 first. Otherwise use the current branch. Get the diff summary:
 
 ```bash
-git diff $(git merge-base origin/main HEAD)..HEAD --stat
+DIFF_BASE=$(git merge-base origin/main HEAD)
+git diff $DIFF_BASE..HEAD --stat
 ```
+
+Keep `$DIFF_BASE` for the launches below and pass it to **every** config as
+`--diff-base`. Without the flag each backend infers its own range, and the
+natural inference (`main...HEAD`) silently widens whenever the local base
+branch has advanced past the merge base — measured at 336 files instead of
+22, varying run to run. That makes diff scope an uncontrolled variable
+underneath a table whose entire purpose is like-for-like comparison: a
+config could look thorough only because it was handed more code. Pin it once
+and every row is scored on the same range.
 
 ## Step 2a: Run each config — turn 1 (fresh)
 
@@ -70,7 +80,8 @@ Create a fresh `$LOG_DIR` under `/tmp/code-review-eval-{timestamp}/`. For each c
 ENVELOPE_FILE="$LOG_DIR/{NAME}-envelope-r1.json"
 BRAMBLE_RUN_TAG="code-review-eval:$(git branch --show-current):{NAME}:r1" \
 WORK_DIR=$(pwd) bazel-bin/bramble/bramble_/bramble code-review \
-  {FLAGS} --verbose --timeout 10m --envelope-file "$ENVELOPE_FILE" \
+  {FLAGS} --diff-base "$DIFF_BASE" \
+  --verbose --timeout 10m --envelope-file "$ENVELOPE_FILE" \
   2>"$LOG_DIR/{NAME}-stderr-r1.txt"
 ```
 
@@ -149,7 +160,7 @@ ENVELOPE_FILE="$LOG_DIR/codex-5.4-mini-envelope-r2.json"
 BRAMBLE_RUN_TAG="code-review-eval:$(git branch --show-current):codex-5.4-mini:r2" \
 WORK_DIR=$(pwd) bazel-bin/bramble/bramble_/bramble code-review \
   --backend codex --model gpt-5.4-mini --effort medium \
-  --resume-session-id "$SESSION_CODEX" \
+  --resume-session-id "$SESSION_CODEX" --diff-base "$DIFF_BASE" \
   --verbose --timeout 10m --envelope-file "$ENVELOPE_FILE" \
   2>"$LOG_DIR/codex-5.4-mini-stderr-r2.txt"
 ```
@@ -171,6 +182,7 @@ BRAMBLE_RUN_TAG="code-review-eval:$(git branch --show-current):codex-5.4-mini:r3
 WORK_DIR=$(pwd) bazel-bin/bramble/bramble_/bramble code-review \
   --backend codex --model gpt-5.4-mini --effort medium \
   --resume-session-id "$SESSION_CODEX" --resume-prompt-style fresh \
+  --diff-base "$DIFF_BASE" \
   --verbose --timeout 10m --envelope-file "$ENVELOPE_FILE" \
   2>"$LOG_DIR/codex-5.4-mini-stderr-r3.txt"
 ```
