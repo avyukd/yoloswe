@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude"
 )
@@ -398,18 +399,27 @@ type claudeAttempt struct {
 	events []claude.Event
 }
 
-func stubClaudeQueryStream(t *testing.T, attempts ...claudeAttempt) *[][]string {
+// claudeStubCalls records what each attempt was launched with. ctxs holds the
+// context handed to that attempt, so tests can assert whether it was cancelled
+// — the difference between hard-killing the CLI and letting it stop gracefully.
+type claudeStubCalls struct {
+	args [][]string
+	ctxs []context.Context
+}
+
+func stubClaudeQueryStream(t *testing.T, attempts ...claudeAttempt) *claudeStubCalls {
 	t.Helper()
-	var argsPerAttempt [][]string
+	calls := &claudeStubCalls{}
 	n := 0
 	orig := claudeQueryStream
 	t.Cleanup(func() { claudeQueryStream = orig })
-	claudeQueryStream = func(_ context.Context, _ string, opts ...claude.SessionOption) (<-chan claude.Event, error) {
+	claudeQueryStream = func(ctx context.Context, _ string, opts ...claude.SessionOption) (<-chan claude.Event, error) {
 		args, err := claude.NewSession(opts...).CLIArgs()
 		if err != nil {
 			return nil, err
 		}
-		argsPerAttempt = append(argsPerAttempt, args)
+		calls.args = append(calls.args, args)
+		calls.ctxs = append(calls.ctxs, ctx)
 
 		cfg := claude.SessionConfig{}
 		for _, o := range opts {
@@ -433,7 +443,7 @@ func stubClaudeQueryStream(t *testing.T, attempts ...claudeAttempt) *[][]string 
 		close(ch)
 		return ch, nil
 	}
-	return &argsPerAttempt
+	return calls
 }
 
 // TestClaudeBackend_ResumeFallbackLadder drives the real RunPrompt through the
@@ -445,7 +455,7 @@ func stubClaudeQueryStream(t *testing.T, attempts ...claudeAttempt) *[][]string 
 // rendered --resume — true by construction, and equally true if RunPrompt had
 // stopped appending WithResume altogether. This one calls RunPrompt.
 func TestClaudeBackend_ResumeFallbackLadder(t *testing.T) {
-	args := stubClaudeQueryStream(t,
+	calls := stubClaudeQueryStream(t,
 		claudeAttempt{
 			err:    errors.New("SDK initialize handshake failed: control request timed out"),
 			stderr: "No conversation found with session ID: sess-prior\n",
@@ -470,15 +480,15 @@ func TestClaudeBackend_ResumeFallbackLadder(t *testing.T) {
 	if result.ResponseText != `{"verdict":"accepted"}` {
 		t.Errorf("response text = %q, want the second attempt's output", result.ResponseText)
 	}
-	if len(*args) != 2 {
-		t.Fatalf("expected 2 attempts, got %d", len(*args))
+	if len(calls.args) != 2 {
+		t.Fatalf("expected 2 attempts, got %d", len(calls.args))
 	}
-	if !hasFlagValue((*args)[0], "--resume", "sess-prior") {
-		t.Errorf("attempt 1 must carry --resume sess-prior; args: %v", (*args)[0])
+	if !hasFlagValue(calls.args[0], "--resume", "sess-prior") {
+		t.Errorf("attempt 1 must carry --resume sess-prior; args: %v", calls.args[0])
 	}
-	for _, a := range (*args)[1] {
+	for _, a := range calls.args[1] {
 		if a == "--resume" {
-			t.Errorf("attempt 2 must not carry --resume; args: %v", (*args)[1])
+			t.Errorf("attempt 2 must not carry --resume; args: %v", calls.args[1])
 		}
 	}
 	// Cache-inclusive: 10 fresh + 90 cache-read.
@@ -492,7 +502,7 @@ func TestClaudeBackend_ResumeFallbackLadder(t *testing.T) {
 // attempt and the status must be ok — a backend that always retried would pass
 // the fallback test above while silently doubling every resumed round.
 func TestClaudeBackend_ResumeSucceedsWithoutRetry(t *testing.T) {
-	args := stubClaudeQueryStream(t, claudeAttempt{events: []claude.Event{
+	calls := stubClaudeQueryStream(t, claudeAttempt{events: []claude.Event{
 		claude.ReadyEvent{Info: claude.SessionInfo{SessionID: "sess-prior", Model: "opus"}},
 		claude.TurnCompleteEvent{Success: true},
 	}})
@@ -505,8 +515,8 @@ func TestClaudeBackend_ResumeSucceedsWithoutRetry(t *testing.T) {
 	if result.ResumeStatus != ResumeStatusOK {
 		t.Errorf("resume status = %q, want %q", result.ResumeStatus, ResumeStatusOK)
 	}
-	if len(*args) != 1 {
-		t.Errorf("a live resume must not retry; attempts = %d", len(*args))
+	if len(calls.args) != 1 {
+		t.Errorf("a live resume must not retry; attempts = %d", len(calls.args))
 	}
 }
 
@@ -514,7 +524,7 @@ func TestClaudeBackend_ResumeSucceedsWithoutRetry(t *testing.T) {
 // fallback: a wedged CLI with no resume-miss evidence must surface its error
 // rather than silently re-running the whole review on a fresh session.
 func TestClaudeBackend_GenuineFailureDoesNotRetry(t *testing.T) {
-	args := stubClaudeQueryStream(t, claudeAttempt{
+	calls := stubClaudeQueryStream(t, claudeAttempt{
 		err:    errors.New("SDK initialize handshake failed: control request timed out"),
 		stderr: "Loaded cached credentials.\n",
 	})
@@ -524,8 +534,99 @@ func TestClaudeBackend_GenuineFailureDoesNotRetry(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the genuine failure to surface")
 	}
-	if len(*args) != 1 {
-		t.Errorf("must not retry without resume-miss evidence; attempts = %d", len(*args))
+	if len(calls.args) != 1 {
+		t.Errorf("must not retry without resume-miss evidence; attempts = %d", len(calls.args))
+	}
+}
+
+// TestClaudeBackend_SuccessLetsCLIStopGracefully guards a regression this PR
+// already made once: threading an attempt-scoped context into QueryStream is
+// right for an abandoned attempt, but the wrapper spawns the CLI with
+// exec.CommandContext and no cmd.Cancel override, so cancelling is a bare
+// SIGKILL. Firing it on the success path killed the CLI mid-shutdown, while it
+// was still flushing the very session transcript the next round resumes from.
+//
+// The stub's channel stays OPEN after the turn event, standing in for a CLI
+// still inside its stdin-close → SIGTERM window. RunPrompt must not have
+// cancelled the context by the time it returns its result.
+func TestClaudeBackend_SuccessLetsCLIStopGracefully(t *testing.T) {
+	ch := make(chan claude.Event, 2)
+	ch <- claude.ReadyEvent{Info: claude.SessionInfo{SessionID: "sess-1", Model: "opus"}}
+	ch <- claude.TurnCompleteEvent{Success: true}
+	// Deliberately NOT closed: the CLI has not finished shutting down.
+
+	// Cancellation is expected eventually — the deferred cancel must still run
+	// so the context isn't leaked. What matters is *when*: measure the delay
+	// between launching the CLI and killing it. Checking ctx.Err() after
+	// RunPrompt returns would always read "cancelled" and prove nothing.
+	cancelled := make(chan time.Time, 1)
+	orig := claudeQueryStream
+	t.Cleanup(func() { claudeQueryStream = orig })
+	claudeQueryStream = func(ctx context.Context, _ string, _ ...claude.SessionOption) (<-chan claude.Event, error) {
+		go func() {
+			<-ctx.Done()
+			cancelled <- time.Now()
+		}()
+		return ch, nil
+	}
+
+	b := newClaudeBackend(Config{BackendType: BackendClaude})
+	start := time.Now()
+	if _, err := b.RunPrompt(context.Background(), "review", nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case at := <-cancelled:
+		// Before the fix this fired within microseconds of the turn event.
+		if held := at.Sub(start); held < claudeShutdownGrace {
+			t.Errorf("CLI was killed %s after launch, inside its %s shutdown window", held, claudeShutdownGrace)
+		}
+	case <-time.After(claudeShutdownGrace * 3):
+		t.Error("context was never cancelled; the attempt context leaks")
+	}
+}
+
+// TestWaitClaudeShutdown_ReturnsPromptlyOnClose is the other half: a CLI that
+// finishes its graceful stop closes the stream, and we must not sit on the full
+// grace period for every successful review.
+func TestWaitClaudeShutdown_ReturnsPromptlyOnClose(t *testing.T) {
+	t.Parallel()
+	ch := make(chan claude.Event, 1)
+	ch <- claude.TextEvent{Text: "trailing"}
+	close(ch)
+
+	start := time.Now()
+	waitClaudeShutdown(ch)
+	if elapsed := time.Since(start); elapsed >= claudeShutdownGrace {
+		t.Errorf("waited %s on an already-closed stream; want prompt return", elapsed)
+	}
+}
+
+// TestClaudeBackend_AbandonedAttemptCancelsCLI pins the original leak fix: the
+// fallback path must tear the first attempt's CLI down, not leave two sessions
+// running at once.
+func TestClaudeBackend_AbandonedAttemptCancelsCLI(t *testing.T) {
+	calls := stubClaudeQueryStream(t,
+		claudeAttempt{
+			err:    errors.New("SDK initialize handshake failed: control request timed out"),
+			stderr: "No conversation found with session ID: sess-prior\n",
+		},
+		claudeAttempt{events: []claude.Event{
+			claude.ReadyEvent{Info: claude.SessionInfo{SessionID: "sess-fresh"}},
+			claude.TurnCompleteEvent{Success: true},
+		}},
+	)
+
+	b := newClaudeBackend(Config{BackendType: BackendClaude, ResumeSessionID: "sess-prior"})
+	if _, err := b.RunPrompt(context.Background(), "review", nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(calls.ctxs) != 2 {
+		t.Fatalf("expected 2 attempts, got %d", len(calls.ctxs))
+	}
+	if calls.ctxs[0].Err() == nil {
+		t.Error("the abandoned first attempt's context must be cancelled so its CLI is torn down")
 	}
 }
 

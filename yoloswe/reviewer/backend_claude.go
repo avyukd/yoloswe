@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude"
 )
@@ -45,6 +46,20 @@ import (
 // claude.WithKeepUserSettings), so a review does not inherit the operator's
 // user/project settings or plugins. That is what we want: two runs of the same
 // review on two machines should see the same tool surface.
+//
+// # Shared shape with backend_cursor.go — keep the copies in step
+//
+// RunPrompt's resume-with-fallback ladder and claudeEventAdapter are
+// structurally the same code as cursorBackend.RunPrompt and
+// cursorEventAdapter, differing only in the SDK package and in this file's
+// stderr-tail argument. Extracting a generic runOneShot helper was proposed
+// and deliberately deferred: backend_cursor.go is outside the PR that added
+// this backend. The copies have ALREADY diverged — this one waits for a
+// graceful CLI shutdown before cancelling the attempt context (see
+// waitClaudeShutdown) while cursor hands the caller's context straight to
+// cursor.QueryStream. Anyone fixing lifecycle or resume behaviour in either
+// file should check whether the other needs the same change, or do the
+// extraction.
 type claudeBackend struct {
 	config Config
 }
@@ -121,6 +136,37 @@ func isClaudeResumeUnavailable(err error, stderrTail string) bool {
 // where nearly the whole context is served from cache.
 func claudeUsageTokens(u claude.TurnUsage) (input, output int64) {
 	return int64(u.TotalInputTokens()), int64(u.OutputTokens)
+}
+
+// claudeShutdownGrace bounds how long waitClaudeShutdown waits for the CLI to
+// stop under its own power. The wrapper's sequence is stdin-close → 500ms →
+// SIGTERM → 500ms → SIGKILL, so ~1s covers a well-behaved exit; the extra
+// margin is for a busy host. A CLI still alive after that is wedged, and the
+// deferred cancel killing it is the correct outcome.
+const claudeShutdownGrace = 2 * time.Second
+
+// waitClaudeShutdown drains stream until it closes, or the grace period
+// expires.
+//
+// A closed stream is a precise signal that the wrapper finished its graceful
+// stop: QueryStream's proxy registers `defer close(out)` before
+// `defer session.Stop()`, and defers run LIFO, so the channel closes only
+// after session.Stop() has returned. Waiting for it means the deferred
+// context cancel can no longer interrupt a shutdown in progress.
+func waitClaudeShutdown(stream <-chan claude.Event) {
+	timer := time.NewTimer(claudeShutdownGrace)
+	defer timer.Stop()
+	for {
+		select {
+		case _, ok := <-stream:
+			if !ok {
+				return
+			}
+		case <-timer.C:
+			slog.Debug("claude CLI still running after turn; cancelling", "grace", claudeShutdownGrace)
+			return
+		}
+	}
 }
 
 // claudeStderrTailLimit bounds the retained stderr tail. Only the last few KiB
@@ -237,10 +283,9 @@ func (b *claudeBackend) runPromptWithOptions(ctx context.Context, prompt string,
 	// tail (see RunPrompt).
 	opts = append(append([]claude.SessionOption{}, opts...), claude.WithStderrHandler(tail.handle))
 
-	// One derived context drives both QueryStream and the adapter, and is
-	// cancelled on every return path.
+	// One derived context drives both QueryStream and the adapter.
 	//
-	// The adapter goroutine needs it so an early return (idle timeout,
+	// The adapter goroutine needs it so an abandoned attempt (idle timeout,
 	// fallback retry) doesn't leak it. QueryStream needs it for a second
 	// reason: its proxy goroutine forwards events with `case out <- evt` and
 	// only gives up on ctx.Done. Once the bridge stops reading, an
@@ -248,6 +293,13 @@ func (b *claudeBackend) runPromptWithOptions(ctx context.Context, prompt string,
 	// lets the deferred session.Stop run — passing the caller's ctx instead
 	// would keep the CLI session alive until the whole review ends, which on
 	// the resume-fallback path means both attempts' sessions running at once.
+	//
+	// Cancelling is a hard kill, NOT a graceful stop: the wrapper spawns the
+	// CLI with exec.CommandContext and no cmd.Cancel override, so cancellation
+	// is a bare SIGKILL. That is the right outcome for an abandoned attempt and
+	// the wrong one for a completed turn — hence waitClaudeShutdown on the
+	// success path below, which lets the wrapper's own stdin-close → SIGTERM →
+	// SIGKILL sequence finish before the deferred cancel fires.
 	queryCtx, cancelQuery := context.WithCancel(ctx)
 	defer cancelQuery()
 
@@ -269,7 +321,8 @@ func (b *claudeBackend) runPromptWithOptions(ctx context.Context, prompt string,
 			actualSessionID = id
 		},
 	}
-	bridged, err := bridgeStreamEvents(adapterCtx, adapter.filtered(adapterCtx), handler, "", b.config.IdleTimeout)
+	stream := adapter.filtered(adapterCtx)
+	bridged, err := bridgeStreamEvents(adapterCtx, stream, handler, "", b.config.IdleTimeout)
 	sessionMu.Lock()
 	readySessionID := actualSessionID
 	sessionMu.Unlock()
@@ -279,6 +332,12 @@ func (b *claudeBackend) runPromptWithOptions(ctx context.Context, prompt string,
 	if err != nil {
 		return reviewErrorResult(resumeStatus, fmt.Errorf("claude: %w", err))
 	}
+
+	// The turn completed, so the CLI is on its way out under its own power.
+	// Give it that chance before the deferred cancel SIGKILLs it — the session
+	// transcript it is flushing is what the next round resumes from, and a
+	// truncated one degrades silently into a full-cost fallback review.
+	waitClaudeShutdown(stream)
 
 	result := &ReviewResult{
 		ResponseText: bridged.responseText,
