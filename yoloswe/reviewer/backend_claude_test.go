@@ -155,14 +155,28 @@ func TestClaudeBaseSessionOptions_PermissionModeBypass(t *testing.T) {
 
 func TestClaudeBaseSessionOptions_ModelAndWorkDir(t *testing.T) {
 	t.Parallel()
+	workDir := t.TempDir()
 	b := newClaudeBackend(Config{
 		BackendType: BackendClaude,
 		Model:       "sonnet",
-		WorkDir:     t.TempDir(),
+		WorkDir:     workDir,
 	})
-	args := claudeArgs(t, b.baseSessionOptions()...)
+	opts := b.baseSessionOptions()
+	args := claudeArgs(t, opts...)
 	if !hasFlagValue(args, "--model", "sonnet") {
 		t.Errorf("expected --model sonnet; args: %v", args)
+	}
+	// WorkDir is not a CLI flag — WithWorkDir sets SessionConfig.WorkDir,
+	// which becomes cmd.Dir — so asserting on rendered args cannot see it.
+	// Without this check the test would pass identically if the
+	// claude.WithWorkDir branch in baseSessionOptions were deleted, and a
+	// reviewer launched from the wrong directory reviews the wrong tree.
+	cfg := claude.SessionConfig{}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	if cfg.WorkDir != workDir {
+		t.Errorf("WorkDir = %q; want %q", cfg.WorkDir, workDir)
 	}
 }
 

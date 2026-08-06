@@ -175,11 +175,25 @@ SCOPE_HINTS=$(python3 $SKILL_DIR/scripts/scope_gate.py --state-dir "$STATE_DIR" 
 # base branch has drifted: a stale main narrows the diff (the reviewer never
 # sees code the PR touched), an advanced main widens it with unrelated
 # commits. Measured on a replayed PR: 336 files instead of 22, and the guess
-# varied run to run. Empty (detached HEAD, missing origin/main) simply omits
-# the flag and restores the previous inferred-scope behaviour.
+# varied run to run.
+#
+# The pin is best-effort — a detached HEAD or a missing origin/main leaves it
+# empty and every reviewer falls back to inferred scope. That fallback must be
+# LOUD. Silently omitting the flag restores the exact failure mode it exists to
+# prevent, and an unpinned round is indistinguishable from a pinned one in the
+# log, so its findings get compared against pinned rounds as if the ranges
+# matched. Do not hard-fail instead: branch contexts (`pr_number: null`,
+# `branch:<name>`) legitimately run without a resolvable base, and aborting
+# there would break the loop for a case that still reviews usefully. Record the
+# warning in the round's `comment_actions` as an `ack` so the state file says
+# which rounds were scoped by inference.
 DIFF_BASE=$(git merge-base "origin/${BASE:-main}" HEAD 2>/dev/null || true)
 DIFF_BASE_ARG=""
-[ -n "$DIFF_BASE" ] && DIFF_BASE_ARG="--diff-base $DIFF_BASE"
+if [ -n "$DIFF_BASE" ]; then
+  DIFF_BASE_ARG="--diff-base $DIFF_BASE"
+else
+  echo "[pr-polish] WARNING: no merge-base for origin/${BASE:-main}..HEAD — reviewers run on INFERRED diff scope this round; findings are not range-comparable with pinned rounds" | tee "$LOG_DIR/diff-base-unpinned.txt" >&2
+fi
 
 [ "$IS_NEW_SERIES" = "1" ] && [ "$PR_NUMBER" != "null" ] && {
   python3 $SKILL_DIR/scripts/pr_ops.py fetch-comments > $STATE_DIR/pp-comments.json
