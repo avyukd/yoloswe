@@ -77,6 +77,46 @@ class ParseDiffTests(unittest.TestCase):
     def test_handles_empty_input(self):
         self.assertEqual(rl.parse_diff(""), [])
 
+    def test_added_file_does_not_leak_a_line_into_the_previous_file(self):
+        """`--- /dev/null` is a header, not a deleted line.
+
+        Found by rendering kernel-8276 in a browser: the old-side pattern
+        anchored on `--- a/`, so an ADDED file's `--- /dev/null` fell through
+        to the `-` branch and was drawn as a code line reading `-- /dev/null`
+        at the tail of the preceding file.
+        """
+        diff = (
+            "diff --git a/kept.py b/kept.py\n"
+            "--- a/kept.py\n+++ b/kept.py\n"
+            "@@ -1,1 +1,2 @@\n one\n+two\n"
+            "diff --git a/new.py b/new.py\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n+++ b/new.py\n"
+            "@@ -0,0 +1,1 @@\n+alpha\n"
+        )
+        files = {f.path: f for f in rl.parse_diff(diff)}
+        self.assertEqual(set(files), {"kept.py", "new.py"})
+        self.assertNotIn(
+            "dev/null",
+            " ".join(l.text for l in files["kept.py"].lines),
+            "the /dev/null header leaked into the previous file's lines")
+        self.assertEqual(
+            [l.kind for l in files["new.py"].lines if l.kind != "hunk"],
+            ["add"])
+
+    def test_deleted_file_is_skipped(self):
+        diff = (
+            "diff --git a/gone.py b/gone.py\n"
+            "deleted file mode 100644\n"
+            "--- a/gone.py\n+++ /dev/null\n"
+            "@@ -1,1 +0,0 @@\n-was here\n"
+            "diff --git a/kept.py b/kept.py\n"
+            "--- a/kept.py\n+++ b/kept.py\n"
+            "@@ -1,0 +1,1 @@\n+added\n"
+        )
+        files = rl.parse_diff(diff)
+        self.assertEqual([f.path for f in files], ["kept.py"])
+
 
 class ClassifyAnchorTests(unittest.TestCase):
     """Every finding must get a home — 28% of real ones are not in a hunk."""

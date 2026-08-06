@@ -61,8 +61,12 @@ RENDER_NEEDS_FETCH = "needs-fetch"
 RENDER_UNRECOVERABLE = "unrecoverable"
 
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
-_NEWFILE_RE = re.compile(r"^\+\+\+ b/(.*)$")
-_OLDFILE_RE = re.compile(r"^--- a/(.*)$")
+_NEWFILE_RE = re.compile(r"^\+\+\+ (?:b/)?(.*)$")
+# Matches the old-side header in every form git emits: `--- a/path`, and
+# `--- /dev/null` for an added file. Anchoring only on `a/` left the /dev/null
+# variant to fall through to the `-` (deletion) branch, where it was rendered
+# as a code line reading `-- /dev/null` at the tail of the PREVIOUS file.
+_OLDFILE_RE = re.compile(r"^--- (?:a/|/dev/null)")
 
 
 # ===========================================================================
@@ -214,8 +218,13 @@ def parse_diff(text: str) -> list[DiffFile]:
         m = _NEWFILE_RE.match(raw)
         if m:
             path = m.group(1)
-            if path == "dev/null":
+            # A deleted file's new side is /dev/null — there is nothing to
+            # render and no new-side line numbers. Match both spellings: the
+            # `b/` prefix is optional in the pattern, so this arrives as
+            # `/dev/null` here and as `dev/null` when git wrote `+++ b/`.
+            if path in ("/dev/null", "dev/null"):
                 cur = None
+                new_ln = old_ln = None
                 continue
             cur = DiffFile(path=hl.normalize_path(path) or path)
             files.append(cur)
