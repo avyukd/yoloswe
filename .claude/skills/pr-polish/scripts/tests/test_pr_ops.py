@@ -2572,6 +2572,61 @@ class TestPRSummaryReachesStateViaCLI(unittest.TestCase):
                          "frozen means round 1 wins; re-deriving would let a "
                          "ratcheting PR re-authorize its own growth")
 
+    def test_new_series_re_anchors_the_frozen_summary(self):
+        """A completed series is a fresh look; the old summary may be stale.
+
+        Observed on this PR: after a squash + force-push, round 2 opened a new
+        series but kept a summary describing half the PR and citing a commit
+        that no longer existed, so reviewers judged scope against stale intent.
+        Re-anchoring is safe exactly here — the prior series' action history is
+        already unreachable, so there is no ratchet to re-authorize.
+        """
+        pr_ops.main(["state-append-round", "branch:x", "1", "aaa",
+                     "--no-verify-head", "--pr-summary", "ORIGINAL"])
+        pr_ops.main(["state-finalize-round", "branch:x", "1", "aaa",
+                     self._actions_file()])
+        pr_ops.main(["state-mark-complete", "branch:x", "converged"])
+        # New series: prior loop completed.
+        pr_ops.main(["state-append-round", "branch:x", "2", "bbb",
+                     "--no-verify-head", "--pr-summary", "REWRITTEN"])
+        _, path = pr_ops.state_paths(None, branch="x")
+        state = json.loads(Path(path).read_text())
+        self.assertEqual(state.get("pr_summary"), "REWRITTEN",
+                         "a new series must re-anchor; the old summary can "
+                         "describe a branch that no longer exists")
+
+    def test_new_series_re_anchors_base_branch(self):
+        """Same boundary: a PR retargeted between series must re-measure."""
+        pr_ops.main(["state-append-round", "branch:x", "1", "aaa",
+                     "--no-verify-head", "--base-branch", "release/v1"])
+        pr_ops.main(["state-finalize-round", "branch:x", "1", "aaa",
+                     self._actions_file()])
+        pr_ops.main(["state-mark-complete", "branch:x", "converged"])
+        pr_ops.main(["state-append-round", "branch:x", "2", "bbb",
+                     "--no-verify-head", "--base-branch", "main"])
+        _, path = pr_ops.state_paths(None, branch="x")
+        state = json.loads(Path(path).read_text())
+        self.assertEqual(state.get("base_branch"), "main")
+
+    def test_mid_series_still_frozen_after_new_series_change(self):
+        """The anti-ratchet freeze must survive the re-anchoring change.
+
+        Guard against 'fix staleness' quietly becoming 'refresh every round',
+        which is the drift the scope contract exists to prevent.
+        """
+        pr_ops.main(["state-append-round", "branch:x", "1", "aaa",
+                     "--no-verify-head", "--pr-summary", "ORIGINAL",
+                     "--base-branch", "release/v1"])
+        # No mark-complete: rounds 2 and 3 are the SAME series.
+        for n, head in (("2", "bbb"), ("3", "ccc")):
+            pr_ops.main(["state-append-round", "branch:x", n, head,
+                         "--no-verify-head", "--pr-summary", "DRIFTED",
+                         "--base-branch", "main"])
+        _, path = pr_ops.state_paths(None, branch="x")
+        state = json.loads(Path(path).read_text())
+        self.assertEqual(state.get("pr_summary"), "ORIGINAL")
+        self.assertEqual(state.get("base_branch"), "release/v1")
+
     def test_frozen_summary_reaches_round_bundle_goal_text(self):
         """The consumer hop, not just the write.
 

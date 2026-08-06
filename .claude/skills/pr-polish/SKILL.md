@@ -42,7 +42,7 @@ Missing/error review streams → log as findings with stderr path cited.
 | `state-finalize-round <ctx> <n> <head_after> <actions.json> [--envelope …]` | Round end |
 | `state-mark-complete <ctx> <reason>` | Exit |
 
-**Round-1 freeze:** `--pr-summary` and `--base-branch` are each written once and never overwritten; later rounds read them back out of state. `--pr-summary` is the goal's spine — omit it and the goal loses the PR's purpose from round 2 on. `--base-branch` anchors the "Files in this PR" range to the PR's real base — omit it and a PR stacked on a non-default branch is measured against the repo default. Passing them again on later rounds is a no-op.
+**Round-1 freeze:** `--pr-summary` and `--base-branch` are written once per *series* and not overwritten by later rounds in it; they're read back out of state. A new series (`state-is-new-series` = 1 — prior loop completed, or the branch was rewritten) re-anchors both, since the old values can describe a branch that no longer exists after a squash or a retarget. `--pr-summary` is the goal's spine — omit it and the goal loses the PR's purpose from round 2 on. `--base-branch` anchors the "Files in this PR" range to the PR's real base — omit it and a PR stacked on a non-default branch is measured against the repo default. Passing them again on later rounds is a no-op.
 
 Key fields: `rounds[n].comment_actions` (audit trail), `low_only_streak` (convergence), `session_ids` (resume), `pr_summary` + `base_branch` (frozen; see above).
 

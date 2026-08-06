@@ -937,18 +937,23 @@ def state_append_round(
     orchestrator computed the SHA in one message and a commit landed before
     this call — refuse rather than corrupt the round's lineage.
 
-    ``pr_summary`` is the PR's own statement of intent (commit list +
-    diffstat against the base). It is written ONCE, on the first round that
-    supplies it, and never overwritten: it is the frozen definition of what
-    this PR is for. Every later round reads it back from state, because the
-    orchestrator computes it in a shell variable at Step 1 that no longer
-    exists by round 2 — which is why the goal silently lost the PR's purpose
-    after round 1.
+    ``pr_summary`` is the PR's own statement of intent. It is written on the
+    first round of a series that supplies it and not overwritten by later
+    rounds in that series: it is the frozen definition of what this PR is for.
+    Every later round reads it back from state, because the orchestrator
+    computes it in a shell variable at Step 1 that no longer exists by round 2
+    — which is why the goal silently lost the PR's purpose after round 1.
+
+    A new series re-anchors it. Freezing across series was observed keeping a
+    summary that described half the PR and cited a commit destroyed by a
+    squash; ``is_new_series`` is the one boundary where the prior series'
+    history is already unreachable, so re-anchoring cannot re-authorize a
+    ratcheting PR's growth.
 
     ``base_branch`` is the PR's base ref (``identify``'s ``base``, i.e. GitHub's
-    baseRefName). Frozen the same way, and read back by ``round_bundle`` so the
-    "Files in this PR" range is anchored to the PR's real ancestor instead of
-    the repo default. The two must agree: PR_SUMMARY's diffstat and the goal's
+    baseRefName). Frozen and re-anchored the same way, and read back by
+    ``round_bundle`` so the "Files in this PR" range is anchored to the PR's
+    real ancestor instead of the repo default. The two must agree: PR_SUMMARY's diffstat and the goal's
     file list describing different merge bases is the same class of bug as the
     two-dot range this change replaced.
 
@@ -1026,11 +1031,19 @@ def state_append_round(
             existing.setdefault("noise_samples", samples)
             if not existing["noise_samples"]:
                 existing["noise_samples"] = samples
-    # Frozen, not refreshed. A PR's remit is fixed when the loop first sees
-    # it; re-deriving it each round would let a ratcheting PR keep
-    # re-authorizing its own growth, which is the drift the scope contract
-    # exists to prevent.
-    if pr_summary and not state.get("pr_summary"):
+    # Frozen within a series, re-anchored at a series boundary. A PR's remit
+    # is fixed when the loop first sees it; re-deriving it every round would
+    # let a ratcheting PR keep re-authorizing its own growth, which is the
+    # drift the scope contract exists to prevent.
+    #
+    # But a NEW series (prior loop completed, or the branch was rewritten) is
+    # a fresh look at a PR that may have changed underneath the old summary.
+    # Observed: after a squash + force-push the frozen summary still described
+    # half the PR and cited a commit that no longer existed, so reviewers were
+    # judging scope against a stale statement of intent. `is_new_series` is
+    # exactly the boundary where re-anchoring is correct and ratcheting is not
+    # possible, because the prior series' action history is already unreachable.
+    if pr_summary and (is_new_series or not state.get("pr_summary")):
         state["pr_summary"] = pr_summary
     # The PR's own base branch, frozen alongside pr_summary and for the same
     # reason: the file-set range must be measured against the SAME ancestor
@@ -1039,7 +1052,10 @@ def state_append_round(
     # branch gets its "Files in this PR" line measured against main while its
     # summary describes the stacked diff — reintroducing the out-of-scope
     # files this whole change exists to remove.
-    if base_branch and not state.get("base_branch"):
+    # Same boundary rule as pr_summary above: frozen within a series, but a
+    # PR retargeted to a new base between series must not keep measuring its
+    # file set against the old one.
+    if base_branch and (is_new_series or not state.get("base_branch")):
         state["base_branch"] = base_branch
     state["current_round"] = n
     state["last_commit_at_round_start"] = head_before
@@ -2098,17 +2114,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "--pr-summary",
         default=None,
         help=(
-            "The PR's own statement of intent (commit list + diffstat). Written "
-            "ONCE and never overwritten — it is the frozen definition of what "
-            "this PR is for, which every later round reads back from state. "
-            "Without it the goal loses the PR's purpose after round 1."
+            "The PR's own statement of intent. Written once per series and not "
+            "overwritten by later rounds in it — the frozen definition of what "
+            "this PR is for, which every later round reads back from state. A "
+            "new series re-anchors it (a squashed or force-pushed branch makes "
+            "the old one stale). Without it the goal loses the PR's purpose "
+            "after round 1."
         ),
     )
     sp.add_argument(
         "--base-branch",
         default=None,
         help=(
-            "The PR's base ref (identify's 'base'). Frozen once, like "
+            "The PR's base ref (identify's 'base'). Frozen per series like "
             "--pr-summary, and used to anchor the 'Files in this PR' range to "
             "the same merge base the PR summary was built against. Omit it and "
             "a PR stacked on a non-default branch is measured against the repo "
