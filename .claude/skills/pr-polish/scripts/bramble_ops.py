@@ -135,7 +135,7 @@ def _files_changed_between(a: str | None, b: str | None) -> list[str]:
 
 
 
-def _files_changed_in_pr(head: str | None, base_ref: str = "origin/main") -> list[str]:
+def _files_changed_in_pr(head: str | None, base_ref: str | None = None) -> list[str]:
     """Repo-relative paths this PR touches, measured from its merge-base.
 
     Three-dot (``base...head``) rather than two-dot against a prior round's
@@ -152,7 +152,18 @@ def _files_changed_in_pr(head: str | None, base_ref: str = "origin/main") -> lis
     """
     if not head:
         return []
-    from _common import run  # noqa: PLC0415
+    from _common import detect_base_branch, run  # noqa: PLC0415
+
+    # Resolve the base the same way the rest of pr-polish does rather than
+    # assuming main: a PR stacked on another branch has a different base, and
+    # hardcoding origin/main would measure it against the wrong ancestor —
+    # reintroducing exactly the "someone else's work counted as this PR's"
+    # error this function exists to remove.
+    if not base_ref:
+        try:
+            base_ref = f"origin/{detect_base_branch()}"
+        except Exception:  # noqa: BLE001 — fall back rather than fail the goal
+            base_ref = "origin/main"
 
     try:
         res = run(["git", "diff", "--name-only", f"{base_ref}...{head}"], check=False)

@@ -1842,6 +1842,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to JSON file with noise_samples array (capped; debug only)",
     )
+    sp.add_argument(
+        "--pr-summary",
+        default=None,
+        help=(
+            "The PR's own statement of intent (commit list + diffstat). Written "
+            "ONCE and never overwritten — it is the frozen definition of what "
+            "this PR is for, which every later round reads back from state. "
+            "Without it the goal loses the PR's purpose after round 1."
+        ),
+    )
 
     sp = sub.add_parser("state-finalize-round")
     sp.add_argument("ctx", help="PR number or 'branch:<name>'")
@@ -1974,6 +1984,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.head_before,
                     verify_head=args.verify_head,
                     noise_filtered=args.noise_filtered,
+                    pr_summary=args.pr_summary,
                     noise_samples=samples,
                 )
             )

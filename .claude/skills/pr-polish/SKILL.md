@@ -38,11 +38,11 @@ Missing/error review streams → log as findings with stderr path cited.
 | Command | When |
 |---|---|
 | `state-load` | Read |
-| `state-append-round <ctx> <n> <head_before>` | Round start (`--no-verify-head` only when resuming interrupted round) |
+| `state-append-round <ctx> <n> <head_before> [--pr-summary "$PR_SUMMARY"]` | Round start (`--no-verify-head` only when resuming interrupted round). **Pass `--pr-summary` on round 1** — it is written once and frozen, and every later round reads it back as the goal's spine. Omit it and the goal loses the PR's purpose from round 2 on. |
 | `state-finalize-round <ctx> <n> <head_after> <actions.json> [--envelope …]` | Round end |
 | `state-mark-complete <ctx> <reason>` | Exit |
 
-Key fields: `rounds[n].comment_actions` (audit trail), `low_only_streak` (convergence), `session_ids` (resume).
+Key fields: `rounds[n].comment_actions` (audit trail), `low_only_streak` (convergence), `session_ids` (resume), `pr_summary` (frozen at round 1; the goal's stable scope anchor).
 
 **Actions file** (the `<actions.json>` arg to `state-finalize-round` / `finalize-and-report`): a JSON **array** of action entries, or an object `{"comment_actions": [...]}` — both are accepted. Per entry:
 - `action`: one of `fixed`, `false_positive`, `wont_fix`, `ack`, `stale`, `pre_existing`/`flake` (CI only) — validated; an unknown verb is a loud error naming the entry index.

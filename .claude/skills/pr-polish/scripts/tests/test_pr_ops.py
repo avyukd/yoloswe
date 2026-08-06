@@ -2492,3 +2492,44 @@ class TestFinalizeAndReport(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPRSummaryReachesStateViaCLI(unittest.TestCase):
+    """The frozen PR_SUMMARY must survive the CLI, not just the Python call.
+
+    SKILL.md drives state-append-round as a subprocess, so a parameter that
+    exists on the function but has no argparse flag is dead code in production.
+    That is exactly what shipped: `state_append_round(pr_summary=...)` froze the
+    value, `round_bundle` read it back, and 407 unit tests passed — while the
+    CLI never declared `--pr-summary` and never passed it, so `state` never held
+    one and the goal was as purposeless as before the fix.
+
+    Tests the boundary the orchestrator actually crosses.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        os.environ["HOME"] = self.tmp.name
+
+    def test_cli_flag_persists_pr_summary(self):
+        rc = pr_ops.main([
+            "state-append-round", "branch:x", "1", "deadbeef",
+            "--no-verify-head", "--pr-summary", "PR GOAL TEXT",
+        ])
+        self.assertEqual(rc, 0)
+        _, path = pr_ops.state_paths(None, branch="x")
+        state = json.loads(Path(path).read_text())
+        self.assertEqual(state.get("pr_summary"), "PR GOAL TEXT",
+                         "the CLI must persist it, or round_bundle reads '' forever")
+
+    def test_frozen_not_overwritten_by_later_rounds(self):
+        pr_ops.main(["state-append-round", "branch:x", "1", "aaa",
+                     "--no-verify-head", "--pr-summary", "ORIGINAL"])
+        pr_ops.main(["state-append-round", "branch:x", "2", "bbb",
+                     "--no-verify-head", "--pr-summary", "DRIFTED"])
+        _, path = pr_ops.state_paths(None, branch="x")
+        state = json.loads(Path(path).read_text())
+        self.assertEqual(state.get("pr_summary"), "ORIGINAL",
+                         "frozen means round 1 wins; re-deriving would let a "
+                         "ratcheting PR re-authorize its own growth")
