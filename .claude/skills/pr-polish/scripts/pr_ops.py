@@ -450,10 +450,32 @@ _BODY_BLOCK_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 
 # Trailing attribution / process lines that carry no review signal. Anchored
 # to the start of a line so prose that merely mentions them survives.
+#
+# Line-start anchoring alone is not enough: a sentence may legitimately OPEN
+# with these words ("Generated with care by the platform team, this migration
+# backfills rows."), and stripping the whole line then deletes review context
+# — the same failure that retired the `## Deployment Notes` heading rule. So
+# each pattern is pinned to the trailer's machine-emitted SHAPE, not just its
+# opening words, and must match to end-of-line so a longer prose sentence
+# cannot satisfy it.
 _BODY_LINE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    # Emoji prefix optional — the trailer is emitted both ways.
-    (re.compile(r"^\s*(?:🤖\s*)?Generated with .*$", re.MULTILINE), "generated-with"),
-    (re.compile(r"^\s*Co-Authored-By:.*$", re.MULTILINE | re.IGNORECASE), "co-authored-by"),
+    # Emoji prefix optional — the trailer is emitted both ways. The tail is a
+    # bare tool name or a markdown link, never a clause: no sentence
+    # punctuation, and the line ends there.
+    (
+        re.compile(
+            r"^\s*(?:🤖\s*)?Generated with \[[^\]]+\]\([^)]*\)\s*$"
+            r"|^\s*(?:🤖\s*)?Generated with [^.,;:!?]{1,60}$",
+            re.MULTILINE,
+        ),
+        "generated-with",
+    ),
+    # A git trailer: `Name <email>`. Prose that happens to start with the word
+    # lacks the angle-bracketed address and survives.
+    (
+        re.compile(r"^\s*Co-Authored-By:[^<\n]*<[^>\n]+>\s*$", re.MULTILINE | re.IGNORECASE),
+        "co-authored-by",
+    ),
     (
         re.compile(r"^\s*<sup>\s*Reviewed by \[.*?</sup>\s*$", re.MULTILINE | re.DOTALL),
         "bot-review-footer",

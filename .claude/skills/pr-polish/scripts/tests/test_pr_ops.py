@@ -2821,6 +2821,35 @@ class TestStripPRBody(unittest.TestCase):
         self.assertEqual(dropped, [])
         self.assertIn("generated with the old script", cleaned)
 
+    def test_prose_opening_with_trailer_words_survives(self) -> None:
+        """Regression: line-start anchoring alone deleted author prose.
+
+        A sentence may legitimately OPEN with these words. Stripping the whole
+        line then eats review context — the same failure that retired the
+        "## Deployment Notes" rule, so the patterns are pinned to the
+        trailer's machine-emitted shape (markdown link / bare tool name;
+        ``Name <email>``) rather than its opening words.
+        """
+        for prose in (
+            "Generated with care by the platform team, this migration backfills rows.",
+            "Co-Authored-By: design review, the retry limit was raised to 5.",
+            "Generated with the old script, so the fixture drifted and needs a rebuild.",
+        ):
+            with self.subTest(prose=prose):
+                cleaned, dropped = pr_ops.strip_pr_body(f"## Notes\n\n{prose}\n")
+                self.assertEqual(dropped, [])
+                self.assertIn(prose, cleaned)
+
+    def test_coauthor_trailer_requires_an_address(self) -> None:
+        """The real trailer carries ``Name <email>``; bare prose does not."""
+        cleaned, dropped = pr_ops.strip_pr_body(
+            "Fixes the parser.\n\n"
+            "Co-authored-by: jiradozer-builder[bot] "
+            "<283316645+jiradozer-builder[bot]@users.noreply.github.com>\n"
+        )
+        self.assertIn("co-authored-by", dropped)
+        self.assertEqual(cleaned, "Fixes the parser.")
+
     def test_author_written_sections_are_never_stripped(self) -> None:
         """Regression: a heading name must not decide what a reviewer sees.
 
