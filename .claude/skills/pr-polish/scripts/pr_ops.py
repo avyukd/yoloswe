@@ -443,7 +443,16 @@ _BODY_BLOCK_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         "coderabbit-block",
     ),
     (
-        re.compile(r"<!--\s*linear-linkback\s*-->.*?\Z", re.IGNORECASE | re.DOTALL),
+        # The linkback's payload is the `<details>` block that follows the
+        # marker, so the strip ends there. Running to `\Z` instead deleted
+        # every author section that happened to sit after it (a trailing
+        # `## Verification` is the common one) — the marker says where bot
+        # output STARTS, never that the author wrote nothing below it.
+        # Marker-only (no `<details>`) falls back to the marker itself.
+        re.compile(
+            r"<!--\s*linear-linkback\s*-->\s*(?:<details>.*?(?:</details>|\Z))?",
+            re.IGNORECASE | re.DOTALL,
+        ),
         "linear-linkback",
     ),
 )
@@ -459,13 +468,19 @@ _BODY_BLOCK_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 # opening words, and must match to end-of-line so a longer prose sentence
 # cannot satisfy it.
 _BODY_LINE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    # Emoji prefix optional — the trailer is emitted both ways. The tail is a
-    # bare tool name or a markdown link, never a clause: no sentence
-    # punctuation, and the line ends there.
+    # Emoji prefix optional — the trailer is emitted both ways. Two shapes,
+    # both bounded: a markdown link, or a bare TOOL NAME.
+    #
+    # "Bare tool name" must stay narrow. An earlier attempt allowed any
+    # punctuation-free tail, which still ate author prose ("Generated with
+    # care by the platform team") because a short unpunctuated clause is not
+    # distinguishable from a tool name by length alone. A product name is 1-3
+    # Capitalized/CamelCase words, so require exactly that — connectives like
+    # "by"/"from"/"the" are lowercase and disqualify the line.
     (
         re.compile(
             r"^\s*(?:🤖\s*)?Generated with \[[^\]]+\]\([^)]*\)\s*$"
-            r"|^\s*(?:🤖\s*)?Generated with [^.,;:!?]{1,60}$",
+            r"|^\s*(?:🤖\s*)?Generated with (?:[A-Z][\w.+-]*)(?: [A-Z][\w.+-]*){0,2}\s*$",
             re.MULTILINE,
         ),
         "generated-with",

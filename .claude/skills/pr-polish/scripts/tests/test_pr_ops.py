@@ -2840,6 +2840,50 @@ class TestStripPRBody(unittest.TestCase):
                 self.assertEqual(dropped, [])
                 self.assertIn(prose, cleaned)
 
+    def test_unpunctuated_prose_opening_with_trailer_words_survives(self) -> None:
+        """Regression: punctuation is not what separates prose from a trailer.
+
+        A first pass allowed any punctuation-free tail after "Generated with",
+        which still ate short unpunctuated author lines. A tool name is 1-3
+        Capitalized words; connectives like "by"/"from" mark prose.
+        """
+        for prose in (
+            "Generated with care by the platform team",
+            "Generated with extensive manual testing before release",
+            "Generated with input from the security review",
+        ):
+            with self.subTest(prose=prose):
+                cleaned, dropped = pr_ops.strip_pr_body(f"## Notes\n\n{prose}\n")
+                self.assertEqual(dropped, [])
+                self.assertIn(prose, cleaned)
+
+    def test_bare_tool_name_trailer_still_strips(self) -> None:
+        """Narrowing the bare form must not cost the real trailers."""
+        for trailer in ("Generated with Claude Code", "Generated with Claude", "Generated with Cursor"):
+            with self.subTest(trailer=trailer):
+                cleaned, dropped = pr_ops.strip_pr_body(f"Fixes the parser.\n\n{trailer}\n")
+                self.assertIn("generated-with", dropped)
+                self.assertEqual(cleaned, "Fixes the parser.")
+
+    def test_linkback_strip_keeps_author_sections_after_it(self) -> None:
+        """Regression: the linkback strip ran to EOF and ate trailing prose.
+
+        The marker says where bot output starts, not that the author wrote
+        nothing below it. Bound the strip to the `<details>` payload.
+        """
+        body = (
+            "## Problem\n\nBroken.\n\n"
+            "<!-- linear-linkback -->\n"
+            "<details>\n<summary><a href=\"https://linear.app/x\">INF-437</a></summary>\n"
+            "bot detail\n</details>\n\n"
+            "## Verification\n\nTests pass.\n"
+        )
+        cleaned, dropped = pr_ops.strip_pr_body(body)
+        self.assertIn("linear-linkback", dropped)
+        self.assertNotIn("bot detail", cleaned)
+        self.assertIn("## Verification", cleaned)
+        self.assertIn("Tests pass.", cleaned)
+
     def test_coauthor_trailer_requires_an_address(self) -> None:
         """The real trailer carries ``Name <email>``; bare prose does not."""
         cleaned, dropped = pr_ops.strip_pr_body(
