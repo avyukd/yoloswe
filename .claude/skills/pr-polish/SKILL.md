@@ -7,13 +7,13 @@ disable-model-invocation: true
 
 # PR Polish Loop
 
-Review → triage → fix → commit locally each round. Exit when converged (Step 3.g) or round cap hit, then force-push once. No mid-loop pushes.
+Review → triage → fix → commit locally each round. Exit when converged (Step 3.g) or round cap hit, then force-push once. No mid-loop pushes (why: `references/why-defer-push.md`).
 
 Helpers: `python3 $SKILL_DIR/scripts/<helper>.py`. `$SKILL_DIR` = directory containing this `SKILL.md`.
 
 | Script | Role |
 |---|---|
-| `pr_ops.py` | Identity, comments, CI, state I/O, `round-bundle`, `remote-head` |
+| `pr_ops.py` | Identity, comments, CI, state I/O, `pr-summary`, `round-bundle`, `remote-head` |
 | `bramble_ops.py` | Goal text, resume ids, triage, envelope recovery |
 | `lint_gate.py` | Diff lint (ruff/golangci/eslint) |
 | `scope_gate.py` | `scope-hints.json` for bramble |
@@ -38,13 +38,15 @@ Missing/error review streams → log as findings with stderr path cited.
 | Command | When |
 |---|---|
 | `state-load` | Read |
-| `state-append-round <ctx> <n> <head_before> [--pr-summary "$PR_SUMMARY"] [--base-branch <base>]` | Round start (`--no-verify-head` only when resuming interrupted round). **Pass both on round 1** — each is written once and frozen. `--pr-summary` is the goal's spine (omit it and the goal loses the PR's purpose from round 2 on); `--base-branch` anchors the "Files in this PR" range to the PR's real base (omit it and a PR stacked on a non-default branch is measured against the repo default). |
+| `state-append-round <ctx> <n> <head_before> [--pr-summary "$PR_SUMMARY"] [--base-branch <base>]` | Round start (`--no-verify-head` only when resuming interrupted round). **Pass both on round 1.** |
 | `state-finalize-round <ctx> <n> <head_after> <actions.json> [--envelope …]` | Round end |
 | `state-mark-complete <ctx> <reason>` | Exit |
 
-Key fields: `rounds[n].comment_actions` (audit trail), `low_only_streak` (convergence), `session_ids` (resume), `pr_summary` (frozen at round 1; the goal's stable scope anchor), `base_branch` (frozen at round 1; the merge base the PR's file list is measured against).
+**Round-1 freeze:** `--pr-summary` and `--base-branch` are each written once and never overwritten; later rounds read them back out of state. `--pr-summary` is the goal's spine — omit it and the goal loses the PR's purpose from round 2 on. `--base-branch` anchors the "Files in this PR" range to the PR's real base — omit it and a PR stacked on a non-default branch is measured against the repo default. Passing them again on later rounds is a no-op.
 
-**Actions file** (the `<actions.json>` arg to `state-finalize-round` / `finalize-and-report`): a JSON **array** of action entries, or an object `{"comment_actions": [...]}` — both are accepted. Per entry:
+Key fields: `rounds[n].comment_actions` (audit trail), `low_only_streak` (convergence), `session_ids` (resume), `pr_summary` + `base_branch` (frozen; see above).
+
+**Actions file** (the `<actions.json>` arg to `state-finalize-round` / `finalize-and-report`): a JSON **array** of action entries, or an object `{"comment_actions": [...]}` — both accepted. Per entry:
 - `action`: one of `fixed`, `false_positive`, `wont_fix`, `ack`, `stale`, `pre_existing`/`flake` (CI only) — validated; an unknown verb is a loud error naming the entry index.
 - `severity`: `high`/`medium`/`low`/`nit` or null (lint advisory) — validated.
 - `source`: `claude`/`codex`/`cursor`/`gemini`/`lint`/`github-inline`/`github-issue`/`ci`/`sweep`.
@@ -61,18 +63,17 @@ GIT_SYNC=$(echo "$PREFLIGHT" | jq -r .git_sync_path)
 if [ "$(echo "$PREFLIGHT" | jq -r '.errors | length')" != "0" ]; then
   echo "$PREFLIGHT" | jq -r '.errors[]' >&2; exit 1
 fi
-# Non-fatal advisories — print but don't abort. The common one: this PR modifies
-# bramble's own review code but BRAMBLE_BIN resolved to a (possibly stale) PATH
-# binary. If you see that, build from this branch (`bazel build //bramble/...`)
-# and re-export BRAMBLE_BIN=$(pwd)/bazel-bin/bramble/bramble_/bramble before the
-# round so the review runs against the code under test.
+# Warnings are non-fatal — print, don't abort. Common one: this PR modifies
+# bramble's own review code but BRAMBLE_BIN resolved to a stale PATH binary.
+# Then build from this branch (`bazel build //bramble/...`) and re-export
+# BRAMBLE_BIN=$(pwd)/bazel-bin/bramble/bramble_/bramble before the round.
 echo "$PREFLIGHT" | jq -r '.warnings[]? | "[preflight warning] " + .' >&2
 python3 $SKILL_DIR/scripts/pr_ops.py identify
 ```
 
 Pin: `$CTX`, `$STATE_DIR`, `$STATE_FILE`, `$BRANCH`, `$PR_NUMBER`, `$REPO`, `$BASE`
 (`identify`'s `base` field — the PR's `baseRefName`, or the detected default
-branch in branch-only mode; used for the review's diff scope in Step 3.b). 
+branch in branch-only mode; used for the review's diff scope in Step 3.b).
 
 `pr_number: null` → skip PR-comment/CI fetch.
 
@@ -108,9 +109,22 @@ python3 "$GIT_SYNC" --verbose --no-push
 Dirty tree (no in-progress round to resume) → `state-mark-complete <ctx> dirty-tree-preflight`, exit.
 Conflict (exit 2) → `state-mark-complete <ctx> sync-conflict`, Final Summary, exit.
 
-Build `$PR_SUMMARY` (≤10 lines): `git log --oneline origin/<base>..HEAD` + diff-stat, where `<base>` is `identify`'s `base`. Round 1 `--goal` = `$PR_SUMMARY`; later rounds use `round-bundle` / `bramble_ops.py goal`, which **leads with the frozen `$PR_SUMMARY`** and appends the action-history briefing (prior fixed/skipped + the PR's own file list, plus any invariant/streak notes). No inter-round diff is embedded — bramble re-reads the working tree, and a diff pinned to the prior round's HEAD is wrong after a rebase.
+Build `$PR_SUMMARY` with the helper — do not hand-roll it:
 
-Pass the same `<base>` to `state-append-round --base-branch` at Step 3.a0 (round start): the file list is measured `origin/<base>...HEAD`, and it must be anchored to the same merge base `$PR_SUMMARY` was built from.
+```bash
+PR_SUMMARY=$(python3 $SKILL_DIR/scripts/pr_ops.py pr-summary --text-only)
+python3 $SKILL_DIR/scripts/pr_ops.py pr-summary | jq '{source, dropped}'   # log what it used
+```
+
+When the PR has a usable description, **that description is the summary** — the author's own statement of intent beats a generated commit list for telling a reviewer what the change is FOR, and therefore what is out of scope. The helper strips only machine-emitted additions: bot-appended blocks (`<!-- CURSOR_SUMMARY -->` and friends) and `Generated with`/`Co-Authored-By`/bot-review-footer trailers. A review bot's restatement of the diff is the *worst* possible goal text — it anchors the reviewer on a summary of the code instead of the intent behind it.
+
+**Author-written prose is never stripped, whatever the heading says.** A "drop `## Deployment Notes`" rule was tried and removed — measured, it had no true positives and deleted real review input (security-posture changes, stacked-PR ordering, migration semantics) that authors filed under those headings. Heading names don't predict whether the prose under them matters to a reviewer.
+
+`source` reports `pr-body`, `pr-body+diffstat`, or `commits-diffstat` (the fallback when there's no PR, no body, or the body strips to nothing); `dropped` lists what was removed, so a surprising goal is traceable.
+
+Round 1 `--goal` = `$PR_SUMMARY`; later rounds use `round-bundle` / `bramble_ops.py goal`, which **leads with the frozen `$PR_SUMMARY`** and appends the action-history briefing (prior fixed/skipped + the PR's own file list, plus any invariant/streak notes). No inter-round diff is embedded — a diff pinned to the prior round's HEAD is wrong after a rebase, and bramble re-reads the working tree anyway.
+
+Pass this same `<base>` to `state-append-round --base-branch` (Step 3.a0): the file list is measured `origin/<base>...HEAD` and must share the merge base `$PR_SUMMARY` was built from.
 
 ## Step 2: Fetch PR comments + CI
 
@@ -145,35 +159,28 @@ Header: `## Round N (M / --rounds)` — N absolute, M = `additional_rounds_run +
 
 ### a0) Open the round in state
 
-Every round starts here — `round-bundle` (Step 3.b) reads `pr_summary` and
-`base_branch` back out of state, so a round that never opened produces a goal
-with no PR purpose and a file list anchored to the repo default.
+Every round starts here — `round-bundle` (Step 3.b) reads `pr_summary` and `base_branch` back out of state, so a round that never opened produces a goal with no PR purpose and a file list anchored to the repo default.
 
 ```bash
 python3 $SKILL_DIR/scripts/pr_ops.py state-append-round "$CTX" {ROUND} $(git rev-parse HEAD) \
   --pr-summary "$PR_SUMMARY" --base-branch "$BASE"
 ```
 
-`$BASE` = `identify`'s `base` (the PR's own `baseRefName`), the same value
-`$PR_SUMMARY` was built against. Both are written once and frozen at round 1;
-passing them on later rounds is harmless. Add `--no-verify-head` only when
-resuming an interrupted round.
+Add `--no-verify-head` only when resuming an interrupted round.
 
 ### a) WIP commit
 
-If dirty: `git add -A && git commit -m "pr-polish: round N snapshot"`. Bramble snapshots working tree at launch.
+If dirty: `git add -A && git commit -m "pr-polish: round N snapshot"`.
 
 ### b) Launch reviewers
 
 Always use `round-bundle` for `$LOG_DIR`, `$GOAL`, resume ids — do not hand-roll attempt index.
 
 ```bash
-# Opt-in reviewer toggles. These are read in three places below (launch,
-# --stream, --envelope) and nothing else sets them, so bind them from the
-# invocation flags here — substituting 1/0 as literals like every other
-# orchestrator var. Leaving one unset is not neutral: `[ "$USE_CLAUDE" = "1" ]`
-# is false, so the reviewer silently never launches and its absence looks
-# identical to "you didn't ask for it".
+# Bind from the invocation flags, substituting 1/0 as literals like every other
+# orchestrator var. Read in three places below (launch, --stream, --envelope).
+# Leaving one unset is NOT neutral: `[ "$USE_CLAUDE" = "1" ]` is false, so the
+# reviewer silently never launches and looks like you never asked for it.
 USE_GEMINI=0   # 1 when --gemini was passed
 USE_CLAUDE=0   # 1 when --claude was passed
 
@@ -182,33 +189,17 @@ LOG_DIR=$(echo "$BUNDLE" | jq -r .log_dir)
 GOAL=$(echo "$BUNDLE" | jq -r .goal_text)
 CODEX_RESUME=$(echo "$BUNDLE" | jq -r '.resume_ids.codex')
 CURSOR_RESUME=$(echo "$BUNDLE" | jq -r '.resume_ids.cursor')
-GEMINI_RESUME=$(echo "$BUNDLE" | jq -r '.resume_ids.gemini')   # used by the --gemini launch
-CLAUDE_RESUME=$(echo "$BUNDLE" | jq -r '.resume_ids.claude')   # used by the --claude launch
+GEMINI_RESUME=$(echo "$BUNDLE" | jq -r '.resume_ids.gemini')
+CLAUDE_RESUME=$(echo "$BUNDLE" | jq -r '.resume_ids.claude')
 [ "{ROUND}" = "1" ] && GOAL="$PR_SUMMARY"
 mkdir -p "$LOG_DIR"
 
 SCOPE_HINTS=$(python3 $SKILL_DIR/scripts/scope_gate.py --state-dir "$STATE_DIR" 2>"$LOG_DIR/scope-gate-stderr.txt")
 
-# Pin the reviewed range. Without --diff-base the agent infers the diff, and
-# the natural inference — `git diff main...HEAD` — is wrong whenever the local
-# base branch has drifted: a stale main narrows the diff (the reviewer never
-# sees code the PR touched), an advanced main widens it with unrelated
-# commits. Measured on a replayed PR: 336 files instead of 22, and the guess
-# varied run to run.
-#
-# The pin is best-effort — a detached HEAD or a missing origin/main leaves it
-# empty and every reviewer falls back to inferred scope. That fallback must be
-# LOUD. Silently omitting the flag restores the exact failure mode it exists to
-# prevent, and an unpinned round is indistinguishable from a pinned one in the
-# log, so its findings get compared against pinned rounds as if the ranges
-# matched. Do not hard-fail instead: branch contexts (`pr_number: null`,
-# `branch:<name>`) legitimately run without a resolvable base, and aborting
-# there would break the loop for a case that still reviews usefully.
-#
-# The block below only warns; it writes no state. When it fires, YOU must add
-# an `ack` entry (source `sweep`, notes naming the unpinned scope) to this
-# round's actions file in step (f), so the state file says which rounds were
-# scoped by inference. Nothing else records it.
+# Pin the reviewed range: unpinned, the agent's inferred `main...HEAD` drifts
+# with the local base branch (measured: 336 files instead of 22, varying run to
+# run). Best-effort — an unresolvable base falls back to inferred scope, which
+# must be LOUD and is NOT a hard failure. See references/why-pin-diff-base.md.
 DIFF_BASE=$(git merge-base "origin/${BASE:-main}" HEAD 2>/dev/null || true)
 DIFF_BASE_ARG=""
 if [ -n "$DIFF_BASE" ]; then
@@ -223,99 +214,60 @@ fi
 }
 ```
 
-Launch every reviewer **inside one `run_in_background` Bash job** (the "join"): the script starts each `bramble code-review` (and the lint gate) with `&`, records their PIDs, then `wait`s on all of them. `wait` returns when *every* child has **exited** — the true all-done signal — and returns promptly if a reviewer crashes without writing an envelope (no hanging to the ceiling on a dead process). The job streams each reviewer's stderr (tee'd to its `-stderr.txt` and to the job's own stdout, so you see per-reviewer progress, including the periodic `[code-review] heartbeat …` lines), and fires **one** completion notification when the join returns. Each reviewer self-kills on inactivity via `--idle-timeout 5m` (a review making steady progress runs as long as it needs; only a stalled backend trips); the outer `timeout 1200` is just an absolute backstop so a wedged process can't outlive the round.
+The warning branch writes no state. When it fires, YOU must add an `ack` entry (source `sweep`, notes naming the unpinned scope) to this round's actions file in step (f) — nothing else records which rounds were scoped by inference.
 
-**Wait ONLY for that one join's completion notification — then triage.** The per-reviewer output you see streaming is for visibility only; it is **not** a signal to act. Do not act on any single reviewer finishing, do not Read the envelope/`-stderr.txt` files in a loop, do not `sleep`-poll, do not call `ScheduleWakeup`, and do not end the turn with a text-only "standing by / awaiting notification" reply. You have nothing to do until the join notifies you that every reviewer has exited — acting before then strands the round or spams the log. This skill may run non-interactively (e.g. driven by jiradozer with one bounded agent turn): there is no harness to re-invoke you on a wakeup or task-notification, so a yielded turn strands the round. The single `run_in_background` join is the only sanctioned wait: it blocks in one tool call and returns when all reviewers exit (each bounded by `--idle-timeout 5m`, with a `timeout 1200` absolute backstop).
+**The join rule: launch every reviewer inside ONE `run_in_background` Bash job, then wait only for that job's single completion notification before triaging** — steps b→c in one turn, no tool calls in between. Streaming per-reviewer output is visibility only, never a cue to act; don't poll envelopes, `sleep`, `ScheduleWakeup`, or end the turn with a "standing by" reply. Non-interactive runs (e.g. jiradozer, one bounded agent turn) have no harness to re-invoke you on a wakeup, so a yielded turn strands the round permanently.
 
-Arm the join in **one** `run_in_background` Bash call (steps b→c in one turn — no tool calls between launch and the completion notification):
+Two non-obvious properties: `wait` returns as soon as every child has *exited*, so a crashed reviewer never hangs the round; and the join's **exit code is not how failure is detected** — multi-PID `wait` reports only the last PID's status, so failure surfaces after the join, in triage, via a missing/empty envelope. Background: `references/why-one-background-join.md`.
 
-Substitute the concrete `$LOG_DIR`/`$GOAL`/`$SCOPE_HINTS`/`$REPO`/`$PR_NUMBER`/resume-id values into this script (orchestrator vars — fresh shell, no persistent `$VAR`), then `run_in_background` the **whole script as one call**. No `bash -c` wrapper, no nested quoting.
+Substitute the concrete `{ROUND}`/`$REPO`/`$PR_NUMBER`/`$GOAL`/`$SCOPE_HINTS`/`$LOG_DIR`/resume-id/`$BRAMBLE_BIN`/`$SKILL_DIR` values in, then run the **whole script as one call**. No `bash -c` wrapper, no nested quoting. Every reviewer uses this template, differing only in the four substitutions tabled below:
 
 ```bash
-# One background join: launch each reviewer with `&`, recording every PID into
-# the PIDS array, then `wait "${PIDS[@]}"`. The array is the safety rail — the
-# join can't desync from the launches (no hand-maintained `wait $A $B $C` line
-# to forget a PID on), and skipping a reviewer just means one fewer element.
-#
-# INVARIANT: every reviewer launch ends with `PIDS+=($!)`. Nothing else touches
-# the wait list.
-#
-# Substitute these orchestrator vars into the script before running (fresh
-# shell, no persistent $VAR): {ROUND}, $REPO, $PR_NUMBER, $GOAL, $SCOPE_HINTS,
-# $LOG_DIR, $CODEX_RESUME/$CURSOR_RESUME/$GEMINI_RESUME, $BRAMBLE_BIN, $SKILL_DIR.
-#
-# Per reviewer: output is tee'd to its -stderr.txt AND to this job's stdout
-# (prefixed) so per-reviewer progress — incl. periodic `[code-review] heartbeat …`
-# lines — streams live. --idle-timeout 5m kills a stalled backend; the outer
-# `timeout 1200` is an absolute backstop (lint gets 120s — it's a fast static
-# pass and must not hold the join for 20 minutes). `set -o pipefail` keeps each
-# subshell's status the reviewer's real one (not the trailing `sed`'s 0).
-#
-# NOTE: the join exit code is NOT how reviewer failure is detected — `wait` with
-# multiple PIDs returns only the LAST one's status, so a crashed reviewer can be
-# masked by a later success. The join's only job is to block until ALL reviewers
-# have EXITED (one completion notification). Per-reviewer failure is detected
-# AFTER the join, in triage: a crashed/timed-out reviewer leaves no/empty
-# envelope → `recover-envelope` + a `stream-missing` finding. So failures
-# surface via envelopes, not the join's exit status.
+( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:<tag>:r{ROUND} \
+  timeout 1200 $BRAMBLE_BIN code-review --backend <backend> --model <model> <extra> \
+    --skip-test-execution --verbose --idle-timeout 5m \
+    --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
+    ${<RESUME>:+--resume-session-id "$<RESUME>"} \
+    --envelope-file "$LOG_DIR/<tag>-envelope.json" \
+  2>&1 | tee "$LOG_DIR/<tag>-stderr.txt" | sed 's/^/[<tag>] /' ) &
+PIDS+=($!)
+```
+
+| `<tag>` | `<backend>` | `<model>` | `<extra>` | `<RESUME>` | Launched |
+|---|---|---|---|---|---|
+| `codex` | `codex` | `gpt-5.6-luna` | `--effort medium` | `CODEX_RESUME` | always |
+| `cursor` | `cursor` | `composer-2.5` | — | `CURSOR_RESUME` | always |
+| `gemini` | `gemini` | `gemini-3-flash-preview` | — | `GEMINI_RESUME` | `if [ "$USE_GEMINI" = "1" ]` |
+| `claude` | `claude` | `opus` | — | `CLAUDE_RESUME` | `if [ "$USE_CLAUDE" = "1" ]` |
+
+The `${VAR:+…}` idiom is load-bearing: an empty resume id must drop the flag entirely, not pass an empty string. Keep the per-reviewer `BRAMBLE_RUN_TAG` — it is how runs are attributed.
+
+Assembled, the job is:
+
+```bash
+# INVARIANT: every reviewer launch ends with `PIDS+=($!)`; nothing else touches
+# the wait list. Timeouts: --idle-timeout 5m kills only a stalled backend (a
+# review making progress runs as long as it needs), `timeout 1200` is the
+# absolute backstop, lint gets 120s so a static pass can't hold the join.
+# `set -o pipefail` keeps each subshell's status the reviewer's, not `sed`'s 0.
 PIDS=()
 
-( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:codex:r{ROUND} \
-  timeout 1200 $BRAMBLE_BIN code-review --backend codex --model gpt-5.6-luna --effort medium \
-    --skip-test-execution --verbose --idle-timeout 5m \
-    --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
-    ${CODEX_RESUME:+--resume-session-id "$CODEX_RESUME"} \
-    --envelope-file "$LOG_DIR/codex-envelope.json" \
-  2>&1 | tee "$LOG_DIR/codex-stderr.txt" | sed 's/^/[codex] /' ) &
-PIDS+=($!)
-
-( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:cursor:r{ROUND} \
-  timeout 1200 $BRAMBLE_BIN code-review --backend cursor --model composer-2.5 \
-    --skip-test-execution --verbose --idle-timeout 5m \
-    --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
-    ${CURSOR_RESUME:+--resume-session-id "$CURSOR_RESUME"} \
-    --envelope-file "$LOG_DIR/cursor-envelope.json" \
-  2>&1 | tee "$LOG_DIR/cursor-stderr.txt" | sed 's/^/[cursor] /' ) &
-PIDS+=($!)
+<codex launch from template>            # always
+<cursor launch from template>           # always
 
 ( set -o pipefail; timeout 120 python3 $SKILL_DIR/scripts/lint_gate.py \
     --state-dir "$STATE_DIR" --round {ROUND} --log-dir "$LOG_DIR" \
   2>&1 | tee "$LOG_DIR/lint-stderr.txt" | sed 's/^/[lint] /' ) &
 PIDS+=($!)
 
-# --gemini only: an extra reviewer launched the same way; it appends to PIDS
-# like any other, so when --gemini is off it's simply absent — the wait can't
-# break.
-if [ "$USE_GEMINI" = "1" ]; then
-  ( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:gemini:r{ROUND} \
-    timeout 1200 $BRAMBLE_BIN code-review --backend gemini --model gemini-3-flash-preview \
-      --skip-test-execution --verbose --idle-timeout 5m \
-      --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
-      ${GEMINI_RESUME:+--resume-session-id "$GEMINI_RESUME"} \
-      --envelope-file "$LOG_DIR/gemini-envelope.json" \
-    2>&1 | tee "$LOG_DIR/gemini-stderr.txt" | sed 's/^/[gemini] /' ) &
-  PIDS+=($!)
-fi
+if [ "$USE_GEMINI" = "1" ]; then <gemini launch from template>; fi
+if [ "$USE_CLAUDE" = "1" ]; then <claude launch from template>; fi
 
-# --claude only: same shape again. Opus is the slowest and priciest of the
-# four, so it stays opt-in rather than joining the default codex+cursor pair.
-if [ "$USE_CLAUDE" = "1" ]; then
-  ( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:claude:r{ROUND} \
-    timeout 1200 $BRAMBLE_BIN code-review --backend claude --model opus \
-      --skip-test-execution --verbose --idle-timeout 5m \
-      --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
-      ${CLAUDE_RESUME:+--resume-session-id "$CLAUDE_RESUME"} \
-      --envelope-file "$LOG_DIR/claude-envelope.json" \
-    2>&1 | tee "$LOG_DIR/claude-stderr.txt" | sed 's/^/[claude] /' ) &
-  PIDS+=($!)
-fi
-
-# Join on EVERY launched reviewer so triage never starts while a reviewer is
-# still running or has yet to write its envelope.
+# Join on EVERY launched reviewer so triage never starts while one is still
+# running or has yet to write its envelope. A skipped reviewer is simply one
+# fewer element — the wait can't desync from the launches.
 wait "${PIDS[@]}"
 ```
-
-The single completion notification = every reviewer has exited (each bounded by `--idle-timeout 5m` for stalls and a `timeout 1200` absolute backstop; lint by `timeout 120`). The `wait` returns once all PIDs exit, and a crashed reviewer exits immediately, so a dead process never hangs the round. All resume ids (`CODEX_RESUME`/`CURSOR_RESUME`/`GEMINI_RESUME`/`CLAUDE_RESUME`) come from the round-prep `round-bundle` block above.
 
 Before triage: `recover-envelope` on each stream path (idempotent). A reviewer that exited without a valid envelope → `stream-missing` finding, not a deadlock.
 
@@ -334,22 +286,7 @@ python3 $SKILL_DIR/scripts/bramble_ops.py triage $STATE_FILE \
 
 Buckets → `must_fix` / `consider_fix` / `batch_ack` / `batch_stale` / `escalate`.
 
-**They are nested under `.action_plan`, not top-level.** The top level carries
-`total`, `unique`, `consensus`, `single_critical`, `single_medium`, `low_acks`,
-`spiral_matches`. Reading `.must_fix` instead of `.action_plan.must_fix` yields
-`null` for every bucket, which looks exactly like an empty plan — and Step 3.g
-treats an empty plan as convergence, so the loop exits reporting success with
-every finding unread.
-
-`triage` prints a census to stderr for this reason; check it against the JSON
-before concluding anything is empty:
-
-```
-[triage] action_plan: must_fix=0 consider_fix=10 batch_ack=3 batch_stale=0 escalate=0 total=13
-```
-
-`total=13` with all buckets `0` means you read the wrong key, not that there is
-nothing to do. To read the plan:
+**Buckets are nested under `.action_plan`, not top-level** (the top level carries `total`, `unique`, `consensus`, `single_critical`, `single_medium`, `low_acks`, `spiral_matches`). Reading `.must_fix` yields `null` for every bucket — indistinguishable from an empty plan, which Step 3.g treats as convergence, so the loop exits reporting success with every finding unread. Cross-check the stderr census (`[triage] action_plan: must_fix=0 consider_fix=10 … total=13`): a non-zero `total` with empty buckets means you read the wrong key.
 
 ```bash
 jq '.action_plan | {must_fix: (.must_fix|length), consider_fix: (.consider_fix|length),
@@ -358,24 +295,19 @@ jq '.action_plan | {must_fix: (.must_fix|length), consider_fix: (.consider_fix|l
 
 **Ownership:** own pre-existing code in touched files. `must_fix` unless false positive (cite file:line). Low/nit → fix if trivial else `ack`. Skips: `false_positive`, `wont_fix`, `stale`.
 
-**Scope contract — the PR's remit is fixed at round 1.** "Touched files" means files the PR touched when you *first saw it*, not files a later round dragged in. Otherwise ownership ratchets: each round's fix touches new files, which the next round then owns, and the PR grows without limit — while every round looks productive, because each one really is closing the previous round's findings.
+**Scope contract — the PR's remit is fixed at round 1.** "Touched files" means files the PR touched when you *first saw it*, not files a later round dragged in. Otherwise ownership ratchets: each round's fix touches new files that the next round then owns, and the PR grows without limit while every round still looks productive. Before fixing anything outside the round-1 file set, ask whether it is *this PR's job*:
 
-Before fixing anything outside the round-1 file set, ask whether this finding is *this PR's job*. Usually it isn't:
+- **Outside the round-1 files** → `wont_fix`, naming where it belongs ("not in this PR's diff — worth a ticket against `<owner>`").
+- **A flaw in a fix an earlier round of this run made** → genuinely yours, fix it. But a *third* correction to the same subsystem means the design is wrong: stop and escalate, because the fourth commit will not settle it.
+- **New machinery to support a fix** (a cache, a latch, a reaper) → prefer the smaller change that needs none; new machinery draws new findings, which is how a two-file fix becomes a thirteen-file one.
 
-- **Outside the round-1 files** → `wont_fix`, and say where it belongs ("not in this PR's diff — worth a ticket against `<owner>`"). You already do this when you notice; make it the rule rather than the lucky round.
-- **A flaw in a fix an earlier round of this same run made** → fix it, that is genuinely yours. But if the same subsystem needs a *third* correction, stop and escalate: three passes at one mechanism means the design is wrong, and the fourth commit will not settle it.
-- **New machinery to support a fix** (a cache, a latch, a reaper) → prefer the smaller change that needs none. New machinery draws new findings, which is how a two-file fix becomes a thirteen-file one.
-
-When you decline on scope, record it as `wont_fix` with the reason — a declined finding is a real outcome, not a gap.
+A scope decline is a real outcome, not a gap: record it as `wont_fix` with the reason.
 
 **Invariants:** same `invariant` from ≥2 reviewers → consensus on all sites. Prefer producer-side fix.
 
 **Spirals:** single-source may auto-demote to stale if evidence gone (±10 lines) or cited line was in prior round's diff. Multi-source → escalate. Default (no `--ask`): re-fix once (`spiral_refix: true`), stop on 2nd recurrence.
 
-Empty plan (`.action_plan.must_fix` and `.action_plan.consider_fix` both empty,
-**and** the stderr census agrees — `total=0`, or every finding accounted for in
-`batch_ack`/`batch_stale`) → converged, Step 3.g. A non-zero `total` with empty
-buckets is a misread, not convergence.
+Empty plan (`.action_plan.must_fix` and `.action_plan.consider_fix` both empty, **and** the stderr census agrees — `total=0`, or every finding accounted for in `batch_ack`/`batch_stale`) → converged, Step 3.g.
 
 ### d) Apply fixes
 
@@ -397,7 +329,7 @@ python3 $SKILL_DIR/scripts/pr_ops.py finalize-and-report $CTX $ROUND $(git rev-p
   $( [ "$USE_CLAUDE" = "1" ] && echo --envelope claude=$LOG_DIR/claude-envelope.json )
 ```
 
-(`state-finalize-round` works too; `finalize-and-report` adds round summary hints.)
+(`state-finalize-round` has the same finalize semantics, without the round summary hints.)
 
 ### g) Convergence
 
@@ -407,10 +339,7 @@ Stop when any:
 - `low_only_streak >= 2` (every low fixed or `ack`/`wont_fix` with reason)
 - Top finding documented false positive + prior round had no `must_fix`
 
-**Acknowledged ≠ resolved.** None of the above fire while a high/critical finding (this
-round or a prior one) is still only `ack`'d/`wont_fix`'d without a cited reason — a deferred
-high issue keeps the loop open. A `wont_fix`/`false_positive` with a real rationale is a
-resolution and does not block convergence; a bare `ack` on a high/critical does.
+**Acknowledged ≠ resolved.** None of the above fire while a high/critical finding (this round or a prior one) is still only `ack`'d/`wont_fix`'d without a cited reason — a deferred high issue keeps the loop open. A `wont_fix`/`false_positive` with a real rationale is a resolution and does not block convergence; a bare `ack` on a high/critical does.
 
 Budget exhausted → Final Summary; `--ask` to continue, else `capped-at-max`.
 
@@ -443,19 +372,13 @@ Print: metrics, round table, full `comment_actions` table (`Round | Source | Pat
 
 ## Measuring this loop's quality
 
-`scripts/escape_rate.py` measures the **escape rate** — substantive findings external
-reviewers posted after this loop declared the PR done, that its own reviewers never
-surfaced. Each is a defect the local loop should have caught, so it is the metric
-this skill is tuned against.
+`scripts/escape_rate.py` measures the **escape rate** — substantive findings external reviewers posted after this loop declared the PR done, which its own reviewers never surfaced. Each is a defect the loop should have caught, so it is the metric this skill is tuned against.
 
 ```bash
 python3 $SKILL_DIR/scripts/escape_rate.py <state-dir>   # one run
 python3 $SKILL_DIR/scripts/escape_rate.py --all         # fleet-wide
 ```
 
-It needs the harvested dataset for a post-run comment census: `pp-comments.json` is
-captured *during* the run and so cannot contain the escapes. `escaped_in_scope`
-separates depth failures (reviewer saw the file, missed the bug) from scope failures.
+It needs the harvested dataset for its post-run comment census — `pp-comments.json` is captured *during* the run and so cannot contain the escapes. `escaped_in_scope` separates depth failures (reviewer saw the file, missed the bug) from scope failures.
 
-Full operating procedure — cadence, bake-off runbook, promotion checklist:
-`docs/design/code-review-benchmark-process.md`.
+Full operating procedure — cadence, bake-off runbook, promotion checklist: `docs/design/code-review-benchmark-process.md`.

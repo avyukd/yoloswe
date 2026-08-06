@@ -2658,5 +2658,185 @@ class TestPRSummaryReachesStateViaCLI(unittest.TestCase):
         return str(p)
 
 
+# Shape of a real PR body: authored prose, then a bot block after a rule.
+_REAL_BODY = """## Core
+
+Adds `claude` as a fourth `bramble code-review` backend (default model opus).
+
+## Verification
+
+- Resume: `[resume=ok]` against a live session id.
+
+<!-- CURSOR_SUMMARY -->
+---
+
+> [!NOTE]
+> **Medium Risk**
+> New review backend and pr-polish orchestration affect automation.
+>
+> **Overview**
+> Adds **`claude`** as a fourth backend, wired through `backend_claude.go`.
+>
+> <sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) for commit 608d8a6.</sup>
+<!-- /CURSOR_SUMMARY -->"""
+
+
+class TestStripPRBody(unittest.TestCase):
+    """Pure function: no gh/git."""
+
+    def test_strips_cursor_summary_block(self) -> None:
+        cleaned, dropped = pr_ops.strip_pr_body(_REAL_BODY)
+        self.assertIn("cursor-summary", dropped)
+        self.assertNotIn("CURSOR_SUMMARY", cleaned)
+        self.assertNotIn("Cursor Bugbot", cleaned)
+        self.assertNotIn("Medium Risk", cleaned)
+
+    def test_preserves_author_intent_verbatim(self) -> None:
+        cleaned, _ = pr_ops.strip_pr_body(_REAL_BODY)
+        self.assertIn("## Core", cleaned)
+        self.assertIn("Adds `claude` as a fourth", cleaned)
+        self.assertIn("## Verification", cleaned)
+        self.assertIn("[resume=ok]", cleaned)
+
+    def test_revert_to_prove_block_pattern_is_load_bearing(self) -> None:
+        """Without the block pattern the bot text survives — proves reachability."""
+        with patch.object(pr_ops, "_BODY_BLOCK_PATTERNS", ()):
+            cleaned, dropped = pr_ops.strip_pr_body(_REAL_BODY)
+        self.assertIn("Cursor Bugbot", cleaned)
+        self.assertNotIn("cursor-summary", dropped)
+
+    def test_strips_coderabbit_release_notes(self) -> None:
+        """A separate marker shape from the Cursor block, which misses it."""
+        body = (
+            "## What\n\nReal intent.\n\n"
+            "<!-- This is an auto-generated comment: release notes by coderabbit.ai -->\n"
+            "## Summary by CodeRabbit\n\n* **New Features**\n"
+            "  * Added APIs to list, create, update, and delete bindings.\n"
+            "<!-- end of auto-generated comment: release notes by coderabbit.ai -->\n"
+        )
+        cleaned, dropped = pr_ops.strip_pr_body(body)
+        self.assertIn("coderabbit-release-notes", dropped)
+        self.assertNotIn("Summary by CodeRabbit", cleaned)
+        self.assertNotIn("New Features", cleaned)
+        self.assertIn("Real intent.", cleaned)
+
+    def test_author_prose_mentioning_coderabbit_survives(self) -> None:
+        """An author explaining bot behavior is review input, not bot output."""
+        body = (
+            "## What\n\n**A stacked PR cannot pass this gate.** CodeRabbit skips "
+            "non-default bases, so neither gating bot produces a verdict.\n"
+        )
+        cleaned, dropped = pr_ops.strip_pr_body(body)
+        self.assertEqual(dropped, [])
+        self.assertIn("CodeRabbit skips", cleaned)
+
+    def test_unclosed_block_strips_to_end(self) -> None:
+        body = "Real intent here.\n\n<!-- CURSOR_SUMMARY -->\nbot text\nmore bot"
+        cleaned, dropped = pr_ops.strip_pr_body(body)
+        self.assertIn("cursor-summary", dropped)
+        self.assertNotIn("bot text", cleaned)
+        self.assertIn("Real intent here.", cleaned)
+
+    def test_strips_generated_with_and_coauthor_lines(self) -> None:
+        body = (
+            "Fixes the parser.\n\n"
+            "🤖 Generated with [Claude Code](https://claude.com/claude-code)\n"
+            "Co-Authored-By: Claude <noreply@anthropic.com>\n"
+        )
+        cleaned, dropped = pr_ops.strip_pr_body(body)
+        self.assertIn("generated-with", dropped)
+        self.assertIn("co-authored-by", dropped)
+        self.assertEqual(cleaned, "Fixes the parser.")
+
+    def test_author_written_sections_are_never_stripped(self) -> None:
+        """Regression: a heading name must not decide what a reviewer sees.
+
+        A "## Deployment Notes" stripper was tried and removed — it had no
+        true positives and ate real review input filed under that heading.
+        The three kinds below are the ones it was measured destroying.
+        """
+        body = (
+            "## What\n\nReal change.\n\n"
+            "## Deployment Notes\n\n"
+            "**Posture change worth its own review:** the job now reads live "
+            "credentials *and* checks out PR code.\n\n"
+            "Stacked on #123; review/merge that first.\n\n"
+            "Migration 227 creates one tenant-scoped table; no backfill.\n\n"
+            "## Verification\n\nTests pass.\n"
+        )
+        cleaned, dropped = pr_ops.strip_pr_body(body)
+        self.assertEqual(dropped, [])
+        self.assertIn("Posture change worth its own review", cleaned)
+        self.assertIn("Stacked on #123", cleaned)
+        self.assertIn("Migration 227", cleaned)
+        self.assertIn("Real change.", cleaned)
+        self.assertIn("Tests pass.", cleaned)
+
+    def test_mentioning_deploy_in_prose_is_not_stripped(self) -> None:
+        body = "## What\n\nThis changes how we deploy the binary, but is not a rollout.\n"
+        cleaned, dropped = pr_ops.strip_pr_body(body)
+        self.assertEqual(dropped, [])
+        self.assertIn("deploy the binary", cleaned)
+
+    def test_empty_body(self) -> None:
+        self.assertEqual(pr_ops.strip_pr_body(""), ("", []))
+        self.assertEqual(pr_ops.strip_pr_body(None), ("", []))
+
+
+class TestBuildPRSummary(unittest.TestCase):
+    def _pr(self, **kw):
+        base = {
+            "pr_number": 311,
+            "title": "fix(x): do the thing",
+            "body": "",
+            "base": "main",
+        }
+        base.update(kw)
+        return base
+
+    def test_uses_pr_body_when_usable(self) -> None:
+        with patch.object(pr_ops, "_commit_diffstat_summary", return_value="COMMITS"):
+            out = pr_ops.build_pr_summary(self._pr(body=_REAL_BODY))
+        self.assertEqual(out["source"], "pr-body")
+        self.assertIn("cursor-summary", out["dropped"])
+        self.assertIn("Adds `claude` as a fourth", out["pr_summary"])
+        self.assertNotIn("Cursor Bugbot", out["pr_summary"])
+        # Title leads so the reviewer sees the one-line intent first.
+        self.assertTrue(out["pr_summary"].startswith("fix(x): do the thing"))
+        # A usable body does not drag the commit list along.
+        self.assertNotIn("COMMITS", out["pr_summary"])
+
+    def test_falls_back_to_commits_when_no_body(self) -> None:
+        with patch.object(pr_ops, "_commit_diffstat_summary", return_value="COMMITS"):
+            out = pr_ops.build_pr_summary(self._pr(body=""))
+        self.assertEqual(out["source"], "commits-diffstat")
+        self.assertIn("COMMITS", out["pr_summary"])
+
+    def test_body_that_strips_to_nothing_falls_back(self) -> None:
+        """A body that is ONLY a bot block must not yield an empty goal."""
+        body = "<!-- CURSOR_SUMMARY -->\nall bot, no author\n<!-- /CURSOR_SUMMARY -->"
+        with patch.object(pr_ops, "_commit_diffstat_summary", return_value="COMMITS"):
+            out = pr_ops.build_pr_summary(self._pr(body=body))
+        self.assertEqual(out["source"], "commits-diffstat")
+        self.assertIn("COMMITS", out["pr_summary"])
+        self.assertNotIn("all bot", out["pr_summary"])
+
+    def test_thin_body_keeps_intent_and_appends_diffstat(self) -> None:
+        with patch.object(pr_ops, "_commit_diffstat_summary", return_value="COMMITS"):
+            out = pr_ops.build_pr_summary(self._pr(body="fix typo"))
+        self.assertEqual(out["source"], "pr-body+diffstat")
+        self.assertIn("fix typo", out["pr_summary"])
+        self.assertIn("COMMITS", out["pr_summary"])
+
+    def test_branch_only_mode_uses_commits(self) -> None:
+        with patch.object(pr_ops, "_commit_diffstat_summary", return_value="COMMITS"):
+            out = pr_ops.build_pr_summary(
+                {"pr_number": None, "title": None, "body": None, "base": "main"}
+            )
+        self.assertEqual(out["source"], "commits-diffstat")
+        self.assertEqual(out["pr_summary"], "COMMITS")
+        self.assertIsNone(out["pr_number"])
+
+
 if __name__ == "__main__":
     unittest.main()

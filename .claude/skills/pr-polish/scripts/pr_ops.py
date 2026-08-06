@@ -90,10 +90,10 @@ def identify_pr(pr_number: int | None = None) -> dict[str, Any]:
         pr_view_args.append(str(pr_number))
     pr_view_args += [
         "--json",
-        "number,title,url,baseRefName,headRefName,headRefOid",
+        "number,title,url,body,baseRefName,headRefName,headRefOid",
         "--jq",
-        "{pr_number: .number, title: .title, url: .url, base: .baseRefName, "
-        "head: .headRefName, head_sha: .headRefOid}",
+        "{pr_number: .number, title: .title, url: .url, body: .body, "
+        "base: .baseRefName, head: .headRefName, head_sha: .headRefOid}",
     ]
     pr_res = run(pr_view_args, check=False)
     pr_data: dict[str, Any] | None = None
@@ -126,6 +126,7 @@ def identify_pr(pr_number: int | None = None) -> dict[str, Any]:
         "pr_number": None,
         "title": None,
         "url": None,
+        "body": None,
         "base": base,
         "head": branch,
         "head_sha": None,
@@ -398,6 +399,191 @@ def fetch_comments(pr: dict[str, Any]) -> dict[str, Any]:
         "head_sha": head_sha,
         "noise_filtered": len(noise),
         "noise_samples": noise[:_NOISE_SAMPLE_CAP],
+    }
+
+
+# ---------------------------------------------------------------------------
+# PR summary: the goal's frozen spine, built from the PR's own description
+# ---------------------------------------------------------------------------
+
+# Bot-appended blocks, dropped whole. A bot's restatement of the diff is the
+# worst possible goal text: it anchors the reviewer on a summary of the code
+# instead of the author's intent. Bot mixes vary per repo, so add patterns
+# from observed bodies rather than guessing.
+_BODY_BLOCK_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"<!--\s*CURSOR_SUMMARY\s*-->.*?(?:<!--\s*/CURSOR_SUMMARY\s*-->|\Z)",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "cursor-summary",
+    ),
+    (
+        re.compile(
+            r"<!--\s*GREPTILE_SUMMARY\s*-->.*?(?:<!--\s*/GREPTILE_SUMMARY\s*-->|\Z)",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "greptile-summary",
+    ),
+    (
+        re.compile(
+            r"<!--\s*This is an auto-generated comment: release notes by coderabbit\.ai\s*-->"
+            r".*?(?:<!--\s*end of auto-generated comment: release notes by coderabbit\.ai\s*-->|\Z)",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "coderabbit-release-notes",
+    ),
+    (
+        # Fallback: same marker shape, other payloads (walkthrough, tests).
+        re.compile(
+            r"<!--\s*This is an auto-generated comment: [^>]*coderabbit\.ai\s*-->"
+            r".*?(?:<!--\s*end of auto-generated comment: [^>]*coderabbit\.ai\s*-->|\Z)",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "coderabbit-block",
+    ),
+    (
+        re.compile(r"<!--\s*linear-linkback\s*-->.*?\Z", re.IGNORECASE | re.DOTALL),
+        "linear-linkback",
+    ),
+)
+
+# Trailing attribution / process lines that carry no review signal. Anchored
+# to the start of a line so prose that merely mentions them survives.
+_BODY_LINE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^\s*🤖 Generated with .*$", re.MULTILINE), "generated-with"),
+    (re.compile(r"^\s*Co-Authored-By:.*$", re.MULTILINE | re.IGNORECASE), "co-authored-by"),
+    (
+        re.compile(r"^\s*<sup>\s*Reviewed by \[.*?</sup>\s*$", re.MULTILINE | re.DOTALL),
+        "bot-review-footer",
+    ),
+)
+
+# Deliberately empty, and should stay that way: strip bot-appended noise,
+# never author-written sections. A "drop ## Deployment/## Rollout" rule was
+# tried and measured — it had no true positives and deleted real review input
+# (security posture changes, stacked-PR ordering, migration semantics) that
+# authors happened to file under those headings. Heading names are a human
+# choice and don't predict content; only machine-emitted delimiters do.
+_BODY_SECTION_TITLES: tuple[tuple[re.Pattern[str], str], ...] = ()
+
+# A body that reduces to less than this many characters isn't a usable goal
+# spine — fall back to commits + diffstat rather than hand the reviewer a
+# stub like "fixes the thing".
+_MIN_USABLE_BODY_CHARS = 80
+
+
+def _strip_section(text: str, pattern: re.Pattern[str]) -> tuple[str, bool]:
+    """Drop markdown sections whose heading matches ``pattern``.
+
+    A section ends at the next heading of the same or shallower depth (or EOF),
+    so a dropped ``## Deployment`` takes its ``### Steps`` subsection with it
+    but leaves the following ``## Verification`` intact.
+    """
+    lines = text.split("\n")
+    out: list[str] = []
+    dropped = False
+    skip_depth: int | None = None
+    for line in lines:
+        heading = re.match(r"^(#{1,6})\s", line)
+        if skip_depth is not None:
+            # Still inside a dropped section until a heading at <= its depth.
+            if heading and len(heading.group(1)) <= skip_depth:
+                skip_depth = None
+            else:
+                continue
+        m = pattern.match(line)
+        if m:
+            skip_depth = len(m.group(1))
+            dropped = True
+            continue
+        out.append(line)
+    return "\n".join(out), dropped
+
+
+def strip_pr_body(body: str) -> tuple[str, list[str]]:
+    """Return ``(cleaned_body, dropped_tags)`` for a raw PR description.
+
+    Removes bot-appended blocks and attribution trailers; author prose is
+    preserved verbatim. Tags (not just a count) so a surprising goal is
+    traceable to what was stripped.
+    """
+    if not body:
+        return "", []
+    cleaned = body.replace("\r\n", "\n")
+    dropped: list[str] = []
+    for pattern, tag in _BODY_BLOCK_PATTERNS:
+        cleaned, n = pattern.subn("", cleaned)
+        if n:
+            dropped.append(tag)
+    for pattern, tag in _BODY_LINE_PATTERNS:
+        cleaned, n = pattern.subn("", cleaned)
+        if n:
+            dropped.append(tag)
+    for pattern, tag in _BODY_SECTION_TITLES:
+        cleaned, hit = _strip_section(cleaned, pattern)
+        if hit:
+            dropped.append(tag)
+    # A stripped block usually leaves a `---` rule and blank runs behind it.
+    cleaned = re.sub(r"\n\s*---\s*\n\s*\Z", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip(), dropped
+
+
+def _commit_diffstat_summary(base: str, max_commits: int = 10) -> str:
+    """Commits + diffstat for ``origin/<base>...HEAD`` — the fallback spine."""
+    log = run(
+        ["git", "log", "--oneline", f"origin/{base}..HEAD"], check=False
+    ).stdout.strip()
+    commits = "\n".join(log.split("\n")[:max_commits]) if log else ""
+    stat = run(
+        ["git", "diff", "--stat", f"origin/{base}...HEAD"], check=False
+    ).stdout.strip()
+    parts = []
+    if commits:
+        parts.append(f"Commits:\n{commits}")
+    if stat:
+        parts.append(f"Diffstat:\n{stat}")
+    return "\n\n".join(parts)
+
+
+def build_pr_summary(pr: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build the frozen ``--pr-summary`` spine for round 1.
+
+    A usable PR description IS the summary — the author's statement of intent
+    beats a commit list for telling a reviewer what the change is FOR, and so
+    what is out of scope. Falls back to commits + diffstat when there is no
+    PR, no body, or nothing usable survives stripping.
+
+    Returns ``{"pr_summary", "source", "dropped", "pr_number", "base"}``;
+    ``source`` is ``pr-body``, ``pr-body+diffstat``, or ``commits-diffstat``.
+    """
+    pr = pr or identify_pr()
+    base = pr.get("base") or "main"
+    title = (pr.get("title") or "").strip()
+    body_raw = pr.get("body") or ""
+    cleaned, dropped = strip_pr_body(body_raw)
+
+    fallback = _commit_diffstat_summary(base)
+    if not cleaned or len(cleaned) < _MIN_USABLE_BODY_CHARS:
+        text = fallback
+        source = "commits-diffstat"
+        if cleaned:
+            # Thin body: keep it (it may be the only stated intent) but lead
+            # with it and let the diffstat carry the shape.
+            text = f"{cleaned}\n\n{fallback}".strip()
+            source = "pr-body+diffstat"
+    else:
+        text = cleaned
+        source = "pr-body"
+    if title:
+        text = f"{title}\n\n{text}".strip()
+    return {
+        "pr_summary": text,
+        "source": source,
+        "dropped": dropped,
+        "pr_number": pr.get("pr_number"),
+        "base": base,
     }
 
 
@@ -1832,6 +2018,21 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("fetch-comments")
 
+    sp = sub.add_parser(
+        "pr-summary",
+        help=(
+            "Build the frozen --pr-summary spine for round 1. Prefers the "
+            "PR's own description (bot blocks and post-merge sections "
+            "stripped); falls back to commits + diffstat when there is no "
+            "PR or no usable body. Emits {pr_summary, source, dropped}."
+        ),
+    )
+    sp.add_argument(
+        "--text-only",
+        action="store_true",
+        help="Print just the summary text (for direct use as --goal / --pr-summary)",
+    )
+
     sp = sub.add_parser("reply-inline")
     sp.add_argument("comment_id", type=int)
     sp.add_argument("body")
@@ -1991,6 +2192,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "identify":
             print_json(identify_pr())
+        elif args.cmd == "pr-summary":
+            result = build_pr_summary()
+            if args.text_only:
+                print(result["pr_summary"])
+            else:
+                print_json(result)
         elif args.cmd == "fetch-comments":
             pr = identify_pr()
             if pr.get("pr_number") is None:
