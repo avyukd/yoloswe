@@ -47,6 +47,24 @@ import (
 // user/project settings or plugins. That is what we want: two runs of the same
 // review on two machines should see the same tool surface.
 //
+// # Known gap, deliberately not fixed here: SIGKILL is the wrapper's only stop
+//
+// agent-cli-wrapper/claude spawns the CLI with exec.CommandContext and sets
+// neither cmd.Cancel nor cmd.WaitDelay, so for every consumer of that package
+// context cancellation is a bare SIGKILL rather than a graceful stop. The
+// producer-side fix is small — set cmd.Cancel to close stdin and cmd.WaitDelay
+// to a grace period — and would remove the need for waitClaudeShutdown here
+// entirely.
+//
+// It is not done in this PR for two reasons. It is outside the file set of a
+// change that adds a review backend, and it alters process teardown for every
+// claude session in the monorepo (yoloswe/planner, yoloswe/codetalk,
+// yoloswe/builder, multiagent/agent, multiagent/subagent — none of which
+// compensate today, and none of which are exercised by this PR's tests).
+// waitClaudeShutdown is the contained consumer-side workaround; the real fix
+// belongs in agent-cli-wrapper/claude/process.go and deserves its own change
+// with those callers in scope.
+//
 // # Shared shape with backend_cursor.go — keep the copies in step
 //
 // RunPrompt's resume-with-fallback ladder and claudeEventAdapter are
@@ -143,16 +161,35 @@ func claudeUsageTokens(u claude.TurnUsage) (input, output int64) {
 // SIGTERM → 500ms → SIGKILL, so ~1s covers a well-behaved exit; the extra
 // margin is for a busy host. A CLI still alive after that is wedged, and the
 // deferred cancel killing it is the correct outcome.
-const claudeShutdownGrace = 2 * time.Second
+//
+// A var, not a const, so tests can shrink it — same reason and shape as
+// heartbeatInterval in backend.go. A 2s wait per successful turn is invisible
+// next to a multi-minute review but would otherwise be pure dead time in the
+// unit suite.
+var claudeShutdownGrace = 2 * time.Second
 
 // waitClaudeShutdown drains stream until it closes, or the grace period
 // expires.
 //
-// A closed stream is a precise signal that the wrapper finished its graceful
-// stop: QueryStream's proxy registers `defer close(out)` before
-// `defer session.Stop()`, and defers run LIFO, so the channel closes only
-// after session.Stop() has returned. Waiting for it means the deferred
-// context cancel can no longer interrupt a shutdown in progress.
+// A closed stream usually means the wrapper finished its graceful stop:
+// QueryStream's proxy registers `defer close(out)` before
+// `defer session.Stop()`, and defers run LIFO, so on the normal path the
+// channel closes only after session.Stop() has returned.
+//
+// Two honest caveats, both benign here but worth knowing before leaning
+// harder on this signal:
+//
+//   - That defer ordering lives in another package's anonymous goroutine and
+//     is not stated as a contract anywhere in agent-cli-wrapper/claude.
+//     Swapping those two adjacent lines would silently turn this wait into a
+//     no-op. The hermetic test below stubs the seam and so cannot catch that.
+//   - The adapter also closes its output on adapterCtx.Done, so a parent
+//     cancellation closes the stream with no graceful stop having happened.
+//     That case is already a teardown, so returning early is correct — but it
+//     means "stream closed" is not unconditionally "session.Stop() returned".
+//
+// This is a consumer-side workaround for a producer-side gap; see the
+// package doc on backend_claude.go for the escalation.
 func waitClaudeShutdown(stream <-chan claude.Event) {
 	timer := time.NewTimer(claudeShutdownGrace)
 	defer timer.Stop()

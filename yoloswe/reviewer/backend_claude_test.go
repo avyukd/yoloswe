@@ -555,6 +555,12 @@ func TestClaudeBackend_SuccessLetsCLIStopGracefully(t *testing.T) {
 	ch <- claude.TurnCompleteEvent{Success: true}
 	// Deliberately NOT closed: the CLI has not finished shutting down.
 
+	// Shrink the grace period: this test only needs to observe that the wait
+	// happens, and a real 2s would be dead time in every unit run.
+	restore := claudeShutdownGrace
+	claudeShutdownGrace = 50 * time.Millisecond
+	t.Cleanup(func() { claudeShutdownGrace = restore })
+
 	// Cancellation is expected eventually — the deferred cancel must still run
 	// so the context isn't leaked. What matters is *when*: measure the delay
 	// between launching the CLI and killing it. Checking ctx.Err() after
