@@ -2578,6 +2578,39 @@ class TestPRSummaryReachesStateViaCLI(unittest.TestCase):
         self.assertEqual(state.get("base_branch"), "release/v2",
                          "the remit's base is fixed at round 1 like pr_summary")
 
+    def test_frozen_base_branch_drives_the_file_set_range(self):
+        """The consumer hop for base_branch, not just the write.
+
+        Persistence coverage alone leaves the same hole `--pr-summary` had:
+        severing `base_branch` from round_bundle -> goal_for_round ->
+        action_history_goal -> _files_changed_in_pr keeps every test green
+        while "Files in this PR" silently re-anchors to the repo default.
+        Assert on the git range actually executed.
+        """
+        pr_ops.main(["state-append-round", "branch:x", "1", "aaa",
+                     "--no-verify-head", "--pr-summary", "SUMMARY",
+                     "--base-branch", "release/v2"])
+        pr_ops.main(["state-finalize-round", "branch:x", "1", "aaa",
+                     self._actions_file()])
+
+        seen: list[list[str]] = []
+        real_run = _common.run
+
+        def spy(cmd, *a, **kw):
+            if cmd[:3] == ["git", "diff", "--name-only"]:
+                seen.append(cmd)
+            return real_run(cmd, *a, **kw)
+
+        with patch.object(_common, "run", spy):
+            pr_ops.round_bundle("branch:x", 2)
+
+        ranges = [c[3] for c in seen if len(c) > 3]
+        self.assertTrue(
+            any(r.startswith("origin/release/v2...") for r in ranges),
+            "the file-set range must use the FROZEN base (origin/release/v2...), "
+            f"not the repo default; ranges executed: {ranges}",
+        )
+
     def _actions_file(self):
         p = Path(self.tmp.name) / "actions.json"
         p.write_text(json.dumps([]))
