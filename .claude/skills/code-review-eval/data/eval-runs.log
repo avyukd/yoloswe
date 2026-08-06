@@ -1087,3 +1087,88 @@ Notes:
 - Cross-backend complementarity is unusually clean here: each non-gemini backend caught one critical bug the other missed in turn 1. Running cursor + codex in parallel (the production /pr-polish setup) catches both highs in round 1, which is the relevant practical signal.
 - Codex turn 3 = turn 2 cache pattern is now consistent across four consecutive evals.
 - Gemini's "fast verdict from summary" on resume is now consistent across four consecutive evals; combined with the turn-1 0-issue verdict on a diff with two confirmed bugs, gemini-3.1-flash-lite-preview remains not viable as a sole reviewer.
+
+## 2026-08-06 — feature/new-models (PR #307: add Claude backend to bramble code-review)
+
+Diff: 15 files, +1578/-52
+
+NOTE: 3-backend run + a within-backend model control. `gemini` CLI is not
+installed on this host (`command -v gemini` empty), so no gemini row — consensus
+counts here are NOT comparable to four-way rows. `claude-sonnet` was added as a
+control for the claude-opus config: same backend, same wiring, same tree, same
+prompt, different model tier. Cursor ran composer-2.5 (the current
+DefaultCursorModel), not the composer-2 named in the SKILL.md config table.
+
+| Config | Turn | Resume | Findings | FPs | Verdict | Confidence | Time | Tokens (in/out) |
+|--------|------|--------|----------|-----|---------|------------|------|-----------------|
+| cursor-composer2.5 | 1 | — | 0 | 0 | accepted | — | 86s | — |
+| cursor-composer2.5 | 2 | ok | 0 | 0 | accepted | — | 74s | — |
+| cursor-composer2.5 | 3 | ok | 1 | 0 | rejected | 0.88 | 47s | — |
+| codex-5.4-mini | 1 | — | 0 | 0 | accepted | — | 333s | 0/0 |
+| codex-5.4-mini | 2 | ok | 0 | 0 | accepted | — | 263s | 0/0 |
+| codex-5.4-mini | 3 | ok | 0 | 0 | accepted | — | 212s | 0/0 |
+| claude-sonnet | 1 | — | 0 | 0 | accepted | — | 158s | 2740550/11129 |
+| claude-sonnet | 2 | ok | 1 | 0 | accepted | 0.6 | 131s | 1197574/10155 |
+| claude-opus | 1 | — | 2 | 0 | rejected | — | 523s | 3212536/27498 |
+| claude-opus | 2 | ok | 2 | 0 | rejected | — | 131s | 1063991/9637 |
+| claude-opus | 3 | ok | 2 | 0 | rejected | — | 95s | 659009/5420 |
+
+Resume health: every turn on every backend reported `ok`. No fallback, no
+unverified, no missing envelopes. First eval in which the claude backend's
+resume path was exercised (it is new in this PR) — 5/5 resumed turns clean.
+
+Consensus (all 4, turn 1): none
+Majority (3 of 4, turn 1): none
+Split (2 of 4, turn 1): none
+Unique to claude-opus (turn 1): (A) harvest_lib.BACKENDS still lists the
+  pre-claude roster, so /pr-polish --claude rounds are silently dropped from
+  the code-review-replay ground-truth dataset; (B) claudeReadOnlyDisallowedTools
+  {Write,Edit,NotebookEdit} disagrees with isMutatingTool
+  {Edit,Write,MultiEdit,Bash,NotebookEdit} on MultiEdit.
+Unique to cursor-composer2.5 (turn 3 only): (C) baseSessionOptions never calls
+  claude.WithDisablePlugins() while the package doc claims reviews inherit
+  neither settings nor plugins; --setting-sources "" and --plugin-dir are
+  separate mechanisms (process.go:73 vs :137) and five other automation callers
+  in the repo pass WithDisablePlugins().
+Unique to claude-sonnet (turn 2 only): (D) the read-only composition is verified
+  only by a manual run, not by a test. Real coverage gap but already triaged in
+  this PR's pr-polish round 1 (behaviour verified live and documented); counted
+  as a repeat, not a new find.
+Disagreements: none — no finding was raised by two configs, so there was nothing
+  to disagree about.
+
+Follow-up deltas:
+- cursor-composer2.5: turn 2 +0/-0. Turn 3 (fresh prompt on a resumed session)
+  +1 new, and it was a REAL defect the other three backends missed across all
+  their turns. This is the first eval where the turn-3 shape — documented as
+  "valid CLI shape with no current production caller; eval-only" — produced the
+  only finding a config contributed. Argues for giving --resume-prompt-style
+  fresh a production caller, or at least a round in /pr-polish.
+- codex-5.4-mini: 0 findings across all three turns; turn 2 and turn 3 identical
+  to turn 1 (accepted, empty). Consistent with the "turn 3 = turn 2 cache
+  pattern" noted in prior evals.
+- claude-sonnet: turn 2 +1 (the coverage observation above). Same backend as
+  claude-opus but found none of opus's two findings.
+- claude-opus: byte-stable across all three turns — same two invariants, same
+  severities, no drift and no invented extras. Turn 2's sufficiency block
+  correctly reasoned "no commits landed and the tree is clean since the prior
+  turn, so no fix could be present" and reported re-checking previously cleared
+  areas. Cost fell sharply on resume (3.2M -> 1.06M -> 0.66M input tokens) as
+  context came from cache.
+
+Notes:
+- ZERO consensus this run. All four real findings were single-source. The
+  ">=2 sources = consensus" heuristic would have surfaced nothing at all on this
+  diff — the strongest evidence yet that single-source findings from a capable
+  model must not be treated as noise.
+- Model tier, not backend wiring, produced the findings: claude-sonnet and
+  claude-opus share the same backend code, options, prompt and tree, and went
+  0 vs 2. This is the controlled experiment the config table's "not
+  cost-comparable" caveat asks for.
+- claude-opus cost ~6x cursor's wall clock on turn 1 (523s vs 86s) and 3.2M
+  input tokens, and was the only config to find anything on the canonical turn.
+- Token reporting has INVERTED vs the SKILL.md claim that "only codex reports
+  these reliably": codex reported 0/0 on all three turns while both claude
+  configs reported real cache-inclusive counts. That line in Step 3 is stale.
+- Complementarity again: opus found A+B, cursor found C, and neither found the
+  other's. No single config was sufficient.

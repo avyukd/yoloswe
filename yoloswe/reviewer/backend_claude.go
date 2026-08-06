@@ -42,10 +42,23 @@ import (
 //
 // # Settings isolation
 //
-// The wrapper defaults SDK sessions to --setting-sources "" (see
-// claude.WithKeepUserSettings), so a review does not inherit the operator's
-// user/project settings or plugins. That is what we want: two runs of the same
-// review on two machines should see the same tool surface.
+// Two runs of the same review on two machines should see the same tool
+// surface, which takes BOTH of the wrapper's isolation switches — they are
+// independent, and defaulted differently:
+//
+//   - Settings sources: the wrapper always passes --setting-sources ""
+//     (process.go), so user/project settings are excluded by default.
+//   - Plugins: only excluded when WithDisablePlugins is passed, which emits
+//     --plugin-dir /dev/null. It is NOT part of the default.
+//
+// So the plugin half must be requested explicitly, which baseSessionOptions
+// does. Every other automation caller of this wrapper in the repo does the
+// same (bramble/session/delegator_runner.go,
+// bramble/sessionanalysis/summarize.go, multiagent/agent/session.go,
+// multiagent/subagent/streaming.go); a reviewer whose available tools depend
+// on which plugins the operator happens to have installed would undermine
+// both this backend's reproducibility and the cross-backend eval comparison
+// that reads its output.
 //
 // # Known gap, deliberately not fixed here: SIGKILL is the wrapper's only stop
 //
@@ -244,11 +257,29 @@ func (t *claudeStderrTail) String() string {
 }
 
 // claudeReadOnlyDisallowedTools names the tools withheld when Config.ReadOnly
-// is set. This is the file-mutation surface of the default tool set; Bash is
-// deliberately not in the list because a reviewer needs it to inspect the diff
-// (git log/diff/show), which is the same trade-off the Codex backend makes with
-// its approval handler.
-var claudeReadOnlyDisallowedTools = []string{"Write", "Edit", "NotebookEdit"}
+// is set. This is the file-mutation surface of the default tool set.
+//
+// MultiEdit is included even though it was not observed in CLI 2.1.223 and
+// appears nowhere else in this repo except isMutatingTool
+// (bramble/session/event_handler.go), which does list it. Unknown names passed
+// to --disallowed-tools are inert — process.go appends them verbatim — so
+// naming it costs nothing if the tool is gone and closes a silent
+// write-permission hole if it is not. isMutatingTool is deliberately left
+// alone: dropping its entry would be a guess in the more dangerous direction
+// (it would stop annotating a real mutation) on the same missing evidence.
+//
+// Bash is deliberately NOT withheld: a reviewer needs git log/diff/show. That
+// is the same trade-off the Codex backend makes with its approval handler, and
+// it is why ReadOnly is a tool restriction rather than a filesystem guarantee
+// (see the package doc).
+//
+// Task is deliberately NOT withheld. It looks like a way around the denylist —
+// spawn a subagent, have it write — but verified live 2026-08-06: a
+// general-purpose subagent launched under these flags received
+// {Agent, Bash, Read, ReportFindings, Skill, ToolSearch} and reported Write
+// unavailable even via deferred-tool lookup. The parent's denylist propagates,
+// so withholding Task would only cost the reviewer a research tool.
+var claudeReadOnlyDisallowedTools = []string{"Write", "Edit", "MultiEdit", "NotebookEdit"}
 
 // claudeAlwaysDisallowedTools names tools withheld from every claude review,
 // read-only or not.
@@ -273,9 +304,16 @@ func (b *claudeBackend) baseSessionOptions() []claude.SessionOption {
 	if effort, ok := claudeEffortLevel(b.config.Effort); ok {
 		opts = append(opts, claude.WithEffort(effort))
 	}
-	// Bypass keeps automation from stalling on an approval prompt; ReadOnly is
-	// enforced by withholding the write tools rather than by denying approvals.
-	opts = append(opts, claude.WithPermissionMode(claude.PermissionModeBypass))
+	opts = append(opts,
+		// Bypass keeps automation from stalling on an approval prompt; ReadOnly
+		// is enforced by withholding the write tools, not by denying approvals.
+		claude.WithPermissionMode(claude.PermissionModeBypass),
+		// Plugins are NOT excluded by the wrapper's defaults — only
+		// --setting-sources "" is. Without this the reviewer's tool surface
+		// varies with whatever plugins the operator has installed. See the
+		// settings isolation note in the package doc above.
+		claude.WithDisablePlugins(),
+	)
 	disallowed := append([]string{}, claudeAlwaysDisallowedTools...)
 	if b.config.ReadOnly {
 		disallowed = append(disallowed, claudeReadOnlyDisallowedTools...)

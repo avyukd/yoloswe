@@ -97,6 +97,50 @@ func TestClaudeBaseSessionOptions_AlwaysWithholdsReportFindings(t *testing.T) {
 	}
 }
 
+// TestClaudeBaseSessionOptions_DisablesPlugins pins reproducibility. The
+// wrapper's defaults exclude user/project *settings* (--setting-sources "")
+// but NOT plugins — that needs WithDisablePlugins, which emits
+// --plugin-dir /dev/null. Without it the reviewer's tool surface depends on
+// whichever plugins the operator has installed, so the same review on two
+// machines can see different tools and the cross-backend eval that reads this
+// backend's output stops being a like-for-like comparison.
+func TestClaudeBaseSessionOptions_DisablesPlugins(t *testing.T) {
+	t.Parallel()
+	b := newClaudeBackend(Config{BackendType: BackendClaude, ReadOnly: true})
+	args := claudeArgs(t, b.baseSessionOptions()...)
+	if !hasFlagValue(args, "--plugin-dir", "/dev/null") {
+		t.Errorf("expected --plugin-dir /dev/null (plugins are not excluded by default); args: %v", args)
+	}
+	// The settings half is the wrapper's default; assert both so a change to
+	// either mechanism surfaces here rather than silently halving isolation.
+	if !hasFlagValue(args, "--setting-sources", "") {
+		t.Errorf("expected --setting-sources \"\"; args: %v", args)
+	}
+}
+
+// TestClaudeReadOnly_CoversKnownMutatingTools ties the denylist to the repo's
+// other enumeration of Claude's mutating surface (isMutatingTool in
+// bramble/session/event_handler.go). The two previously disagreed on
+// MultiEdit, which meant a "read-only" review might still have had a write
+// path. Bash is the one intentional difference — the reviewer needs it.
+func TestClaudeReadOnly_CoversKnownMutatingTools(t *testing.T) {
+	t.Parallel()
+	// Mirrors isMutatingTool minus Bash; keep in step with that switch.
+	knownMutating := []string{"Edit", "Write", "MultiEdit", "NotebookEdit"}
+	got := make(map[string]bool, len(claudeReadOnlyDisallowedTools))
+	for _, tool := range claudeReadOnlyDisallowedTools {
+		got[tool] = true
+	}
+	for _, tool := range knownMutating {
+		if !got[tool] {
+			t.Errorf("read-only denylist is missing known mutating tool %q", tool)
+		}
+	}
+	if got["Bash"] {
+		t.Error("Bash must stay available: the reviewer needs git log/diff/show")
+	}
+}
+
 // TestClaudeBaseSessionOptions_PermissionModeBypass guards the automation
 // contract: any mode that can raise an approval prompt hangs a non-interactive
 // review until the idle timeout kills it.
