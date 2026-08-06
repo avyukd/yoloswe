@@ -737,6 +737,8 @@ def state_append_round(
     verify_head: bool = True,
     noise_filtered: int = 0,
     noise_samples: list[dict[str, Any]] | None = None,
+    pr_summary: str | None = None,
+    base_branch: str | None = None,
 ) -> dict[str, Any]:
     """Start a new round or refresh head_before on an in-progress round.
 
@@ -745,6 +747,21 @@ def state_append_round(
     ``head_before`` against ``git rev-parse HEAD``. A mismatch means the
     orchestrator computed the SHA in one message and a commit landed before
     this call — refuse rather than corrupt the round's lineage.
+
+    ``pr_summary`` is the PR's own statement of intent (commit list +
+    diffstat against the base). It is written ONCE, on the first round that
+    supplies it, and never overwritten: it is the frozen definition of what
+    this PR is for. Every later round reads it back from state, because the
+    orchestrator computes it in a shell variable at Step 1 that no longer
+    exists by round 2 — which is why the goal silently lost the PR's purpose
+    after round 1.
+
+    ``base_branch`` is the PR's base ref (``identify``'s ``base``, i.e. GitHub's
+    baseRefName). Frozen the same way, and read back by ``round_bundle`` so the
+    "Files in this PR" range is anchored to the PR's real ancestor instead of
+    the repo default. The two must agree: PR_SUMMARY's diffstat and the goal's
+    file list describing different merge bases is the same class of bug as the
+    two-dot range this change replaced.
 
     ``noise_filtered`` / ``noise_samples`` record bot process-noise that
     ``fetch-comments`` dropped at intake (linear linkbacks, claude-bot
@@ -766,6 +783,13 @@ def state_append_round(
     pr_number, branch = _resolve_ctx(ctx)
     _, path = state_paths(pr_number, branch=branch)
     state = read_json(path, default=None)
+    # Decide the series boundary HERE, while `completed` is still readable.
+    # This function is about to clear that flag (below), which destroys the
+    # only evidence that a new loop started — so every later consumer in this
+    # round would see a restarted series as a continuation and drag the prior
+    # series' goal and bramble sessions into a review of different code. The
+    # decision is persisted on the round entry so it survives the clear.
+    is_new_series = _is_first_round_of_series(state, n)
     if state is None:
         state = {
             "pr_number": pr_number,
@@ -795,10 +819,16 @@ def state_append_round(
                 "comment_actions": [],
                 "noise_filtered": noise_filtered,
                 "noise_samples": samples,
+                "is_new_series": is_new_series,
             }
         )
     else:
         existing["head_before"] = head_before
+        # Sticky: the first append of this round made the call while
+        # `completed` was still readable. A resumed round re-appends after
+        # the flag was already cleared, so re-deriving now would always say
+        # "continuation" and silently downgrade a genuine series boundary.
+        existing.setdefault("is_new_series", is_new_series)
         # Preserve the max noise count across resumes — re-fetching may
         # re-count zero if bot posts have been resolved in the meantime.
         existing["noise_filtered"] = max(existing.get("noise_filtered", 0) or 0, noise_filtered)
@@ -807,6 +837,21 @@ def state_append_round(
             existing.setdefault("noise_samples", samples)
             if not existing["noise_samples"]:
                 existing["noise_samples"] = samples
+    # Frozen, not refreshed. A PR's remit is fixed when the loop first sees
+    # it; re-deriving it each round would let a ratcheting PR keep
+    # re-authorizing its own growth, which is the drift the scope contract
+    # exists to prevent.
+    if pr_summary and not state.get("pr_summary"):
+        state["pr_summary"] = pr_summary
+    # The PR's own base branch, frozen alongside pr_summary and for the same
+    # reason: the file-set range must be measured against the SAME ancestor
+    # the PR_SUMMARY diffstat was built from. Without it the goal falls back
+    # to the repo default (origin/HEAD), so a PR stacked on a non-default
+    # branch gets its "Files in this PR" line measured against main while its
+    # summary describes the stacked diff — reintroducing the out-of-scope
+    # files this whole change exists to remove.
+    if base_branch and not state.get("base_branch"):
+        state["base_branch"] = base_branch
     state["current_round"] = n
     state["last_commit_at_round_start"] = head_before
     # When the orchestrator re-invokes pr-polish on a state file that
@@ -1522,24 +1567,44 @@ def round_bundle(ctx: int | str, n: int) -> dict[str, Any]:
     state_dir, state_file = state_paths(pr_number, branch=branch)
     log_dir = state_dir / f"r{n}" / f"a{_next_attempt(state_dir, n)}"
     state = read_json(state_file, default=None)
+    # Prefer the boundary decision state_append_round recorded on this round.
+    # Re-deriving it here would read a state whose `completed` flag that same
+    # append already cleared, so every restarted series would look like a
+    # continuation — inheriting the prior series' goal and bramble sessions.
+    # Fall back to deriving only when the round predates the recorded field
+    # (older state files) or hasn't been appended yet.
     is_new_series = 1 if _is_first_round_of_series(state, n) else 0
+    if state is not None:
+        recorded = next(
+            (
+                r.get("is_new_series")
+                for r in (state.get("rounds") or [])
+                if r.get("n") == n and r.get("is_new_series") is not None
+            ),
+            None,
+        )
+        if recorded is not None:
+            is_new_series = 1 if recorded else 0
 
     head_res = run(["git", "rev-parse", "HEAD"], check=False)
     head_before = head_res.stdout.strip() if head_res.returncode == 0 else ""
 
-    # PR_SUMMARY: leave empty here — building it requires a base-branch
-    # diff that the orchestrator already computes once at Step 1. The
-    # agent threads it into goal_for_round via a separate arg. Keep this
-    # helper bramble-agnostic at the PR_SUMMARY boundary.
+    # PR_SUMMARY comes from state, where round 1 froze it. It used to be
+    # passed as "" here on the theory that the orchestrator threaded it in
+    # separately — but the SKILL only sets GOAL=$PR_SUMMARY when ROUND=1, so
+    # from round 2 on the goal carried no statement of what the PR was for.
+    # A round-16 reviewer saw action history and a diff, with the PR's own
+    # purpose absent entirely.
     goal_text = ""
     if state is not None:
         try:
             goal_text = bramble_ops.goal_for_round(
                 n,
-                pr_summary="",
+                pr_summary=state.get("pr_summary") or "",
                 state=state,
                 head_before=head_before or None,
                 is_new_series=bool(is_new_series),
+                base_branch=state.get("base_branch") or None,
             )
         except Exception as e:  # noqa: BLE001 — diagnostic, not fatal
             goal_text = f"# goal_for_round failed: {e}"
@@ -1825,6 +1890,27 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to JSON file with noise_samples array (capped; debug only)",
     )
+    sp.add_argument(
+        "--pr-summary",
+        default=None,
+        help=(
+            "The PR's own statement of intent (commit list + diffstat). Written "
+            "ONCE and never overwritten — it is the frozen definition of what "
+            "this PR is for, which every later round reads back from state. "
+            "Without it the goal loses the PR's purpose after round 1."
+        ),
+    )
+    sp.add_argument(
+        "--base-branch",
+        default=None,
+        help=(
+            "The PR's base ref (identify's 'base'). Frozen once, like "
+            "--pr-summary, and used to anchor the 'Files in this PR' range to "
+            "the same merge base the PR summary was built against. Omit it and "
+            "a PR stacked on a non-default branch is measured against the repo "
+            "default instead."
+        ),
+    )
 
     sp = sub.add_parser("state-finalize-round")
     sp.add_argument("ctx", help="PR number or 'branch:<name>'")
@@ -1957,6 +2043,8 @@ def main(argv: list[str] | None = None) -> int:
                     args.head_before,
                     verify_head=args.verify_head,
                     noise_filtered=args.noise_filtered,
+                    pr_summary=args.pr_summary,
+                    base_branch=args.base_branch,
                     noise_samples=samples,
                 )
             )

@@ -2236,6 +2236,47 @@ class TestRoundBundle(unittest.TestCase):
         self.assertIn("Round 2", out["goal_text"])
         self.assertIn("a.go:5", out["goal_text"])
 
+    def test_restarted_series_gets_fresh_goal_and_resume_ids(self) -> None:
+        # A converged loop that is re-invoked starts a NEW series, and a new
+        # series must not inherit the prior one's goal or bramble sessions.
+        # The boundary signal is only readable BEFORE state_append_round
+        # clears `completed`, so round_bundle cannot re-derive it from the
+        # post-append state — by then every new series looks like a
+        # continuation. Symptom in production: round N's goal opens with
+        # "Files changed since round N-1" computed across the prior series'
+        # head, dragging unrelated files into the review scope.
+        pr_ops.state_append_round(99, 1, "sha1", verify_head=False,
+                                  pr_summary="PR #99: the frozen purpose")
+        pr_ops.state_finalize_round(
+            99, 1, "sha1f",
+            [{"comment_id": 1, "action": "fixed", "severity": "high",
+              "path": "a.go", "line": 5, "source": "codex", "topic": "bug"}],
+            auto_reply=False,
+        )
+        # Seed the prior series' bramble session so a leaked resume is visible.
+        _, state_file = pr_ops.state_paths(99)
+        seeded = _common.read_json(state_file, default={})
+        seeded["rounds"][0]["session_ids"] = {"codex": "prior-series-session"}
+        _common.atomic_write_json(state_file, seeded)
+        pr_ops.state_mark_complete(99, "converged")
+
+        # New loop, new series: round 2 is the first round after completion.
+        pr_ops.state_append_round(99, 2, "sha1f", verify_head=False)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["git", "rev-parse"]:
+                return _common.RunResult(stdout="sha1f\n", stderr="", returncode=0)
+            return _common.RunResult(stdout="", stderr="", returncode=1)
+        with patch.object(pr_ops, "run", side_effect=fake_run):
+            out = pr_ops.round_bundle(99, 2)
+
+        # Fresh session, not the prior series' conversation.
+        self.assertEqual(out["resume_ids"].get("codex", ""), "")
+        # The goal is the PR's frozen purpose, not an inter-round delta
+        # measured against the prior series' head.
+        self.assertIn("the frozen purpose", out["goal_text"])
+        self.assertNotIn("Files changed since round 1", out["goal_text"])
+
 
 class TestFinalizeAndReport(unittest.TestCase):
     """finalize-and-report wraps state_finalize_round and emits the
@@ -2488,6 +2529,133 @@ class TestFinalizeAndReport(unittest.TestCase):
         self.assertIn("top=medium", out["round_summary"])
         self.assertIn("fixed 1", out["round_summary"])
         self.assertEqual(out["next_round_n"], 2)
+
+
+
+class TestPRSummaryReachesStateViaCLI(unittest.TestCase):
+    """The frozen PR_SUMMARY must survive the CLI, not just the Python call.
+
+    SKILL.md drives state-append-round as a subprocess, so a parameter that
+    exists on the function but has no argparse flag is dead code in production.
+    That is exactly what shipped: `state_append_round(pr_summary=...)` froze the
+    value, `round_bundle` read it back, and 407 unit tests passed — while the
+    CLI never declared `--pr-summary` and never passed it, so `state` never held
+    one and the goal was as purposeless as before the fix.
+
+    Tests the boundary the orchestrator actually crosses.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        os.environ["HOME"] = self.tmp.name
+
+    def test_cli_flag_persists_pr_summary(self):
+        rc = pr_ops.main([
+            "state-append-round", "branch:x", "1", "deadbeef",
+            "--no-verify-head", "--pr-summary", "PR GOAL TEXT",
+        ])
+        self.assertEqual(rc, 0)
+        _, path = pr_ops.state_paths(None, branch="x")
+        state = json.loads(Path(path).read_text())
+        self.assertEqual(state.get("pr_summary"), "PR GOAL TEXT",
+                         "the CLI must persist it, or round_bundle reads '' forever")
+
+    def test_frozen_not_overwritten_by_later_rounds(self):
+        pr_ops.main(["state-append-round", "branch:x", "1", "aaa",
+                     "--no-verify-head", "--pr-summary", "ORIGINAL"])
+        pr_ops.main(["state-append-round", "branch:x", "2", "bbb",
+                     "--no-verify-head", "--pr-summary", "DRIFTED"])
+        _, path = pr_ops.state_paths(None, branch="x")
+        state = json.loads(Path(path).read_text())
+        self.assertEqual(state.get("pr_summary"), "ORIGINAL",
+                         "frozen means round 1 wins; re-deriving would let a "
+                         "ratcheting PR re-authorize its own growth")
+
+    def test_frozen_summary_reaches_round_bundle_goal_text(self):
+        """The consumer hop, not just the write.
+
+        Persistence tests pass even if `round_bundle` goes back to passing
+        `pr_summary=""` — that is precisely the regression this PR fixes, and
+        it lived through 407 green tests. Assert on the value the orchestrator
+        actually hands bramble: `round_bundle(...)["goal_text"]`.
+        """
+        pr_ops.main(["state-append-round", "branch:x", "1", "aaa",
+                     "--no-verify-head", "--pr-summary", "FROZEN-PURPOSE"])
+        pr_ops.main(["state-finalize-round", "branch:x", "1", "aaa",
+                     self._actions_file()])
+        out = pr_ops.round_bundle("branch:x", 2)
+        self.assertTrue(
+            out["goal_text"].startswith("FROZEN-PURPOSE"),
+            "round 2's goal must LEAD with the frozen summary; got: "
+            f"{out['goal_text'][:120]!r}",
+        )
+
+    def test_cli_flag_persists_base_branch(self):
+        """The file-set anchor must be the PR's base, not the repo default.
+
+        Without this the 'Files in this PR' range falls back to origin/HEAD,
+        so a PR stacked on a non-default branch is measured against a
+        different ancestor than its own PR_SUMMARY diffstat.
+        """
+        rc = pr_ops.main([
+            "state-append-round", "branch:x", "1", "deadbeef",
+            "--no-verify-head", "--base-branch", "release/v2",
+        ])
+        self.assertEqual(rc, 0)
+        _, path = pr_ops.state_paths(None, branch="x")
+        state = json.loads(Path(path).read_text())
+        self.assertEqual(state.get("base_branch"), "release/v2",
+                         "the CLI must persist the base, or the file-set range "
+                         "silently re-anchors to the repo default")
+
+    def test_base_branch_frozen_not_overwritten(self):
+        pr_ops.main(["state-append-round", "branch:x", "1", "aaa",
+                     "--no-verify-head", "--base-branch", "release/v2"])
+        pr_ops.main(["state-append-round", "branch:x", "2", "bbb",
+                     "--no-verify-head", "--base-branch", "main"])
+        _, path = pr_ops.state_paths(None, branch="x")
+        state = json.loads(Path(path).read_text())
+        self.assertEqual(state.get("base_branch"), "release/v2",
+                         "the remit's base is fixed at round 1 like pr_summary")
+
+    def test_frozen_base_branch_drives_the_file_set_range(self):
+        """The consumer hop for base_branch, not just the write.
+
+        Persistence coverage alone leaves the same hole `--pr-summary` had:
+        severing `base_branch` from round_bundle -> goal_for_round ->
+        action_history_goal -> _files_changed_in_pr keeps every test green
+        while "Files in this PR" silently re-anchors to the repo default.
+        Assert on the git range actually executed.
+        """
+        pr_ops.main(["state-append-round", "branch:x", "1", "aaa",
+                     "--no-verify-head", "--pr-summary", "SUMMARY",
+                     "--base-branch", "release/v2"])
+        pr_ops.main(["state-finalize-round", "branch:x", "1", "aaa",
+                     self._actions_file()])
+
+        seen: list[list[str]] = []
+        real_run = _common.run
+
+        def spy(cmd, *a, **kw):
+            if cmd[:3] == ["git", "diff", "--name-only"]:
+                seen.append(cmd)
+            return real_run(cmd, *a, **kw)
+
+        with patch.object(_common, "run", spy):
+            pr_ops.round_bundle("branch:x", 2)
+
+        ranges = [c[3] for c in seen if len(c) > 3]
+        self.assertTrue(
+            any(r.startswith("origin/release/v2...") for r in ranges),
+            "the file-set range must use the FROZEN base (origin/release/v2...), "
+            f"not the repo default; ranges executed: {ranges}",
+        )
+
+    def _actions_file(self):
+        p = Path(self.tmp.name) / "actions.json"
+        p.write_text(json.dumps([]))
+        return str(p)
 
 
 if __name__ == "__main__":

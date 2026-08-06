@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -55,7 +56,10 @@ class TestGoalForRound(unittest.TestCase):
         goal = bramble_ops.goal_for_round(2, "PR_SUMMARY", state)
         self.assertIn("Round 2", goal)
         self.assertIn("a.go:5", goal)
-        self.assertNotIn("PR_SUMMARY", goal)
+        # PR_SUMMARY now LEADS every round. The old contract asserted it was
+        # absent from round 2+, which is precisely the defect: a reviewer with
+        # no statement of the PR's purpose cannot judge a finding out of scope.
+        self.assertTrue(goal.startswith("PR_SUMMARY"), goal)
 
     def test_round_two_with_empty_state_falls_back(self) -> None:
         # Round 1 produced no actions; reanchor on PR_SUMMARY rather than send empty.
@@ -390,7 +394,7 @@ class TestActionHistoryGoal(unittest.TestCase):
         with patch("_common.run") as run_mock:
             run_mock.return_value = type("R", (), {"returncode": 0, "stdout": "a.go\nb.py\n"})()
             out = bramble_ops.action_history_goal(state, 2, head_before="sha-cur")
-        self.assertIn("Files changed since round 1: a.go, b.py.", out)
+        self.assertIn("Files in this PR: a.go, b.py.", out)
 
     def test_omits_files_changed_line_when_diff_empty(self) -> None:
         from unittest.mock import patch  # noqa: PLC0415
@@ -425,7 +429,7 @@ class TestActionHistoryGoal(unittest.TestCase):
             )()
             out = bramble_ops.action_history_goal(state, 2, head_before="sha-cur")
         self.assertIn("Round 2.", out)
-        self.assertIn("Files changed since round 1: a.go, b.py.", out)
+        self.assertIn("Files in this PR: a.go, b.py.", out)
         self.assertNotIn("Prior round fixed", out)
         self.assertNotIn("Skipped", out)
 
@@ -1728,6 +1732,117 @@ class TestGoalCLI(unittest.TestCase):
         self.assertIn("Round 2", out)
         self.assertIn("a.go:5", out)
 
+    def _goal_cli_ranges(self, *argv) -> list[str]:
+        """Run the goal CLI and return every `git diff --name-only` range it executed.
+
+        Asserting on the range actually handed to git is the only way to catch a
+        base that is silently dropped between the CLI and _files_changed_in_pr:
+        the goal text still renders a plausible "Files in this PR" line when the
+        base is wrong, so output-shape assertions pass either way.
+        """
+        seen: list[list[str]] = []
+        real_run = _common.run
+
+        def spy(cmd, *a, **kw):
+            if cmd[:3] == ["git", "diff", "--name-only"]:
+                seen.append(cmd)
+            return real_run(cmd, *a, **kw)
+
+        with patch.object(_common, "run", spy):
+            self._run(*argv)
+        return [c[3] for c in seen if len(c) > 3]
+
+    def test_goal_cli_uses_base_branch_frozen_in_state(self) -> None:
+        """The consumer hop the round_bundle path already pins, on its sibling.
+
+        `round_bundle` threads state['base_branch'] into goal_for_round, but the
+        standalone `goal` CLI is a second entry point to the same goal text. When
+        it drops the frozen base, the file list falls back to the repo default —
+        the same "wrong ancestor" defect this PR exists to fix, one call site over.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            sf = Path(d) / "state.json"
+            sf.write_text(json.dumps({
+                "base_branch": "release/v2",
+                "rounds": [{
+                    "n": 1,
+                    "comment_actions": [
+                        {"action": "fixed", "path": "a.go", "line": 5, "source": "codex"},
+                    ],
+                }],
+            }))
+            ranges = self._goal_cli_ranges(
+                "goal", "2", "--pr-summary", "PR_SUM", "--state-file", str(sf),
+                "--head-before", "HEAD",
+            )
+        self.assertTrue(
+            any(r.startswith("origin/release/v2...") for r in ranges),
+            "the goal CLI must measure the file set against the FROZEN base "
+            f"(origin/release/v2...), not the repo default; ranges: {ranges}",
+        )
+
+    def test_goal_cli_base_branch_flag_overrides_state(self) -> None:
+        """--base-branch wins over state, and is dispatched rather than merely declared.
+
+        A flag that parses but never reaches goal_for_round is exactly how
+        --pr-summary shipped dead; assert on the executed git range so a
+        declared-but-undispatched flag fails here.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            sf = Path(d) / "state.json"
+            sf.write_text(json.dumps({
+                "base_branch": "release/v2",
+                "rounds": [{
+                    "n": 1,
+                    "comment_actions": [
+                        {"action": "fixed", "path": "a.go", "line": 5, "source": "codex"},
+                    ],
+                }],
+            }))
+            ranges = self._goal_cli_ranges(
+                "goal", "2", "--pr-summary", "PR_SUM", "--state-file", str(sf),
+                "--base-branch", "release/v9", "--head-before", "HEAD",
+            )
+        self.assertTrue(
+            any(r.startswith("origin/release/v9...") for r in ranges),
+            f"--base-branch must override state['base_branch']; ranges: {ranges}",
+        )
+        self.assertFalse(
+            any(r.startswith("origin/release/v2...") for r in ranges),
+            f"the state base must not also be measured; ranges: {ranges}",
+        )
+
+    def test_goal_cli_range_control_discriminates(self) -> None:
+        """Control: the assertions above must be capable of failing.
+
+        With no base anywhere, the range must NOT be origin/release/v2 — proving
+        the two tests above track the base they were given rather than passing on
+        any range at all.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            sf = Path(d) / "state.json"
+            sf.write_text(json.dumps({
+                "rounds": [{
+                    "n": 1,
+                    "comment_actions": [
+                        {"action": "fixed", "path": "a.go", "line": 5, "source": "codex"},
+                    ],
+                }],
+            }))
+            ranges = self._goal_cli_ranges(
+                "goal", "2", "--pr-summary", "PR_SUM", "--state-file", str(sf),
+                "--head-before", "HEAD",
+            )
+        self.assertTrue(
+            ranges,
+            "the control must actually reach _files_changed_in_pr — an empty "
+            "range list would make the assertion below vacuous",
+        )
+        self.assertFalse(
+            any(r.startswith("origin/release/v2...") for r in ranges),
+            f"no base was frozen, so the frozen-base range must be absent; ranges: {ranges}",
+        )
+
     def test_is_new_series_flag_returns_pr_summary(self) -> None:
         """--is-new-series 1 must short-circuit to PR_SUMMARY even when the
         state file has a converged prior round whose head_after is set."""
@@ -1761,7 +1876,7 @@ class TestGoalCLI(unittest.TestCase):
     def test_head_before_flag_emits_files_changed_line(self) -> None:
         # SKILL passes --head-before "$(git rev-parse HEAD)"; the CLI must
         # accept it and thread it into action_history_goal so the model
-        # sees "Files changed since round N-1: ...".
+        # sees "Files in this PR: ..." — the PR's own file set, stable across rebases.
         from unittest.mock import patch  # noqa: PLC0415
 
         with tempfile.TemporaryDirectory() as d:
@@ -1789,7 +1904,7 @@ class TestGoalCLI(unittest.TestCase):
                     "--state-file", str(sf),
                     "--head-before", "sha-cur",
                 )
-        self.assertIn("Files changed since round 1: a.go, b.py.", out)
+        self.assertIn("Files in this PR: a.go, b.py.", out)
 
 
 class TestPriorSessionIDCLI(unittest.TestCase):
@@ -2535,92 +2650,6 @@ class TestRecoverEnvelope(unittest.TestCase):
             "verdict 'lgtm' not allowed"), "accepted")
 
 
-class TestRoundDiff(unittest.TestCase):
-    """`round_diff` shells out to ``git diff prior_head_after..head_before``
-    and truncates. Test with a real tmp git repo so the helper exercises
-    the same plumbing the orchestrator runs through.
-    """
-
-    def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
-        self._git("init", "-q")
-        self._git("config", "user.email", "t@t")
-        self._git("config", "user.name", "t")
-        self._git("config", "commit.gpgsign", "false")
-        # Run the helper as if the orchestrator launched it inside the
-        # tmp repo. ``_common.run`` honours `cwd`, so we just cd. Saves
-        # us monkey-patching subprocess plumbing per call.
-        self._old_cwd = os.getcwd()
-        os.chdir(self.root)
-        self.addCleanup(os.chdir, self._old_cwd)
-
-    def _git(self, *args: str) -> str:
-        import subprocess
-
-        res = subprocess.run(
-            ["git", *args], cwd=str(self.root),
-            capture_output=True, text=True, check=False,
-        )
-        if res.returncode != 0:
-            raise RuntimeError(f"git {args}: {res.stderr}")
-        return res.stdout
-
-    def _commit(self, name: str, body: str) -> str:
-        (self.root / name).write_text(body)
-        self._git("add", name)
-        self._git("commit", "-q", "-m", f"add {name}")
-        return self._git("rev-parse", "HEAD").strip()
-
-    def test_returns_diff_between_prior_head_after_and_head_before(self) -> None:
-        sha1 = self._commit("a.txt", "hello\n")
-        sha2 = self._commit("a.txt", "hello\nworld\n")
-        state = {"rounds": [{"n": 1, "head_before": "x", "head_after": sha1}]}
-        text = bramble_ops.round_diff(state, 2, head_before=sha2)
-        self.assertIn("+world", text)
-        self.assertIn("a.txt", text)
-
-    def test_empty_when_round_one(self) -> None:
-        self.assertEqual(bramble_ops.round_diff({}, 1, head_before="abc"), "")
-
-    def test_empty_when_no_prior_round(self) -> None:
-        self.assertEqual(bramble_ops.round_diff({"rounds": []}, 2, head_before="abc"), "")
-
-    def test_empty_when_prior_round_never_finalized(self) -> None:
-        state = {"rounds": [{"n": 1, "head_before": "x", "head_after": None}]}
-        self.assertEqual(bramble_ops.round_diff(state, 2, head_before="abc"), "")
-
-    def test_empty_when_head_before_missing(self) -> None:
-        state = {"rounds": [{"n": 1, "head_before": "x", "head_after": "y"}]}
-        self.assertEqual(bramble_ops.round_diff(state, 2, head_before=None), "")
-
-    def test_empty_when_shas_equal(self) -> None:
-        state = {"rounds": [{"n": 1, "head_before": "x", "head_after": "abc"}]}
-        self.assertEqual(bramble_ops.round_diff(state, 2, head_before="abc"), "")
-
-    def test_truncates_long_diffs_with_elision_footer(self) -> None:
-        sha1 = self._commit("a.txt", "x\n")
-        # 50 lines added to a.txt
-        big = "\n".join(f"line {i}" for i in range(50)) + "\n"
-        (self.root / "a.txt").write_text(big)
-        self._git("add", "a.txt")
-        self._git("commit", "-q", "-m", "big")
-        sha2 = self._git("rev-parse", "HEAD").strip()
-        state = {"rounds": [{"n": 1, "head_after": sha1}]}
-        text = bramble_ops.round_diff(state, 2, head_before=sha2, max_lines=10)
-        self.assertIn("...elided", text)
-        # Exactly 11 lines: 10 + footer
-        self.assertEqual(len(text.splitlines()), 11)
-
-    def test_unreachable_sha_returns_empty(self) -> None:
-        state = {
-            "rounds": [{"n": 1, "head_after": "0" * 40}],
-        }
-        text = bramble_ops.round_diff(state, 2, head_before="1" * 40)
-        self.assertEqual(text, "")
-
-
 class TestPriorRoundModifiedHunks(unittest.TestCase):
     """E1: spiral demote when cited line falls inside a hunk a prior round
     modified. Validates hunk-header parsing and the boundary semantics.
@@ -2887,7 +2916,7 @@ class TestGoalLowStreakSentence(unittest.TestCase):
     def test_streak_two_appends_sentence(self) -> None:
         state = self._state(2)
         out = bramble_ops.goal_for_round(
-            2, "PR_SUMMARY", state, head_before="b", include_round_diff=False
+            2, "PR_SUMMARY", state, head_before="b"
         )
         self.assertIn("last 2 rounds returned only low-severity findings", out)
         self.assertIn("returning zero findings is the right call", out)
@@ -2897,14 +2926,14 @@ class TestGoalLowStreakSentence(unittest.TestCase):
     def test_streak_one_no_sentence(self) -> None:
         state = self._state(1)
         out = bramble_ops.goal_for_round(
-            2, "PR_SUMMARY", state, head_before="b", include_round_diff=False
+            2, "PR_SUMMARY", state, head_before="b"
         )
         self.assertNotIn("low-severity findings", out)
 
     def test_streak_three_uses_actual_count(self) -> None:
         state = self._state(3)
         out = bramble_ops.goal_for_round(
-            2, "PR_SUMMARY", state, head_before="b", include_round_diff=False
+            2, "PR_SUMMARY", state, head_before="b"
         )
         self.assertIn("last 3 rounds", out)
 
@@ -2912,7 +2941,7 @@ class TestGoalLowStreakSentence(unittest.TestCase):
         state = self._state(2)
         out = bramble_ops.goal_for_round(
             2, "PR_SUMMARY", state, head_before="b",
-            is_new_series=True, include_round_diff=False,
+            is_new_series=True,
         )
         self.assertEqual(out, "PR_SUMMARY")
         self.assertNotIn("low-severity findings", out)
@@ -2921,10 +2950,121 @@ class TestGoalLowStreakSentence(unittest.TestCase):
         # Round 1 always returns PR_SUMMARY; no streak logic applies.
         state = self._state(2)
         out = bramble_ops.goal_for_round(
-            1, "PR_SUMMARY", state, head_before="b", include_round_diff=False
+            1, "PR_SUMMARY", state, head_before="b"
         )
         self.assertEqual(out, "PR_SUMMARY")
 
+
+
+class TestPRFileSetSurvivesRebase(unittest.TestCase):
+    """The file list must name the PR's own files, not the base branch's churn.
+
+    This is the defect that made a long-running PR ratchet: the old anchor was
+    `prior_round_head..HEAD`, which after a rebase spans everything the base
+    moved. Measured on a real 16-round run it reported 199-200 files where the
+    PR touched 54 — ~146 files of other people's work handed to the reviewer as
+    this PR's, every round after a rebase.
+
+    A fixture where both ranges agree cannot catch this, so this builds a real
+    repo and actually rebases.
+    """
+
+    def _git(self, *args):
+        subprocess.run(["git", *args], cwd=self.repo, check=True,
+                       capture_output=True, text=True)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = self.tmp.name
+        self._git("init", "-q", "-b", "main")
+        self._git("config", "user.email", "t@t")
+        self._git("config", "user.name", "t")
+        Path(self.repo, "base.txt").write_text("base\n")
+        self._git("add", "-A")
+        self._git("commit", "-qm", "base")
+        self._git("branch", "-M", "main")
+        # Stand in for origin/main so the three-dot range resolves.
+        self._git("update-ref", "refs/remotes/origin/main", "HEAD")
+
+        # The PR: one file.
+        self._git("checkout", "-qb", "pr")
+        Path(self.repo, "pr_file.txt").write_text("pr work\n")
+        self._git("add", "-A")
+        self._git("commit", "-qm", "pr work")
+        self.prior_round_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo,
+            capture_output=True, text=True, check=True).stdout.strip()
+
+        # main moves by SIX files while the PR sits — this is the churn a rebase
+        # drags into a two-dot range.
+        self._git("checkout", "-q", "main")
+        for i in range(6):
+            Path(self.repo, f"main_churn_{i}.txt").write_text("theirs\n")
+        self._git("add", "-A")
+        self._git("commit", "-qm", "main moves on")
+        self._git("update-ref", "refs/remotes/origin/main", "HEAD")
+
+        self._git("checkout", "-q", "pr")
+        self._git("rebase", "-q", "main")
+        self.head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo,
+            capture_output=True, text=True, check=True).stdout.strip()
+
+    def test_pr_file_set_excludes_base_churn(self):
+        cwd = os.getcwd()
+        os.chdir(self.repo)
+        try:
+            files = bramble_ops._files_changed_in_pr(self.head)
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(files, ["pr_file.txt"],
+                         "the PR touches ONE file; anything else is the base branch's work")
+
+    def test_goal_names_only_the_prs_files_after_rebase(self):
+        """End-to-end at the GOAL level — where the bug actually lived.
+
+        The helper test above proves `_files_changed_in_pr` is right; this
+        proves action_history_goal CALLS it. Reverting the call site to the old
+        two-dot anchor fails here and nowhere else.
+        """
+        state = {
+            "rounds": [{
+                "n": 1,
+                "head_before": self.prior_round_head,
+                "head_after": self.prior_round_head,
+                "comment_actions": [
+                    {"action": "fixed", "path": "pr_file.txt", "line": 1, "notes": "x"}
+                ],
+            }]
+        }
+        cwd = os.getcwd()
+        os.chdir(self.repo)
+        try:
+            text = bramble_ops.action_history_goal(state, 2, head_before=self.head)
+        finally:
+            os.chdir(cwd)
+        self.assertIn("pr_file.txt", text)
+        self.assertNotIn("main_churn_0.txt", text,
+                         "the goal must not present the base branch's churn as this PR's work")
+
+    def test_old_anchor_would_have_included_base_churn(self):
+        """Control: proves the fixture actually discriminates.
+
+        Without this, `test_pr_file_set_excludes_base_churn` could pass on a
+        fixture where both anchors agree — which is exactly how the original
+        tests for this line stayed green across the bug.
+        """
+        cwd = os.getcwd()
+        os.chdir(self.repo)
+        try:
+            polluted = bramble_ops._files_changed_between(self.prior_round_head, self.head)
+        finally:
+            os.chdir(cwd)
+        self.assertIn("main_churn_0.txt", polluted,
+                      "control: the old two-dot anchor must drag in base churn, "
+                      "or this fixture proves nothing")
+        self.assertGreater(len(polluted), 1)
 
 if __name__ == "__main__":
     unittest.main()

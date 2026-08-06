@@ -38,11 +38,11 @@ Missing/error review streams → log as findings with stderr path cited.
 | Command | When |
 |---|---|
 | `state-load` | Read |
-| `state-append-round <ctx> <n> <head_before>` | Round start (`--no-verify-head` only when resuming interrupted round) |
+| `state-append-round <ctx> <n> <head_before> [--pr-summary "$PR_SUMMARY"] [--base-branch <base>]` | Round start (`--no-verify-head` only when resuming interrupted round). **Pass both on round 1** — each is written once and frozen. `--pr-summary` is the goal's spine (omit it and the goal loses the PR's purpose from round 2 on); `--base-branch` anchors the "Files in this PR" range to the PR's real base (omit it and a PR stacked on a non-default branch is measured against the repo default). |
 | `state-finalize-round <ctx> <n> <head_after> <actions.json> [--envelope …]` | Round end |
 | `state-mark-complete <ctx> <reason>` | Exit |
 
-Key fields: `rounds[n].comment_actions` (audit trail), `low_only_streak` (convergence), `session_ids` (resume).
+Key fields: `rounds[n].comment_actions` (audit trail), `low_only_streak` (convergence), `session_ids` (resume), `pr_summary` (frozen at round 1; the goal's stable scope anchor), `base_branch` (frozen at round 1; the merge base the PR's file list is measured against).
 
 **Actions file** (the `<actions.json>` arg to `state-finalize-round` / `finalize-and-report`): a JSON **array** of action entries, or an object `{"comment_actions": [...]}` — both are accepted. Per entry:
 - `action`: one of `fixed`, `false_positive`, `wont_fix`, `ack`, `stale`, `pre_existing`/`flake` (CI only) — validated; an unknown verb is a loud error naming the entry index.
@@ -108,7 +108,9 @@ python3 "$GIT_SYNC" --verbose --no-push
 Dirty tree (no in-progress round to resume) → `state-mark-complete <ctx> dirty-tree-preflight`, exit.
 Conflict (exit 2) → `state-mark-complete <ctx> sync-conflict`, Final Summary, exit.
 
-Build `$PR_SUMMARY` (≤10 lines): `git log --oneline origin/<base>..HEAD` + diff-stat. Round 1 `--goal` = `$PR_SUMMARY`; later rounds use `round-bundle` / `bramble_ops.py goal` (prior fixed/skipped + files changed + inter-round diff).
+Build `$PR_SUMMARY` (≤10 lines): `git log --oneline origin/<base>..HEAD` + diff-stat, where `<base>` is `identify`'s `base`. Round 1 `--goal` = `$PR_SUMMARY`; later rounds use `round-bundle` / `bramble_ops.py goal`, which **leads with the frozen `$PR_SUMMARY`** and appends the action-history briefing (prior fixed/skipped + the PR's own file list, plus any invariant/streak notes). No inter-round diff is embedded — bramble re-reads the working tree, and a diff pinned to the prior round's HEAD is wrong after a rebase.
+
+Pass the same `<base>` to `state-append-round --base-branch` at Step 3.a0 (round start): the file list is measured `origin/<base>...HEAD`, and it must be anchored to the same merge base `$PR_SUMMARY` was built from.
 
 ## Step 2: Fetch PR comments + CI
 
@@ -126,6 +128,7 @@ Triage reads these only when `IS_NEW_SERIES=1`. Still run bramble every round.
 ```
 additional_rounds_run = 0
 while additional_rounds_run < --rounds:
+  a0) open the round in state (--pr-summary + --base-branch on round 1)
   a) WIP commit if dirty
   b) scope_gate → round-bundle → one bg join: launch reviewers (codex+cursor+lint[+gemini][+claude]), wait on exit
   c) triage → action plan
@@ -139,6 +142,22 @@ while additional_rounds_run < --rounds:
 Header: `## Round N (M / --rounds)` — N absolute, M = `additional_rounds_run + 1`.
 
 **Orchestrator vars** (`$LOG_DIR`, `$CTX`, etc.): substitute concrete values into each Bash call — fresh shell every time, no persistent `$VAR`.
+
+### a0) Open the round in state
+
+Every round starts here — `round-bundle` (Step 3.b) reads `pr_summary` and
+`base_branch` back out of state, so a round that never opened produces a goal
+with no PR purpose and a file list anchored to the repo default.
+
+```bash
+python3 $SKILL_DIR/scripts/pr_ops.py state-append-round "$CTX" {ROUND} $(git rev-parse HEAD) \
+  --pr-summary "$PR_SUMMARY" --base-branch "$BASE"
+```
+
+`$BASE` = `identify`'s `base` (the PR's own `baseRefName`), the same value
+`$PR_SUMMARY` was built against. Both are written once and frozen at round 1;
+passing them on later rounds is harmless. Add `--no-verify-head` only when
+resuming an interrupted round.
 
 ### a) WIP commit
 

@@ -80,14 +80,6 @@ _ACTION_HISTORY_CAP = 20
 # can't blow the whole prompt.
 _TOPIC_CHAR_CAP = 80
 
-# Default truncation cap for the inter-round diff appended to the goal
-# channel (D1). 200 lines is roughly the same order of magnitude as a
-# typical round's commit; bigger diffs almost always indicate a rebase
-# or tooling-generated change that the reviewer doesn't need to re-read
-# inline. Defined here at module top because ``goal_for_round`` (defined
-# above ``round_diff``) consumes it as a default-argument value.
-_ROUND_DIFF_DEFAULT_MAX_LINES = 200
-
 
 def _is_first_round_of_series(state: dict[str, Any] | None, n: int) -> bool:
     """Mirror of pr_ops._is_first_round_of_series.
@@ -142,11 +134,54 @@ def _files_changed_between(a: str | None, b: str | None) -> list[str]:
     return [line.strip() for line in res.stdout.splitlines() if line.strip()]
 
 
+
+def _files_changed_in_pr(head: str | None, base_ref: str | None = None) -> list[str]:
+    """Repo-relative paths this PR touches, measured from its merge-base.
+
+    Three-dot (``base...head``) rather than two-dot against a prior round's
+    HEAD. Two-dot spans everything the base branch moved when the branch was
+    rebased, so on a long-running PR it reports the union of this PR's work and
+    main's churn — 200 files where the PR touches 54.
+
+    Stable across rebases by construction: the merge-base moves with the base,
+    so the answer stays "what this PR changed" rather than "what changed since
+    an arbitrary earlier commit".
+
+    Returns ``[]`` on any git failure; the caller omits the line rather than
+    claiming the PR touches nothing.
+    """
+    if not head:
+        return []
+    from _common import detect_base_branch, run  # noqa: PLC0415
+
+    # Callers that know the PR's real base (round_bundle, reading the frozen
+    # state["base_branch"]) pass base_ref explicitly — that is the accurate
+    # path. This fallback only resolves the repo DEFAULT branch (origin/HEAD),
+    # which is right for a PR targeting the default and wrong for one stacked
+    # on another branch; it exists so branch-only mode (no PR, no recorded
+    # base) still produces a sane range rather than none.
+    if not base_ref:
+        try:
+            base_ref = f"origin/{detect_base_branch()}"
+        except Exception:  # noqa: BLE001 — fall back rather than fail the goal
+            base_ref = "origin/main"
+
+    try:
+        res = run(["git", "diff", "--name-only", f"{base_ref}...{head}"], check=False)
+    except Exception:  # noqa: BLE001 — best-effort git invocation
+        return []
+    if res.returncode != 0:
+        sys.stderr.write(f"[bramble_ops] pr file-set range rejected: {base_ref}...{head}\n")
+        return []
+    return [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
+
+
 def action_history_goal(
     state: dict[str, Any] | None,
     round_: int,
     *,
     head_before: str | None = None,
+    base_branch: str | None = None,
 ) -> str:
     """Build the --goal text for round 2+: a per-turn briefing telling the
     resumed model what the immediately-prior round actioned plus which
@@ -214,14 +249,32 @@ def action_history_goal(
         parts.append("Skipped: " + "; ".join(truncated) + suffix + ".")
 
     if head_before:
-        prev_anchor = prev.get("head_after") or prev.get("head_before")
-        files = _files_changed_between(prev_anchor, head_before)
+        # Anchored to the PR's own base, NOT the prior round's HEAD.
+        #
+        # `prev_head..HEAD` spans everything main moved when the branch was
+        # rebased between rounds — measured on kernel#8373 at rounds 14-16 it
+        # reported 199, 200 and 200 files against a true PR diff of 54. That is
+        # ~146 files of other people's work presented to the reviewer as this
+        # PR's, every round after a rebase. Findings then land on code the PR
+        # never touched, the loop owns them under "touched files", and the diff
+        # ratchets.
+        #
+        # Three-dot against the merge-base is the PR's own file set and is
+        # stable across rebases, which is what the scope contract means by
+        # "files the PR touched when you first saw it".
+        # base_branch is the PR's frozen base ref (state["base_branch"], from
+        # `identify`). Passing it keeps this range anchored to the same merge
+        # base PR_SUMMARY was built against; None falls back to the repo
+        # default, which is only correct for a PR targeting that default.
+        files = _files_changed_in_pr(
+            head_before,
+            base_ref=f"origin/{base_branch}" if base_branch else None,
+        )
         if files:
-            prev_n = prev.get("n") or "?"
             # Cap files list at a few entries; pathological churn shouldn't blow the prompt.
             shown = files[:_ACTION_HISTORY_CAP]
             tail = f" (and {len(files) - len(shown)} more)" if len(files) > len(shown) else ""
-            parts.append(f"Files changed since round {prev_n}: " + ", ".join(shown) + tail + ".")
+            parts.append("Files in this PR: " + ", ".join(shown) + tail + ".")
 
     if len(parts) == 1:  # only the "Round N." stub — nothing to say
         return ""
@@ -406,24 +459,24 @@ def goal_for_round(
     *,
     head_before: str | None = None,
     is_new_series: bool | None = None,
-    include_round_diff: bool = True,
-    round_diff_max_lines: int = _ROUND_DIFF_DEFAULT_MAX_LINES,
+    base_branch: str | None = None,
 ) -> str:
     """Return the ``--goal`` text bramble should see for this round.
 
-    Round 1: PR_SUMMARY (commit list + diffstat).
+    Every round leads with PR_SUMMARY — the frozen statement of what this PR
+    is for, read back from state where round 1 wrote it. Round 2+ appends the
+    per-turn action-history briefing from ``action_history_goal``.
 
-    Round 2+: per-turn action-history briefing built by
-    ``action_history_goal``. Falls back to PR_SUMMARY when there's
-    nothing to say (e.g. round 1 produced an empty action plan).
+    PR_SUMMARY is not a fallback. A reviewer that cannot see the PR's purpose
+    has no basis for calling a finding out of scope.
 
     Round 2+ also gets:
       - When the prior round's ``low_only_streak`` is >= 2, a one-line
         convergence-pressure sentence appended (B1).
-      - When ``include_round_diff`` is True and the prior round's
-        ``head_after`` is reachable, the diff between the prior round's
-        HEAD and this round's HEAD is appended under a "Diff since
-        round N-1" header (D1). Truncated at ``round_diff_max_lines``.
+      - No inter-round diff. Bramble snapshots the working tree at launch
+        and its resumed prompt says "re-review the full diff", so embedding
+        a copy in the goal gave the reviewer nothing it could not already
+        see — while being wrong whenever the branch had rebased.
 
     ``head_before`` is this round's HEAD, used to compute the
     files-changed-since-prior-round line and the round diff.
@@ -438,26 +491,24 @@ def goal_for_round(
     """
     if round_ < 2 or is_new_series:
         return pr_summary
-    history = action_history_goal(state, round_, head_before=head_before)
-    body = history or pr_summary
-    parts = [body]
+    history = action_history_goal(
+        state, round_, head_before=head_before, base_branch=base_branch
+    )
+    # PR_SUMMARY leads every round, it is not a fallback. It used to be
+    # `history or pr_summary`, so once a round produced any action history the
+    # PR's own purpose dropped out of the goal for the rest of the run — and
+    # round-bundle was passing "" for it anyway. A reviewer that cannot see
+    # what the PR is FOR has no way to tell an in-scope finding from an
+    # out-of-scope one, which is how "touched files" ratchets.
+    parts = [p for p in (pr_summary, history) if p]
+    if not parts:
+        return ""
     invariants = _prior_invariants_note(state, round_)
     if invariants:
         parts.append(invariants)
     pressure = _low_only_streak_pressure(state, round_)
     if pressure:
         parts.append(pressure)
-    if include_round_diff:
-        diff_text = round_diff(
-            state, round_, head_before=head_before, max_lines=round_diff_max_lines
-        )
-        if diff_text:
-            rounds = state.get("rounds") or []
-            prior = [r for r in rounds if (r.get("n") or 0) < round_]
-            prev_n = max((r.get("n") or 0) for r in prior) if prior else round_ - 1
-            parts.append(
-                f"Diff since round {prev_n} (truncated at {round_diff_max_lines} lines):\n{diff_text}"
-            )
     return "\n\n".join(parts)
 
 
@@ -1633,73 +1684,6 @@ def recover_envelope(path: Path, *, suffix: str = "-recovered") -> Path:
 # ---------------------------------------------------------------------------
 
 
-def round_diff(
-    state: dict[str, Any] | None,
-    round_: int,
-    *,
-    head_before: str | None = None,
-    max_lines: int = _ROUND_DIFF_DEFAULT_MAX_LINES,
-) -> str:
-    """Return ``git diff <prior_head_after>..<head_before>`` text, truncated.
-
-    Returns ``""`` when:
-      - ``round_`` < 2 (no prior round to diff against),
-      - state has no rounds before ``round_``,
-      - the prior round's ``head_after`` is None (interrupted prior round
-        that never finalized),
-      - ``head_before`` is None or equals the prior anchor,
-      - git rejects the range (unreachable SHAs in shallow clones / worktrees).
-
-    Truncation appends a ``...elided N lines`` footer when the diff exceeds
-    ``max_lines``. The footer is on its own line so callers can grep for
-    "elided" to detect truncation.
-
-    Pure git plumbing. Used by the goal-builder to feed the resumed
-    reviewer the diff between rounds rather than re-snapshotting the
-    whole PR.
-    """
-    if round_ < 2 or not state:
-        return ""
-    rounds = state.get("rounds") or []
-    prior = [r for r in rounds if (r.get("n") or 0) < round_]
-    if not prior:
-        return ""
-    prev = max(prior, key=lambda r: r.get("n") or 0)
-    prev_anchor = prev.get("head_after")
-    if not prev_anchor or not head_before or prev_anchor == head_before:
-        return ""
-    from _common import run  # noqa: PLC0415
-
-    try:
-        res = run(
-            ["git", "diff", f"{prev_anchor}..{head_before}"],
-            check=False,
-        )
-    except Exception as e:  # noqa: BLE001 — best-effort
-        print(
-            f"bramble_ops: round-diff git diff {prev_anchor[:7]}..{head_before[:7]} "
-            f"failed: {e}",
-            file=sys.stderr,
-        )
-        return ""
-    if res.returncode != 0:
-        print(
-            f"bramble_ops: round-diff git diff {prev_anchor[:7]}..{head_before[:7]} "
-            f"returned {res.returncode}; cited SHA may be unreachable. "
-            f"stderr: {res.stderr.strip() or '(empty)'}",
-            file=sys.stderr,
-        )
-        return ""
-    text = res.stdout
-    if not text.strip():
-        return ""
-    lines = text.splitlines()
-    if len(lines) > max_lines:
-        elided = len(lines) - max_lines
-        return "\n".join(lines[:max_lines]) + f"\n...elided {elided} lines"
-    return text
-
-
 # ---------------------------------------------------------------------------
 # Modified-hunk lookup for spiral-stale demote (E1)
 # ---------------------------------------------------------------------------
@@ -1855,6 +1839,15 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--pr-summary", required=True)
     sp.add_argument("--state-file")
     sp.add_argument(
+        "--base-branch",
+        help=(
+            "The PR's own base ref (GitHub's baseRefName), used to anchor the "
+            "'Files in this PR' range to origin/<base>...HEAD. Overrides "
+            "state['base_branch']; when neither is given, the file list falls "
+            "back to the repo default, which is wrong for a stacked PR."
+        ),
+    )
+    sp.add_argument(
         "--head-before",
         help="This round's HEAD; used to compute the files-changed-since-prior-round line.",
     )
@@ -1868,18 +1861,6 @@ def _build_parser() -> argparse.ArgumentParser:
             "from the model's perspective, and walking the prior series' "
             "head_after produces a noisy goal blob (the SHA may be unreachable)."
         ),
-    )
-    sp.add_argument(
-        "--no-round-diff",
-        dest="include_round_diff",
-        action="store_false",
-        default=True,
-        help="Skip the inter-round diff append (default: include).",
-    )
-    sp.add_argument(
-        "--round-diff-max-lines",
-        type=int,
-        default=_ROUND_DIFF_DEFAULT_MAX_LINES,
     )
 
     sp = sub.add_parser(
@@ -1914,27 +1895,6 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     sp.add_argument("envelope_path")
-
-    sp = sub.add_parser(
-        "round-diff",
-        help=(
-            "Print git diff <prior_round.head_after>..<head_before> for "
-            "round N, truncated at --max-lines. Empty when no prior round "
-            "or SHAs are unreachable. Pure git plumbing — used by the "
-            "goal builder to feed the resumed reviewer the inter-round diff."
-        ),
-    )
-    sp.add_argument("state_file")
-    sp.add_argument("round_", type=int)
-    sp.add_argument(
-        "--head-before",
-        help="This round's HEAD; if omitted, falls back to git rev-parse HEAD.",
-    )
-    sp.add_argument(
-        "--max-lines",
-        type=int,
-        default=_ROUND_DIFF_DEFAULT_MAX_LINES,
-    )
 
     sp = sub.add_parser(
         "parse-stream",
@@ -2006,6 +1966,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "goal":
             state = read_json(Path(args.state_file), default=None) if args.state_file else None
             is_new = (args.is_new_series == "1") if args.is_new_series is not None else None
+            # Explicit --base-branch wins; otherwise fall back to the base frozen
+            # in state at round 1, the same source round_bundle threads. Without
+            # this the goal's file list is measured against the repo default,
+            # which is a different ancestor than the PR's own base.
+            base_branch = args.base_branch or (state or {}).get("base_branch") or None
             print(
                 goal_for_round(
                     args.round_,
@@ -2013,8 +1978,7 @@ def main(argv: list[str] | None = None) -> int:
                     state,
                     head_before=args.head_before,
                     is_new_series=is_new,
-                    include_round_diff=args.include_round_diff,
-                    round_diff_max_lines=args.round_diff_max_lines,
+                    base_branch=base_branch,
                 )
             )
         elif args.cmd == "prior-session-id":
@@ -2031,23 +1995,6 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.cmd == "recover-envelope":
             print(str(recover_envelope(Path(args.envelope_path))))
-        elif args.cmd == "round-diff":
-            state = read_json(Path(args.state_file), default=None)
-            head_before = args.head_before
-            if head_before is None:
-                from _common import run as _run  # noqa: PLC0415
-
-                res = _run(["git", "rev-parse", "HEAD"], check=False)
-                if res.returncode == 0:
-                    head_before = res.stdout.strip() or None
-            print(
-                round_diff(
-                    state,
-                    args.round_,
-                    head_before=head_before,
-                    max_lines=args.max_lines,
-                )
-            )
         elif args.cmd == "parse-stream":
             findings = parse_stream(Path(args.stream_file), source=args.backend)
             print_json(findings)
