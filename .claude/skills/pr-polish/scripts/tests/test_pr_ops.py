@@ -2928,6 +2928,48 @@ class TestBuildPRSummary(unittest.TestCase):
         self.assertIn("rewires the widget cache", out["pr_summary"])
         self.assertNotIn("FALLBACK", out["pr_summary"])
 
+    def _run_cli(self, argv: list[str]) -> str:
+        """Invoke pr_ops.main and capture stdout — the SKILL.md entry point."""
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = pr_ops.main(argv)
+        self.assertEqual(rc, 0, f"{argv} exited {rc}")
+        return buf.getvalue()
+
+    def test_cli_pr_summary_emits_json(self) -> None:
+        """CLI boundary: argparse registration + JSON dispatch path."""
+        fake = {
+            "pr_summary": "T\n\nbody",
+            "source": "pr-body",
+            "dropped": ["cursor-summary"],
+            "pr_number": 9,
+            "base": "main",
+        }
+        with patch.object(pr_ops, "build_pr_summary", return_value=fake):
+            out = json.loads(self._run_cli(["pr-summary"]))
+        self.assertEqual(out["source"], "pr-body")
+        self.assertEqual(out["dropped"], ["cursor-summary"])
+        self.assertEqual(out["pr_summary"], "T\n\nbody")
+
+    def test_cli_pr_summary_text_only_emits_plain_text(self) -> None:
+        """--text-only must print the summary alone, parseable as $(...)."""
+        fake = {
+            "pr_summary": "T\n\nbody",
+            "source": "pr-body",
+            "dropped": [],
+            "pr_number": 9,
+            "base": "main",
+        }
+        with patch.object(pr_ops, "build_pr_summary", return_value=fake):
+            out = self._run_cli(["pr-summary", "--text-only"])
+        self.assertEqual(out.strip(), "T\n\nbody")
+        # Must not be JSON — SKILL.md feeds this straight to --goal.
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(out)
+
     def test_branch_only_mode_uses_commits(self) -> None:
         with patch.object(pr_ops, "_commit_diffstat_summary", return_value="COMMITS"):
             out = pr_ops.build_pr_summary(
