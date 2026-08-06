@@ -738,6 +738,7 @@ def state_append_round(
     noise_filtered: int = 0,
     noise_samples: list[dict[str, Any]] | None = None,
     pr_summary: str | None = None,
+    base_branch: str | None = None,
 ) -> dict[str, Any]:
     """Start a new round or refresh head_before on an in-progress round.
 
@@ -754,6 +755,13 @@ def state_append_round(
     orchestrator computes it in a shell variable at Step 1 that no longer
     exists by round 2 — which is why the goal silently lost the PR's purpose
     after round 1.
+
+    ``base_branch`` is the PR's base ref (``identify``'s ``base``, i.e. GitHub's
+    baseRefName). Frozen the same way, and read back by ``round_bundle`` so the
+    "Files in this PR" range is anchored to the PR's real ancestor instead of
+    the repo default. The two must agree: PR_SUMMARY's diffstat and the goal's
+    file list describing different merge bases is the same class of bug as the
+    two-dot range this change replaced.
 
     ``noise_filtered`` / ``noise_samples`` record bot process-noise that
     ``fetch-comments`` dropped at intake (linear linkbacks, claude-bot
@@ -822,6 +830,15 @@ def state_append_round(
     # exists to prevent.
     if pr_summary and not state.get("pr_summary"):
         state["pr_summary"] = pr_summary
+    # The PR's own base branch, frozen alongside pr_summary and for the same
+    # reason: the file-set range must be measured against the SAME ancestor
+    # the PR_SUMMARY diffstat was built from. Without it the goal falls back
+    # to the repo default (origin/HEAD), so a PR stacked on a non-default
+    # branch gets its "Files in this PR" line measured against main while its
+    # summary describes the stacked diff — reintroducing the out-of-scope
+    # files this whole change exists to remove.
+    if base_branch and not state.get("base_branch"):
+        state["base_branch"] = base_branch
     state["current_round"] = n
     state["last_commit_at_round_start"] = head_before
     # When the orchestrator re-invokes pr-polish on a state file that
@@ -1557,6 +1574,7 @@ def round_bundle(ctx: int | str, n: int) -> dict[str, Any]:
                 state=state,
                 head_before=head_before or None,
                 is_new_series=bool(is_new_series),
+                base_branch=state.get("base_branch") or None,
             )
         except Exception as e:  # noqa: BLE001 — diagnostic, not fatal
             goal_text = f"# goal_for_round failed: {e}"
@@ -1852,6 +1870,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "Without it the goal loses the PR's purpose after round 1."
         ),
     )
+    sp.add_argument(
+        "--base-branch",
+        default=None,
+        help=(
+            "The PR's base ref (identify's 'base'). Frozen once, like "
+            "--pr-summary, and used to anchor the 'Files in this PR' range to "
+            "the same merge base the PR summary was built against. Omit it and "
+            "a PR stacked on a non-default branch is measured against the repo "
+            "default instead."
+        ),
+    )
 
     sp = sub.add_parser("state-finalize-round")
     sp.add_argument("ctx", help="PR number or 'branch:<name>'")
@@ -1985,6 +2014,7 @@ def main(argv: list[str] | None = None) -> int:
                     verify_head=args.verify_head,
                     noise_filtered=args.noise_filtered,
                     pr_summary=args.pr_summary,
+                    base_branch=args.base_branch,
                     noise_samples=samples,
                 )
             )

@@ -154,11 +154,12 @@ def _files_changed_in_pr(head: str | None, base_ref: str | None = None) -> list[
         return []
     from _common import detect_base_branch, run  # noqa: PLC0415
 
-    # Resolve the base the same way the rest of pr-polish does rather than
-    # assuming main: a PR stacked on another branch has a different base, and
-    # hardcoding origin/main would measure it against the wrong ancestor —
-    # reintroducing exactly the "someone else's work counted as this PR's"
-    # error this function exists to remove.
+    # Callers that know the PR's real base (round_bundle, reading the frozen
+    # state["base_branch"]) pass base_ref explicitly — that is the accurate
+    # path. This fallback only resolves the repo DEFAULT branch (origin/HEAD),
+    # which is right for a PR targeting the default and wrong for one stacked
+    # on another branch; it exists so branch-only mode (no PR, no recorded
+    # base) still produces a sane range rather than none.
     if not base_ref:
         try:
             base_ref = f"origin/{detect_base_branch()}"
@@ -174,11 +175,13 @@ def _files_changed_in_pr(head: str | None, base_ref: str | None = None) -> list[
         return []
     return [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
 
+
 def action_history_goal(
     state: dict[str, Any] | None,
     round_: int,
     *,
     head_before: str | None = None,
+    base_branch: str | None = None,
 ) -> str:
     """Build the --goal text for round 2+: a per-turn briefing telling the
     resumed model what the immediately-prior round actioned plus which
@@ -259,14 +262,19 @@ def action_history_goal(
         # Three-dot against the merge-base is the PR's own file set and is
         # stable across rebases, which is what the scope contract means by
         # "files the PR touched when you first saw it".
-        files = _files_changed_in_pr(head_before)
+        # base_branch is the PR's frozen base ref (state["base_branch"], from
+        # `identify`). Passing it keeps this range anchored to the same merge
+        # base PR_SUMMARY was built against; None falls back to the repo
+        # default, which is only correct for a PR targeting that default.
+        files = _files_changed_in_pr(
+            head_before,
+            base_ref=f"origin/{base_branch}" if base_branch else None,
+        )
         if files:
-            prev_n = prev.get("n") or "?"
             # Cap files list at a few entries; pathological churn shouldn't blow the prompt.
             shown = files[:_ACTION_HISTORY_CAP]
             tail = f" (and {len(files) - len(shown)} more)" if len(files) > len(shown) else ""
             parts.append("Files in this PR: " + ", ".join(shown) + tail + ".")
-            _ = prev_n
 
     if len(parts) == 1:  # only the "Round N." stub — nothing to say
         return ""
@@ -451,6 +459,7 @@ def goal_for_round(
     *,
     head_before: str | None = None,
     is_new_series: bool | None = None,
+    base_branch: str | None = None,
 ) -> str:
     """Return the ``--goal`` text bramble should see for this round.
 
@@ -482,7 +491,9 @@ def goal_for_round(
     """
     if round_ < 2 or is_new_series:
         return pr_summary
-    history = action_history_goal(state, round_, head_before=head_before)
+    history = action_history_goal(
+        state, round_, head_before=head_before, base_branch=base_branch
+    )
     # PR_SUMMARY leads every round, it is not a fallback. It used to be
     # `history or pr_summary`, so once a round produced any action history the
     # PR's own purpose dropped out of the goal for the rest of the run — and

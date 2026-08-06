@@ -2490,9 +2490,6 @@ class TestFinalizeAndReport(unittest.TestCase):
         self.assertEqual(out["next_round_n"], 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestPRSummaryReachesStateViaCLI(unittest.TestCase):
     """The frozen PR_SUMMARY must survive the CLI, not just the Python call.
@@ -2533,3 +2530,59 @@ class TestPRSummaryReachesStateViaCLI(unittest.TestCase):
         self.assertEqual(state.get("pr_summary"), "ORIGINAL",
                          "frozen means round 1 wins; re-deriving would let a "
                          "ratcheting PR re-authorize its own growth")
+
+    def test_frozen_summary_reaches_round_bundle_goal_text(self):
+        """The consumer hop, not just the write.
+
+        Persistence tests pass even if `round_bundle` goes back to passing
+        `pr_summary=""` — that is precisely the regression this PR fixes, and
+        it lived through 407 green tests. Assert on the value the orchestrator
+        actually hands bramble: `round_bundle(...)["goal_text"]`.
+        """
+        pr_ops.main(["state-append-round", "branch:x", "1", "aaa",
+                     "--no-verify-head", "--pr-summary", "FROZEN-PURPOSE"])
+        pr_ops.main(["state-finalize-round", "branch:x", "1", "aaa",
+                     self._actions_file()])
+        out = pr_ops.round_bundle("branch:x", 2)
+        self.assertTrue(
+            out["goal_text"].startswith("FROZEN-PURPOSE"),
+            "round 2's goal must LEAD with the frozen summary; got: "
+            f"{out['goal_text'][:120]!r}",
+        )
+
+    def test_cli_flag_persists_base_branch(self):
+        """The file-set anchor must be the PR's base, not the repo default.
+
+        Without this the 'Files in this PR' range falls back to origin/HEAD,
+        so a PR stacked on a non-default branch is measured against a
+        different ancestor than its own PR_SUMMARY diffstat.
+        """
+        rc = pr_ops.main([
+            "state-append-round", "branch:x", "1", "deadbeef",
+            "--no-verify-head", "--base-branch", "release/v2",
+        ])
+        self.assertEqual(rc, 0)
+        _, path = pr_ops.state_paths(None, branch="x")
+        state = json.loads(Path(path).read_text())
+        self.assertEqual(state.get("base_branch"), "release/v2",
+                         "the CLI must persist the base, or the file-set range "
+                         "silently re-anchors to the repo default")
+
+    def test_base_branch_frozen_not_overwritten(self):
+        pr_ops.main(["state-append-round", "branch:x", "1", "aaa",
+                     "--no-verify-head", "--base-branch", "release/v2"])
+        pr_ops.main(["state-append-round", "branch:x", "2", "bbb",
+                     "--no-verify-head", "--base-branch", "main"])
+        _, path = pr_ops.state_paths(None, branch="x")
+        state = json.loads(Path(path).read_text())
+        self.assertEqual(state.get("base_branch"), "release/v2",
+                         "the remit's base is fixed at round 1 like pr_summary")
+
+    def _actions_file(self):
+        p = Path(self.tmp.name) / "actions.json"
+        p.write_text(json.dumps([]))
+        return str(p)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -2844,9 +2844,6 @@ class TestGoalLowStreakSentence(unittest.TestCase):
         self.assertEqual(out, "PR_SUMMARY")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestPRFileSetSurvivesRebase(unittest.TestCase):
     """The file list must name the PR's own files, not the base branch's churn.
@@ -2957,3 +2954,6 @@ class TestPRFileSetSurvivesRebase(unittest.TestCase):
                       "control: the old two-dot anchor must drag in base churn, "
                       "or this fixture proves nothing")
         self.assertGreater(len(polluted), 1)
+
+if __name__ == "__main__":
+    unittest.main()
