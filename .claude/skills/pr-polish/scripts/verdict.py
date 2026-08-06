@@ -142,6 +142,40 @@ def open_high_deferrals(state: dict) -> list[dict]:
     return out
 
 
+def _claim_matches(claim: str, touched: set[str]) -> bool:
+    """Does ``claim`` name one of the repo-relative paths in ``touched``?
+
+    Exact match first. Failing that, treat the shorter of the two as a
+    path *suffix* of the longer, on whole path components only. Two
+    reasons the comparison cannot simply be equality:
+
+    * reviewers do not agree on how much of the path they emit — some
+      cite ``verdict.py``, some ``.claude/skills/pr-polish/scripts/verdict.py``
+    * an action recorded from a PR comment carries whatever prefix the
+      external bot chose.
+
+    Suffix matching keeps those honest claims verifiable while refusing
+    the collision that basename matching allowed: ``other/util.go`` no
+    longer satisfies a claim on ``pkg/a/util.go``, because neither is a
+    component-aligned suffix of the other. A bare ``util.go`` claim still
+    matches any ``util.go`` — that ambiguity is in the input, not the
+    comparison, and this is no weaker than the previous behaviour.
+    """
+    if claim in touched:
+        return True
+    claim_parts = Path(claim).parts
+    if not claim_parts:
+        return False
+    for t in touched:
+        t_parts = Path(t).parts
+        if len(claim_parts) <= len(t_parts):
+            if t_parts[-len(claim_parts):] == claim_parts:
+                return True
+        elif claim_parts[-len(t_parts):] == t_parts:
+            return True
+    return False
+
+
 def verify_fix_claims(state: dict, repo_root: Optional[Path]) -> dict:
     """Check each ``fixed`` claim against what the round actually changed.
 
@@ -179,8 +213,16 @@ def verify_fix_claims(state: dict, repo_root: Optional[Path]) -> dict:
                     capture_output=True, text=True, check=False,
                 )
                 if res.returncode == 0:
+                    # Keep full repo-relative paths. Collapsing to
+                    # ``Path(...).name`` here made the whole check
+                    # basename-only, which is load-bearing in a monorepo:
+                    # a claim on ``yoloswe/reviewer/BUILD.bazel`` verified
+                    # against *any* touched ``BUILD.bazel``, and the same
+                    # for SKILL.md, __init__.py, README.md and every
+                    # repeated ``tests/test_*.py``. See ``_claim_matches``
+                    # for how bare-basename claims are still honoured.
                     files = {
-                        Path(ln.strip()).name
+                        ln.strip()
                         for ln in res.stdout.splitlines()
                         if ln.strip()
                     }
@@ -217,7 +259,7 @@ def verify_fix_claims(state: dict, repo_root: Optional[Path]) -> dict:
                 unknown += 1
                 continue
             total += 1
-            if Path(str(path)).name in touched_from.get(n, set()):
+            if _claim_matches(str(path), touched_from.get(n, set())):
                 verified += 1
             else:
                 unverified += 1

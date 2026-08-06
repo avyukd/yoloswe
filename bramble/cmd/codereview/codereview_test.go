@@ -1384,6 +1384,30 @@ func TestDiffScopeFlagValidation(t *testing.T) {
 			t.Errorf("unhelpful error: %v", err)
 		}
 	})
+	// The dangerous case the malformed check cannot see. A caller that
+	// interpolates an unguarded `$(git merge-base ...)` passes
+	// --diff-base "" when the command fails; that clears scope.base, so
+	// the malformed-revision guard skips it and diffScopeClause drops
+	// the clause. The run then reverts to the inferred scope the flag
+	// exists to replace, while the command line still reads as pinned.
+	t.Run("explicitly empty base rejected, not silently dropped", func(t *testing.T) {
+		_, err := validateModeFlags("code", "", "", "", false,
+			diffScope{base: "", baseSet: true})
+		if err == nil {
+			t.Fatal("--diff-base \"\" accepted; run would silently revert to inferred scope")
+		}
+		if !strings.Contains(err.Error(), "--diff-base") {
+			t.Errorf("error must name the offending flag, got: %v", err)
+		}
+	})
+	t.Run("omitted base still allowed", func(t *testing.T) {
+		// baseSet false is the caller who never asked for a pin. That
+		// must stay legal or every unpinned invocation becomes an error.
+		if _, err := validateModeFlags("code", "", "", "", false,
+			diffScope{}); err != nil {
+			t.Fatalf("omitted --diff-base rejected: %v", err)
+		}
+	})
 	t.Run("head without base rejected", func(t *testing.T) {
 		if _, err := validateModeFlags("code", "", "", "", false,
 			diffScope{head: "HEAD"}); err == nil {

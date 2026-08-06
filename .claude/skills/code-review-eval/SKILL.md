@@ -53,9 +53,19 @@ Identify the branch to review. If an argument is given, `git checkout` that bran
 first. Otherwise use the current branch. Get the diff summary:
 
 ```bash
-DIFF_BASE=$(git merge-base origin/main HEAD)
+DIFF_BASE=$(git merge-base origin/main HEAD 2>/dev/null || true)
+if [ -z "$DIFF_BASE" ]; then
+  echo "[code-review-eval] ABORT: no merge-base for origin/main..HEAD — every config would run on inferred scope and the comparison table would be meaningless" >&2
+  exit 1
+fi
 git diff $DIFF_BASE..HEAD --stat
 ```
+
+Abort rather than warn-and-continue, unlike `/pr-polish`. pr-polish still
+reviews usefully on an inferred range, so it degrades loudly and records the
+fact; an eval whose whole output is a like-for-like table across configs has
+nothing to salvage from an uncontrolled range, and its rows persist into
+`data/eval-runs.log` where later runs are compared against them.
 
 Keep `$DIFF_BASE` for the launches below and pass it to **every** config as
 `--diff-base`. Without the flag each backend infers its own range, and the

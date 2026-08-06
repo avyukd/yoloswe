@@ -184,9 +184,12 @@ SCOPE_HINTS=$(python3 $SKILL_DIR/scripts/scope_gate.py --state-dir "$STATE_DIR" 
 # log, so its findings get compared against pinned rounds as if the ranges
 # matched. Do not hard-fail instead: branch contexts (`pr_number: null`,
 # `branch:<name>`) legitimately run without a resolvable base, and aborting
-# there would break the loop for a case that still reviews usefully. Record the
-# warning in the round's `comment_actions` as an `ack` so the state file says
-# which rounds were scoped by inference.
+# there would break the loop for a case that still reviews usefully.
+#
+# The block below only warns; it writes no state. When it fires, YOU must add
+# an `ack` entry (source `sweep`, notes naming the unpinned scope) to this
+# round's actions file in step (f), so the state file says which rounds were
+# scoped by inference. Nothing else records it.
 DIFF_BASE=$(git merge-base "origin/${BASE:-main}" HEAD 2>/dev/null || true)
 DIFF_BASE_ARG=""
 if [ -n "$DIFF_BASE" ]; then

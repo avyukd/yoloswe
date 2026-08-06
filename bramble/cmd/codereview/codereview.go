@@ -205,7 +205,7 @@ func runCodeReview(cmd *cobra.Command, args []string) (retErr error) {
 
 	mode, err := validateModeFlags(reviewMode, scopeHintsFile, rubricFile,
 		reviewPromptFile, skipTestExecution,
-		diffScope{base: diffBase, head: diffHead})
+		diffScope{base: diffBase, head: diffHead, baseSet: cmd.Flags().Changed("diff-base")})
 	if err != nil {
 		// Tag the failure envelope with the operator's *requested*
 		// mode when it's a known literal. Without this, an orchestrator
@@ -296,7 +296,7 @@ func runCodeReview(cmd *cobra.Command, args []string) (retErr error) {
 
 	prompt, err := buildPromptForRun(mode, goal, scopeHintsFile, rubricFile,
 		reviewPromptFile, skipTestExecution, style,
-		diffScope{base: diffBase, head: diffHead})
+		diffScope{base: diffBase, head: diffHead, baseSet: cmd.Flags().Changed("diff-base")})
 	if err != nil {
 		return emitEarlyFailure(err, r.EffectiveModel(), mode, emitEnvelope)
 	}
@@ -605,6 +605,16 @@ func normalizePromptStyle(resumeSessionID, rawStyle string, styleExplicit bool) 
 type diffScope struct {
 	base string
 	head string
+	// baseSet records that --diff-base was passed on the command line,
+	// distinguishing "caller did not pin the range" from "caller tried to
+	// pin it and computed an empty value". The second is the more
+	// dangerous of the two and is invisible without this: an empty base
+	// skips the ValidGitRevision check below and diffScopeClause then
+	// drops the clause, so the run reverts to the inferred scope this
+	// flag exists to replace while looking to the operator like a pinned
+	// one. Callers hit it by interpolating an unguarded
+	// `$(git merge-base ...)` that failed.
+	baseSet bool
 }
 
 func loadPromptOptions(mode reviewer.ReviewMode, hintsPath, rubricPath, personaPath string, skipTestExecution bool, scope diffScope) (reviewer.PromptOptions, error) {
@@ -746,6 +756,15 @@ func validateModeFlags(modeStr, hintsPath, rubricPath, personaPath string, skipT
 	case reviewer.ReviewModeCode, "":
 		if rubricPath != "" {
 			return "", fmt.Errorf("--review-rubric-file requires --review-mode design-doc")
+		}
+		// Same reasoning as the malformed-revision check below, for the
+		// case that check cannot see: `--diff-base ""` passes the
+		// scope.base != "" guard and is dropped silently. A caller that
+		// named the flag asked for a pinned range, so failing to
+		// resolve one is an error, not a fallback.
+		if scope.baseSet && scope.base == "" {
+			return "", fmt.Errorf("--diff-base was given an empty value; " +
+				"resolve the merge base or omit the flag")
 		}
 		// Reject a malformed revision here rather than letting the prompt
 		// builder drop the clause: a silently-omitted diff scope leaves
