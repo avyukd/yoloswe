@@ -737,6 +737,7 @@ def state_append_round(
     verify_head: bool = True,
     noise_filtered: int = 0,
     noise_samples: list[dict[str, Any]] | None = None,
+    pr_summary: str | None = None,
 ) -> dict[str, Any]:
     """Start a new round or refresh head_before on an in-progress round.
 
@@ -745,6 +746,14 @@ def state_append_round(
     ``head_before`` against ``git rev-parse HEAD``. A mismatch means the
     orchestrator computed the SHA in one message and a commit landed before
     this call — refuse rather than corrupt the round's lineage.
+
+    ``pr_summary`` is the PR's own statement of intent (commit list +
+    diffstat against the base). It is written ONCE, on the first round that
+    supplies it, and never overwritten: it is the frozen definition of what
+    this PR is for. Every later round reads it back from state, because the
+    orchestrator computes it in a shell variable at Step 1 that no longer
+    exists by round 2 — which is why the goal silently lost the PR's purpose
+    after round 1.
 
     ``noise_filtered`` / ``noise_samples`` record bot process-noise that
     ``fetch-comments`` dropped at intake (linear linkbacks, claude-bot
@@ -807,6 +816,12 @@ def state_append_round(
             existing.setdefault("noise_samples", samples)
             if not existing["noise_samples"]:
                 existing["noise_samples"] = samples
+    # Frozen, not refreshed. A PR's remit is fixed when the loop first sees
+    # it; re-deriving it each round would let a ratcheting PR keep
+    # re-authorizing its own growth, which is the drift the scope contract
+    # exists to prevent.
+    if pr_summary and not state.get("pr_summary"):
+        state["pr_summary"] = pr_summary
     state["current_round"] = n
     state["last_commit_at_round_start"] = head_before
     # When the orchestrator re-invokes pr-polish on a state file that
@@ -1527,16 +1542,18 @@ def round_bundle(ctx: int | str, n: int) -> dict[str, Any]:
     head_res = run(["git", "rev-parse", "HEAD"], check=False)
     head_before = head_res.stdout.strip() if head_res.returncode == 0 else ""
 
-    # PR_SUMMARY: leave empty here — building it requires a base-branch
-    # diff that the orchestrator already computes once at Step 1. The
-    # agent threads it into goal_for_round via a separate arg. Keep this
-    # helper bramble-agnostic at the PR_SUMMARY boundary.
+    # PR_SUMMARY comes from state, where round 1 froze it. It used to be
+    # passed as "" here on the theory that the orchestrator threaded it in
+    # separately — but the SKILL only sets GOAL=$PR_SUMMARY when ROUND=1, so
+    # from round 2 on the goal carried no statement of what the PR was for.
+    # A round-16 reviewer saw action history and a diff, with the PR's own
+    # purpose absent entirely.
     goal_text = ""
     if state is not None:
         try:
             goal_text = bramble_ops.goal_for_round(
                 n,
-                pr_summary="",
+                pr_summary=state.get("pr_summary") or "",
                 state=state,
                 head_before=head_before or None,
                 is_new_series=bool(is_new_series),
