@@ -833,6 +833,19 @@ def apply_human_review_command(
         return 2
 
     dataset_path, dataset = _load_dataset(dataset_dir, target)
+
+    # Defense in depth. `_load_dataset` also accepts a literal `*.json` path
+    # (pre-existing behaviour `validate --all` depends on), which the slug
+    # check above already forecloses for this command. Assert containment
+    # anyway: this is the one code path that WRITES the benchmark, so it
+    # should not depend on a caller-side guard staying where it is.
+    try:
+        dataset_path.resolve().relative_to(dataset_dir.resolve())
+    except ValueError:
+        print(f"error: {dataset_path} resolves outside {dataset_dir}",
+              file=sys.stderr)
+        return 2
+
     gt = cl.load_ground_truth(dataset)
     if gt is None:
         print(f"error: {target} has no frozen ground_truth_v3 block",

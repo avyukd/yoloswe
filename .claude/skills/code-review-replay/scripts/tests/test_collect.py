@@ -16,6 +16,7 @@ if str(SCRIPT_DIR) not in sys.path:
 import collect  # noqa: E402
 import collect_lib as cl  # noqa: E402
 import harvest_lib as hl  # noqa: E402
+import humanreview_lib as hr  # noqa: E402
 
 
 def _fv(file, line, verdict, *, severity="high", topic="t", reason="r",
@@ -1524,3 +1525,192 @@ class UnchangedFileTruePositiveTests(unittest.TestCase):
             any("did not modify" in w for w in warnings),
             f"expected an out-of-diff warning, got {warnings}",
         )
+
+
+class ApplyHumanReviewCommandTests(unittest.TestCase):
+    """End-to-end tests for the ONE command that writes the frozen benchmark.
+
+    `humanreview_lib` is unit-tested separately; this covers the CLI wrapper
+    that composes it — the fingerprint refusal, `--dry-run`'s no-write
+    guarantee, `--strip`, the post-apply `validate_dataset` gate, and the
+    path-containment assertion. Gap identified by cursor in PR #309 review:
+    the library was well covered while the command that drives it was not.
+    """
+
+    def _setup(self, td, *, converged=True):
+        root = Path(td)
+        ds_dir = root / "dataset"
+        ds_dir.mkdir()
+        entry = {
+            "file": "a/b.py", "line": 10, "severity": "high", "topic": "t",
+            "first_seen_round": 1, "surfaced_by": ["codex"],
+            "judge_reason": "r", "reviewer_severity": "high",
+            "verdict_history": [], "resolved": True,
+            "comment_action_xref": None,
+        }
+        dataset = {
+            "schema_version": 3, "harvest_source": "pr-polish",
+            "pr": {"repo_name": "kernel", "pr_number": "1"},
+            "harvested_rounds": [{"head_before": "a" * 40,
+                                  "files_changed": ["a/b.py"]}],
+            "ground_truth_v3": {
+                "schema_version": 4, "frozen_at": "2026-01-01T00:00:00Z",
+                "collector_git_sha": "abc", "rounds_run": 2,
+                "census_converged": converged,
+                "true_positives": [dict(entry)], "false_positives": [],
+                "contested": [], "per_round_diff": [], "dataset_xref": {},
+            },
+        }
+        (ds_dir / "kernel-1.json").write_text(json.dumps(dataset))
+        return root, ds_dir
+
+    def _stage(self, root, gt, verdicts):
+        ov = hr.new_overlay("kernel-1", gt)
+        ov["verdicts"] = verdicts
+        hr.save_overlay(hr.overlay_path(root, "kernel-1"), ov)
+        return ov
+
+    def _gt(self, ds_dir):
+        return json.loads(
+            (ds_dir / "kernel-1.json").read_text())["ground_truth_v3"]
+
+    def _verdict(self, op, **kw):
+        v = {"op": op, "file": "a/b.py", "line": 10, "reviewer": "t",
+             "at": "2026-08-06T00:00:00Z", "reason": "because"}
+        v.update(kw)
+        return v
+
+    def test_dry_run_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, ds_dir = self._setup(td)
+            self._stage(root, self._gt(ds_dir), [self._verdict("confirm")])
+            before = (ds_dir / "kernel-1.json").read_bytes()
+            rc = collect.apply_human_review_command(
+                target="kernel-1", dataset_dir=ds_dir, eval_root=root,
+                dry_run=True, strip=False, force=False)
+            self.assertEqual(rc, 0)
+            self.assertEqual((ds_dir / "kernel-1.json").read_bytes(), before)
+
+    def test_apply_is_idempotent_across_repeated_runs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, ds_dir = self._setup(td)
+            self._stage(root, self._gt(ds_dir), [
+                self._verdict("reject"),
+                self._verdict("add", file="c/d.py", line=5, severity="low",
+                              topic="new"),
+            ])
+            seen = []
+            for _ in range(3):
+                rc = collect.apply_human_review_command(
+                    target="kernel-1", dataset_dir=ds_dir, eval_root=root,
+                    dry_run=False, strip=False, force=False)
+                self.assertEqual(rc, 0)
+                seen.append((ds_dir / "kernel-1.json").read_bytes())
+            self.assertEqual(seen[0], seen[1])
+            self.assertEqual(seen[1], seen[2])
+
+    def test_refuses_when_ground_truth_changed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, ds_dir = self._setup(td)
+            self._stage(root, self._gt(ds_dir), [self._verdict("confirm")])
+            # Simulate a re-collection: a new judged finding appears.
+            doc = json.loads((ds_dir / "kernel-1.json").read_text())
+            doc["ground_truth_v3"]["true_positives"].append({
+                "file": "new/x.py", "line": 3, "severity": "high",
+                "topic": "re-collected", "first_seen_round": 3,
+                "surfaced_by": ["codex"], "judge_reason": "",
+                "reviewer_severity": None, "verdict_history": [],
+                "resolved": True, "comment_action_xref": None})
+            (ds_dir / "kernel-1.json").write_text(json.dumps(doc))
+            before = (ds_dir / "kernel-1.json").read_bytes()
+
+            rc = collect.apply_human_review_command(
+                target="kernel-1", dataset_dir=ds_dir, eval_root=root,
+                dry_run=False, strip=False, force=False)
+            self.assertEqual(rc, 2)
+            self.assertEqual((ds_dir / "kernel-1.json").read_bytes(), before,
+                             "a refused apply must not write")
+
+    def test_force_overrides_a_changed_ground_truth(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, ds_dir = self._setup(td)
+            self._stage(root, self._gt(ds_dir), [self._verdict("confirm")])
+            doc = json.loads((ds_dir / "kernel-1.json").read_text())
+            doc["ground_truth_v3"]["true_positives"][0]["topic"] = "reworded"
+            (ds_dir / "kernel-1.json").write_text(json.dumps(doc))
+
+            rc = collect.apply_human_review_command(
+                target="kernel-1", dataset_dir=ds_dir, eval_root=root,
+                dry_run=False, strip=False, force=True)
+            self.assertEqual(rc, 0)
+            self.assertIn("human_verdict", self._gt(ds_dir)["true_positives"][0])
+
+    def test_strip_restores_the_pre_human_block(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, ds_dir = self._setup(td)
+            before = json.loads(
+                (ds_dir / "kernel-1.json").read_text())["ground_truth_v3"]
+            self._stage(root, self._gt(ds_dir), [
+                self._verdict("reject"),
+                self._verdict("add", file="c/d.py", line=5, severity="low",
+                              topic="new"),
+            ])
+            collect.apply_human_review_command(
+                target="kernel-1", dataset_dir=ds_dir, eval_root=root,
+                dry_run=False, strip=False, force=False)
+            rc = collect.apply_human_review_command(
+                target="kernel-1", dataset_dir=ds_dir, eval_root=root,
+                dry_run=False, strip=True, force=False)
+            self.assertEqual(rc, 0)
+            after = self._gt(ds_dir)
+            key = lambda e: (e["file"], str(e["line"]))  # noqa: E731
+            for bucket in ("true_positives", "false_positives"):
+                self.assertEqual(
+                    sorted(after.get(bucket) or [], key=key),
+                    sorted(before.get(bucket) or [], key=key),
+                    f"{bucket} did not round-trip")
+
+    def test_rejects_a_traversal_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, ds_dir = self._setup(td)
+            rc = collect.apply_human_review_command(
+                target="../../../etc/passwd", dataset_dir=ds_dir,
+                eval_root=root, dry_run=True, strip=False, force=False)
+            self.assertEqual(rc, 2)
+
+    def test_missing_overlay_is_an_error_not_a_silent_noop(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, ds_dir = self._setup(td)
+            rc = collect.apply_human_review_command(
+                target="kernel-1", dataset_dir=ds_dir, eval_root=root,
+                dry_run=False, strip=False, force=False)
+            self.assertEqual(rc, 2)
+
+    def test_unconverged_census_warns_but_applies(self):
+        """Unconverged records need the human pass MOST — warn, never block."""
+        with tempfile.TemporaryDirectory() as td:
+            root, ds_dir = self._setup(td, converged=False)
+            self._stage(root, self._gt(ds_dir), [self._verdict("confirm")])
+            rc = collect.apply_human_review_command(
+                target="kernel-1", dataset_dir=ds_dir, eval_root=root,
+                dry_run=False, strip=False, force=False)
+            self.assertEqual(rc, 0)
+            gt = self._gt(ds_dir)
+            self.assertIn("human_verdict", gt["true_positives"][0])
+            self.assertFalse(gt["census_converged"],
+                             "a human pass must not flip convergence")
+
+    def test_applied_record_still_validates(self):
+        with tempfile.TemporaryDirectory() as td:
+            root, ds_dir = self._setup(td)
+            self._stage(root, self._gt(ds_dir), [
+                self._verdict("reseverity", severity="nit"),
+                self._verdict("add", file="c/d.py", line=5, severity="medium",
+                              topic="new"),
+            ])
+            collect.apply_human_review_command(
+                target="kernel-1", dataset_dir=ds_dir, eval_root=root,
+                dry_run=False, strip=False, force=False)
+            doc = json.loads((ds_dir / "kernel-1.json").read_text())
+            errors, _ = cl.validate_dataset(doc)
+            self.assertEqual(errors, [])
