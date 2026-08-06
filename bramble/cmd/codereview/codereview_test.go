@@ -934,6 +934,61 @@ func TestCmd_ResumeFlagsAreWired(t *testing.T) {
 	}
 }
 
+func TestCmd_DiffScopeFlagsAreWired(t *testing.T) {
+	// Cobra-level proof for --diff-base/--diff-head, in the same shape as
+	// its siblings above. The helper-level TestDiffScopeFlagValidation
+	// constructs diffScope literals directly, so it proves the validation
+	// rule and nothing about how baseSet gets its value: deleting
+	// `baseSet: cmd.Flags().Changed("diff-base")` from runCodeReview
+	// leaves every other test in this package passing while the bug
+	// returns in full — an empty --diff-base silently reverts the run to
+	// inferred scope behind a command line that still reads as pinned.
+	//
+	// This also pins the pflag behaviour the whole fix rests on: Changed
+	// must be true for a flag explicitly set to the empty string. It is
+	// (pflag.Set marks Changed before inspecting the value), but nothing
+	// stated it, so a pflag change would have disarmed the check
+	// silently instead of failing here.
+	prevBase, prevHead := diffBase, diffHead
+	t.Cleanup(func() { diffBase, diffHead = prevBase, prevHead })
+
+	if err := Cmd.ParseFlags([]string{"--diff-base", ""}); err != nil {
+		t.Fatalf("ParseFlags failed: %v", err)
+	}
+	if !Cmd.Flags().Changed("diff-base") {
+		t.Error("Changed(\"diff-base\") = false after an explicit empty value; " +
+			"the empty-base rejection in validateModeFlags is disarmed")
+	}
+	if diffBase != "" {
+		t.Errorf("diffBase global = %q, want empty", diffBase)
+	}
+	// The load-bearing assertion: the scope runCodeReview actually builds
+	// carries baseSet, and validateModeFlags rejects it. Asserting only on
+	// Changed() above would pass even if the wiring were deleted.
+	if scope := diffScopeFromFlags(Cmd); !scope.baseSet {
+		t.Error("diffScopeFromFlags dropped baseSet; an empty --diff-base " +
+			"would revert the run to inferred scope without an error")
+	}
+	if _, err := validateModeFlags("code", "", "", "", false,
+		diffScopeFromFlags(Cmd)); err == nil {
+		t.Error("empty --diff-base accepted end-to-end from parsed flags")
+	}
+
+	const sha = "35e2b581d06cef4b34daff5a2b476fb3ec361194"
+	if err := Cmd.ParseFlags([]string{"--diff-base", sha, "--diff-head", "HEAD"}); err != nil {
+		t.Fatalf("ParseFlags second pass failed: %v", err)
+	}
+	if diffBase != sha {
+		t.Errorf("diffBase global = %q, want %s", diffBase, sha)
+	}
+	if diffHead != "HEAD" {
+		t.Errorf("diffHead global = %q, want HEAD", diffHead)
+	}
+	if scope := diffScopeFromFlags(Cmd); scope.base != sha || scope.head != "HEAD" {
+		t.Errorf("diffScopeFromFlags = %+v, want base %s head HEAD", scope, sha)
+	}
+}
+
 func TestCmd_TimeoutFlagsAreWired(t *testing.T) {
 	// Cobra-level proof that --idle-timeout and --timeout are registered,
 	// carry the new defaults (idle 3m, absolute cap off), and parse into the

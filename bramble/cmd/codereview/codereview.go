@@ -205,7 +205,7 @@ func runCodeReview(cmd *cobra.Command, args []string) (retErr error) {
 
 	mode, err := validateModeFlags(reviewMode, scopeHintsFile, rubricFile,
 		reviewPromptFile, skipTestExecution,
-		diffScope{base: diffBase, head: diffHead, baseSet: cmd.Flags().Changed("diff-base")})
+		diffScopeFromFlags(cmd))
 	if err != nil {
 		// Tag the failure envelope with the operator's *requested*
 		// mode when it's a known literal. Without this, an orchestrator
@@ -296,7 +296,7 @@ func runCodeReview(cmd *cobra.Command, args []string) (retErr error) {
 
 	prompt, err := buildPromptForRun(mode, goal, scopeHintsFile, rubricFile,
 		reviewPromptFile, skipTestExecution, style,
-		diffScope{base: diffBase, head: diffHead, baseSet: cmd.Flags().Changed("diff-base")})
+		diffScopeFromFlags(cmd))
 	if err != nil {
 		return emitEarlyFailure(err, r.EffectiveModel(), mode, emitEnvelope)
 	}
@@ -615,6 +615,20 @@ type diffScope struct {
 	// one. Callers hit it by interpolating an unguarded
 	// `$(git merge-base ...)` that failed.
 	baseSet bool
+}
+
+// diffScopeFromFlags builds the scope from the parsed command. It exists
+// as a named function, rather than a struct literal at each call site, so
+// the wiring is testable: constructing diffScope inline meant nothing
+// pinned that baseSet was populated at all, and dropping it left the whole
+// suite green while an empty --diff-base went back to being silently
+// accepted.
+func diffScopeFromFlags(cmd *cobra.Command) diffScope {
+	return diffScope{
+		base:    diffBase,
+		head:    diffHead,
+		baseSet: cmd.Flags().Changed("diff-base"),
+	}
 }
 
 func loadPromptOptions(mode reviewer.ReviewMode, hintsPath, rubricPath, personaPath string, skipTestExecution bool, scope diffScope) (reviewer.PromptOptions, error) {
