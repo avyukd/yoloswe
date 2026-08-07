@@ -300,6 +300,43 @@ class TestGoalForRound(unittest.TestCase):
         self.assertIn("a.go:5 wont_fix: out of scope", goal)
         self.assertNotIn("deferred, not fixed", goal)
 
+    def test_frozen_reason_gets_room_for_the_whole_argument(self) -> None:
+        # A rationale truncated at the 80-char topic cap loses the argument
+        # exactly where it starts to matter, and the next reviewer re-raises
+        # the item. Measured on this PR at round 3, which cost a full round.
+        reason = (
+            "Declining the placeholder-reason half. The proposed fix is a blocklist of "
+            "non-answers, which is inexhaustible, and pr_ops._action_is_open_deferral "
+            "already defines the repo's one policy for whether a wont_fix counts as "
+            "justified: a non-empty reason."
+        )
+        state = {
+            "rounds": [
+                {"n": 1, "comment_actions": [
+                    {"action": "wont_fix", "path": "a.go", "line": 5, "reason": reason},
+                ]},
+            ]
+        }
+        goal = bramble_ops.goal_for_round(2, "PR_SUMMARY", state)
+        self.assertIn("already defines the repo's one policy", goal)
+        self.assertNotIn("…", goal)
+        # The per-turn path keeps the tight topic cap — only the frozen
+        # block's reason is the payload.
+        self.assertGreater(bramble_ops._DECLINE_REASON_CHAR_CAP, bramble_ops._TOPIC_CHAR_CAP)
+
+    def test_per_turn_labels_keep_the_tight_topic_cap(self) -> None:
+        long_topic = "x" * 300
+        state = {
+            "rounds": [
+                {"n": 1, "comment_actions": [
+                    {"action": "ack", "path": "a.go", "line": 5, "topic": long_topic},
+                ]},
+            ]
+        }
+        goal = bramble_ops.goal_for_round(2, "PR_SUMMARY", state)
+        self.assertIn("…", goal)
+        self.assertNotIn("x" * 100, goal)
+
     def test_frozen_declines_deduped_by_address(self) -> None:
         # The same finding declined in three rounds is one line, carrying the
         # most recent reason — the block is bounded by distinct addresses, not

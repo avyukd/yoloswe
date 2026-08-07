@@ -82,6 +82,15 @@ _ACTION_HISTORY_CAP = 20
 # can't blow the whole prompt.
 _TOPIC_CHAR_CAP = 80
 
+# Cap for a settled decline's rationale, which gets far more room than a
+# topic because it is doing different work. A topic is a label — 80 chars
+# identifies which finding is meant. A rationale is the argument that stops
+# the next reviewer re-raising the item, and an argument cut off mid-clause
+# persuades nobody. Measured on this PR: a decline whose reason truncated at
+# 80 chars to "…The proposed fix is a blocklist of non-a…" was re-raised by
+# the same backend the very next round, costing a full round.
+_DECLINE_REASON_CHAR_CAP = 400
+
 
 def _is_first_round_of_series(state: dict[str, Any] | None, n: int) -> bool:
     """Mirror of pr_ops._is_first_round_of_series.
@@ -295,12 +304,12 @@ def action_history_goal(
     return " ".join(parts)
 
 
-def _truncate(s: str) -> str:
-    """Cap a string at _TOPIC_CHAR_CAP chars with an ellipsis tail."""
+def _truncate(s: str, cap: int = _TOPIC_CHAR_CAP) -> str:
+    """Cap a string at ``cap`` chars with an ellipsis tail."""
     s = (s or "").strip()
-    if len(s) <= _TOPIC_CHAR_CAP:
+    if len(s) <= cap:
         return s
-    return s[: _TOPIC_CHAR_CAP - 1].rstrip() + "…"
+    return s[: cap - 1].rstrip() + "…"
 
 
 def _action_address(action: dict[str, Any]) -> str:
@@ -398,9 +407,12 @@ def _skipped_label(action: dict[str, Any], verb: str, *, settled: bool = False) 
     Reason takes precedence over topic when both are present — the
     reason is what the orchestrator decided, and the model needs that
     decision (and not the original finding's topic) to avoid re-arguing
-    the skip. The whole description is capped at _TOPIC_CHAR_CAP so
-    a long reason can't bloat the goal text. Address shape matches
-    ``_action_label``.
+    the skip. Address shape matches ``_action_label``.
+
+    The description is capped at _TOPIC_CHAR_CAP, or the far roomier
+    _DECLINE_REASON_CHAR_CAP under ``settled`` — a frozen decline's reason is
+    the argument that keeps the item closed, so truncating it mid-clause
+    buys back a round of re-litigation for the tokens it saves.
 
     Deferral-class verbs (see ``_DEFERRED_VERBS``) get a ``(deferred, not
     fixed)`` gloss so the resumed reviewer reads them as still-open rather
@@ -428,7 +440,8 @@ def _skipped_label(action: dict[str, Any], verb: str, *, settled: bool = False) 
         label_verb = verb
     description = (action.get("reason") or action.get("topic") or "").strip()
     if description:
-        return f"{base} {label_verb}: {_truncate(description)}"
+        cap = _DECLINE_REASON_CHAR_CAP if settled else _TOPIC_CHAR_CAP
+        return f"{base} {label_verb}: {_truncate(description, cap)}"
     return f"{base} {label_verb}"
 
 
