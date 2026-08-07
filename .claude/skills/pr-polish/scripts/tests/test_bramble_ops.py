@@ -171,6 +171,188 @@ class TestGoalForRound(unittest.TestCase):
         }
         goal = bramble_ops.goal_for_round(2, "PR_SUMMARY", state)
         self.assertNotIn("Invariants named in the prior round", goal)
+
+    def test_settled_declines_persist_across_all_prior_rounds(self) -> None:
+        # The per-turn briefing covers the prior round only; declines are the
+        # exception. A wont_fix decided in round 1 must still be visible in
+        # round 4's goal, with its reason — otherwise the next reviewer can't
+        # tell a settled decision from an unnoticed finding and re-raises it.
+        state = {
+            "rounds": [
+                {"n": 1, "comment_actions": [
+                    {"action": "wont_fix", "path": "a.go", "line": 5,
+                     "reason": "not in this PR's diff"},
+                ]},
+                {"n": 2, "comment_actions": [
+                    {"action": "false_positive", "path": "b.go", "line": 7,
+                     "reason": "caller already validates"},
+                ]},
+                {"n": 3, "comment_actions": [
+                    {"action": "fixed", "path": "c.go", "line": 9, "topic": "nil deref"},
+                ]},
+            ]
+        }
+        goal = bramble_ops.goal_for_round(4, "PR_SUMMARY", state)
+        self.assertIn("do not re-raise these", goal)
+        self.assertIn("a.go:5 wont_fix: not in this PR's diff", goal)
+        self.assertIn("b.go:7 false_positive: caller already validates", goal)
+
+    def test_later_fix_supersedes_an_earlier_decline(self) -> None:
+        # The orchestrator can change its mind: a round that fixes an address
+        # declined earlier un-settles it, so it drops out of the frozen block
+        # rather than telling the reviewer not to raise something now fixed.
+        state = {
+            "rounds": [
+                {"n": 1, "comment_actions": [
+                    {"action": "wont_fix", "path": "a.go", "line": 5, "reason": "out of scope"},
+                ]},
+                {"n": 2, "comment_actions": [
+                    {"action": "fixed", "path": "a.go", "line": 5, "topic": "did it after all"},
+                ]},
+            ]
+        }
+        goal = bramble_ops.goal_for_round(3, "PR_SUMMARY", state)
+        self.assertNotIn("do not re-raise these", goal)
+        self.assertNotIn("out of scope", goal)
+
+    def test_no_declines_no_frozen_section(self) -> None:
+        state = {
+            "rounds": [
+                {"n": 1, "comment_actions": [
+                    {"action": "ack", "path": "a.go", "line": 5, "topic": "rename"},
+                ]},
+            ]
+        }
+        goal = bramble_ops.goal_for_round(2, "PR_SUMMARY", state)
+        self.assertNotIn("do not re-raise these", goal)
+
+    def test_reasonless_decline_is_not_frozen(self) -> None:
+        # A decline with no recorded reason is a protocol violation, and
+        # freezing it would suppress the finding for every remaining round on
+        # no stated grounds. It stays in the per-turn briefing as still-open
+        # work, so the next reviewer may raise it again.
+        state = {
+            "rounds": [
+                {"n": 1, "comment_actions": [
+                    {"action": "wont_fix", "path": "a.go", "line": 5, "topic": "unused param"},
+                    {"action": "false_positive", "path": "b.go", "line": 7},
+                ]},
+            ]
+        }
+        goal = bramble_ops.goal_for_round(2, "PR_SUMMARY", state)
+        self.assertNotIn("do not re-raise these", goal)
+        # Still visible for the one round, and marked as open. A bare
+        # false_positive would otherwise read as resolved: it carries no
+        # deferral gloss, because normally it does remove the item from scope.
+        self.assertIn("a.go:5 wont_fix (no reason recorded — treat as open): unused param", goal)
+        self.assertIn("b.go:7 false_positive (no reason recorded — treat as open)", goal)
+
+    def test_settled_address_never_appears_in_both_blocks(self) -> None:
+        # Round 1 declines with a reason (settled); round 2 re-records the
+        # same address with none. Round 3's goal must not simultaneously say
+        # "do not re-raise" and list it as still-open work — the earlier
+        # reasoned decision stands, and only the frozen block carries it.
+        state = {
+            "rounds": [
+                {"n": 1, "comment_actions": [
+                    {"action": "wont_fix", "path": "a.go", "line": 5, "reason": "belongs to net/"},
+                ]},
+                {"n": 2, "comment_actions": [
+                    {"action": "wont_fix", "path": "a.go", "line": 5},
+                ]},
+            ]
+        }
+        goal = bramble_ops.goal_for_round(3, "PR_SUMMARY", state)
+        self.assertIn("a.go:5 wont_fix: belongs to net/", goal)
+        self.assertNotIn("treat as open", goal)
+        self.assertNotIn("deferred, not fixed", goal)
+        self.assertEqual(goal.count("a.go:5"), 1)
+
+    def test_later_fix_still_un_settles_after_reasonless_redecline(self) -> None:
+        # Only `fixed` un-settles. Once it does, the address is open again
+        # and the frozen block must stop claiming it.
+        state = {
+            "rounds": [
+                {"n": 1, "comment_actions": [
+                    {"action": "wont_fix", "path": "a.go", "line": 5, "reason": "belongs to net/"},
+                ]},
+                {"n": 2, "comment_actions": [
+                    {"action": "fixed", "path": "a.go", "line": 5, "topic": "did it after all"},
+                ]},
+            ]
+        }
+        goal = bramble_ops.goal_for_round(3, "PR_SUMMARY", state)
+        self.assertNotIn("do not re-raise these", goal)
+        self.assertNotIn("belongs to net/", goal)
+
+    def test_frozen_declines_drop_the_deferred_gloss(self) -> None:
+        # Inside a block headed "do not re-raise these", "(deferred, not
+        # fixed)" reads as a contradiction — it invites the reviewer to treat
+        # a closed decision as open work.
+        state = {
+            "rounds": [
+                {"n": 1, "comment_actions": [
+                    {"action": "wont_fix", "path": "a.go", "line": 5, "reason": "out of scope"},
+                ]},
+            ]
+        }
+        goal = bramble_ops.goal_for_round(2, "PR_SUMMARY", state)
+        self.assertIn("a.go:5 wont_fix: out of scope", goal)
+        self.assertNotIn("deferred, not fixed", goal)
+
+    def test_frozen_reason_gets_room_for_the_whole_argument(self) -> None:
+        # A rationale truncated at the 80-char topic cap loses the argument
+        # exactly where it starts to matter, and the next reviewer re-raises
+        # the item. Measured on this PR at round 3, which cost a full round.
+        reason = (
+            "Declining the placeholder-reason half. The proposed fix is a blocklist of "
+            "non-answers, which is inexhaustible, and pr_ops._action_is_open_deferral "
+            "already defines the repo's one policy for whether a wont_fix counts as "
+            "justified: a non-empty reason."
+        )
+        state = {
+            "rounds": [
+                {"n": 1, "comment_actions": [
+                    {"action": "wont_fix", "path": "a.go", "line": 5, "reason": reason},
+                ]},
+            ]
+        }
+        goal = bramble_ops.goal_for_round(2, "PR_SUMMARY", state)
+        self.assertIn("already defines the repo's one policy", goal)
+        self.assertNotIn("…", goal)
+        # The per-turn path keeps the tight topic cap — only the frozen
+        # block's reason is the payload.
+        self.assertGreater(bramble_ops._DECLINE_REASON_CHAR_CAP, bramble_ops._TOPIC_CHAR_CAP)
+
+    def test_per_turn_labels_keep_the_tight_topic_cap(self) -> None:
+        long_topic = "x" * 300
+        state = {
+            "rounds": [
+                {"n": 1, "comment_actions": [
+                    {"action": "ack", "path": "a.go", "line": 5, "topic": long_topic},
+                ]},
+            ]
+        }
+        goal = bramble_ops.goal_for_round(2, "PR_SUMMARY", state)
+        self.assertIn("…", goal)
+        self.assertNotIn("x" * 100, goal)
+
+    def test_frozen_declines_deduped_by_address(self) -> None:
+        # The same finding declined in three rounds is one line, carrying the
+        # most recent reason — the block is bounded by distinct addresses, not
+        # by how many times a reviewer re-raised the item before it stuck.
+        state = {
+            "rounds": [
+                {"n": n, "comment_actions": [
+                    {"action": "wont_fix", "path": "a.go", "line": 5,
+                     "reason": f"reason from round {n}"},
+                ]}
+                for n in (1, 2, 3)
+            ]
+        }
+        goal = bramble_ops.goal_for_round(4, "PR_SUMMARY", state)
+        self.assertEqual(goal.count("a.go:5"), 1)
+        self.assertIn("reason from round 3", goal)
         self.assertNotIn("fold new sites", goal)
 
 
@@ -258,13 +440,14 @@ class TestActionHistoryGoal(unittest.TestCase):
         self.assertIn("Prior round fixed:", out)
         self.assertIn("a.go:10 — null check missing", out)
         self.assertIn("Skipped:", out)
-        # Reason wins when present (the orchestrator's decision is what
-        # the model needs to know to avoid re-arguing the skip). Deferral-class
-        # verbs carry the "(deferred, not fixed)" gloss so the resumed reviewer
-        # reads the finding as still open.
-        self.assertIn("b.py:42 wont_fix (deferred, not fixed): design tradeoff", out)
-        # Topic-only fallback when no reason was recorded.
+        # Topic-only fallback when no reason was recorded. Deferral-class verbs
+        # carry the "(deferred, not fixed)" gloss so the resumed reviewer reads
+        # the finding as still open.
         self.assertIn("d.go:8 ack (deferred, not fixed): rename helper", out)
+        # Settled declines leave the per-turn briefing: they belong to the
+        # cumulative _frozen_declines_note block, which carries them for the
+        # whole run rather than just the round they were decided in.
+        self.assertNotIn("b.py:42", out)
         # Stale entries are deliberately excluded from the goal channel.
         self.assertNotIn("c.go:5", out)
         self.assertNotIn("stale", out)
