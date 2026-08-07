@@ -777,6 +777,36 @@ def parse_envelope(obj: dict[str, Any] | None, *, source: str) -> list[dict[str,
         return []
     mode = obj.get("review_mode") or REVIEW_MODE_CODE
     status = obj.get("status")
+    # "partial" is a run that produced real findings and THEN failed (e.g. the
+    # idle timeout fired mid-review). Both halves matter: the findings are
+    # genuine review work and must not be discarded, and the failure is still a
+    # signal the orchestrator has to see. So we fall through to the normal
+    # issue-parsing path below AND append the failure finding, rather than
+    # choosing one. Dropping the findings is what made #8682 r2 expensive —
+    # ~12min of completed analysis thrown away because the last stretch was
+    # quiet.
+    if status == "partial":
+        partial_msg = obj.get("error") or "bramble run ended early (partial)"
+        findings = parse_envelope({**obj, "status": "ok"}, source=source)
+        failure: dict[str, Any] = {
+            "source": source,
+            # medium, not high: unlike a total failure this round DID get
+            # reviewed. Routing it to must_fix would make every partial run
+            # look like a blocking defect in the diff.
+            "severity": "medium",
+            "message": f"{partial_msg} (kept {len(findings)} finding(s) from the partial run)",
+            "suggestion": None,
+            "topic": topic_of(partial_msg),
+            "status": status,
+            "review_mode": mode,
+        }
+        if mode == REVIEW_MODE_DESIGN_DOC:
+            failure["section"] = None
+            failure["dimension"] = None
+        else:
+            failure["file"] = None
+            failure["line"] = None
+        return [*findings, failure]
     if status != "ok":
         # A failed bramble run is a real signal — the orchestrator must
         # surface it, not silently drop it. ``high`` routes through

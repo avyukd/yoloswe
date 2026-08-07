@@ -991,10 +991,17 @@ func TestCmd_DiffScopeFlagsAreWired(t *testing.T) {
 
 func TestCmd_TimeoutFlagsAreWired(t *testing.T) {
 	// Cobra-level proof that --idle-timeout and --timeout are registered,
-	// carry the new defaults (idle 3m, absolute cap off), and parse into the
+	// carry the new defaults (idle 8m, absolute cap off), and parse into the
 	// globals runCodeReview reads (idle-timeout flows into reviewer.Config.
 	// IdleTimeout; --timeout gates the conditional context.WithTimeout). Guards
 	// the default against a silent regression the reviewer tests can't see.
+	//
+	// Why 8m: codex's own transport carries a server-side ~300s idle timeout,
+	// after which it reconnects and resumes on its own (measured: every
+	// within-turn silence >=5m in a 10-day log was 301-302s and ended in a
+	// responses_retry). A client bound at or below that races the backend's own
+	// recovery and kills a turn that was about to continue. 8m sits clear of
+	// it; --timeout remains the absolute cap for callers that want one.
 	prevTimeout := timeout
 	prevIdle := idleTimeout
 	t.Cleanup(func() {
@@ -1006,8 +1013,8 @@ func TestCmd_TimeoutFlagsAreWired(t *testing.T) {
 	if err := Cmd.ParseFlags([]string{}); err != nil {
 		t.Fatalf("ParseFlags (defaults) failed: %v", err)
 	}
-	if idleTimeout != 3*time.Minute {
-		t.Errorf("--idle-timeout default = %s, want 3m (inactivity bound for bare callers)", idleTimeout)
+	if idleTimeout != 8*time.Minute {
+		t.Errorf("--idle-timeout default = %s, want 8m (clear of the backend's own ~300s keepalive)", idleTimeout)
 	}
 	if timeout != 0 {
 		t.Errorf("--timeout default = %s, want 0 (absolute cap off; rely on idle)", timeout)

@@ -960,6 +960,43 @@ class TestParseEnvelope(unittest.TestCase):
     def test_missing_envelope_yields_empty_list(self) -> None:
         self.assertEqual(bramble_ops.parse_envelope(None, source="codex"), [])
 
+    def test_partial_envelope_keeps_its_findings_and_reports_the_failure(self) -> None:
+        # A run that found real defects and THEN died (idle timeout mid-review)
+        # must deliver both halves. Discarding the findings is what made
+        # kernel#8682 r2 expensive: ~12min of completed analysis dropped
+        # because the last stretch of the stream was quiet.
+        env = {
+            "status": "partial",
+            "error": "codex: review idle: no events for 5m0s",
+            "review": {
+                "issues": [
+                    {
+                        "severity": "high",
+                        "file": "a.py",
+                        "line": 10,
+                        "message": "real defect found before the timeout",
+                    }
+                ]
+            },
+        }
+        got = bramble_ops.parse_envelope(env, source="codex")
+        self.assertEqual(len(got), 2, "expected the finding plus a failure row")
+        finding, failure = got
+        self.assertEqual(finding["file"], "a.py")
+        self.assertEqual(finding["severity"], "high")
+        # The failure row is medium, not high: this round WAS reviewed, so it
+        # must not present as a blocking defect in the diff itself.
+        self.assertEqual(failure["severity"], "medium")
+        self.assertEqual(failure["status"], "partial")
+        self.assertIn("kept 1 finding", failure["message"])
+
+    def test_partial_envelope_with_no_findings_still_reports(self) -> None:
+        env = {"status": "partial", "error": "died early"}
+        got = bramble_ops.parse_envelope(env, source="codex")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["status"], "partial")
+        self.assertIn("kept 0 finding", got[0]["message"])
+
     def test_v2_class_level_issue_expands_sites_to_findings(self) -> None:
         # v2 schema: an issue with invariant+sites[] expands into N
         # findings that share the invariant name + topic, so the

@@ -156,6 +156,12 @@ type bridgeResult struct {
 // a per-call parameter (sourced from reviewer.Config.IdleTimeout) rather than a
 // package global so one caller's opt-in (the code-review CLI) can't silently
 // impose a stall policy on every other reviewer caller (e.g. yoloswe/swe.go).
+//
+// "In-scope" is decided by scopeID ALONE. Every event this scope receives resets
+// the clock, including ones the bridge cannot render (SDK types outside the
+// agentstream subset, or a conditional event returning KindUnknown). The timer
+// answers "is the backend alive", and an event we can't display is still proof
+// that it is. See applyEvent for the incident this distinction comes from.
 func bridgeStreamEvents[E any](
 	ctx context.Context,
 	events <-chan E,
@@ -205,23 +211,42 @@ func bridgeStreamEvents[E any](
 			return nil, true, false, fmt.Errorf("session ended without result")
 		}
 
-		sev, ok := any(ev).(agentstream.Event)
-		if !ok {
-			return nil, false, false, nil
-		}
-		kind := sev.StreamEventKind()
-		if kind == agentstream.KindUnknown {
-			return nil, false, false, nil
-		}
-
 		// Scope filtering for multiplexed channels: an out-of-scope event is
-		// another thread's traffic and must not reset our idle clock.
+		// another thread's traffic and must not reset our idle clock. This runs
+		// FIRST and is the only thing that can deny liveness — see below.
 		if scopeID != "" {
 			if scoped, ok := any(ev).(agentstream.Scoped); ok {
 				if id := scoped.ScopeID(); id != "" && id != scopeID {
 					return nil, false, false, nil
 				}
 			}
+		}
+
+		// Liveness is a TRANSPORT fact, not a semantic one: any event that
+		// belongs to this scope proves the backend is alive, whether or not the
+		// bridge knows how to render it. Everything below only decides what to
+		// DO with the event; it must never decide whether the stream is alive.
+		//
+		// Why this is separate from the kind switch: agentstream is a deliberate
+		// common SUBSET (see agentstream/doc.go) — SDK-specific events like
+		// codex.ItemStartedEvent, ItemCompletedEvent, TokenUsageEvent and
+		// CommandOutputEvent intentionally don't implement agentstream.Event, and
+		// conditional events legitimately return KindUnknown. Treating either as
+		// "not alive" conflated "I can't render this" with "nothing happened".
+		//
+		// Measured on kernel#8682 r2: codex sent item/started 17s after the last
+		// renderable event, then went quiet. The bridge ignored it and tripped a
+		// 300s idle timer at 309s on a stream whose real silence was 293s,
+		// discarding a review holding ~2M input tokens. Round 3's 132s gap
+		// carried item/started + item/completed and nothing else. Fleet-wide this
+		// was the largest single failure bucket (143 of 1,734 envelopes).
+		sev, isStreamEvent := any(ev).(agentstream.Event)
+		if !isStreamEvent {
+			return nil, false, true, nil
+		}
+		kind := sev.StreamEventKind()
+		if kind == agentstream.KindUnknown {
+			return nil, false, true, nil
 		}
 
 		switch kind {
@@ -306,7 +331,8 @@ func bridgeStreamEvents[E any](
 			// the idle decision below depends solely on lastEvent staleness —
 			// NOT on whether the drain saw anything. Draining out-of-scope
 			// multiplex noise must never suppress the idle trip for a stalled
-			// in-scope thread on a shared channel.
+			// in-scope thread on a shared channel. "In-scope" here means the
+			// scopeID check only — an unrenderable event still proves liveness.
 			for {
 				select {
 				case ev, ok := <-events:

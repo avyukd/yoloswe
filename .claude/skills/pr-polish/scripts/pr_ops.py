@@ -1436,6 +1436,58 @@ def _post_inline_replies(
             a.pop("reply_error", None)
 
 
+def _reject_orphan_envelopes(
+    state_dir: Path,
+    n: int,
+    envelope_overrides: dict[str, Path],
+) -> None:
+    """Fail loudly when this round's log dir holds an envelope finalize wasn't given.
+
+    Measured on kernel#8682 r1: the orchestrator concluded codex produced
+    nothing, wrote ``ack … no envelope``, and finalized WITHOUT
+    ``--envelope codex=…``. The envelope landed 2m26s later —
+    ``status: ok`` with three findings, one at 0.98 confidence that then cost
+    four more rounds to rediscover. Nothing noticed, because a backend absent
+    from ``envelope_overrides`` is silently skipped (that skip is correct for a
+    reviewer that never launched; it is catastrophic for one that did).
+
+    A finding written to disk and never read is the worst failure this loop
+    has, so it is a hard error rather than a warning: the round is not
+    finalizable until the orchestrator either passes the envelope or removes
+    it. Only backends whose envelope exists AND is non-empty are flagged — a
+    zero-byte file is a reviewer that died mid-write, which the
+    ``stream-missing`` path handles correctly.
+    """
+    import bramble_ops  # noqa: PLC0415
+
+    log_root = state_dir / f"r{n}"
+    if not log_root.is_dir():
+        return
+    passed = {
+        p.resolve()
+        for p in envelope_overrides.values()
+        if p is not None
+    }
+    orphans: list[str] = []
+    for backend in bramble_ops.BACKENDS:
+        for found in sorted(log_root.glob(f"a*/{backend}-envelope.json")):
+            try:
+                if found.stat().st_size == 0 or found.resolve() in passed:
+                    continue
+            except OSError:
+                continue
+            orphans.append(str(found))
+    if orphans:
+        raise ValueError(
+            f"round {n}: envelope(s) on disk were not passed to finalize: "
+            + ", ".join(orphans)
+            + ". A reviewer that wrote an envelope produced findings — pass it "
+            "with --envelope <backend>=<path>, or delete the file if it is a "
+            "stale attempt. Silently dropping it loses real review work "
+            "(kernel#8682 r1)."
+        )
+
+
 def _persist_round_findings(
     state_dir: Path,
     entry: dict[str, Any],
@@ -1452,6 +1504,8 @@ def _persist_round_findings(
     # Imported lazily to avoid a top-level circular import between
     # pr_ops and bramble_ops.
     import bramble_ops  # noqa: PLC0415
+
+    _reject_orphan_envelopes(state_dir, n, envelope_overrides)
 
     reviews_dir = state_dir / "reviews"
     # Re-finalizing a round with a different envelope set must not leave
@@ -1477,7 +1531,7 @@ def _persist_round_findings(
         # initial seed for codex/cursor); don't pop, so consumers
         # that index into the field unconditionally still work.
         entry[f"{backend}_findings"] = []
-        for bucket_key in ("session_ids", "resume_status"):
+        for bucket_key in ("session_ids", "resume_status", "stream_status"):
             bucket = entry.get(bucket_key)
             if isinstance(bucket, dict):
                 bucket.pop(backend, None)
@@ -1505,13 +1559,27 @@ def _persist_round_findings(
         # disk but parses to non-dict / missing keys would let the previous
         # finalize's values survive — same resume-stale-session class
         # of bug as the omitted-backend cleanup above.
-        for bucket_key in ("session_ids", "resume_status", "sufficiency_claims"):
+        for bucket_key in (
+            "session_ids",
+            "resume_status",
+            "sufficiency_claims",
+            "stream_status",
+        ):
             bucket = entry.get(bucket_key)
             if isinstance(bucket, dict):
                 bucket.pop(backend, None)
                 if not bucket:
                     entry.pop(bucket_key, None)
         if isinstance(obj, dict):
+            # Persist the envelope's own status so downstream consumers can
+            # tell "reviewed and found nothing" from "never reviewed". A bare
+            # `<backend>_findings: []` cannot: on #8682 it meant a DROPPED
+            # envelope in r1 and a real backend error in r2/r3, and any metric
+            # reading the array length conflates the two. Convergence
+            # (Step 3.g) and escape_rate both key off this instead.
+            entry.setdefault("stream_status", {})[backend] = (
+                obj.get("status") or "unknown"
+            )
             if obj.get("session_id"):
                 entry.setdefault("session_ids", {})[backend] = obj.get("session_id")
             if obj.get("resume_status"):

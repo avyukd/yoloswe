@@ -18,7 +18,7 @@ Helpers: `python3 $SKILL_DIR/scripts/<helper>.py`. `$SKILL_DIR` = directory cont
 | `lint_gate.py` | Diff lint (ruff/golangci/eslint) |
 | `scope_gate.py` | `scope-hints.json` for bramble |
 
-Missing/error review streams → log as findings with stderr path cited.
+Missing/error review streams → log as findings with stderr path cited. A `status: "partial"` envelope (the reviewer found things, then hit the idle timeout) keeps its findings **and** reports the failure — triage sees both.
 
 ## Arguments
 
@@ -231,15 +231,20 @@ per-reviewer `BRAMBLE_RUN_TAG` is how runs are attributed.
 
 ```bash
 # INVARIANT: every reviewer launch ends with `PIDS+=($!)`; nothing else touches
-# the wait list. Timeouts: --idle-timeout 5m kills only a stalled backend (a
-# review making progress runs as long as it needs), `timeout 1200` is the
+# the wait list. Timeouts: --idle-timeout 8m kills only a stalled backend (a
+# review making progress runs as long as it needs), `timeout 2400` is the
 # absolute backstop, lint gets 120s so a static pass can't hold the join.
+# 8m, not 5m: codex's transport has a server-side ~300s keepalive after which it
+# reconnects and resumes on its own, so a 5m client bound raced the backend's
+# own recovery and killed live turns (measured on #8682 r2: 12min of review
+# holding ~2M input tokens, discarded). The backstop is 2x the old 1200s to stay
+# well clear of the idle bound — a real review on a large diff runs 18min+.
 # `set -o pipefail` keeps each subshell's status the reviewer's, not `sed`'s 0.
 PIDS=()
 
 ( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:codex:r{ROUND} \
-  timeout 1200 $BRAMBLE_BIN code-review --backend codex --model gpt-5.6-luna --effort medium \
-    --skip-test-execution --verbose --idle-timeout 5m \
+  timeout 2400 $BRAMBLE_BIN code-review --backend codex --model gpt-5.6-luna --effort medium \
+    --skip-test-execution --verbose --idle-timeout 8m \
     --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
     ${CODEX_RESUME:+--resume-session-id "$CODEX_RESUME"} \
     --envelope-file "$LOG_DIR/codex-envelope.json" \
@@ -247,8 +252,8 @@ PIDS=()
 PIDS+=($!)
 
 ( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:cursor:r{ROUND} \
-  timeout 1200 $BRAMBLE_BIN code-review --backend cursor --model composer-2.5 \
-    --skip-test-execution --verbose --idle-timeout 5m \
+  timeout 2400 $BRAMBLE_BIN code-review --backend cursor --model composer-2.5 \
+    --skip-test-execution --verbose --idle-timeout 8m \
     --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
     ${CURSOR_RESUME:+--resume-session-id "$CURSOR_RESUME"} \
     --envelope-file "$LOG_DIR/cursor-envelope.json" \
@@ -262,8 +267,8 @@ PIDS+=($!)
 
 if [ "$USE_GEMINI" = "1" ]; then
   ( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:gemini:r{ROUND} \
-    timeout 1200 $BRAMBLE_BIN code-review --backend gemini --model gemini-3-flash-preview \
-      --skip-test-execution --verbose --idle-timeout 5m \
+    timeout 2400 $BRAMBLE_BIN code-review --backend gemini --model gemini-3-flash-preview \
+      --skip-test-execution --verbose --idle-timeout 8m \
       --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
       ${GEMINI_RESUME:+--resume-session-id "$GEMINI_RESUME"} \
       --envelope-file "$LOG_DIR/gemini-envelope.json" \
@@ -273,8 +278,8 @@ fi
 
 if [ "$USE_CLAUDE" = "1" ]; then
   ( set -o pipefail; BRAMBLE_RUN_TAG=pr-polish:$REPO:$PR_NUMBER:claude:r{ROUND} \
-    timeout 1200 $BRAMBLE_BIN code-review --backend claude --model opus \
-      --skip-test-execution --verbose --idle-timeout 5m \
+    timeout 2400 $BRAMBLE_BIN code-review --backend claude --model opus \
+      --skip-test-execution --verbose --idle-timeout 8m \
       --goal "$GOAL" --scope-hints-file "$SCOPE_HINTS" $DIFF_BASE_ARG \
       ${CLAUDE_RESUME:+--resume-session-id "$CLAUDE_RESUME"} \
       --envelope-file "$LOG_DIR/claude-envelope.json" \
@@ -289,6 +294,8 @@ wait "${PIDS[@]}"
 ```
 
 Before triage: `recover-envelope` on each stream path (idempotent). A reviewer that exited without a valid envelope → `stream-missing` finding, not a deadlock.
+
+**`stream-missing` requires that no envelope file exists — check before you write it.** On #8682 r1 the orchestrator recorded `ack … no envelope` while `codex-envelope.json` was on disk with `status: ok` and 3 findings (including a 0.98-confidence bug that then took four more rounds to rediscover). `finalize-and-report` now rejects a round that ignores an envelope present in `$LOG_DIR`, so this fails loudly rather than silently costing a reviewer. If a stream really produced nothing, `cat` the envelope's `status`/`error` and cite it — "the backend stalled" is a claim about the backend, and codex keeps its own log (`~/.codex/logs_2.sqlite`, table `logs`) that will say whether it actually did.
 
 ### c) Triage
 
@@ -365,6 +372,8 @@ Stop when any:
 
 **Acknowledged ≠ resolved.** None of the above fire while a high/critical finding (this round or a prior one) is still only `ack`'d/`wont_fix`'d without a cited reason — a deferred high issue keeps the loop open. A `wont_fix`/`false_positive` with a real rationale is a resolution and does not block convergence; a bare `ack` on a high/critical does.
 
+**Nobody looked ≠ nothing to find.** "Zero findings" only converges a batch when at least one reviewer actually **produced a verdict** — read `rounds[n].stream_status` (persisted per backend from each envelope's own `status`), not the length of `<backend>_findings`. An empty findings array is produced equally by a clean diff and by a backend that never returned, and the batch protocol makes that gap expensive: the batch pushes on it, and the external reviewers become the first real bar. A round where every stream is `error`/`absent` is **inconclusive** — retry it once (it does not consume `--rounds`), then exit `reviewers-unavailable`. Push anyway (the work is real), but say in the Final Summary that the local bar was never met.
+
 Budget exhausted → Final Summary; `--ask` to continue, else `capped-at-max`.
 
 | Gate | `--ask` | Default |
@@ -372,6 +381,7 @@ Budget exhausted → Final Summary; `--ask` to continue, else `capped-at-max`.
 | PR mismatch | Ask | Abort `pr-mismatch-abort` |
 | Rounds exhausted | Ask | Stop `capped-at-max` |
 | Spiral | Ask | Re-fix once; 2nd or multi-source → `spiral-escalated` |
+| No stream returned a verdict | Ask | Retry once, then `reviewers-unavailable` |
 
 ## Step 4: Push
 
@@ -395,7 +405,7 @@ python3 $SKILL_DIR/scripts/pr_ops.py state-mark-complete $CTX <reason>
 python3 $SKILL_DIR/scripts/verdict.py "$STATE_DIR" --repo-root "$(pwd)" --write || true
 ```
 
-Reasons: `converged`, `all-low`, `false-positive-top`, `capped-at-max`, `spiral-escalated`, `pr-mismatch-abort`, `sync-conflict`, `dirty-tree-preflight`, `user-paused`, `abandoned`.
+Reasons: `converged`, `all-low`, `false-positive-top`, `capped-at-max`, `spiral-escalated`, `pr-mismatch-abort`, `sync-conflict`, `dirty-tree-preflight`, `user-paused`, `abandoned`, `reviewers-unavailable`.
 
 Print: metrics, round table, full `comment_actions` table (`Round | Source | Path:Line | Severity | Action | Notes`), state file path.
 

@@ -387,3 +387,220 @@ func TestFormatHeartbeat(t *testing.T) {
 		t.Errorf("expected reasoning char count, got: %q", active)
 	}
 }
+
+// --- Liveness is a transport fact, not a semantic one --------------------
+//
+// Regression tests for kernel#8682: the bridge only reset the idle clock on
+// events it could RENDER, so a backend that was demonstrably alive — sending
+// events the agentstream subset doesn't cover — was killed as "stalled". These
+// pin the corrected contract: scopeID alone decides liveness.
+
+// testNonStreamEvent implements NO agentstream interface at all — the shape of
+// codex.ItemStartedEvent / ItemCompletedEvent / TokenUsageEvent /
+// CommandOutputEvent, which agentstream/doc.go deliberately excludes from the
+// common subset. Arrival still proves the backend is alive.
+type testNonStreamEvent struct{ note string }
+
+// testScopedUnknownEvent returns KindUnknown but carries a scope — the shape of
+// a conditional event (e.g. ACP ToolCallUpdateEvent mid-status).
+type testScopedUnknownEvent struct{ scopeID string }
+
+func (e testScopedUnknownEvent) StreamEventKind() agentstream.EventKind {
+	return agentstream.KindUnknown
+}
+func (e testScopedUnknownEvent) ScopeID() string { return e.scopeID }
+
+// The r3 gap: item/started and item/completed were the ONLY events for 132s.
+// Neither implements agentstream.Event, so the old bridge saw dead air and
+// killed a working review.
+func TestBridgeStreamEvents_UnrenderableEventsKeepStreamAlive(t *testing.T) {
+	withHeartbeat(t, 5*time.Millisecond)
+
+	ch := make(chan interface{})
+	handler := &recordingHandler{}
+	done := make(chan struct{})
+	var result *bridgeResult
+	var err error
+	go func() {
+		result, err = bridgeStreamEvents(context.Background(), ch, handler, "", 60*time.Millisecond)
+		close(done)
+	}()
+
+	// Drip unrenderable events for well over the idle window. Each must reset
+	// the clock even though none of them can be displayed.
+	for i := 0; i < 8; i++ {
+		ch <- testNonStreamEvent{note: "item/started"}
+		time.Sleep(20 * time.Millisecond)
+		select {
+		case <-done:
+			t.Fatalf("bridge died at drip %d: an unrenderable in-scope event must reset the idle clock (err=%v)", i, err)
+		default:
+		}
+	}
+	ch <- testTurnCompleteEvent{success: true, durationMs: 1}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bridgeStreamEvents did not return after the terminal event")
+	}
+	if err != nil {
+		t.Fatalf("unrenderable events must not produce an idle error, got: %v", err)
+	}
+	if result == nil || !result.success {
+		t.Fatal("expected a successful result")
+	}
+	// Liveness only — they must still never be rendered.
+	if len(handler.texts) != 0 || len(handler.toolStarts) != 0 {
+		t.Errorf("unrenderable events must not reach the handler: texts=%d toolStarts=%d",
+			len(handler.texts), len(handler.toolStarts))
+	}
+}
+
+// A KindUnknown event that passes the scope check is also proof of life.
+func TestBridgeStreamEvents_UnknownKindKeepsStreamAlive(t *testing.T) {
+	withHeartbeat(t, 5*time.Millisecond)
+
+	ch := make(chan agentstream.Event)
+	handler := &recordingHandler{}
+	done := make(chan struct{})
+	var err error
+	go func() {
+		_, err = bridgeStreamEvents(context.Background(), ch, handler, "thread-1", 60*time.Millisecond)
+		close(done)
+	}()
+
+	for i := 0; i < 6; i++ {
+		ch <- testScopedUnknownEvent{scopeID: "thread-1"}
+		time.Sleep(20 * time.Millisecond)
+		select {
+		case <-done:
+			t.Fatalf("bridge died at drip %d: an in-scope KindUnknown event must reset the idle clock (err=%v)", i, err)
+		default:
+		}
+	}
+	ch <- testTurnCompleteEvent{success: true, durationMs: 1}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bridgeStreamEvents did not return after the terminal event")
+	}
+	if err != nil {
+		t.Fatalf("in-scope KindUnknown must not produce an idle error, got: %v", err)
+	}
+}
+
+// The multiplex guard must SURVIVE the fix: another thread's traffic still must
+// not keep a stalled thread alive, whether or not it is renderable.
+func TestBridgeStreamEvents_OutOfScopeEventsStillTripIdle(t *testing.T) {
+	withHeartbeat(t, 5*time.Millisecond)
+
+	ch := make(chan agentstream.Event)
+	handler := &recordingHandler{}
+	done := make(chan struct{})
+	var err error
+	go func() {
+		_, err = bridgeStreamEvents(context.Background(), ch, handler, "thread-1", 60*time.Millisecond)
+		close(done)
+	}()
+
+	// Our thread speaks once, then only OTHER threads talk. The idle timer must
+	// still trip — out-of-scope noise is not our liveness.
+	ch <- testScopedTextEvent{testTextEvent: testTextEvent{delta: "ours"}, scopeID: "thread-1"}
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			select {
+			case ch <- testScopedUnknownEvent{scopeID: "thread-2"}:
+			case <-done:
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("out-of-scope traffic suppressed the idle trip — the multiplex guard regressed")
+	}
+	if err == nil || !strings.Contains(err.Error(), "review idle") {
+		t.Fatalf("expected an idle-timeout error despite out-of-scope traffic, got: %v", err)
+	}
+}
+
+// A stream that genuinely emits NOTHING must still be killed — the fix must not
+// disable the timeout wholesale.
+func TestBridgeStreamEvents_TrueSilenceStillTripsIdle(t *testing.T) {
+	withHeartbeat(t, 5*time.Millisecond)
+
+	ch := make(chan agentstream.Event)
+	handler := &recordingHandler{}
+	done := make(chan struct{})
+	var err error
+	go func() {
+		_, err = bridgeStreamEvents(context.Background(), ch, handler, "", 40*time.Millisecond)
+		close(done)
+	}()
+
+	ch <- testTextEvent{delta: "hello"}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("true silence must still trip the idle timeout")
+	}
+	if err == nil || !strings.Contains(err.Error(), "review idle") {
+		t.Fatalf("expected an idle-timeout error, got: %v", err)
+	}
+}
+
+// Replay of the kernel#8682 r2 timing, scaled down 1000x. Real numbers:
+// agentMessage/delta at t, item/started at t+17s, kill at t+309s on a 300s
+// timer. Bramble measured 309s of silence; the wire had 293s. With item/started
+// counted the turn survives.
+func TestBridgeStreamEvents_Kernel8682R2TimingSurvives(t *testing.T) {
+	withHeartbeat(t, 3*time.Millisecond)
+
+	const idle = 300 * time.Millisecond // stands in for 300s
+	ch := make(chan interface{})
+	handler := &recordingHandler{}
+	done := make(chan struct{})
+	var err error
+	go func() {
+		_, err = bridgeStreamEvents(context.Background(), ch, handler, "", idle)
+		close(done)
+	}()
+
+	ch <- testTextEvent{delta: "agentMessage/delta"} // t
+	time.Sleep(60 * time.Millisecond)                // +17s, scaled up for timer slack
+	ch <- testNonStreamEvent{note: "item/started"}   // the event the old code discarded
+
+	// Now wait past the point where the OLD code would have died. The old clock
+	// ran from agentMessage/delta, so it trips at t+300ms; the corrected clock
+	// runs from item/started and does not trip until t+360ms. Sleeping to
+	// ~t+330ms straddles the two: dead under the old rule, alive under the new.
+	// (Bounded by the terminal event below, so a slow machine cannot flake into
+	// a false pass — it would time out at the select instead.)
+	time.Sleep(270 * time.Millisecond)
+	select {
+	case <-done:
+		t.Fatalf("regressed: killed at the 8682 r2 timing — item/started must reset the clock (err=%v)", err)
+	default:
+	}
+
+	ch <- testTurnCompleteEvent{success: true, durationMs: 1}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bridgeStreamEvents did not return after the terminal event")
+	}
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

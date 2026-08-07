@@ -84,7 +84,7 @@ func init() {
 	Cmd.Flags().BoolVar(&verbose, "verbose", false, "Show tool call details")
 	Cmd.Flags().StringVar(&goal, "goal", "", "Review goal (default: infer from branch)")
 	Cmd.Flags().DurationVar(&timeout, "timeout", 0, "Absolute hard cap on the whole review (0 = none; rely on --idle-timeout). A review making steady progress is bounded only by --idle-timeout.")
-	Cmd.Flags().DurationVar(&idleTimeout, "idle-timeout", 3*time.Minute, "Kill the review after this much inactivity (no stream events). Resets on every event, so it only trips a stalled backend. 0 disables.")
+	Cmd.Flags().DurationVar(&idleTimeout, "idle-timeout", 8*time.Minute, "Kill the review after this much inactivity (no stream events). Resets on every in-scope event, so it only trips a stalled backend. 0 disables.")
 	Cmd.Flags().StringVar(&protocolLogDir, "protocol-log-dir", "", "Directory for protocol session logs (Codex only; also supports $BRAMBLE_PROTOCOL_LOG_DIR)")
 	Cmd.Flags().StringVar(&envelopeFile, "envelope-file", "", "Write the JSON ResultEnvelope to this file instead of stdout (stdout then carries only progress events)")
 	Cmd.Flags().BoolVar(&skipTestExecution, "skip-test-execution", false, "Instruct the reviewer not to run tests/build commands (caller runs them separately)")

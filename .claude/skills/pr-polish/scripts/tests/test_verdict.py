@@ -112,6 +112,15 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(out["verdict"], "not_ready")
         self.assertIn("abnormal_exit", [b["code"] for b in out["blockers"]])
 
+    def test_reviewers_unavailable_can_never_be_ready(self):
+        # A batch where every reviewer failed to return a verdict never held
+        # the local bar. The diff may be fine, but nothing here checked it —
+        # and under the batch protocol that hands the first real review to the
+        # external reviewers. kernel#8682 b1 pushed exactly this way.
+        out = v.compute_verdict(_state(exit_reason="reviewers-unavailable"))
+        self.assertEqual(out["verdict"], "not_ready")
+        self.assertIn("abnormal_exit", [b["code"] for b in out["blockers"]])
+
     def test_clean_converged_run_is_ready(self):
         self.assertEqual(v.compute_verdict(_state())["verdict"], "ready")
 

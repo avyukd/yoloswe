@@ -56,6 +56,11 @@ _ABNORMAL_EXITS = {
     "dirty-tree-preflight",
     "user-paused",
     "abandoned",
+    # Every reviewer failed to return a verdict, so the local bar was never
+    # actually held. The work may be fine — but nothing here checked it, and
+    # under the batch protocol that means the external reviewers are the first
+    # real review this diff gets.
+    "reviewers-unavailable",
 }
 
 # A high/critical wont_fix currently clears its block on ANY non-empty
