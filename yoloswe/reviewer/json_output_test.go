@@ -993,3 +993,37 @@ func TestReviewPartialResult(t *testing.T) {
 		}
 	}
 }
+
+// Every backend must carry the bridge's partial result into the ReviewResult,
+// not just the one that happened to get a test first. The claude call site is
+// covered end-to-end via RunPrompt (backend_claude_test.go); the other three
+// need a per-backend fake-client harness, so pin the shared contract they all
+// depend on instead — a call site that reverts to reviewErrorResult drops
+// ResponseText and DurationMs, and this asserts what "carried through" means.
+func TestReviewPartialResult_CarriesTextAndDuration(t *testing.T) {
+	const body = `{"verdict":"rejected","summary":"s","issues":[` +
+		`{"severity":"high","file":"a.go","line":1,"message":"m"}]}`
+	res, err := reviewPartialResult(
+		ResumeStatusOK,
+		&bridgeResult{responseText: body, durationMs: 720000},
+		errTest,
+	)
+	if err == nil {
+		t.Fatal("the error must still be returned")
+	}
+	if res.ResponseText != body {
+		t.Errorf("ResponseText = %q, want the streamed body", res.ResponseText)
+	}
+	// 0ms on a twelve-minute review is the misreading this change exists to
+	// stop, and setting it on the bridgeResult alone did not reach the envelope.
+	if res.DurationMs != 720000 {
+		t.Errorf("DurationMs = %d, want 720000 carried through to the result", res.DurationMs)
+	}
+	env := BuildEnvelope(res, BackendCodex, "m", "s1", "")
+	if env.Status != StatusPartial {
+		t.Errorf("envelope status = %s, want partial", env.Status)
+	}
+	if env.DurationMs != 720000 {
+		t.Errorf("envelope duration_ms = %d, want the elapsed time", env.DurationMs)
+	}
+}

@@ -44,6 +44,14 @@ func reviewPartialResult(resumeStatus ResumeStatus, bridged *bridgeResult, err e
 	return &ReviewResult{
 		Success:      false,
 		ResponseText: bridged.responseText,
+		// Carry the elapsed time the bridge measured. Setting it on the
+		// bridgeResult and dropping it here left the envelope reporting 0ms
+		// anyway — the fix has to reach the layer the metric is read from.
+		// Token counts stay zero: they live on the TurnComplete event that by
+		// definition never arrived, and codex's TokenUsageEvent is outside the
+		// agentstream subset, so plumbing them is a cross-backend interface
+		// change rather than a carry-through.
+		DurationMs:   bridged.durationMs,
 		ErrorMessage: err.Error(),
 		ResumeStatus: resumeStatus,
 	}, err
