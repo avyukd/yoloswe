@@ -223,6 +223,11 @@ def action_history_goal(
     if not prior:
         return ""
     prev = max(prior, key=lambda r: r.get("n") or 0)
+    # Addresses the cumulative block already owns. Membership is by address,
+    # not by row: a round that re-records a settled address without a reason
+    # must not surface it here as still-open while the frozen block says the
+    # opposite. Both blocks read the same derivation.
+    settled_addresses = _settled_declines(state, round_)
 
     fixed: list[str] = []
     skipped: list[str] = []
@@ -232,11 +237,10 @@ def action_history_goal(
             label = _action_label(action)
             if label:
                 fixed.append(label)
-        elif verb in _GOAL_SKIP_VERBS and not _is_frozen_decline(action):
-            # A settled decline that recorded its reason belongs to the
-            # cumulative block instead (``_frozen_declines_note``); one that
-            # did NOT is still open as far as anyone can tell, so it stays
-            # here and gets the deferral gloss.
+        elif verb in _GOAL_SKIP_VERBS and _action_address(action) not in settled_addresses:
+            # A decline settled with a reason belongs to the cumulative block
+            # (``_frozen_declines_note``); anything else is still open as far
+            # as anyone can tell, so it stays here and says so.
             #
             # _GOAL_SKIP_VERBS excludes ``stale``: stale entries are bot
             # comments anchored to superseded code the resumed model doesn't
@@ -412,37 +416,45 @@ def _skipped_label(action: dict[str, Any], verb: str, *, settled: bool = False) 
     base = _action_address(action)
     if not base:
         return ""
-    glossed = verb in _DEFERRED_VERBS and not settled
-    label_verb = f"{verb} (deferred, not fixed)" if glossed else verb
+    if verb in _SETTLED_VERBS and not settled and not _decline_rationale(action):
+        # A settling verb that reached the per-turn path recorded no reason,
+        # so nothing settled. Say that outright: ``false_positive`` carries no
+        # deferral gloss (it normally removes the item from scope), and left
+        # bare it would read as resolved for the one round before vanishing.
+        label_verb = f"{verb} (no reason recorded — treat as open)"
+    elif verb in _DEFERRED_VERBS and not settled:
+        label_verb = f"{verb} (deferred, not fixed)"
+    else:
+        label_verb = verb
     description = (action.get("reason") or action.get("topic") or "").strip()
     if description:
         return f"{base} {label_verb}: {_truncate(description)}"
     return f"{base} {label_verb}"
 
 
-def _frozen_declines_note(state: dict[str, Any] | None, round_: int) -> str:
-    """Return the cumulative "settled, do not re-raise" block, or "".
+def _settled_declines(state: dict[str, Any] | None, round_: int) -> dict[str, str]:
+    """Address → rendered label for every decline settled before ``round_``.
 
-    The only goal section that walks *every* prior round rather than the
-    immediately-prior one. The rest of the briefing is per-turn context the
-    resumed model also holds in conversation history; a decline is not
-    context, it is a decision — and a decision the next reviewer cannot see
-    is indistinguishable from an unnoticed one. It returns as a fresh
-    finding every round, costs a triage slot, and tempts a re-fix of
-    something already settled. Measured on kernel#8374: re-litigation of
-    settled items stopped the round this block was introduced, and none of
-    the five frozen items returned across the six rounds after.
+    The single source of truth for an address's settled state, consulted by
+    both goal blocks: ``_frozen_declines_note`` renders it, and
+    ``action_history_goal`` uses membership to keep a settled address out of
+    the per-turn briefing. Deriving both from one walk is what stops the goal
+    saying "do not re-raise this" and "(deferred, not fixed)" about the same
+    address in the same turn — a contradiction that a per-row test cannot
+    rule out, because the two blocks read different rows.
 
-    Only declines that recorded a reason are frozen (``_is_frozen_decline``);
-    the reason is the whole point, since a bare "declined" invites the
-    reviewer to re-argue — and freezing a reasonless one would bury the
-    finding for the rest of the run on no stated grounds.
+    An address is settled once any prior round declined it *with a reason*
+    (``_is_frozen_decline``) and no later round fixed it:
 
-    A later ``fixed`` on the same address supersedes the decline: the
-    orchestrator changed its mind, so the item is no longer settled.
+    * Only ``fixed`` un-settles. The orchestrator changed its mind, so the
+      item is genuinely open again.
+    * A later reasonless re-decline does NOT un-settle. The earlier reasoned
+      decision stands on its own; a later row with no rationale is sloppy
+      bookkeeping, not a reversal — and treating it as one would resurrect
+      an item that was properly closed.
     """
     if not state or round_ < 2:
-        return ""
+        return {}
     settled: dict[str, str] = {}
     prior = sorted(
         (r for r in state.get("rounds") or [] if (r.get("n") or 0) < round_),
@@ -459,9 +471,27 @@ def _frozen_declines_note(state: dict[str, Any] | None, round_: int) -> str:
                     settled[address] = label
             elif action.get("action") == "fixed":
                 settled.pop(address, None)
-    if not settled:
+    return settled
+
+
+def _frozen_declines_note(state: dict[str, Any] | None, round_: int) -> str:
+    """Return the cumulative "settled, do not re-raise" block, or "".
+
+    The only goal section that walks *every* prior round rather than the
+    immediately-prior one. The rest of the briefing is per-turn context the
+    resumed model also holds in conversation history; a decline is not
+    context, it is a decision — and a decision the next reviewer cannot see
+    is indistinguishable from an unnoticed one. It returns as a fresh
+    finding every round, costs a triage slot, and tempts a re-fix of
+    something already settled. Measured on kernel#8374: re-litigation of
+    settled items stopped the round this block was introduced, and none of
+    the five frozen items returned across the six rounds after.
+
+    Membership and rendering both come from ``_settled_declines``.
+    """
+    labels = list(_settled_declines(state, round_).values())
+    if not labels:
         return ""
-    labels = list(settled.values())
     shown = labels[:_ACTION_HISTORY_CAP]
     tail = f"\n- ({len(labels) - len(shown)} more)" if len(labels) > len(shown) else ""
     bulleted = "".join(f"\n- {label}" for label in shown)

@@ -241,9 +241,49 @@ class TestGoalForRound(unittest.TestCase):
         }
         goal = bramble_ops.goal_for_round(2, "PR_SUMMARY", state)
         self.assertNotIn("do not re-raise these", goal)
-        # Still visible for the one round, and marked as open.
-        self.assertIn("a.go:5 wont_fix (deferred, not fixed): unused param", goal)
-        self.assertIn("b.go:7 false_positive", goal)
+        # Still visible for the one round, and marked as open. A bare
+        # false_positive would otherwise read as resolved: it carries no
+        # deferral gloss, because normally it does remove the item from scope.
+        self.assertIn("a.go:5 wont_fix (no reason recorded — treat as open): unused param", goal)
+        self.assertIn("b.go:7 false_positive (no reason recorded — treat as open)", goal)
+
+    def test_settled_address_never_appears_in_both_blocks(self) -> None:
+        # Round 1 declines with a reason (settled); round 2 re-records the
+        # same address with none. Round 3's goal must not simultaneously say
+        # "do not re-raise" and list it as still-open work — the earlier
+        # reasoned decision stands, and only the frozen block carries it.
+        state = {
+            "rounds": [
+                {"n": 1, "comment_actions": [
+                    {"action": "wont_fix", "path": "a.go", "line": 5, "reason": "belongs to net/"},
+                ]},
+                {"n": 2, "comment_actions": [
+                    {"action": "wont_fix", "path": "a.go", "line": 5},
+                ]},
+            ]
+        }
+        goal = bramble_ops.goal_for_round(3, "PR_SUMMARY", state)
+        self.assertIn("a.go:5 wont_fix: belongs to net/", goal)
+        self.assertNotIn("treat as open", goal)
+        self.assertNotIn("deferred, not fixed", goal)
+        self.assertEqual(goal.count("a.go:5"), 1)
+
+    def test_later_fix_still_un_settles_after_reasonless_redecline(self) -> None:
+        # Only `fixed` un-settles. Once it does, the address is open again
+        # and the frozen block must stop claiming it.
+        state = {
+            "rounds": [
+                {"n": 1, "comment_actions": [
+                    {"action": "wont_fix", "path": "a.go", "line": 5, "reason": "belongs to net/"},
+                ]},
+                {"n": 2, "comment_actions": [
+                    {"action": "fixed", "path": "a.go", "line": 5, "topic": "did it after all"},
+                ]},
+            ]
+        }
+        goal = bramble_ops.goal_for_round(3, "PR_SUMMARY", state)
+        self.assertNotIn("do not re-raise these", goal)
+        self.assertNotIn("belongs to net/", goal)
 
     def test_frozen_declines_drop_the_deferred_gloss(self) -> None:
         # Inside a block headed "do not re-raise these", "(deferred, not
