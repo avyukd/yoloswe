@@ -2,6 +2,7 @@ package reviewer
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -787,6 +788,23 @@ func TestBridgeStreamEvents_EveryFailurePathPreservesPartialWork(t *testing.T) {
 		}
 		if res == nil || res.responseText != body {
 			t.Fatalf("channel close dropped the streamed body: %+v", res)
+		}
+	})
+
+	t.Run("backend error event", func(t *testing.T) {
+		// The arm that stayed nil for one round after the consolidation, while
+		// the helper's comment already claimed totality. Triple consensus
+		// (codex + cursor + claude), PR #314 r4.
+		withHeartbeat(t, 10*time.Millisecond)
+		ch := make(chan agentstream.Event, 2)
+		ch <- testTextEvent{delta: body}
+		ch <- testErrorEvent{err: errors.New("transport reset"), ctx: "stream"}
+		res, err := bridgeStreamEvents(context.Background(), ch, &recordingHandler{}, "", 0)
+		if err == nil {
+			t.Fatal("a backend error event must still be an error")
+		}
+		if res == nil || res.responseText != body {
+			t.Fatalf("KindError dropped the streamed body: %+v", res)
 		}
 	})
 

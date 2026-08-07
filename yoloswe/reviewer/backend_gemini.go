@@ -133,22 +133,29 @@ func (b *geminiBackend) RunPrompt(ctx context.Context, prompt string, handler Ev
 	}
 
 	var r *bridgeResult
+	// drainPartial collects whatever the bridge streamed before failing. Used by
+	// BOTH failure branches: ctx.Done can win the select after a cancellation,
+	// and a branch that skipped this would discard partial work exactly like
+	// the paths already fixed in the bridge itself.
+	drainPartial := func() *bridgeResult {
+		select {
+		case partial := <-bridgePartial:
+			return partial
+		default:
+			return nil
+		}
+	}
+
 	select {
 	case r = <-bridged:
 	case err := <-bridgeErr:
-		// Keep any text streamed before the failure so an idle timeout that
-		// fired after real findings becomes status="partial".
-		var partial *bridgeResult
-		select {
-		case partial = <-bridgePartial:
-		default:
-		}
+		partial := drainPartial()
 		if promptErr != nil {
 			return reviewPartialResult(resumeStatus, partial, fmt.Errorf("gemini: prompt failed: %w (bridge: %v)", promptErr, err))
 		}
 		return reviewPartialResult(resumeStatus, partial, fmt.Errorf("gemini: %w", err))
 	case <-ctx.Done():
-		return reviewErrorResult(resumeStatus, ctx.Err())
+		return reviewPartialResult(resumeStatus, drainPartial(), ctx.Err())
 	}
 
 	if promptErr != nil {

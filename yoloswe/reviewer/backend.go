@@ -198,9 +198,14 @@ func bridgeStreamEvents[E any](
 
 	// failed is the ONLY way this function reports a failure. Every terminal
 	// error path routes through it, so "does this exit preserve partial work?"
-	// has exactly one answer for all of them: yes, always. Three consecutive
-	// review rounds each found a different exit that dropped accumulated text
-	// (idle timeout, channel close, then ctx cancellation) because each was
+	// has exactly one answer for all of them: yes, always. The exits are
+	// ctx.Done, the idle timeout, channel-close (both arms), and the KindError
+	// event; `nil event channel` returns before any text can accumulate.
+	// TestBridgeStreamEvents_EveryFailurePathPreservesPartialWork covers each —
+	// keep a subtest there when adding an exit, or this comment becomes a claim
+	// nothing checks. Four consecutive review rounds each found a different exit
+	// that dropped accumulated text (idle timeout, channel close, ctx
+	// cancellation, KindError) because each was
 	// deciding that question for itself — the fix is one rule, not a fourth
 	// case. A caller that ignores the result is unaffected; the error is
 	// unchanged.
@@ -227,15 +232,16 @@ func bridgeStreamEvents[E any](
 	// a stalled thread alive). It mutates the enclosing accumulators directly.
 	applyEvent := func(ev E, ok bool) (res *bridgeResult, done bool, inScope bool, err error) {
 		if !ok {
-			// Channel closed without TurnComplete. Preservation is decided by
-			// the single `failed` rule below, not here.
-			text := responseText.String()
-			if text != "" {
+			// Channel closed without TurnComplete. Both arms go through
+			// `failed` — the second is empty by construction, but exempting it
+			// by reasoning is how the rule stops being checkable.
+			if text := responseText.String(); text != "" {
 				res, ferr := failed(fmt.Errorf(
 					"session ended unexpectedly (partial response: %d chars)", len(text)))
 				return res, true, false, ferr
 			}
-			return nil, true, false, fmt.Errorf("session ended without result")
+			res, ferr := failed(fmt.Errorf("session ended without result"))
+			return res, true, false, ferr
 		}
 
 		// Scope filtering for multiplexed channels: an out-of-scope event is
@@ -341,7 +347,11 @@ func bridgeStreamEvents[E any](
 			if handler != nil {
 				handler.OnError(ee.StreamErr(), ee.StreamErrorContext())
 			}
-			return nil, true, true, fmt.Errorf("error: %w", ee.StreamErr())
+			// Backend error events are a terminal failure like any other, so
+			// they go through `failed` too. This arm was the hole that made the
+			// "every terminal path" claim false for one more round.
+			res, ferr := failed(fmt.Errorf("error: %w", ee.StreamErr()))
+			return res, true, true, ferr
 		}
 		return nil, false, true, nil
 	}
