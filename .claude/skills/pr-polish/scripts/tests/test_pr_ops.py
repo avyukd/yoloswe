@@ -3233,6 +3233,24 @@ class OrphanEnvelopeGuardTests(unittest.TestCase):
             rec.write_text(json.dumps(_envelope()))
             pr_ops._reject_orphan_envelopes(sd, 1, {"codex": rec})
 
+    def test_a_missing_override_cannot_silence_the_guard(self):
+        """The recovered-envelope exemption must require a real file.
+
+        Matching on filename alone let a stale, missing, or misspelled override
+        suppress detection for that backend entirely — a wider hole than the one
+        the exemption closes, since the guard would then say nothing while a
+        real envelope went unread.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            d = sd / "r1" / "a1"
+            d.mkdir(parents=True)
+            (d / "codex-envelope.json").write_text(json.dumps(_envelope()))
+            with self.assertRaises(ValueError):
+                pr_ops._reject_orphan_envelopes(
+                    sd, 1, {"codex": d / "codex-envelope-recovered.json"},
+                )
+
     def test_ignores_other_rounds(self):
         with tempfile.TemporaryDirectory() as td:
             sd = Path(td)

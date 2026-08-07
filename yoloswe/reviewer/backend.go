@@ -364,9 +364,40 @@ func bridgeStreamEvents[E any](
 		return nil, false, true, nil
 	}
 
+	// drainQueued processes every event already sitting on the channel. Both
+	// the cancellation and the idle arms need it: the SDK channels are buffered
+	// (codex EventBufferSize defaults to 100), so a terminal condition can win
+	// the select while a wave of already-emitted events is still queued —
+	// including the TurnComplete that would have made this a success, and the
+	// text a partial result is supposed to preserve. Returns a terminal result
+	// when one is found in the queue.
+	drainQueued := func() (*bridgeResult, bool, error) {
+		for {
+			select {
+			case ev, ok := <-events:
+				res, done, inScope, err := applyEvent(ev, ok)
+				if done {
+					return res, true, err
+				}
+				if inScope {
+					lastEvent = time.Now()
+				}
+			default:
+				return nil, false, nil
+			}
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
+			// Drain before reporting the cancellation: a review that finished
+			// in the same instant the context died should be delivered, not
+			// discarded, and its streamed text belongs to the partial result
+			// either way.
+			if res, done, err := drainQueued(); done {
+				return res, err
+			}
 			return failed(ctx.Err())
 		case <-ticker.C:
 			// Before declaring the review stalled, drain every event already
@@ -378,20 +409,8 @@ func bridgeStreamEvents[E any](
 			// multiplex noise must never suppress the idle trip for a stalled
 			// in-scope thread on a shared channel. "In-scope" here means the
 			// scopeID check only — an unrenderable event still proves liveness.
-			for {
-				select {
-				case ev, ok := <-events:
-					res, done, inScope, err := applyEvent(ev, ok)
-					if done {
-						return res, err
-					}
-					if inScope {
-						lastEvent = time.Now()
-					}
-					continue
-				default:
-				}
-				break
+			if res, done, err := drainQueued(); done {
+				return res, err
 			}
 			if idleTimeout > 0 && time.Since(lastEvent) >= idleTimeout {
 				return failed(fmt.Errorf("review idle: no events for %s (stalled backend)", idleTimeout))

@@ -850,3 +850,29 @@ func TestBridgeStreamEvents_PartialResultCarriesElapsedTime(t *testing.T) {
 		t.Errorf("durationMs = %d, want the elapsed time of the run", res.durationMs)
 	}
 }
+
+// A terminal condition can win the select while a wave of already-emitted
+// events is still queued — the SDK channels are buffered (codex
+// EventBufferSize defaults to 100). The idle arm drained for exactly this
+// reason; ctx.Done did not, so a review that finished in the same instant the
+// context died was discarded along with the TurnComplete that would have made
+// it a success.
+func TestBridgeStreamEvents_CancellationDrainsQueuedEvents(t *testing.T) {
+	withHeartbeat(t, 10*time.Millisecond)
+
+	// Buffer the whole turn, then cancel before the loop reads any of it.
+	ch := make(chan agentstream.Event, 4)
+	ch <- testTextEvent{delta: `{"verdict":"accepted","summary":"s","issues":[]}`}
+	ch <- testTurnCompleteEvent{success: true, durationMs: 7}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	res, err := bridgeStreamEvents(ctx, ch, &recordingHandler{}, "", 0)
+	if err != nil {
+		t.Fatalf("a completed turn sitting in the buffer must be delivered, got: %v", err)
+	}
+	if res == nil || !res.success {
+		t.Fatalf("expected the queued TurnComplete to win, got %+v", res)
+	}
+}

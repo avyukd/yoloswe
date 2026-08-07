@@ -477,9 +477,11 @@ def reviewer_stream_statuses(state: dict) -> dict[str, dict[str, int]]:
 
 
 #: Envelope statuses that mean a reviewer actually returned a verdict.
-#: "partial" counts — it carries real findings alongside the failure that
-#: ended the run.
-_LIVE_STREAM_STATUSES = frozenset({"ok", "partial"})
+#: Derived from bramble_ops.STATUSES_WITH_BODY, not restated: that constant
+#: exists so a future body-carrying status is added once and every consumer
+#: follows. A second literal with the same membership is the drift it was
+#: introduced to prevent — this module was the first place to reintroduce it.
+_LIVE_STREAM_STATUSES = frozenset(bramble_ops.STATUSES_WITH_BODY)
 
 #: Streams in ``BACKENDS`` that are NOT model reviewers and therefore cannot
 #: stand in for one. ``lint`` is a static diff pass: ``lint_gate.py`` writes

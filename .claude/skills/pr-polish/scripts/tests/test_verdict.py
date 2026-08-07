@@ -471,3 +471,30 @@ class Step5InvocationContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StatusVocabularySharingTests(unittest.TestCase):
+    """One definition of "this envelope carries a body", not two.
+
+    STATUSES_WITH_BODY says a future body-carrying status joins there and every
+    consumer follows. A parallel literal in verdict.py made that false the round
+    after it was written.
+    """
+
+    def test_live_statuses_derive_from_the_shared_constant(self):
+        import bramble_ops
+        self.assertEqual(
+            set(v._LIVE_STREAM_STATUSES), set(bramble_ops.STATUSES_WITH_BODY)
+        )
+
+    def test_a_new_body_carrying_status_propagates(self):
+        import bramble_ops
+        import importlib
+        orig = bramble_ops.STATUSES_WITH_BODY
+        try:
+            bramble_ops.STATUSES_WITH_BODY = ("ok", "partial", "truncated")
+            importlib.reload(v)
+            self.assertIn("truncated", v._LIVE_STREAM_STATUSES)
+        finally:
+            bramble_ops.STATUSES_WITH_BODY = orig
+            importlib.reload(v)

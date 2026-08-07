@@ -1589,11 +1589,20 @@ def _reject_orphan_envelopes(
     # Without this the documented recovery flow trips the guard and a recovered
     # round cannot finalize at all — a check meant to stop findings being
     # dropped would instead block the mechanism that rescues them.
-    covered_backends = {
-        b for b in bramble_ops.BACKENDS
-        if (src := envelope_overrides.get(b)) is not None
-        and src.name.startswith(f"{b}-envelope")
-    }
+    # The override must EXIST and be non-empty to cover anything: a filename
+    # match alone let a stale, missing, or misspelled path silence the guard for
+    # that backend, which is a wider hole than the one the exemption closes —
+    # the guard would then say nothing while a real envelope went unread.
+    covered_backends = set()
+    for b in bramble_ops.BACKENDS:
+        src = envelope_overrides.get(b)
+        if src is None or not src.name.startswith(f"{b}-envelope"):
+            continue
+        try:
+            if src.exists() and src.stat().st_size > 0:
+                covered_backends.add(b)
+        except OSError:
+            continue
     orphans: list[str] = []
     for backend in bramble_ops.BACKENDS:
         if backend in covered_backends:
