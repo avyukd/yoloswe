@@ -431,7 +431,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument(
         "--write",
         action="store_true",
-        help="Persist to <state_dir>/verdict.json.",
+        help="Persist to <state_dir>/verdict.json and state['verdict'].",
     )
     args = p.parse_args(argv)
 
