@@ -1582,8 +1582,22 @@ def _reject_orphan_envelopes(
         if not attempts:
             return
         active_dirs = {attempts[-1].resolve()}
+    # A backend whose RECOVERED envelope was passed is accounted for: SKILL
+    # Step 3.b runs `recover-envelope`, which writes a sibling
+    # `<backend>-envelope-recovered.json` and returns THAT path, so finalize
+    # legitimately receives the sibling while the original stays on disk.
+    # Without this the documented recovery flow trips the guard and a recovered
+    # round cannot finalize at all — a check meant to stop findings being
+    # dropped would instead block the mechanism that rescues them.
+    covered_backends = {
+        b for b in bramble_ops.BACKENDS
+        if (src := envelope_overrides.get(b)) is not None
+        and src.name.startswith(f"{b}-envelope")
+    }
     orphans: list[str] = []
     for backend in bramble_ops.BACKENDS:
+        if backend in covered_backends:
+            continue
         for found in sorted(log_root.glob(f"a*/{backend}-envelope.json")):
             try:
                 resolved = found.resolve()
@@ -1695,6 +1709,12 @@ def _persist_round_findings(
                 bucket.pop(backend, None)
                 if not bucket:
                     entry.pop(bucket_key, None)
+        if not isinstance(obj, dict):
+            # The file exists but did not parse — a reviewer that died
+            # mid-write. That is a failed stream, not a missing claim, and
+            # leaving no key at all is the same "nobody looked" reads as
+            # "nothing to find" hole the `absent` branch above closes.
+            entry.setdefault("stream_status", {})[backend] = "unreadable"
         if isinstance(obj, dict):
             # Persist the envelope's own status so downstream consumers can
             # tell "reviewed and found nothing" from "never reviewed". A bare

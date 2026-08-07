@@ -3215,6 +3215,24 @@ class OrphanEnvelopeGuardTests(unittest.TestCase):
             self.assertIn("a2", msg)
             self.assertNotIn("a1", msg)
 
+    def test_a_recovered_envelope_covers_its_original(self):
+        """The documented recovery flow must not trip this guard.
+
+        SKILL Step 3.b runs recover-envelope, which writes a sibling
+        <backend>-envelope-recovered.json and returns THAT path — so finalize
+        legitimately gets the sibling while the original stays on disk. Left
+        alone, a check meant to stop findings being dropped instead blocked the
+        mechanism that rescues them.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            d = sd / "r1" / "a1"
+            d.mkdir(parents=True)
+            (d / "codex-envelope.json").write_text(json.dumps(_envelope()))
+            rec = d / "codex-envelope-recovered.json"
+            rec.write_text(json.dumps(_envelope()))
+            pr_ops._reject_orphan_envelopes(sd, 1, {"codex": rec})
+
     def test_ignores_other_rounds(self):
         with tempfile.TemporaryDirectory() as td:
             sd = Path(td)
@@ -3458,6 +3476,23 @@ class StreamStatusPersistenceTests(unittest.TestCase):
             )
             self.assertEqual(entry["stream_status"]["cursor"], "absent")
             self.assertEqual(entry["stream_status"]["codex"], "ok")
+
+    def test_an_unreadable_envelope_records_a_status(self):
+        """A file that exists but does not parse is a failed stream.
+
+        Leaving no key at all is the same "nobody looked" reads as "nothing to
+        find" hole the absent branch closes — and this is the shape a reviewer
+        that died mid-write actually produces.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            d = sd / "r1" / "a1"
+            d.mkdir(parents=True)
+            bad = d / "codex-envelope.json"
+            bad.write_text("{ truncated mid-writ")
+            entry: dict = {}
+            pr_ops._persist_round_findings(sd, entry, None, "br", 1, {"codex": bad})
+            self.assertEqual(entry["stream_status"]["codex"], "unreadable")
 
     def test_a_backend_never_launched_records_nothing(self):
         with tempfile.TemporaryDirectory() as td:

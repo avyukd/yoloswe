@@ -55,6 +55,12 @@ const (
 
 	// EventTypeReasoningDelta fires for streaming reasoning/thinking text.
 	EventTypeReasoningDelta
+
+	// eventTypeSentinelForTest must stay LAST. It is not an event: it counts
+	// the block so TestEventTypeRosterIsComplete can tell when a type was added
+	// without being added to that test's roster. Anchoring on a real constant
+	// meant appending one moved the anchor too, and the check passed.
+	eventTypeSentinelForTest
 )
 
 // Event is the interface for all events.

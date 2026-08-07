@@ -414,9 +414,13 @@ func TestScopeIDReportsTheOwningThread(t *testing.T) {
 // adding a type without adding it to the roster fails here rather than silently
 // widening the multiplex hole.
 func TestEventTypeRosterIsComplete(t *testing.T) {
-	// EventTypeReasoningDelta is the last constant in the iota block; the count
-	// is therefore its value + 1.
-	const declared = int(EventTypeReasoningDelta) + 1
+	// Anchor on the FIRST constant, not the last: `int(EventTypeReasoningDelta)+1`
+	// tracked whatever sat at the end of the iota block, so appending a new type
+	// there moved the target and the count still matched — the exact addition
+	// this test exists to catch. A sentinel after the block is fixed relative to
+	// the start, so any new constant inserted anywhere before it raises the
+	// count while the hand-written roster stays put.
+	const declared = int(eventTypeSentinelForTest)
 	if got := len(scopedRosterForTest()); got != declared {
 		t.Errorf("roster has %d event types but %d EventType constants are declared; "+
 			"a new event type must be added to the roster or it is never checked "+

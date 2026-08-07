@@ -25,8 +25,8 @@ Missing/error review streams → log as findings with stderr path cited. A `stat
 | Flag | Default | Meaning |
 |---|---|---|
 | `--rounds N` | `5` | Up to N additional rounds this invocation. Budget resets on re-invoke. `--rounds 0` = no-op. |
-| `--gemini` | off | Extra reviewer (`gemini-3-flash-preview`). ≥2 sources = consensus. Sets `USE_GEMINI=1`. |
-| `--claude` | off | Extra reviewer (`claude` backend, `opus`). Highest per-round cost of the four — reach for it on a diff where codex+cursor disagree or keep missing the same class of bug. Sets `USE_CLAUDE=1`. |
+| `--gemini` | off | Extra reviewer (`gemini-3-flash-preview`). Sets `USE_GEMINI=1`. |
+| `--claude` | off | Extra reviewer (`claude` backend, `opus`). Sets `USE_CLAUDE=1`. |
 | `--ask` / `--interactive` | off | Enable `AskUserQuestion` at gates (Step 3.g). Default: never block. |
 
 ## State tracking

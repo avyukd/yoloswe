@@ -988,6 +988,29 @@ class TestParseEnvelope(unittest.TestCase):
             self.assertEqual(after["status"], "partial")
             self.assertTrue(after["error"], "the failure half must survive")
 
+    def test_parse_sufficiency_reads_a_partial_envelope(self) -> None:
+        """Everything readable off "ok" is readable off "partial".
+
+        parse_envelope and recover_envelope were taught the new status; this
+        consumer was not, so a reviewer that emitted a sufficiency claim and
+        then hit the idle timeout had it silently dropped. Both now branch on
+        STATUSES_WITH_BODY so a future body-carrying status follows for free.
+        """
+        env = {
+            "status": "partial",
+            "error": "codex: review idle",
+            "review": {"verdict": "rejected", "issues": [],
+                       "sufficiency": {"is_confident_complete": False,
+                                       "evidence": "more sites remain"}},
+        }
+        got = bramble_ops.parse_sufficiency(env)
+        self.assertIsNotNone(got)
+        self.assertFalse(got["is_confident_complete"])
+
+    def test_parse_sufficiency_still_rejects_a_failed_envelope(self) -> None:
+        env = {"status": "error", "review": {"sufficiency": {"is_confident_complete": True}}}
+        self.assertIsNone(bramble_ops.parse_sufficiency(env))
+
     def test_missing_envelope_yields_empty_list(self) -> None:
         self.assertEqual(bramble_ops.parse_envelope(None, source="codex"), [])
 

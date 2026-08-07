@@ -423,7 +423,7 @@ func TestBridgeStreamEvents_UnrenderableEventsKeepStreamAlive(t *testing.T) {
 	var result *bridgeResult
 	var err error
 	go func() {
-		result, err = bridgeStreamEvents(context.Background(), ch, handler, "", 60*time.Millisecond)
+		result, err = bridgeStreamEvents(context.Background(), ch, handler, "", 200*time.Millisecond)
 		close(done)
 	}()
 
@@ -467,7 +467,7 @@ func TestBridgeStreamEvents_UnknownKindKeepsStreamAlive(t *testing.T) {
 	done := make(chan struct{})
 	var err error
 	go func() {
-		_, err = bridgeStreamEvents(context.Background(), ch, handler, "thread-1", 60*time.Millisecond)
+		_, err = bridgeStreamEvents(context.Background(), ch, handler, "thread-1", 200*time.Millisecond)
 		close(done)
 	}()
 
@@ -502,7 +502,7 @@ func TestBridgeStreamEvents_OutOfScopeEventsStillTripIdle(t *testing.T) {
 	done := make(chan struct{})
 	var err error
 	go func() {
-		_, err = bridgeStreamEvents(context.Background(), ch, handler, "thread-1", 60*time.Millisecond)
+		_, err = bridgeStreamEvents(context.Background(), ch, handler, "thread-1", 200*time.Millisecond)
 		close(done)
 	}()
 
@@ -568,7 +568,10 @@ func TestBridgeStreamEvents_TrueSilenceStillTripsIdle(t *testing.T) {
 func TestBridgeStreamEvents_Kernel8682R2TimingSurvives(t *testing.T) {
 	withHeartbeat(t, 3*time.Millisecond)
 
-	const idle = 300 * time.Millisecond // stands in for 300s
+	// Margins are wide on purpose: the point is the ORDERING (item/started
+	// resets the clock), not tight timing. A 30ms gap against a 300ms bound
+	// made this a scheduler race under parallel `bazel test`.
+	const idle = 900 * time.Millisecond // stands in for 300s
 	ch := make(chan interface{})
 	handler := &recordingHandler{}
 	done := make(chan struct{})
@@ -579,16 +582,17 @@ func TestBridgeStreamEvents_Kernel8682R2TimingSurvives(t *testing.T) {
 	}()
 
 	ch <- testTextEvent{delta: "agentMessage/delta"} // t
-	time.Sleep(60 * time.Millisecond)                // +17s, scaled up for timer slack
+	time.Sleep(180 * time.Millisecond)               // +17s, scaled up for timer slack
 	ch <- testNonStreamEvent{note: "item/started"}   // the event the old code discarded
 
 	// Now wait past the point where the OLD code would have died. The old clock
-	// ran from agentMessage/delta, so it trips at t+300ms; the corrected clock
-	// runs from item/started and does not trip until t+360ms. Sleeping to
-	// ~t+330ms straddles the two: dead under the old rule, alive under the new.
+	// ran from agentMessage/delta, so it trips at t+900ms; the corrected clock
+	// runs from item/started and does not trip until t+1080ms. Sleeping to
+	// ~t+990ms straddles the two: dead under the old rule, alive under the new,
+	// with a 90ms cushion on each side rather than 30ms.
 	// (Bounded by the terminal event below, so a slow machine cannot flake into
 	// a false pass — it would time out at the select instead.)
-	time.Sleep(270 * time.Millisecond)
+	time.Sleep(810 * time.Millisecond)
 	select {
 	case <-done:
 		t.Fatalf("regressed: killed at the 8682 r2 timing — item/started must reset the clock (err=%v)", err)
@@ -631,7 +635,7 @@ func TestBridgeStreamEvents_UnrenderableOutOfScopeDoesNotKeepUsAlive(t *testing.
 	done := make(chan struct{})
 	var err error
 	go func() {
-		_, err = bridgeStreamEvents(context.Background(), ch, handler, "thread-1", 60*time.Millisecond)
+		_, err = bridgeStreamEvents(context.Background(), ch, handler, "thread-1", 200*time.Millisecond)
 		close(done)
 	}()
 
@@ -672,7 +676,7 @@ func TestBridgeStreamEvents_UnscopedEventCountsAsLivenessByDesign(t *testing.T) 
 	handler := &recordingHandler{}
 	done := make(chan struct{})
 	go func() {
-		_, _ = bridgeStreamEvents(context.Background(), ch, handler, "thread-1", 60*time.Millisecond)
+		_, _ = bridgeStreamEvents(context.Background(), ch, handler, "thread-1", 200*time.Millisecond)
 		close(done)
 	}()
 

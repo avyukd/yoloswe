@@ -401,9 +401,10 @@ func emitVerdictLine(env reviewer.ResultEnvelope) {
 	case reviewer.StatusPartial:
 		// stdout is the surface an orchestrator reads first, and "error: …"
 		// alone is what produced `ack … no envelope` on kernel#8682 r1. A
-		// partial run has findings by construction (BuildEnvelope only assigns
-		// StatusPartial when the body parsed and validated), so say so here
-		// too — otherwise the line contradicts the envelope beside it.
+		// partial run parsed a schema-valid body, so it has a verdict and
+		// usually findings — an accepted body with zero issues also validates,
+		// hence the count rather than a claim that findings exist. Report both
+		// halves so the line does not contradict the envelope beside it.
 		fmt.Fprintf(os.Stdout, "partial: %s (%d issues kept) after: %s%s\n",
 			env.Review.Verdict, len(env.Review.Issues), env.Error, resumeSuffix)
 	default:

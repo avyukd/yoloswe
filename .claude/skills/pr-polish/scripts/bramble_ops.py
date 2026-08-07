@@ -55,6 +55,15 @@ BACKENDS = ("claude", "codex", "cursor", "gemini", "lint")
 # default well before _normalize_mode lands. The two strings must match
 # yoloswe/reviewer.ReviewMode so the wire format stays stable across
 # the Python triage layer and the Go envelope writer.
+#: Envelope statuses that carry a usable review body. "partial" is a run that
+#: produced findings and THEN failed (idle timeout mid-stream): everything a
+#: consumer reads off "ok" — issues, verdict, sufficiency — is equally present.
+#: Branch on this, not on `== "ok"`: every `!= "ok"` test in the tree predates
+#: "partial" and silently routes it to the failure arm, discarding real review
+#: work. A future status that carries a body joins here and every consumer
+#: follows without being found again.
+STATUSES_WITH_BODY = ("ok", "partial")
+
 REVIEW_MODE_CODE = "code"
 REVIEW_MODE_DESIGN_DOC = "design-doc"
 REVIEW_MODES = (REVIEW_MODE_CODE, REVIEW_MODE_DESIGN_DOC)
@@ -903,7 +912,7 @@ def parse_sufficiency(obj: dict[str, Any] | None) -> dict[str, Any] | None:
     """
     if obj is None:
         return None
-    if (obj.get("status") or "") != "ok":
+    if (obj.get("status") or "") not in STATUSES_WITH_BODY:
         return None
     suff = (obj.get("review") or {}).get("sufficiency")
     if not isinstance(suff, dict):
@@ -1840,7 +1849,7 @@ def recover_envelope(path: Path, *, suffix: str = "-recovered") -> Path:
     # the run — so rewriting it would silently delete the failure half and make
     # a truncated review read as a complete one. Its findings are already
     # reachable: parse_envelope handles partial directly.
-    if obj.get("status") in ("ok", "partial"):
+    if obj.get("status") in STATUSES_WITH_BODY:
         return path
     error_text = obj.get("error") or ""
     verdict = _classify_recovery_verdict(error_text)
