@@ -3304,6 +3304,36 @@ class LowOnlyStreakLivenessTests(unittest.TestCase):
             pr_ops._compute_low_only_streak(prior, "high", had_live_reviewer=True), 0
         )
 
+    def test_the_backfill_path_applies_the_same_dead_round_rule(self):
+        """Both writers of low_only_streak must answer one question the same way.
+
+        _backfill_low_only_streak reconstructs the streak from top_severity
+        history. Left alone, it re-derived the inflated number the forward path
+        had just been fixed to stop producing — the same defect at the second
+        writer, which is why both now route through _round_counts_as_low_only.
+        """
+        prior = [
+            {"n": 1, "top_severity": "low", "stream_status": {"codex": "ok"}},
+            # Dead: top_severity None only because nobody reported.
+            {"n": 2, "top_severity": None,
+             "stream_status": {"codex": "error", "cursor": "absent"}},
+        ]
+        # Only round 1 is evidence, so the streak is 1 — not 2.
+        self.assertEqual(pr_ops._backfill_low_only_streak(prior), 1)
+
+    def test_the_backfill_path_still_resets_on_a_live_high_round(self):
+        prior = [
+            {"n": 1, "top_severity": "low", "stream_status": {"codex": "ok"}},
+            {"n": 2, "top_severity": "high", "stream_status": {"codex": "ok"}},
+        ]
+        self.assertEqual(pr_ops._backfill_low_only_streak(prior), 0)
+
+    def test_the_backfill_path_is_unchanged_for_pre_stream_status_rounds(self):
+        # No stream_status at all reads as live, so historical reconstruction
+        # behaves exactly as before the field existed.
+        prior = [{"n": 1, "top_severity": "low"}, {"n": 2, "top_severity": "low"}]
+        self.assertEqual(pr_ops._backfill_low_only_streak(prior), 2)
+
     def test_liveness_is_read_from_stream_status(self):
         self.assertTrue(pr_ops._round_had_live_reviewer({"stream_status": {"codex": "ok"}}))
         self.assertTrue(pr_ops._round_had_live_reviewer({"stream_status": {"codex": "partial"}}))
@@ -3318,6 +3348,67 @@ class LowOnlyStreakLivenessTests(unittest.TestCase):
         )
         # No data is not "nobody looked".
         self.assertTrue(pr_ops._round_had_live_reviewer({}))
+
+
+class ConvergedSignalLivenessTests(unittest.TestCase):
+    """The in-loop guard, exercised through finalize_and_report itself.
+
+    _round_had_live_reviewer and verdict.py were each covered alone, so
+    deleting the production guard left both green (codex, r7). This asserts
+    the wiring.
+    """
+
+    def _finalize(self, tmp, stream_files, n=1, prior=None):
+        sd = Path(tmp)
+        d = sd / f"r{n}" / "a1"
+        d.mkdir(parents=True)
+        overrides = {}
+        for backend, status in stream_files.items():
+            f = d / f"{backend}-envelope.json"
+            if status is not None:
+                f.write_text(json.dumps({"status": status, "backend": backend,
+                                         "review": {"verdict": "accepted", "issues": []}}))
+            overrides[backend] = f
+        rounds = list(prior or [])
+        rounds.append({"n": n, "comment_actions": []})
+        (sd / "pr-polish-state.json").write_text(
+            json.dumps({"pr_number": None, "branch": "br", "rounds": rounds})
+        )
+        import unittest.mock as _mock
+        with _mock.patch.object(
+            pr_ops, "state_paths",
+            return_value=(sd, sd / "pr-polish-state.json"),
+        ):
+            return pr_ops.finalize_and_report(
+                "branch:br", n, "deadbeef", [], envelope_overrides=overrides,
+            )
+
+    def test_a_dead_round_cannot_report_converged(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = self._finalize(td, {"codex": "error", "cursor": None, "lint": "ok"})
+            self.assertIsNone(out["converged_signal"])
+            self.assertIsNone(out["exit_reason_hint"])
+
+    def test_a_live_clean_round_may_report_converged(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = self._finalize(td, {"codex": "ok", "lint": "ok"})
+            self.assertTrue(out["converged_signal"])
+
+    def test_a_recovered_round_clears_an_earlier_dead_round(self):
+        """The in-loop gate is per-round, not series-wide.
+
+        A series-wide read meant one dead round blocked convergence for every
+        round after it, so a recovered run could never signal done and would
+        burn its budget to the cap.
+        """
+        prior = [{"n": 1, "comment_actions": [],
+                  "stream_status": {"codex": "error", "cursor": "absent"}}]
+        with tempfile.TemporaryDirectory() as td:
+            out = self._finalize(td, {"codex": "ok", "lint": "ok"}, n=2, prior=prior)
+            self.assertTrue(
+                out["converged_signal"],
+                "a healthy round must be able to converge after an earlier dead one",
+            )
 
 
 class StreamStatusPersistenceTests(unittest.TestCase):

@@ -1235,6 +1235,26 @@ def _has_unresolved_high_deferral(rounds: list[dict[str, Any]]) -> bool:
     return False
 
 
+def _round_counts_as_low_only(
+    top_severity: str | None, *, had_live_reviewer: bool
+) -> bool:
+    """Did this round produce low-only evidence?
+
+    THE single answer to that question. Both writers of ``low_only_streak``
+    (finalize and the backfill reconstruction) route through here — asking it
+    separately is how the same dead-round defect landed twice, once per writer.
+
+    A round no live model reviewer returned produced no evidence at all, so it
+    is not low-only: its ``top_severity`` is None only because nobody reported,
+    and ``severity_rank(None)`` sits below "low", which is exactly the
+    "nobody looked" == "nothing to find" reading this field's consumers were
+    hardened against.
+    """
+    if not had_live_reviewer:
+        return False
+    return severity_rank(top_severity) <= severity_rank("low")
+
+
 def _backfill_low_only_streak(prior_rounds: list[dict[str, Any]]) -> int:
     """Reconstruct the streak ending at the most recent prior round when
     its ``low_only_streak`` field is missing (state file from before the
@@ -1246,7 +1266,14 @@ def _backfill_low_only_streak(prior_rounds: list[dict[str, Any]]) -> int:
     """
     streak = 0
     for rnd in sorted(prior_rounds, key=lambda r: r.get("n") or 0, reverse=True):
-        if severity_rank(rnd.get("top_severity")) <= severity_rank("low"):
+        live = _round_had_live_reviewer(rnd)
+        if not live:
+            # A dead round holds the streak: it neither counts as evidence nor
+            # terminates the run of low-only rounds before it. Same rule the
+            # forward path applies; rounds predating stream_status read as
+            # live, so historical reconstruction is unchanged.
+            continue
+        if _round_counts_as_low_only(rnd.get("top_severity"), had_live_reviewer=live):
             streak += 1
         else:
             break
@@ -1322,8 +1349,7 @@ def _compute_low_only_streak(
         held = prev.get("low_only_streak")
         return held if isinstance(held, int) else _backfill_low_only_streak(prior_rounds)
 
-    is_low_only = severity_rank(this_top_severity) <= severity_rank("low")
-    if not is_low_only:
+    if not _round_counts_as_low_only(this_top_severity, had_live_reviewer=had_live_reviewer):
         return 0
     if not prior_rounds:
         return 1
@@ -2124,9 +2150,14 @@ def finalize_and_report(
     # gates on this too, but only at exit — by then the batch has already
     # pushed, so the in-loop hint has to carry the same rule or the recovery it
     # exists to trigger never happens.
-    import verdict as _verdict  # noqa: PLC0415 — lazy: avoid a top-level cycle
-
-    no_live_reviewer = bool(_verdict.rounds_without_a_live_stream(state))
+    #
+    # Scoped to THIS round, unlike verdict.py's series-wide blocker. The two
+    # answer different questions: "is this batch's record trustworthy" is
+    # rightly permanent, but "may this round converge" must clear when the
+    # reviewers recover — a series-wide read here meant one dead round blocked
+    # convergence for every round after it, so a recovered run could never
+    # signal done and would burn its budget to the cap.
+    no_live_reviewer = not _round_had_live_reviewer(entry)
 
     deferred_high = _has_unresolved_high_deferral(rounds)
     if deferred_high or no_live_reviewer:
