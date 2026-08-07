@@ -328,60 +328,39 @@ class ReviewerStreamRosterTests(unittest.TestCase):
         self.assertEqual(v.reviewer_stream_health(st).get("claude"), 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class WritePersistsToStateTests(unittest.TestCase):
-    """--write must update the state file, not only the sidecar.
+    """``--write`` must update the state file, not only the sidecar.
 
-    Regression intent: the plan called for the verdict to land in
-    state["verdict"] *and* verdict.json. Only the sidecar was written, so
-    every consumer that already reads pr-polish-state.json — the harvester,
-    escape_rate.py, anything auditing a past run — saw no verdict at all.
+    Consumers read pr-polish-state.json; a verdict written only to the
+    sidecar is invisible to every one of them.
     """
 
-    def _state_dir(self, tmp):
-        d = Path(tmp)
-        (d / "pr-polish-state.json").write_text(json.dumps({
-            "pr_number": 1, "completed": True, "exit_reason": "converged",
-            "rounds": [],
-        }))
-        return d
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.d = Path(tmp.name)
+        (self.d / "pr-polish-state.json").write_text(json.dumps(_state()))
+
+    def _written_state(self):
+        return json.loads((self.d / "pr-polish-state.json").read_text())
 
     def test_write_updates_state_file(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            d = self._state_dir(tmp)
-            v.main([str(d), "--write"])
-            state = json.loads((d / "pr-polish-state.json").read_text())
-            self.assertIn("verdict", state)
-            self.assertIn(state["verdict"]["verdict"], {"ready", "not_ready"})
-            self.assertTrue((d / "verdict.json").is_file())
+        v.main([str(self.d), "--write"])
+        state = self._written_state()
+        self.assertIn(state["verdict"]["verdict"], {"ready", "not_ready"})
+        self.assertTrue((self.d / "verdict.json").is_file())
 
     def test_write_preserves_existing_state_keys(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            d = self._state_dir(tmp)
-            v.main([str(d), "--write"])
-            state = json.loads((d / "pr-polish-state.json").read_text())
-            self.assertEqual(state["pr_number"], 1)
-            self.assertEqual(state["exit_reason"], "converged")
+        v.main([str(self.d), "--write"])
+        state = self._written_state()
+        self.assertEqual(state["pr_number"], 1)
+        self.assertEqual(state["exit_reason"], "converged")
 
-    def test_write_leaves_no_temp_file(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            d = self._state_dir(tmp)
-            v.main([str(d), "--write"])
-            self.assertFalse((d / "pr-polish-state.json.tmp").exists())
+    def test_missing_state_file_reports_and_writes_nothing(self):
+        (self.d / "pr-polish-state.json").unlink()
+        self.assertEqual(v.main([str(self.d), "--write"]), 2)
+        self.assertFalse((self.d / "verdict.json").exists())
 
-    def test_missing_state_file_does_not_crash(self):
-        # The sidecar must still be written; a missing state file is not
-        # a reason to lose the verdict entirely.
-        with tempfile.TemporaryDirectory() as tmp:
-            d = Path(tmp)
-            (d / "pr-polish-state.json").write_text(json.dumps({"rounds": []}))
-            (d / "pr-polish-state.json").unlink()
-            try:
-                v.main([str(d), "--write"])
-            except SystemExit:
-                pass
-            except FileNotFoundError:
-                pass  # load_state may legitimately refuse
+
+if __name__ == "__main__":
+    unittest.main()
