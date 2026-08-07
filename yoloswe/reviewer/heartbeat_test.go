@@ -604,3 +604,88 @@ func TestBridgeStreamEvents_Kernel8682R2TimingSurvives(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+// testUnscopedThreadEvent is the pre-fix shape of codex's ItemStartedEvent &
+// friends: carries a thread id in a plain field, implements neither
+// agentstream.Event nor agentstream.Scoped. Before ScopeID() was added to those
+// types, the bridge could not tell whose traffic this was — and once ANY
+// arriving event counted as liveness, another thread's chatter kept a stalled
+// thread alive. Consensus finding (cursor + claude) on PR #314.
+type testUnscopedThreadEvent struct{ threadID string }
+
+// testScopedNonStreamEvent is the POST-fix shape: still outside the
+// agentstream.Event subset, but scoped, so the bridge can attribute it.
+type testScopedNonStreamEvent struct{ scopeID string }
+
+func (e testScopedNonStreamEvent) ScopeID() string { return e.scopeID }
+
+// The multiplex guard must hold for unrenderable events too: an event scoped to
+// ANOTHER thread must not reset our idle clock, even though it is now liveness
+// evidence for its own thread.
+func TestBridgeStreamEvents_UnrenderableOutOfScopeDoesNotKeepUsAlive(t *testing.T) {
+	withHeartbeat(t, 5*time.Millisecond)
+
+	ch := make(chan interface{})
+	handler := &recordingHandler{}
+	done := make(chan struct{})
+	var err error
+	go func() {
+		_, err = bridgeStreamEvents(context.Background(), ch, handler, "thread-1", 60*time.Millisecond)
+		close(done)
+	}()
+
+	// Our thread speaks once, then only thread-2's unrenderable traffic flows.
+	ch <- testScopedTextEvent{testTextEvent: testTextEvent{delta: "ours"}, scopeID: "thread-1"}
+	go func() {
+		for {
+			select {
+			case ch <- testScopedNonStreamEvent{scopeID: "thread-2"}:
+			case <-done:
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("another thread's unrenderable traffic suppressed the idle trip")
+	}
+	if err == nil || !strings.Contains(err.Error(), "review idle") {
+		t.Fatalf("expected an idle-timeout error, got: %v", err)
+	}
+}
+
+// Documents the residual hole this design accepts: an event carrying a thread
+// id that does NOT implement Scoped is unattributable, so it counts as liveness
+// for every bridge on a shared channel. The fix is at the producer — every
+// multiplexed codex event now implements ScopeID() — and
+// TestEveryThreadedCodexEventIsScoped in the codex package is what keeps that
+// true. This test pins the bridge's half of the contract so the two cannot
+// drift apart silently.
+func TestBridgeStreamEvents_UnscopedEventCountsAsLivenessByDesign(t *testing.T) {
+	withHeartbeat(t, 5*time.Millisecond)
+
+	ch := make(chan interface{})
+	handler := &recordingHandler{}
+	done := make(chan struct{})
+	go func() {
+		_, _ = bridgeStreamEvents(context.Background(), ch, handler, "thread-1", 60*time.Millisecond)
+		close(done)
+	}()
+
+	for i := 0; i < 5; i++ {
+		ch <- testUnscopedThreadEvent{threadID: "thread-2"}
+		time.Sleep(20 * time.Millisecond)
+		select {
+		case <-done:
+			t.Fatalf("drip %d: an unscoped event cannot be attributed, so it counts "+
+				"as liveness — if this now trips, the bridge changed and the "+
+				"producer-side ScopeID() contract needs revisiting", i)
+		default:
+		}
+	}
+	ch <- testTurnCompleteEvent{success: true, durationMs: 1}
+	<-done
+}

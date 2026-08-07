@@ -3,6 +3,7 @@ package reviewer
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -900,5 +901,95 @@ func TestSufficiency_OmittedRemainsNil(t *testing.T) {
 func TestSchemaVersion_IsV2(t *testing.T) {
 	if JSONSchemaVersion != 2 {
 		t.Errorf("JSONSchemaVersion = %d, want 2 (Issue.Invariant/Sites + ReviewBody.Sufficiency)", JSONSchemaVersion)
+	}
+}
+
+// errTest is a fixed sentinel for the partial-result cases below.
+var errTest = errors.New("review idle: no events for 8m0s (stalled backend)")
+
+// --- status="partial": a failed run that still produced findings ----------
+//
+// The shape this exists for: the idle timeout fires after the reviewer has
+// already streamed a complete, schema-valid body. Both halves matter — the
+// findings are genuine review work, and the failure is still something the
+// caller must see. Measured on kernel#8682 r2, a review holding ~2M input
+// tokens and real defects was discarded because the last stretch was quiet.
+
+func TestBuildEnvelope_FailedButParseableIsPartial(t *testing.T) {
+	result := &ReviewResult{
+		ResponseText: `{"verdict":"rejected","summary":"found a bug","issues":[` +
+			`{"severity":"high","file":"a.go","line":1,"message":"boom"}]}`,
+		Success:      false,
+		ErrorMessage: "codex: review idle: no events for 8m0s (stalled backend)",
+	}
+	env := BuildEnvelope(result, BackendCodex, "m", "sess-1", "")
+	if env.Status != StatusPartial {
+		t.Fatalf("status = %s, want partial (findings must survive the timeout)", env.Status)
+	}
+	if len(env.Review.Issues) != 1 {
+		t.Errorf("issues = %d, want 1 preserved", len(env.Review.Issues))
+	}
+	if env.Error == "" {
+		t.Error("partial must still report the failure that ended the run")
+	}
+	if env.SessionID != "sess-1" {
+		t.Errorf("session_id = %q, want it preserved so the next round can resume", env.SessionID)
+	}
+}
+
+func TestBuildEnvelope_FailedWithNoBodyStaysError(t *testing.T) {
+	// Nothing was produced, so there is nothing to keep: still a plain error.
+	// Guards against "partial" swallowing genuine total failures.
+	result := &ReviewResult{
+		Success:      false,
+		ErrorMessage: "codex: review idle: no events for 8m0s (stalled backend)",
+	}
+	env := BuildEnvelope(result, BackendCodex, "m", "", "")
+	if env.Status != StatusError {
+		t.Fatalf("status = %s, want error when no body was produced", env.Status)
+	}
+}
+
+func TestBuildEnvelope_FailedWithUnparseableBodyStaysError(t *testing.T) {
+	result := &ReviewResult{
+		ResponseText: "I was thinking about the diff when the stream died",
+		Success:      false,
+		ErrorMessage: "codex: review idle: no events for 8m0s (stalled backend)",
+	}
+	env := BuildEnvelope(result, BackendCodex, "m", "", "")
+	if env.Status != StatusError {
+		t.Fatalf("status = %s, want error: prose is not a review body", env.Status)
+	}
+}
+
+// reviewPartialResult is the backend-side half: it must carry streamed text
+// into the result so BuildEnvelope can see it, and degrade to a plain error
+// when the stream produced nothing.
+func TestReviewPartialResult(t *testing.T) {
+	body := `{"verdict":"rejected","summary":"s","issues":[]}`
+	res, err := reviewPartialResult(ResumeStatusOK, &bridgeResult{responseText: body}, errTest)
+	if err == nil {
+		t.Fatal("the error must still be returned")
+	}
+	if res.ResponseText != body {
+		t.Errorf("ResponseText = %q, want the streamed body preserved", res.ResponseText)
+	}
+	if res.Success {
+		t.Error("a partial result is not a success")
+	}
+
+	// Nil bridge (failure before the stream opened) and empty text both
+	// degrade to the plain error shape.
+	for name, b := range map[string]*bridgeResult{
+		"nil":   nil,
+		"empty": {responseText: ""},
+	} {
+		res, err := reviewPartialResult(ResumeStatusOK, b, errTest)
+		if err == nil {
+			t.Fatalf("%s: expected the error", name)
+		}
+		if res.ResponseText != "" {
+			t.Errorf("%s: ResponseText = %q, want empty", name, res.ResponseText)
+		}
 	}
 }

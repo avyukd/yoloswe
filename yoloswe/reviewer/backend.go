@@ -349,7 +349,14 @@ func bridgeStreamEvents[E any](
 				break
 			}
 			if idleTimeout > 0 && time.Since(lastEvent) >= idleTimeout {
-				return nil, fmt.Errorf("review idle: no events for %s (stalled backend)", idleTimeout)
+				// Return what the reviewer already streamed alongside the
+				// error. A stalled review that had named real defects is
+				// partial work, not zero work, and callers that plumb this
+				// into BuildEnvelope surface it as status="partial" instead
+				// of discarding it. The error is unchanged, so a caller that
+				// ignores the result behaves exactly as before.
+				return &bridgeResult{responseText: responseText.String()},
+					fmt.Errorf("review idle: no events for %s (stalled backend)", idleTimeout)
 			}
 			// Emit a heartbeat line at most every heartbeatInterval even if the
 			// ticker fires more often for idle-check precision.

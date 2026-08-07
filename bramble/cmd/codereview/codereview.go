@@ -309,10 +309,21 @@ func runCodeReview(cmd *cobra.Command, args []string) (retErr error) {
 		// r.resumeStatus was repopulated still surfaces Unverified
 		// when resume was requested — same fallback the deferred
 		// guard applies on the panic/silent-exit path.
-		env := reviewer.BuildEnvelope(&reviewer.ReviewResult{
-			ErrorMessage: err.Error(),
-			ResumeStatus: effectiveResumeStatus(activeReviewer, resumeSessionID),
-		}, reviewer.BackendType(backend), r.EffectiveModel(), r.LastSessionID(), mode)
+		// Keep whatever the reviewer managed to produce. A failed run that
+		// still emitted a schema-valid body (the shape of an idle timeout
+		// firing after real findings) becomes status="partial" in
+		// BuildEnvelope rather than discarding the work — synthesizing a
+		// bare ErrorMessage here threw away everything the reviewer had
+		// said. `result` is nil on most error paths, so fall back to the
+		// synthesized shape when there is genuinely nothing to keep.
+		failed := result
+		if failed == nil {
+			failed = &reviewer.ReviewResult{}
+		}
+		failed.ErrorMessage = err.Error()
+		failed.ResumeStatus = effectiveResumeStatus(activeReviewer, resumeSessionID)
+		env := reviewer.BuildEnvelope(failed,
+			reviewer.BackendType(backend), r.EffectiveModel(), r.LastSessionID(), mode)
 		emitVerdictLine(env)
 		emitEnvelope(env)
 		return fmt.Errorf("review failed: %w", err)

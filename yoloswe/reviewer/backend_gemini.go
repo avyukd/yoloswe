@@ -110,9 +110,14 @@ func (b *geminiBackend) RunPrompt(ctx context.Context, prompt string, handler Ev
 	// the event channel, so the bridge must drain concurrently.
 	bridged := make(chan *bridgeResult, 1)
 	bridgeErr := make(chan error, 1)
+	// Partial output on the error path: bridgeStreamEvents returns any text it
+	// accumulated alongside an idle-timeout error, so stash it for the error
+	// branch below instead of dropping it with the result.
+	bridgePartial := make(chan *bridgeResult, 1)
 	go func() {
 		r, err := bridgeStreamEvents(adapterCtx, filterGeminiEvents(adapterCtx, b.client.Events()), handler, "", b.config.IdleTimeout)
 		if err != nil {
+			bridgePartial <- r
 			bridgeErr <- err
 		} else {
 			bridged <- r
@@ -131,10 +136,17 @@ func (b *geminiBackend) RunPrompt(ctx context.Context, prompt string, handler Ev
 	select {
 	case r = <-bridged:
 	case err := <-bridgeErr:
-		if promptErr != nil {
-			return reviewErrorResult(resumeStatus, fmt.Errorf("gemini: prompt failed: %w (bridge: %v)", promptErr, err))
+		// Keep any text streamed before the failure so an idle timeout that
+		// fired after real findings becomes status="partial".
+		var partial *bridgeResult
+		select {
+		case partial = <-bridgePartial:
+		default:
 		}
-		return reviewErrorResult(resumeStatus, fmt.Errorf("gemini: %w", err))
+		if promptErr != nil {
+			return reviewPartialResult(resumeStatus, partial, fmt.Errorf("gemini: prompt failed: %w (bridge: %v)", promptErr, err))
+		}
+		return reviewPartialResult(resumeStatus, partial, fmt.Errorf("gemini: %w", err))
 	case <-ctx.Done():
 		return reviewErrorResult(resumeStatus, ctx.Err())
 	}

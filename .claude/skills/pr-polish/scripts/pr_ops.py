@@ -1457,6 +1457,16 @@ def _reject_orphan_envelopes(
     it. Only backends whose envelope exists AND is non-empty are flagged — a
     zero-byte file is a reviewer that died mid-write, which the
     ``stream-missing`` path handles correctly.
+
+    **Scoped to the attempt being finalized.** ``round_bundle`` allocates a
+    FRESH ``a<n>`` dir on resume and deliberately preserves prior attempts
+    (see ``_next_attempt``), so a retried round legitimately has valid
+    envelopes under earlier attempts that this finalize is not about.
+    Scanning the whole ``r<n>`` tree would flag every one of them and make
+    resume impossible — a guard against losing findings must not itself break
+    the retry path that exists to recover them. The active attempt is derived
+    from the passed envelope paths; with none passed there is nothing to scope
+    to and nothing to check.
     """
     import bramble_ops  # noqa: PLC0415
 
@@ -1468,11 +1478,19 @@ def _reject_orphan_envelopes(
         for p in envelope_overrides.values()
         if p is not None
     }
+    # The attempt dirs the orchestrator is actually finalizing. An envelope
+    # elsewhere under r<n> belongs to a different attempt and is out of scope.
+    active_dirs = {p.parent for p in passed}
+    if not active_dirs:
+        return
     orphans: list[str] = []
     for backend in bramble_ops.BACKENDS:
         for found in sorted(log_root.glob(f"a*/{backend}-envelope.json")):
             try:
-                if found.stat().st_size == 0 or found.resolve() in passed:
+                resolved = found.resolve()
+                if resolved.parent not in active_dirs:
+                    continue
+                if found.stat().st_size == 0 or resolved in passed:
                     continue
             except OSError:
                 continue

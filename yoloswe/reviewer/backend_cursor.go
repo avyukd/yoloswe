@@ -103,7 +103,9 @@ func (b *cursorBackend) runPromptWithOptions(ctx context.Context, prompt string,
 		resumeStatus = resumeStatusAfterSessionReady(resumeStatus, requestedResumeID, readySessionID)
 	}
 	if err != nil {
-		return reviewErrorResult(resumeStatus, fmt.Errorf("cursor: %w", err))
+		// Preserve any streamed text so an idle timeout that fired after real
+		// findings becomes status="partial" rather than discarding them.
+		return reviewPartialResult(resumeStatus, bridged, fmt.Errorf("cursor: %w", err))
 	}
 
 	// Check for turn-level errors (TurnCompleteEvent.Error).

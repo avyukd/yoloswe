@@ -3173,6 +3173,48 @@ class OrphanEnvelopeGuardTests(unittest.TestCase):
             (d / "codex-envelope.json").write_text("")
             pr_ops._reject_orphan_envelopes(sd, 1, {})
 
+    def test_a_prior_attempts_envelope_is_not_an_orphan(self):
+        """Resume must stay possible: round_bundle keeps prior attempt dirs.
+
+        `_next_attempt` allocates a FRESH a<n> on resume and deliberately
+        preserves earlier attempts, so a retried round legitimately has valid
+        envelopes under a1 while finalizing a2. Scanning all of r<n> flagged
+        every one of them and made resume impossible — a guard against losing
+        findings must not break the retry path that exists to recover them.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            a1 = sd / "r1" / "a1"
+            a1.mkdir(parents=True)
+            a2 = sd / "r1" / "a2"
+            a2.mkdir(parents=True)
+            (a1 / "codex-envelope.json").write_text(json.dumps(_envelope()))
+            (a2 / "codex-envelope.json").write_text(json.dumps(_envelope()))
+            # Finalizing a2 must not trip on a1's leftover.
+            pr_ops._reject_orphan_envelopes(
+                sd, 1, {"codex": a2 / "codex-envelope.json"}
+            )
+
+    def test_still_catches_an_orphan_inside_the_active_attempt(self):
+        """Scoping to the active attempt must not blunt the actual guard."""
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            a1 = sd / "r1" / "a1"
+            a1.mkdir(parents=True)
+            a2 = sd / "r1" / "a2"
+            a2.mkdir(parents=True)
+            (a1 / "codex-envelope.json").write_text(json.dumps(_envelope()))
+            # a2 holds BOTH; only cursor is passed, so codex is a real orphan.
+            (a2 / "codex-envelope.json").write_text(json.dumps(_envelope()))
+            (a2 / "cursor-envelope.json").write_text(json.dumps(_envelope()))
+            with self.assertRaises(ValueError) as ctx:
+                pr_ops._reject_orphan_envelopes(
+                    sd, 1, {"cursor": a2 / "cursor-envelope.json"}
+                )
+            msg = str(ctx.exception)
+            self.assertIn("a2", msg)
+            self.assertNotIn("a1", msg)
+
     def test_ignores_other_rounds(self):
         with tempfile.TemporaryDirectory() as td:
             sd = Path(td)
@@ -3181,13 +3223,32 @@ class OrphanEnvelopeGuardTests(unittest.TestCase):
             pr_ops._reject_orphan_envelopes(sd, 2, {})
 
     def test_finds_an_envelope_in_a_later_attempt_dir(self):
+        """The guard works in any attempt dir, not just a1."""
         with tempfile.TemporaryDirectory() as td:
             sd = Path(td)
             d2 = sd / "r1" / "a2"
             d2.mkdir(parents=True)
             (d2 / "codex-envelope.json").write_text(json.dumps(_envelope()))
-            with self.assertRaises(ValueError):
-                pr_ops._reject_orphan_envelopes(sd, 1, {})
+            (d2 / "cursor-envelope.json").write_text(json.dumps(_envelope()))
+            with self.assertRaises(ValueError) as ctx:
+                pr_ops._reject_orphan_envelopes(
+                    sd, 1, {"cursor": d2 / "cursor-envelope.json"}
+                )
+            self.assertIn("codex-envelope.json", str(ctx.exception))
+
+    def test_passing_no_envelopes_checks_nothing(self):
+        """No passed envelope means no attempt to scope to.
+
+        finalize already rejects a zero-envelope call upstream (SKILL Step 3.f
+        always passes at least codex/cursor/lint), so there is no case where
+        this silently swallows a real orphan.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            d1 = sd / "r1" / "a1"
+            d1.mkdir(parents=True)
+            (d1 / "codex-envelope.json").write_text(json.dumps(_envelope()))
+            pr_ops._reject_orphan_envelopes(sd, 1, {})
 
     def test_no_round_dir_is_not_an_error(self):
         with tempfile.TemporaryDirectory() as td:

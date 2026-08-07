@@ -81,6 +81,8 @@ type ThreadStartedEvent struct {
 // Type returns the event type.
 func (e ThreadStartedEvent) Type() EventType { return EventTypeThreadStarted }
 
+func (e ThreadStartedEvent) ScopeID() string { return e.ThreadID }
+
 // ThreadReadyEvent fires when MCP startup completes for a thread.
 type ThreadReadyEvent struct {
 	ThreadID string
@@ -88,6 +90,8 @@ type ThreadReadyEvent struct {
 
 // Type returns the event type.
 func (e ThreadReadyEvent) Type() EventType { return EventTypeThreadReady }
+
+func (e ThreadReadyEvent) ScopeID() string { return e.ThreadID }
 
 // TurnStartedEvent fires when a turn begins.
 type TurnStartedEvent struct {
@@ -97,6 +101,14 @@ type TurnStartedEvent struct {
 
 // Type returns the event type.
 func (e TurnStartedEvent) Type() EventType { return EventTypeTurnStarted }
+
+// ScopeID reports the owning thread so a multiplexed consumer can filter this
+// event to its own thread. These SDK-only events deliberately stay outside the
+// agentstream.Event subset (see agentstream/doc.go), but a consumer that treats
+// ANY arriving event as proof the backend is alive still has to tell whose
+// traffic it is — without ScopeID another thread's activity would keep a
+// genuinely stalled thread alive on the shared client.Events() channel.
+func (e TurnStartedEvent) ScopeID() string { return e.ThreadID }
 
 // TurnCompletedEvent fires when a turn finishes.
 //
@@ -166,6 +178,8 @@ type ItemStartedEvent struct {
 // Type returns the event type.
 func (e ItemStartedEvent) Type() EventType { return EventTypeItemStarted }
 
+func (e ItemStartedEvent) ScopeID() string { return e.ThreadID }
+
 // ItemCompletedEvent fires when an item completes.
 type ItemCompletedEvent struct {
 	ThreadID string
@@ -177,6 +191,8 @@ type ItemCompletedEvent struct {
 
 // Type returns the event type.
 func (e ItemCompletedEvent) Type() EventType { return EventTypeItemCompleted }
+
+func (e ItemCompletedEvent) ScopeID() string { return e.ThreadID }
 
 // TokenUsageEvent contains token usage information from a Codex
 // `codex/event/token_count` notification.
@@ -195,6 +211,8 @@ type TokenUsageEvent struct {
 
 // Type returns the event type.
 func (e TokenUsageEvent) Type() EventType { return EventTypeTokenUsage }
+
+func (e TokenUsageEvent) ScopeID() string { return e.ThreadID }
 
 // TurnUsage contains token usage for a turn.
 type TurnUsage struct {
@@ -231,6 +249,8 @@ type StateChangeEvent struct {
 
 // Type returns the event type.
 func (e StateChangeEvent) Type() EventType { return EventTypeStateChange }
+
+func (e StateChangeEvent) ScopeID() string { return e.ThreadID }
 
 // CommandStartEvent fires when a shell command begins.
 type CommandStartEvent struct {
@@ -271,6 +291,8 @@ type CommandOutputEvent struct {
 
 // Type returns the event type.
 func (e CommandOutputEvent) Type() EventType { return EventTypeCommandOutput }
+
+func (e CommandOutputEvent) ScopeID() string { return e.ThreadID }
 
 // CommandEndEvent fires when a shell command completes.
 type CommandEndEvent struct {

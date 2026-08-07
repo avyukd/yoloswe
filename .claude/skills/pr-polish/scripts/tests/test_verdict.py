@@ -121,6 +121,53 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(out["verdict"], "not_ready")
         self.assertIn("abnormal_exit", [b["code"] for b in out["blockers"]])
 
+    def test_a_round_with_no_live_stream_blocks_ready(self):
+        # The automated half of the stream_status contract. Without it the
+        # field is written and never read, and a completed+converged run whose
+        # every stream errored still reports ready — "nobody looked" reading as
+        # "nothing to find".
+        st = _state(rounds=[{
+            "n": 1,
+            "comment_actions": [],
+            "stream_status": {"codex": "error", "cursor": "error"},
+        }])
+        out = v.compute_verdict(st)
+        self.assertEqual(out["verdict"], "not_ready")
+        self.assertIn("no_live_reviewer", [b["code"] for b in out["blockers"]])
+
+    def test_a_partial_stream_counts_as_a_live_reviewer(self):
+        # partial carries real findings alongside the failure that ended the
+        # run, so it is review coverage — not a dead round.
+        st = _state(rounds=[{
+            "n": 1,
+            "comment_actions": [],
+            "stream_status": {"codex": "partial", "cursor": "error"},
+        }])
+        out = v.compute_verdict(st)
+        self.assertNotIn("no_live_reviewer", [b["code"] for b in out["blockers"]])
+
+    def test_rounds_predating_stream_status_are_not_judged(self):
+        # No recorded status is "no data", not "nobody looked". Assuming the
+        # latter is the same absent-vs-empty conflation this field ends.
+        st = _state(rounds=[{"n": 1, "comment_actions": []}])
+        self.assertEqual(v.rounds_without_a_live_stream(st), [])
+        self.assertEqual(v.compute_verdict(st)["verdict"], "ready")
+
+    def test_silent_reviewer_advisory_names_the_cause_when_known(self):
+        st = _state(rounds=[{
+            "n": 1,
+            "comment_actions": [],
+            "codex_findings": [],
+            "cursor_findings": [],
+            "stream_status": {"codex": "error", "cursor": "ok"},
+        }])
+        out = v.compute_verdict(st)
+        details = [a["detail"] for a in out["advisories"] if a["code"] == "silent_reviewer"]
+        self.assertTrue(
+            any("never returned a verdict" in d for d in details),
+            f"expected codex's silence attributed to its error status, got {details}",
+        )
+
     def test_clean_converged_run_is_ready(self):
         self.assertEqual(v.compute_verdict(_state())["verdict"], "ready")
 

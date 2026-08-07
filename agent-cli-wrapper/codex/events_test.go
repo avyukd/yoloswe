@@ -2,8 +2,11 @@ package codex
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 	"time"
+
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/agentstream"
 )
 
 func TestEventType_Values(t *testing.T) {
@@ -339,5 +342,63 @@ func TestEventInterface(t *testing.T) {
 	for _, e := range events {
 		// Just verify Type() can be called (interface is satisfied)
 		_ = e.Type()
+	}
+}
+
+// Every codex event that names a thread must expose it as agentstream.Scoped.
+//
+// codex multiplexes all threads onto one client.Events() channel, so a consumer
+// filtering to its own thread can only do so via ScopeID(). A ThreadID field
+// that isn't reachable through the interface is invisible to that filter: the
+// event arrives unattributable, and a consumer treating arrival as proof of
+// life keeps a stalled thread alive on another thread's traffic. That was a real
+// regression (PR #314, found independently by two reviewers), and it returns the
+// moment someone adds a threaded event type without ScopeID. Reflection over the
+// struct field is deliberate — an enumerated list would go stale exactly when it
+// matters.
+func TestEveryThreadedCodexEventIsScoped(t *testing.T) {
+	events := []Event{
+		ClientReadyEvent{},
+		ThreadStartedEvent{},
+		ThreadReadyEvent{},
+		TurnStartedEvent{},
+		TurnCompletedEvent{},
+		TextDeltaEvent{},
+		ItemStartedEvent{},
+		ItemCompletedEvent{},
+		TokenUsageEvent{},
+		ErrorEvent{},
+		StateChangeEvent{},
+		CommandStartEvent{},
+		CommandOutputEvent{},
+		CommandEndEvent{},
+		ReasoningDeltaEvent{},
+	}
+	for _, e := range events {
+		v := reflect.ValueOf(e)
+		if _, hasField := v.Type().FieldByName("ThreadID"); !hasField {
+			continue
+		}
+		if _, ok := any(e).(agentstream.Scoped); !ok {
+			t.Errorf("%T carries ThreadID but does not implement agentstream.Scoped; "+
+				"a multiplexed consumer cannot attribute it", e)
+		}
+	}
+}
+
+// ScopeID must return the event's own thread, not a constant.
+func TestScopeIDReportsTheOwningThread(t *testing.T) {
+	cases := []agentstream.Scoped{
+		ItemStartedEvent{ThreadID: "t-1"},
+		ItemCompletedEvent{ThreadID: "t-1"},
+		TokenUsageEvent{ThreadID: "t-1"},
+		CommandOutputEvent{ThreadID: "t-1"},
+		TurnStartedEvent{ThreadID: "t-1"},
+		StateChangeEvent{ThreadID: "t-1"},
+	}
+	for _, e := range cases {
+		if got := e.ScopeID(); got != "t-1" {
+			t.Errorf("%T.ScopeID() = %q, want t-1", e, got)
+		}
 	}
 }

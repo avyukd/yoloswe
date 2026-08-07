@@ -321,6 +321,24 @@ def compute_verdict(state: dict, *, repo_root: Optional[Path] = None) -> dict:
             }
         )
 
+    # "Nobody looked" is not "nothing to find". A round whose every stream is
+    # error/absent reviewed nothing, so its empty finding list cannot support a
+    # ready verdict — and under the batch protocol the batch has already pushed
+    # on it. This is the automated half of the stream_status contract: without
+    # it the field is written and never read, and "reviewed clean" stays
+    # indistinguishable from "never reviewed" in the verdict.
+    dead_rounds = rounds_without_a_live_stream(state)
+    if dead_rounds:
+        blockers.append(
+            {
+                "code": "no_live_reviewer",
+                "detail": "round(s) "
+                + ", ".join(str(n) for n in dead_rounds)
+                + " had no reviewer return a verdict (all streams error/absent)",
+                "severity": "high",
+            }
+        )
+
     fix_claims = verify_fix_claims(state, repo_root)
     for row in fix_claims["unverified_rows"]:
         if severity_rank(row.get("severity")) >= severity_rank("high"):
@@ -361,15 +379,26 @@ def compute_verdict(state: dict, *, repo_root: Optional[Path] = None) -> dict:
                 )
 
     streams = reviewer_stream_health(state)
+    stream_statuses = reviewer_stream_statuses(state)
     for backend, count in streams.items():
-        if count == 0:
-            advisories.append(
-                {
-                    "code": "silent_reviewer",
-                    "detail": f"{backend} produced zero findings in every "
-                    "round — consensus was structurally impossible",
-                }
+        if count != 0:
+            continue
+        # Say WHY it was silent when the envelope statuses are on record.
+        # "codex found nothing" and "codex never returned" warrant opposite
+        # responses, and the bare count cannot tell them apart.
+        seen = stream_statuses.get(backend) or {}
+        live = sum(n for s, n in seen.items() if s in _LIVE_STREAM_STATUSES)
+        if seen and live == 0:
+            detail = (
+                f"{backend} never returned a verdict "
+                f"({', '.join(f'{s}x{n}' for s, n in sorted(seen.items()))})"
             )
+        else:
+            detail = (
+                f"{backend} produced zero findings in every "
+                "round — consensus was structurally impossible"
+            )
+        advisories.append({"code": "silent_reviewer", "detail": detail})
 
     if blockers:
         verdict = "not_ready"
@@ -392,6 +421,7 @@ def compute_verdict(state: dict, *, repo_root: Optional[Path] = None) -> dict:
                 k: v for k, v in fix_claims.items() if k != "unverified_rows"
             },
             "reviewer_streams": streams,
+            "reviewer_stream_statuses": stream_statuses,
             "open_high_deferrals": len(open_high_deferrals(state)),
         },
     }
@@ -422,6 +452,59 @@ def reviewer_stream_health(state: dict) -> dict[str, int]:
                 count += len(rnd.get(key) or [])
         if seen:
             out[backend] = count
+    return out
+
+
+def reviewer_stream_statuses(state: dict) -> dict[str, dict[str, int]]:
+    """Per-backend tally of persisted envelope statuses across all rounds.
+
+    The count-based view above cannot separate "ran and found nothing" from
+    "never ran" — a zero is produced by both. ``stream_status`` records the
+    envelope's own status, so report it alongside: ``{"codex": {"ok": 3,
+    "error": 2}}``. Backends with no recorded status in any round are omitted,
+    matching ``reviewer_stream_health``'s absent-key convention.
+    """
+    out: dict[str, dict[str, int]] = {}
+    for rnd in state.get("rounds") or []:
+        statuses = rnd.get("stream_status")
+        if not isinstance(statuses, dict):
+            continue
+        for backend, status in statuses.items():
+            out.setdefault(backend, {})
+            key = str(status)
+            out[backend][key] = out[backend].get(key, 0) + 1
+    return out
+
+
+#: Envelope statuses that mean a reviewer actually returned a verdict.
+#: "partial" counts — it carries real findings alongside the failure that
+#: ended the run.
+_LIVE_STREAM_STATUSES = frozenset({"ok", "partial"})
+
+
+def rounds_without_a_live_stream(state: dict) -> list[int]:
+    """Rounds where no reviewer returned a verdict, newest-relevant first.
+
+    A round whose streams are all ``error``/``absent`` reviewed nothing. Its
+    empty finding list is produced equally by a clean diff and by a backend
+    that never returned, and under the batch protocol the batch pushes on it —
+    handing the first real review to the external reviewers.
+
+    Only rounds that recorded ``stream_status`` at all are judged. Rounds
+    written before the field existed are skipped rather than assumed broken:
+    treating "no data" as "nobody looked" is the same absent-vs-empty
+    conflation this function exists to end.
+    """
+    out: list[int] = []
+    for rnd in state.get("rounds") or []:
+        statuses = rnd.get("stream_status")
+        if not isinstance(statuses, dict) or not statuses:
+            continue
+        if any(v in _LIVE_STREAM_STATUSES for v in statuses.values()):
+            continue
+        n = rnd.get("n")
+        if isinstance(n, int):
+            out.append(n)
     return out
 
 
