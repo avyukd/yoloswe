@@ -360,6 +360,15 @@ func (c *Client) readLoop(ctx context.Context) {
 }
 
 // handleMessage processes a single JSON-RPC message from the agent.
+//
+// A frame that fails HERE is fatal by design: this decode reads only `id` and
+// `method`, so its error arm means the line is not recoverable JSON at all and
+// carries no method to distinguish droppable progress traffic from a terminal
+// frame. Failing loud beats hanging the caller until EOF.
+//
+// The per-method decode in handleNotification is already the tolerant half —
+// it returns silently on a malformed body, so protocol drift in a session
+// update cannot abort a run.
 func (c *Client) handleMessage(line []byte) {
 	// Peek at the message to determine its type
 	var base struct {

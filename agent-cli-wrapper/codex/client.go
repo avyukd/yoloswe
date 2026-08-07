@@ -551,6 +551,13 @@ func (c *Client) readLoop(ctx context.Context) {
 }
 
 // handleMessage processes a single JSON-RPC message.
+//
+// A frame that fails HERE is fatal, unlike the per-kind decodes below. This
+// outer decode reads only `id` and `method`, so reaching its error arm means the
+// line is not recoverable JSON at all and no method can be identified — there is
+// no way to tell a droppable progress notification from the turn/completed whose
+// loss would hang the caller until EOF. Failing loud is the safe direction; see
+// handleNotification for the frames that ARE safe to skip.
 func (c *Client) handleMessage(line []byte) {
 	// Try to determine if this is a response or notification
 	var base struct {
@@ -599,9 +606,22 @@ func (c *Client) handleResponse(line []byte, id int64) {
 }
 
 // handleNotification processes a JSON-RPC notification.
+//
+// A malformed NON-TERMINAL notification is skipped, not fatal. The codex
+// protocol drifts (new shapes for existing methods), and one bad progress frame
+// must not discard a review that is otherwise streaming fine — the same rule
+// cursor adopted after an array-shaped tool_call field aborted 102 real reviews
+// over a single decode error. Here the method name survives the failed body
+// decode, so it is a reliable discriminator: only the terminal notification,
+// whose loss leaves the caller with no TurnCompletedEvent, stays fatal.
 func (c *Client) handleNotification(line []byte, method string) {
 	var notif JSONRPCNotification
 	if err := json.Unmarshal(line, &notif); err != nil {
+		if !isTerminalNotification(method) {
+			slog.Debug("codex: skipping unparseable notification",
+				"method", method, "error", err, "line", string(line))
+			return
+		}
 		c.emitError("", "", &ProtocolError{Message: "failed to parse notification", Line: string(line), Cause: err}, "parse_notification")
 		return
 	}
@@ -646,6 +666,22 @@ func (c *Client) handleNotification(line []byte, method string) {
 	case NotifyCodexEventReasoningDelta:
 		c.handleReasoningDelta(notif.Params)
 	}
+}
+
+// isTerminalNotification reports whether losing this notification would strand
+// the caller waiting for a completion signal. Only these stay fatal when their
+// body fails to decode; every other method carries progress or telemetry that a
+// review can finish without.
+//
+// NotifyCodexEventError is included because it is codex's own failure report:
+// dropping it converts a reported error into an unexplained idle timeout, which
+// is precisely the misdiagnosis this class of bug keeps producing.
+func isTerminalNotification(method string) bool {
+	switch method {
+	case NotifyTurnCompleted, NotifyCodexEventTaskComplete, NotifyCodexEventError:
+		return true
+	}
+	return false
 }
 
 func (c *Client) handleThreadStarted(params json.RawMessage) {

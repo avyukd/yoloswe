@@ -1,8 +1,14 @@
 package reviewer
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/acp"
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/codex"
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/cursor"
 )
 
 func TestSummarizeToolInput_RedactsSensitiveValues(t *testing.T) {
@@ -92,4 +98,53 @@ func TestSummarizeToolInput_Empty(t *testing.T) {
 	if got := summarizeToolInput(map[string]interface{}{}); got != "" {
 		t.Errorf("summarizeToolInput({}) = %q, want empty", got)
 	}
+}
+
+// The raw frame that failed to parse must reach the log. Without it the record
+// names a Go struct field but never what the backend actually sent — the gap
+// that forced the cursor protocol-error investigation to infer the wire shape
+// from a decode error instead of reading the frame.
+func TestProtocolErrorLine_ExtractsAndBounds(t *testing.T) {
+	t.Run("extracts from a wrapped error", func(t *testing.T) {
+		inner := &cursor.ProtocolError{
+			Message: "failed to parse message",
+			Line:    `{"type":"tool_call","tool_call":[{"readToolCall":{}}]}`,
+		}
+		line, n, ok := protocolErrorLine(fmt.Errorf("cursor: %w", inner))
+		if !ok {
+			t.Fatal("expected the offending line to be recovered through the wrap")
+		}
+		if !strings.Contains(line, `"readToolCall"`) {
+			t.Errorf("line lost the offending shape: %q", line)
+		}
+		if n != len(inner.Line) {
+			t.Errorf("line_len = %d, want %d", n, len(inner.Line))
+		}
+	})
+
+	t.Run("truncates an oversized frame but reports true length", func(t *testing.T) {
+		full := strings.Repeat("x", maxLoggedProtocolLine*3)
+		line, n, ok := protocolErrorLine(&codex.ProtocolError{Message: "boom", Line: full})
+		if !ok {
+			t.Fatal("expected ok")
+		}
+		if len(line) >= len(full) {
+			t.Errorf("oversized frame was not truncated: got %d bytes", len(line))
+		}
+		if !strings.HasSuffix(line, "...[truncated]") {
+			t.Errorf("truncation must be visible in the log, got suffix %q", line[len(line)-20:])
+		}
+		if n != len(full) {
+			t.Errorf("line_len = %d, want the untruncated %d", n, len(full))
+		}
+	})
+
+	t.Run("absent for errors carrying no line", func(t *testing.T) {
+		if _, _, ok := protocolErrorLine(errors.New("plain")); ok {
+			t.Error("a non-protocol error must not report a line")
+		}
+		if _, _, ok := protocolErrorLine(&acp.ProtocolError{Message: "no line"}); ok {
+			t.Error("an empty Line must be reported absent, not as an empty field")
+		}
+	})
 }

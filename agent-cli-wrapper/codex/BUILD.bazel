@@ -39,6 +39,7 @@ go_test(
         "errors_test.go",
         "event_translate_test.go",
         "events_test.go",
+        "notification_tolerance_test.go",
         "process_test.go",
         "state_test.go",
         "thread_test.go",
@@ -47,6 +48,7 @@ go_test(
     deps = [
         "//agent-cli-wrapper/agentstream",
         "//agent-cli-wrapper/llmendpoint",
+        "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
     ],
 )

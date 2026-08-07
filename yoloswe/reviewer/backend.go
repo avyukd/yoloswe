@@ -2,6 +2,7 @@ package reviewer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -501,9 +502,51 @@ func (h *rendererEventHandler) OnTurnComplete(success bool, durationMs int64) {
 
 func (h *rendererEventHandler) OnError(err error, context string) {
 	h.r.Error(err, context)
-	slog.Error("reviewer error",
+	attrs := []any{
 		"context", context,
-		"error", err.Error())
+		"error", err.Error(),
+	}
+	// Preserve the frame that failed to parse. Without it the log records only
+	// the Go decode error, which names a struct field but not what the backend
+	// actually sent — the gap that forced the 102-failure cursor investigation
+	// to infer the wire shape from a type error instead of reading it.
+	if line, n, ok := protocolErrorLine(err); ok {
+		attrs = append(attrs, "line", line, "line_len", n)
+	}
+	slog.Error("reviewer error", attrs...)
+}
+
+// protocolLiner is implemented by each backend's ProtocolError. It is declared
+// here, at the consumer, because the backends are independent packages with no
+// shared error type — a structural interface avoids one type assertion per
+// backend and picks up any future backend for free.
+type protocolLiner interface {
+	ProtocolLine() string
+}
+
+// maxLoggedProtocolLine bounds the captured frame. A frame may be up to the
+// 10MB NDJSON cap and may carry file contents pulled in by the review, so the
+// log stores only a head — enough to identify the shape that broke the parser,
+// which is always near the start (the type discriminator and the offending
+// field). line_len is reported separately so truncation is never mistaken for a
+// short frame.
+const maxLoggedProtocolLine = 2048
+
+// protocolErrorLine extracts the raw offending frame from err or anything it
+// wraps, returning the truncated head and the untruncated length.
+func protocolErrorLine(err error) (string, int, bool) {
+	var pl protocolLiner
+	if !errors.As(err, &pl) {
+		return "", 0, false
+	}
+	line := pl.ProtocolLine()
+	if line == "" {
+		return "", 0, false
+	}
+	if len(line) > maxLoggedProtocolLine {
+		return line[:maxLoggedProtocolLine] + "...[truncated]", len(line), true
+	}
+	return line, len(line), true
 }
 
 // sensitiveToolInputKeys names keys whose values may contain shell commands,

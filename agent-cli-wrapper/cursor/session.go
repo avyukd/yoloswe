@@ -237,17 +237,39 @@ func isTerminalFrame(line []byte) bool {
 // hasResultTypeDiscriminator scans raw bytes for a `"type":"result"` field,
 // tolerating insignificant whitespace around the colon, so a truncated or
 // otherwise invalid result frame is still recognized as terminal.
+//
+// EVERY `"type"` occurrence is checked, not just the first. A result frame that
+// carries an earlier nested `"type"` — e.g.
+// `{"meta":{"type":"x"},"type":"result",...}` — is exactly the case the
+// first-match-only version got wrong: it read as non-terminal and the frame was
+// silently skipped, dropping the only completion signal. Since this runs only
+// after a failed decode, the line is already truncated or corrupt, so the
+// nested key may well be the only one intact.
+//
+// Scanning every occurrence cannot introduce a false positive that the previous
+// version avoided: a non-result frame is matched only if it contains the literal
+// bytes `"type":"result"` somewhere, and an escaped occurrence inside a JSON
+// string (`"{\"type\":\"result\"}"`) does not match — the backslashes break the
+// prefix. Erring toward terminal is also the safe direction: a spurious fatal
+// error is visible, while a missed terminal frame hangs the caller until EOF.
 func hasResultTypeDiscriminator(line []byte) bool {
-	idx := bytes.Index(line, []byte(`"type"`))
-	if idx < 0 {
-		return false
+	const key = `"type"`
+	for offset := 0; ; {
+		idx := bytes.Index(line[offset:], []byte(key))
+		if idx < 0 {
+			return false
+		}
+		offset += idx + len(key)
+
+		rest := bytes.TrimLeft(line[offset:], " \t\r\n")
+		if len(rest) == 0 || rest[0] != ':' {
+			continue
+		}
+		rest = bytes.TrimLeft(rest[1:], " \t\r\n")
+		if bytes.HasPrefix(rest, []byte(`"result"`)) {
+			return true
+		}
 	}
-	rest := bytes.TrimLeft(line[idx+len(`"type"`):], " \t\r\n")
-	if len(rest) == 0 || rest[0] != ':' {
-		return false
-	}
-	rest = bytes.TrimLeft(rest[1:], " \t\r\n")
-	return bytes.HasPrefix(rest, []byte(`"result"`))
 }
 
 func (s *Session) handleSystemInit(msg *SystemInitMessage) {
