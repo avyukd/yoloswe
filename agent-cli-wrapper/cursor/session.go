@@ -200,7 +200,9 @@ func (s *Session) handleLine(line []byte, textBuilder *strings.Builder) {
 			})
 			return
 		}
-		slog.Debug("cursor: skipping unparseable frame", "error", err, "line", framelogLine(line))
+		loggedLine, loggedLen := framelogLine(line)
+		slog.Debug("cursor: skipping unparseable frame",
+			"error", err, "line", loggedLine, "line_len", loggedLen)
 		return
 	}
 	if msg == nil {
@@ -223,9 +225,8 @@ func (s *Session) handleLine(line []byte, textBuilder *strings.Builder) {
 // framelogLine renders a raw frame for the debug log: bounded and redacted by
 // the shared framelog rule. cursor is the backend with observed protocol drift,
 // so this is the site most likely to actually fire.
-func framelogLine(line []byte) string {
-	rendered, _ := framelog.RenderBytes(line)
-	return rendered
+func framelogLine(line []byte) (string, int) {
+	return framelog.RenderBytes(line)
 }
 
 // isTerminalFrame reports whether the raw line is a "result" frame — the one

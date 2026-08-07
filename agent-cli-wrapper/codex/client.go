@@ -576,8 +576,9 @@ func (c *Client) handleMessage(line []byte) {
 	}
 	if err := json.Unmarshal(line, &base); err != nil {
 		if method, ok := recoverMethod(line); ok && !isTerminalNotification(method) {
+			loggedLine, loggedLen := framelogLine(line)
 			slog.Debug("codex: skipping unparseable non-terminal frame",
-				"method", method, "error", err, "line", framelogLine(line))
+				"method", method, "error", err, "line", loggedLine, "line_len", loggedLen)
 			return
 		}
 		c.emitError("", "", &ProtocolError{Message: "failed to parse message", Line: string(line), Cause: err}, "parse_message")
@@ -633,8 +634,9 @@ func (c *Client) handleNotification(line []byte, method string) {
 	var notif JSONRPCNotification
 	if err := json.Unmarshal(line, &notif); err != nil {
 		if !isTerminalNotification(method) {
+			loggedLine, loggedLen := framelogLine(line)
 			slog.Debug("codex: skipping unparseable notification",
-				"method", method, "error", err, "line", framelogLine(line))
+				"method", method, "error", err, "line", loggedLine, "line_len", loggedLen)
 			return
 		}
 		c.emitError("", "", &ProtocolError{Message: "failed to parse notification", Line: string(line), Cause: err}, "parse_notification")
@@ -686,9 +688,8 @@ func (c *Client) handleNotification(line []byte, method string) {
 // framelogLine renders a raw frame for the debug log: bounded and redacted by
 // the shared framelog rule, so a drifted frame can be diagnosed without writing
 // reviewed file contents to the log.
-func framelogLine(line []byte) string {
-	rendered, _ := framelog.RenderBytes(line)
-	return rendered
+func framelogLine(line []byte) (string, int) {
+	return framelog.RenderBytes(line)
 }
 
 // recoverMethod extracts the JSON-RPC method from a line too corrupt for
@@ -703,10 +704,15 @@ func framelogLine(line []byte) string {
 //     should have been fatal. This mirrors hasResultTypeDiscriminator in the
 //     cursor package, which is depth-aware for the same reason — one rule, not
 //     two byte scanners with different trust rules.
-//   - A top-level "id" marks a response or a request, not a notification.
-//     isTerminalNotification is a notification-only allowlist, so applying it to
-//     a response would drop it and leave sendRequestAndWait blocked on its
-//     channel until context cancellation.
+//   - A top-level "id" appearing BEFORE the truncation point marks a response
+//     or a request, not a notification. isTerminalNotification is a
+//     notification-only allowlist, so applying it to a response would drop it
+//     and leave sendRequestAndWait blocked on its channel until context
+//     cancellation. The scan stops at the first unterminated string, so an "id"
+//     after the cut is not seen — a request-shaped frame whose id trails a
+//     truncated params would still be skipped. That is latent, not live: codex
+//     dispatches no inbound requests, and a response without a top-level method
+//     falls through to fatal anyway. TestRecoverMethod pins the accepted limit.
 //
 // Depth is tracked outside string literals (with escape handling), so an
 // escaped or embedded occurrence cannot forge a method. Recovery failing is

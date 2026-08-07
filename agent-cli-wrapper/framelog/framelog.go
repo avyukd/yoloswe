@@ -54,10 +54,30 @@ const maxKeyLen = 64
 // String VALUES become a `"<str:N>"` marker; keys and non-string literals are
 // kept, so the frame's structure — the shape that identifies the drift —
 // stays readable. Values under discriminatorKeys survive verbatim.
+// The callers are hot paths, not once-per-run error paths: the SDK debug sites
+// render on EVERY skipped frame, and a frame may reach the 10MB NDJSON cap. So
+// the input is bounded BEFORE redaction — redacting first would mean a full
+// scan and a multi-MB allocation to produce 2KB of log, exactly during the
+// drift incident this is built for.
+//
+// Slicing first is safe: a cut mid-token lands in redactValues' unterminated-
+// string branch and is redacted as `<str:N,truncated>`. Redaction can only
+// lengthen a token (a marker is longer than a short value), so the output is
+// re-bounded afterwards.
 func Render(line string) (rendered string, length int) {
-	redacted := redactValues(line)
+	truncated := len(line) > MaxLen
+	head := line
+	if truncated {
+		head = line[:MaxLen]
+	}
+
+	redacted := redactValues(head)
 	if len(redacted) > MaxLen {
-		return redacted[:MaxLen] + "...[truncated]", len(line)
+		redacted = redacted[:MaxLen]
+		truncated = true
+	}
+	if truncated {
+		return redacted + "...[truncated]", len(line)
 	}
 	return redacted, len(line)
 }
@@ -85,6 +105,15 @@ func redactValues(line string) string {
 
 	for i := 0; i < len(line); i++ {
 		if line[i] != '"' {
+			// A discriminator's value must be the scalar string IMMEDIATELY
+			// after its colon. Any structural token means the value is an array
+			// or object, so the strings inside it are payload, not a
+			// discriminator — `{"type":["SECRET_TOKEN"]}` leaked verbatim while
+			// pendingKey survived the '['.
+			switch line[i] {
+			case '[', '{', ',', '}', ']':
+				pendingKey = ""
+			}
 			b.WriteByte(line[i])
 			continue
 		}

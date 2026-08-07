@@ -99,3 +99,55 @@ func TestRender_KeepsNonStringLiterals(t *testing.T) {
 	assert.Contains(t, got, "false")
 	assert.Contains(t, got, "null")
 }
+
+// A discriminator's value is only the scalar string immediately after its
+// colon. When the value is an array or object, the strings inside are payload
+// and must redact — pendingKey surviving a '[' leaked them verbatim.
+func TestRender_DiscriminatorWithStructuredValueDoesNotLeak(t *testing.T) {
+	for _, line := range []string{
+		`{"type":["SECRET_TOKEN"]}`,
+		`{"jsonrpc":["SECRET_TOKEN"]}`,
+		`{"method":{"nested":"SECRET_TOKEN"}}`,
+		`{"type":[{"deep":"SECRET_TOKEN"}]}`,
+		`{"status":["SECRET_TOKEN"],"type":"result"}`,
+	} {
+		got, _ := Render(line)
+		assert.NotContains(t, got, "SECRET_TOKEN",
+			"a structured discriminator value must redact its contents: %s", line)
+	}
+}
+
+// A discriminator following a structural token must still be recognised — the
+// pendingKey reset must not over-clear.
+func TestRender_DiscriminatorAfterStructuralTokenStillKept(t *testing.T) {
+	got, _ := Render(`{"params":{"x":"secret"},"type":"result"}`)
+	assert.Contains(t, got, `"type":"result"`)
+	assert.NotContains(t, got, "secret")
+}
+
+// The SDK debug sites render on every skipped frame, and a frame may reach the
+// 10MB NDJSON cap. Redacting the whole frame before bounding it would mean a
+// full scan and a multi-MB allocation to produce 2KB of log.
+func TestRender_BoundsBeforeRedacting(t *testing.T) {
+	huge := `{"type":"result","blob":"` + strings.Repeat("x", 4*1024*1024) + `"}`
+
+	got, n := Render(huge)
+	assert.Equal(t, len(huge), n, "the true frame length must still be reported")
+	assert.LessOrEqual(t, len(got), MaxLen+len("...[truncated]"))
+	assert.Contains(t, got, "truncated")
+
+	// Bounding must not cost more than the bound: allocation is proportional to
+	// MaxLen, not to the input. A full-frame scan would show up as a large
+	// allocation here.
+	allocs := testing.AllocsPerRun(10, func() { _, _ = Render(huge) })
+	assert.Less(t, allocs, 50.0, "rendering must not allocate per input byte")
+}
+
+// A cut mid-token is safe: it lands in the unterminated-string branch and is
+// redacted rather than emitted.
+func TestRender_SliceMidTokenStillRedacts(t *testing.T) {
+	line := `{"type":"result","secret":"` + strings.Repeat("S", MaxLen*2)
+	got, _ := Render(line)
+	assert.NotContains(t, got, strings.Repeat("S", 100),
+		"a value cut by the bound must not survive verbatim")
+}

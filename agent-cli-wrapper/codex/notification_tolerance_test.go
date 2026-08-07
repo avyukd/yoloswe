@@ -134,6 +134,13 @@ func TestRecoverMethod(t *testing.T) {
 		// sendRequestAndWait blocked until context cancellation.
 		{"top-level id refuses recovery", `{"jsonrpc":"2.0","id":7,"result":{"method":"item/started"`, "", false},
 		{"top-level id before method still refuses", `{"id":3,"method":"item/started","params":{`, "", false},
+		// ACCEPTED LIMITATION: the scan stops at the first unterminated string,
+		// so an "id" after the truncation point is never seen and this frame is
+		// skipped. Latent, not live — codex dispatches no inbound requests, and
+		// a response with no top-level method falls through to fatal anyway.
+		// Pinned so the docstring's narrowed claim stays checkable.
+		{"id after the truncation point is NOT seen (documented limit)",
+			`{"jsonrpc":"2.0","method":"item/started","params":{"a":"cut`, "item/started", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
