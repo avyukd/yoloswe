@@ -121,7 +121,11 @@ func (b *codexBackend) RunPrompt(ctx context.Context, prompt string, handler Eve
 
 	bridged, err := bridgeStreamEvents(ctx, b.client.Events(), handler, b.thread.ID(), b.config.IdleTimeout)
 	if err != nil {
-		return reviewErrorResult(resumeStatus, fmt.Errorf("codex: %w", err))
+		// Carry any text the reviewer streamed before it failed. An idle
+		// timeout that fires after real findings is partial work, and
+		// BuildEnvelope turns a failed-but-parseable result into
+		// status="partial" rather than discarding it.
+		return reviewPartialResult(resumeStatus, bridged, fmt.Errorf("codex: %w", err))
 	}
 
 	result := &ReviewResult{

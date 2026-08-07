@@ -45,6 +45,7 @@ go_test(
     ],
     embed = [":codex"],
     deps = [
+        "//agent-cli-wrapper/agentstream",
         "//agent-cli-wrapper/llmendpoint",
         "@com_github_stretchr_testify//require",
     ],

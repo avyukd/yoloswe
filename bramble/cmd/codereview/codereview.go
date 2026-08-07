@@ -84,7 +84,7 @@ func init() {
 	Cmd.Flags().BoolVar(&verbose, "verbose", false, "Show tool call details")
 	Cmd.Flags().StringVar(&goal, "goal", "", "Review goal (default: infer from branch)")
 	Cmd.Flags().DurationVar(&timeout, "timeout", 0, "Absolute hard cap on the whole review (0 = none; rely on --idle-timeout). A review making steady progress is bounded only by --idle-timeout.")
-	Cmd.Flags().DurationVar(&idleTimeout, "idle-timeout", 3*time.Minute, "Kill the review after this much inactivity (no stream events). Resets on every event, so it only trips a stalled backend. 0 disables.")
+	Cmd.Flags().DurationVar(&idleTimeout, "idle-timeout", 8*time.Minute, "Kill the review after this much inactivity (no stream events). Resets on every in-scope event, so it only trips a stalled backend. 0 disables.")
 	Cmd.Flags().StringVar(&protocolLogDir, "protocol-log-dir", "", "Directory for protocol session logs (Codex only; also supports $BRAMBLE_PROTOCOL_LOG_DIR)")
 	Cmd.Flags().StringVar(&envelopeFile, "envelope-file", "", "Write the JSON ResultEnvelope to this file instead of stdout (stdout then carries only progress events)")
 	Cmd.Flags().BoolVar(&skipTestExecution, "skip-test-execution", false, "Instruct the reviewer not to run tests/build commands (caller runs them separately)")
@@ -309,10 +309,10 @@ func runCodeReview(cmd *cobra.Command, args []string) (retErr error) {
 		// r.resumeStatus was repopulated still surfaces Unverified
 		// when resume was requested — same fallback the deferred
 		// guard applies on the panic/silent-exit path.
-		env := reviewer.BuildEnvelope(&reviewer.ReviewResult{
-			ErrorMessage: err.Error(),
-			ResumeStatus: effectiveResumeStatus(activeReviewer, resumeSessionID),
-		}, reviewer.BackendType(backend), r.EffectiveModel(), r.LastSessionID(), mode)
+		failed := failedReviewResult(result, err,
+			effectiveResumeStatus(activeReviewer, resumeSessionID))
+		env := reviewer.BuildEnvelope(failed,
+			reviewer.BackendType(backend), r.EffectiveModel(), r.LastSessionID(), mode)
 		emitVerdictLine(env)
 		emitEnvelope(env)
 		return fmt.Errorf("review failed: %w", err)
@@ -365,21 +365,49 @@ func effectiveResumeStatus(r *reviewer.Reviewer, requestedResumeSessionID string
 	return ""
 }
 
+// failedReviewResult builds the ReviewResult for a failed review, keeping
+// whatever the reviewer managed to produce. A run that streamed a schema-valid
+// body before dying — the shape of an idle timeout firing after real findings —
+// becomes status="partial" in BuildEnvelope instead of a discarded review;
+// synthesizing a bare ErrorMessage here threw away everything it had said.
+// result is nil on most error paths, so fall back to an empty shape when there
+// is genuinely nothing to keep.
+func failedReviewResult(result *reviewer.ReviewResult, err error, resume reviewer.ResumeStatus) *reviewer.ReviewResult {
+	failed := result
+	if failed == nil {
+		failed = &reviewer.ReviewResult{}
+	}
+	failed.ErrorMessage = err.Error()
+	failed.ResumeStatus = resume
+	return failed
+}
+
 // emitVerdictLine prints a single human-readable summary to stdout so the
 // Monitor tool can surface the outcome to Claude before the envelope file is
 // flushed. When --resume-session-id was set, the line ends with a
 // [resume=ok|fallback|unverified] suffix so callers streaming stdout can see
-// resume health without parsing the envelope. Both the success path
-// ("verdict: ...") and the bramble-level failure path ("error: ...") share
-// this so resume signal isn't lost on early errors.
+// resume health without parsing the envelope. All three outcomes share this so
+// resume signal isn't lost on early errors: success ("verdict: ..."), a run
+// that produced findings and then failed ("partial: ..."), and a bramble-level
+// failure ("error: ...").
 func emitVerdictLine(env reviewer.ResultEnvelope) {
 	resumeSuffix := ""
 	if env.ResumeStatus != "" {
 		resumeSuffix = fmt.Sprintf(" [resume=%s]", env.ResumeStatus)
 	}
-	if env.Status == reviewer.StatusOK {
+	switch env.Status {
+	case reviewer.StatusOK:
 		fmt.Fprintf(os.Stdout, "verdict: %s (%d issues)%s\n", env.Review.Verdict, len(env.Review.Issues), resumeSuffix)
-	} else {
+	case reviewer.StatusPartial:
+		// stdout is the surface an orchestrator reads first, and "error: …"
+		// alone is what produced `ack … no envelope` on kernel#8682 r1. A
+		// partial run parsed a schema-valid body, so it has a verdict and
+		// usually findings — an accepted body with zero issues also validates,
+		// hence the count rather than a claim that findings exist. Report both
+		// halves so the line does not contradict the envelope beside it.
+		fmt.Fprintf(os.Stdout, "partial: %s (%d issues kept) after: %s%s\n",
+			env.Review.Verdict, len(env.Review.Issues), env.Error, resumeSuffix)
+	default:
 		fmt.Fprintf(os.Stdout, "error: %s%s\n", env.Error, resumeSuffix)
 	}
 }

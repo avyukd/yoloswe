@@ -162,6 +162,14 @@ def load_comments(state_dir: Path, record: Optional[dict]) -> list[dict]:
         if out:
             return out
     blob = _load(state_dir / "pp-comments.json")
+    # Both shapes are live on disk: fetch-comments emits the wrapped object
+    # today, but 7 state dirs (newest 2026-07-18) still hold the legacy bare
+    # list. bramble_ops.py's triage CLI already normalizes both; this did not,
+    # and since the --all loop had no per-dir guard, ONE legacy file aborted the
+    # entire 638-run fleet scan — which is why the escape rate, the metric this
+    # skill is tuned against, had never been measured fleet-wide.
+    if isinstance(blob, list):
+        return blob
     return (blob or {}).get("comments") or []
 
 
@@ -360,15 +368,31 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.scan_all:
         rows = []
+        failed = 0
         for d in sorted(args.projects_root.iterdir()):
             if not d.is_dir():
                 continue
-            row = compute_escape_rate(d, args.dataset_dir)
+            # One malformed state dir must never abort the fleet scan: the
+            # aggregate over hundreds of runs is the point, and a partial
+            # answer beats a traceback. Failures are counted and named on
+            # stderr so a silently-shrinking denominator stays visible.
+            try:
+                row = compute_escape_rate(d, args.dataset_dir)
+            except Exception as exc:  # noqa: BLE001 - report and continue
+                failed += 1
+                print(f"[escape_rate] skipped {d.name}: {exc}", file=sys.stderr)
+                continue
             if row is None:
                 continue
             rows.append(row)
             if args.write:
                 (d / "escape-metrics.json").write_text(json.dumps(row, indent=2))
+        if failed:
+            print(
+                f"[escape_rate] {failed} state dir(s) failed to parse; "
+                f"aggregate covers {len(rows)}",
+                file=sys.stderr,
+            )
         print(json.dumps(aggregate(rows), indent=2))
         return 0
 

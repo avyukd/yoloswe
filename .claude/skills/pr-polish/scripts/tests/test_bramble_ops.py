@@ -957,8 +957,99 @@ class TestParseEnvelope(unittest.TestCase):
         self.assertEqual(got[0]["severity"], "high")
         self.assertIn("backend crashed", got[0]["message"])
 
+    def test_recover_envelope_never_rewrites_a_partial(self) -> None:
+        """Recovery must not delete the failure half of a partial envelope.
+
+        A partial already carries BOTH halves — real findings and the failure
+        that ended the run. Recovery rewrites status to "ok" and clears error,
+        so applying it here would make a truncated review read as a complete
+        one. The findings need no rescuing: parse_envelope handles partial
+        directly. (codex, PR #314 r3.)
+        """
+        import tempfile
+        from pathlib import Path as _P
+        with tempfile.TemporaryDirectory() as td:
+            p = _P(td) / "codex-envelope.json"
+            env = {
+                "status": "partial",
+                # Contains a recovery token ("changes"), which is exactly what
+                # would have tripped the rewrite.
+                "error": "codex: review idle: request_changes pending",
+                "review": {
+                    "verdict": "rejected",
+                    "issues": [{"severity": "high", "file": "a.py", "line": 1,
+                                "message": "m"}],
+                },
+            }
+            p.write_text(json.dumps(env))
+            out = bramble_ops.recover_envelope(p)
+            self.assertEqual(out, p, "partial must not be rewritten to a new path")
+            after = json.loads(p.read_text())
+            self.assertEqual(after["status"], "partial")
+            self.assertTrue(after["error"], "the failure half must survive")
+
+    def test_parse_sufficiency_reads_a_partial_envelope(self) -> None:
+        """Everything readable off "ok" is readable off "partial".
+
+        parse_envelope and recover_envelope were taught the new status; this
+        consumer was not, so a reviewer that emitted a sufficiency claim and
+        then hit the idle timeout had it silently dropped. Both now branch on
+        STATUSES_WITH_BODY so a future body-carrying status follows for free.
+        """
+        env = {
+            "status": "partial",
+            "error": "codex: review idle",
+            "review": {"verdict": "rejected", "issues": [],
+                       "sufficiency": {"is_confident_complete": False,
+                                       "evidence": "more sites remain"}},
+        }
+        got = bramble_ops.parse_sufficiency(env)
+        self.assertIsNotNone(got)
+        self.assertFalse(got["is_confident_complete"])
+
+    def test_parse_sufficiency_still_rejects_a_failed_envelope(self) -> None:
+        env = {"status": "error", "review": {"sufficiency": {"is_confident_complete": True}}}
+        self.assertIsNone(bramble_ops.parse_sufficiency(env))
+
     def test_missing_envelope_yields_empty_list(self) -> None:
         self.assertEqual(bramble_ops.parse_envelope(None, source="codex"), [])
+
+    def test_partial_envelope_keeps_its_findings_and_reports_the_failure(self) -> None:
+        # A run that found real defects and THEN died (idle timeout mid-review)
+        # must deliver both halves. Discarding the findings is what made
+        # kernel#8682 r2 expensive: ~12min of completed analysis dropped
+        # because the last stretch of the stream was quiet.
+        env = {
+            "status": "partial",
+            "error": "codex: review idle: no events for 5m0s",
+            "review": {
+                "issues": [
+                    {
+                        "severity": "high",
+                        "file": "a.py",
+                        "line": 10,
+                        "message": "real defect found before the timeout",
+                    }
+                ]
+            },
+        }
+        got = bramble_ops.parse_envelope(env, source="codex")
+        self.assertEqual(len(got), 2, "expected the finding plus a failure row")
+        finding, failure = got
+        self.assertEqual(finding["file"], "a.py")
+        self.assertEqual(finding["severity"], "high")
+        # The failure row is medium, not high: this round WAS reviewed, so it
+        # must not present as a blocking defect in the diff itself.
+        self.assertEqual(failure["severity"], "medium")
+        self.assertEqual(failure["status"], "partial")
+        self.assertIn("kept 1 finding", failure["message"])
+
+    def test_partial_envelope_with_no_findings_still_reports(self) -> None:
+        env = {"status": "partial", "error": "died early"}
+        got = bramble_ops.parse_envelope(env, source="codex")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["status"], "partial")
+        self.assertIn("kept 0 finding", got[0]["message"])
 
     def test_v2_class_level_issue_expands_sites_to_findings(self) -> None:
         # v2 schema: an issue with invariant+sites[] expands into N

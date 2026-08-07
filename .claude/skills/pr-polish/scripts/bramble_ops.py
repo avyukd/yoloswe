@@ -55,6 +55,15 @@ BACKENDS = ("claude", "codex", "cursor", "gemini", "lint")
 # default well before _normalize_mode lands. The two strings must match
 # yoloswe/reviewer.ReviewMode so the wire format stays stable across
 # the Python triage layer and the Go envelope writer.
+#: Envelope statuses that carry a usable review body. "partial" is a run that
+#: produced findings and THEN failed (idle timeout mid-stream): everything a
+#: consumer reads off "ok" — issues, verdict, sufficiency — is equally present.
+#: Branch on this, not on `== "ok"`: every `!= "ok"` test in the tree predates
+#: "partial" and silently routes it to the failure arm, discarding real review
+#: work. A future status that carries a body joins here and every consumer
+#: follows without being found again.
+STATUSES_WITH_BODY = ("ok", "partial")
+
 REVIEW_MODE_CODE = "code"
 REVIEW_MODE_DESIGN_DOC = "design-doc"
 REVIEW_MODES = (REVIEW_MODE_CODE, REVIEW_MODE_DESIGN_DOC)
@@ -777,6 +786,36 @@ def parse_envelope(obj: dict[str, Any] | None, *, source: str) -> list[dict[str,
         return []
     mode = obj.get("review_mode") or REVIEW_MODE_CODE
     status = obj.get("status")
+    # "partial" is a run that produced real findings and THEN failed (e.g. the
+    # idle timeout fired mid-review). Both halves matter: the findings are
+    # genuine review work and must not be discarded, and the failure is still a
+    # signal the orchestrator has to see. So we fall through to the normal
+    # issue-parsing path below AND append the failure finding, rather than
+    # choosing one. Dropping the findings is what made #8682 r2 expensive —
+    # ~12min of completed analysis thrown away because the last stretch was
+    # quiet.
+    if status == "partial":
+        partial_msg = obj.get("error") or "bramble run ended early (partial)"
+        findings = parse_envelope({**obj, "status": "ok"}, source=source)
+        failure: dict[str, Any] = {
+            "source": source,
+            # medium, not high: unlike a total failure this round DID get
+            # reviewed. Routing it to must_fix would make every partial run
+            # look like a blocking defect in the diff.
+            "severity": "medium",
+            "message": f"{partial_msg} (kept {len(findings)} finding(s) from the partial run)",
+            "suggestion": None,
+            "topic": topic_of(partial_msg),
+            "status": status,
+            "review_mode": mode,
+        }
+        if mode == REVIEW_MODE_DESIGN_DOC:
+            failure["section"] = None
+            failure["dimension"] = None
+        else:
+            failure["file"] = None
+            failure["line"] = None
+        return [*findings, failure]
     if status != "ok":
         # A failed bramble run is a real signal — the orchestrator must
         # surface it, not silently drop it. ``high`` routes through
@@ -873,7 +912,7 @@ def parse_sufficiency(obj: dict[str, Any] | None) -> dict[str, Any] | None:
     """
     if obj is None:
         return None
-    if (obj.get("status") or "") != "ok":
+    if (obj.get("status") or "") not in STATUSES_WITH_BODY:
         return None
     suff = (obj.get("review") or {}).get("sufficiency")
     if not isinstance(suff, dict):
@@ -1803,7 +1842,14 @@ def recover_envelope(path: Path, *, suffix: str = "-recovered") -> Path:
     obj = read_json(path, default=None)
     if not isinstance(obj, dict):
         return path
-    if obj.get("status") == "ok":
+    # "ok" needs no recovery; "partial" must not RECEIVE it. Recovery exists to
+    # rescue a run whose verdict was lost to a vocabulary mismatch, and it does
+    # that by rewriting status to "ok" and clearing error. A partial envelope
+    # already carries both halves — real findings AND the failure that ended
+    # the run — so rewriting it would silently delete the failure half and make
+    # a truncated review read as a complete one. Its findings are already
+    # reachable: parse_envelope handles partial directly.
+    if obj.get("status") in STATUSES_WITH_BODY:
         return path
     error_text = obj.get("error") or ""
     verdict = _classify_recovery_verdict(error_text)

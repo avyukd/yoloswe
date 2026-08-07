@@ -156,6 +156,12 @@ type bridgeResult struct {
 // a per-call parameter (sourced from reviewer.Config.IdleTimeout) rather than a
 // package global so one caller's opt-in (the code-review CLI) can't silently
 // impose a stall policy on every other reviewer caller (e.g. yoloswe/swe.go).
+//
+// "In-scope" is decided by scopeID ALONE. Every event this scope receives resets
+// the clock, including ones the bridge cannot render (SDK types outside the
+// agentstream subset, or a conditional event returning KindUnknown). The timer
+// answers "is the backend alive", and an event we can't display is still proof
+// that it is. See applyEvent for the incident this distinction comes from.
 func bridgeStreamEvents[E any](
 	ctx context.Context,
 	events <-chan E,
@@ -190,6 +196,43 @@ func bridgeStreamEvents[E any](
 	var window heartbeatWindow
 	toolsInFlight := 0
 
+	// failed is the ONLY way this function reports a failure. Every terminal
+	// error path routes through it, so "does this exit preserve partial work?"
+	// has exactly one answer for all of them: yes, always. The exits are
+	// ctx.Done, the idle timeout, channel-close (both arms), and the KindError
+	// event; `nil event channel` returns before any text can accumulate.
+	// TestBridgeStreamEvents_EveryFailurePathPreservesPartialWork covers each —
+	// keep a subtest there when adding an exit, or this comment becomes a claim
+	// nothing checks. Four consecutive review rounds each found a different exit
+	// that dropped accumulated text (idle timeout, channel close, ctx
+	// cancellation, KindError) because each was
+	// deciding that question for itself — the fix is one rule, not a fourth
+	// case. A caller that ignores the result is unaffected; the error is
+	// unchanged.
+	//
+	// The ctx path is the one that matters most in production: SKILL Step 3.b
+	// wraps every reviewer in `timeout 2400`, GNU timeout sends SIGTERM, and
+	// codereview.go installs signal.NotifyContext(SIGINT, SIGTERM) on the
+	// review context — so the absolute backstop cancels here, not at the idle
+	// timeout.
+	failed := func(err error) (*bridgeResult, error) {
+		text := responseText.String()
+		if text == "" {
+			// Nothing accumulated: there is no partial work to preserve, and a
+			// non-nil empty result would make BuildEnvelope try to parse "".
+			return nil, err
+		}
+		// Carry elapsed time. Token counts are only on the TurnComplete event,
+		// which by definition never arrived here, so they stay zero — but the
+		// wall time is known, and reporting 0ms for a review that ran twelve
+		// minutes before stalling is the misreading this whole change exists to
+		// stop. A partial envelope should say how long it got.
+		return &bridgeResult{
+			responseText: text,
+			durationMs:   time.Since(start).Milliseconds(),
+		}, err
+	}
+
 	// applyEvent processes one received event. done reports a terminal result
 	// (TurnComplete/Error or a closed/invalid stream); inScope reports whether
 	// the event counts toward liveness (only in-scope events reset the idle
@@ -197,31 +240,54 @@ func bridgeStreamEvents[E any](
 	// a stalled thread alive). It mutates the enclosing accumulators directly.
 	applyEvent := func(ev E, ok bool) (res *bridgeResult, done bool, inScope bool, err error) {
 		if !ok {
-			// Channel closed without TurnComplete.
-			text := responseText.String()
-			if text != "" {
-				return nil, true, false, fmt.Errorf("session ended unexpectedly (partial response: %d chars)", len(text))
+			// Channel closed without TurnComplete. Both arms go through
+			// `failed` — the second is empty by construction, but exempting it
+			// by reasoning is how the rule stops being checkable.
+			if text := responseText.String(); text != "" {
+				res, ferr := failed(fmt.Errorf(
+					"session ended unexpectedly (partial response: %d chars)", len(text)))
+				return res, true, false, ferr
 			}
-			return nil, true, false, fmt.Errorf("session ended without result")
-		}
-
-		sev, ok := any(ev).(agentstream.Event)
-		if !ok {
-			return nil, false, false, nil
-		}
-		kind := sev.StreamEventKind()
-		if kind == agentstream.KindUnknown {
-			return nil, false, false, nil
+			res, ferr := failed(fmt.Errorf("session ended without result"))
+			return res, true, false, ferr
 		}
 
 		// Scope filtering for multiplexed channels: an out-of-scope event is
-		// another thread's traffic and must not reset our idle clock.
+		// another thread's traffic and must not reset our idle clock. This runs
+		// FIRST and is the only thing that can deny liveness — see below.
 		if scopeID != "" {
 			if scoped, ok := any(ev).(agentstream.Scoped); ok {
 				if id := scoped.ScopeID(); id != "" && id != scopeID {
 					return nil, false, false, nil
 				}
 			}
+		}
+
+		// Liveness is a TRANSPORT fact, not a semantic one: any event that
+		// belongs to this scope proves the backend is alive, whether or not the
+		// bridge knows how to render it. Everything below only decides what to
+		// DO with the event; it must never decide whether the stream is alive.
+		//
+		// Why this is separate from the kind switch: agentstream is a deliberate
+		// common SUBSET (see agentstream/doc.go) — SDK-specific events like
+		// codex.ItemStartedEvent, ItemCompletedEvent, TokenUsageEvent and
+		// CommandOutputEvent intentionally don't implement agentstream.Event, and
+		// conditional events legitimately return KindUnknown. Treating either as
+		// "not alive" conflated "I can't render this" with "nothing happened".
+		//
+		// Measured on kernel#8682 r2: codex sent item/started 17s after the last
+		// renderable event, then went quiet. The bridge ignored it and tripped a
+		// 300s idle timer at 309s on a stream whose real silence was 293s,
+		// discarding a review holding ~2M input tokens. Round 3's 132s gap
+		// carried item/started + item/completed and nothing else. Fleet-wide this
+		// was the largest single failure bucket (143 of 1,734 envelopes).
+		sev, isStreamEvent := any(ev).(agentstream.Event)
+		if !isStreamEvent {
+			return nil, false, true, nil
+		}
+		kind := sev.StreamEventKind()
+		if kind == agentstream.KindUnknown {
+			return nil, false, true, nil
 		}
 
 		switch kind {
@@ -289,15 +355,50 @@ func bridgeStreamEvents[E any](
 			if handler != nil {
 				handler.OnError(ee.StreamErr(), ee.StreamErrorContext())
 			}
-			return nil, true, true, fmt.Errorf("error: %w", ee.StreamErr())
+			// Backend error events are a terminal failure like any other, so
+			// they go through `failed` too. This arm was the hole that made the
+			// "every terminal path" claim false for one more round.
+			res, ferr := failed(fmt.Errorf("error: %w", ee.StreamErr()))
+			return res, true, true, ferr
 		}
 		return nil, false, true, nil
+	}
+
+	// drainQueued processes every event already sitting on the channel. Both
+	// the cancellation and the idle arms need it: the SDK channels are buffered
+	// (codex EventBufferSize defaults to 100), so a terminal condition can win
+	// the select while a wave of already-emitted events is still queued —
+	// including the TurnComplete that would have made this a success, and the
+	// text a partial result is supposed to preserve. Returns a terminal result
+	// when one is found in the queue.
+	drainQueued := func() (*bridgeResult, bool, error) {
+		for {
+			select {
+			case ev, ok := <-events:
+				res, done, inScope, err := applyEvent(ev, ok)
+				if done {
+					return res, true, err
+				}
+				if inScope {
+					lastEvent = time.Now()
+				}
+			default:
+				return nil, false, nil
+			}
+		}
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			// Drain before reporting the cancellation: a review that finished
+			// in the same instant the context died should be delivered, not
+			// discarded, and its streamed text belongs to the partial result
+			// either way.
+			if res, done, err := drainQueued(); done {
+				return res, err
+			}
+			return failed(ctx.Err())
 		case <-ticker.C:
 			// Before declaring the review stalled, drain every event already
 			// queued: select can pick the ticker over a ready events case, so a
@@ -306,24 +407,13 @@ func bridgeStreamEvents[E any](
 			// the idle decision below depends solely on lastEvent staleness —
 			// NOT on whether the drain saw anything. Draining out-of-scope
 			// multiplex noise must never suppress the idle trip for a stalled
-			// in-scope thread on a shared channel.
-			for {
-				select {
-				case ev, ok := <-events:
-					res, done, inScope, err := applyEvent(ev, ok)
-					if done {
-						return res, err
-					}
-					if inScope {
-						lastEvent = time.Now()
-					}
-					continue
-				default:
-				}
-				break
+			// in-scope thread on a shared channel. "In-scope" here means the
+			// scopeID check only — an unrenderable event still proves liveness.
+			if res, done, err := drainQueued(); done {
+				return res, err
 			}
 			if idleTimeout > 0 && time.Since(lastEvent) >= idleTimeout {
-				return nil, fmt.Errorf("review idle: no events for %s (stalled backend)", idleTimeout)
+				return failed(fmt.Errorf("review idle: no events for %s (stalled backend)", idleTimeout))
 			}
 			// Emit a heartbeat line at most every heartbeatInterval even if the
 			// ticker fires more often for idle-check precision.

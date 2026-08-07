@@ -405,7 +405,9 @@ func (b *claudeBackend) runPromptWithOptions(ctx context.Context, prompt string,
 		resumeStatus = resumeStatusAfterSessionReady(resumeStatus, requestedResumeID, readySessionID)
 	}
 	if err != nil {
-		return reviewErrorResult(resumeStatus, fmt.Errorf("claude: %w", err))
+		// Preserve any streamed text so an idle timeout that fired after real
+		// findings becomes status="partial" rather than discarding them.
+		return reviewPartialResult(resumeStatus, bridged, fmt.Errorf("claude: %w", err))
 	}
 
 	// The turn completed, so the CLI is on its way out under its own power.

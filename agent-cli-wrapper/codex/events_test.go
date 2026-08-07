@@ -2,8 +2,11 @@ package codex
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 	"time"
+
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/agentstream"
 )
 
 func TestEventType_Values(t *testing.T) {
@@ -339,5 +342,88 @@ func TestEventInterface(t *testing.T) {
 	for _, e := range events {
 		// Just verify Type() can be called (interface is satisfied)
 		_ = e.Type()
+	}
+}
+
+// Every codex event that names a thread must expose it as agentstream.Scoped.
+//
+// codex multiplexes all threads onto one client.Events() channel, so a consumer
+// filtering to its own thread can only do so via ScopeID(). A ThreadID field
+// that isn't reachable through the interface is invisible to that filter: the
+// event arrives unattributable, and a consumer treating arrival as proof of
+// life keeps a stalled thread alive on another thread's traffic. That was a real
+// regression (PR #314, found independently by two reviewers).
+//
+// The ThreadID check is reflective, but the roster below is hand-written, so a
+// NEW event type is invisible here until someone adds it —
+// TestEventTypeRosterIsComplete pins the roster against the EventType constants
+// so that gap fails loudly instead of silently.
+func scopedRosterForTest() []Event {
+	return []Event{
+		ClientReadyEvent{},
+		ThreadStartedEvent{},
+		ThreadReadyEvent{},
+		TurnStartedEvent{},
+		TurnCompletedEvent{},
+		TextDeltaEvent{},
+		ItemStartedEvent{},
+		ItemCompletedEvent{},
+		TokenUsageEvent{},
+		ErrorEvent{},
+		StateChangeEvent{},
+		CommandStartEvent{},
+		CommandOutputEvent{},
+		CommandEndEvent{},
+		ReasoningDeltaEvent{},
+	}
+}
+
+func TestEveryThreadedCodexEventIsScoped(t *testing.T) {
+	for _, e := range scopedRosterForTest() {
+		v := reflect.ValueOf(e)
+		if _, hasField := v.Type().FieldByName("ThreadID"); !hasField {
+			continue
+		}
+		if _, ok := any(e).(agentstream.Scoped); !ok {
+			t.Errorf("%T carries ThreadID but does not implement agentstream.Scoped; "+
+				"a multiplexed consumer cannot attribute it", e)
+		}
+	}
+}
+
+// ScopeID must return the event's own thread, not a constant.
+func TestScopeIDReportsTheOwningThread(t *testing.T) {
+	cases := []agentstream.Scoped{
+		ItemStartedEvent{ThreadID: "t-1"},
+		ItemCompletedEvent{ThreadID: "t-1"},
+		TokenUsageEvent{ThreadID: "t-1"},
+		CommandOutputEvent{ThreadID: "t-1"},
+		TurnStartedEvent{ThreadID: "t-1"},
+		StateChangeEvent{ThreadID: "t-1"},
+	}
+	for _, e := range cases {
+		if got := e.ScopeID(); got != "t-1" {
+			t.Errorf("%T.ScopeID() = %q, want t-1", e, got)
+		}
+	}
+}
+
+// The roster in TestEveryThreadedCodexEventIsScoped is hand-written, which is
+// the one thing reflection cannot cover: an event type nobody listed is an
+// event type nobody checks. Pin its size against the EventType constants so
+// adding a type without adding it to the roster fails here rather than silently
+// widening the multiplex hole.
+func TestEventTypeRosterIsComplete(t *testing.T) {
+	// Anchor on the FIRST constant, not the last: `int(EventTypeReasoningDelta)+1`
+	// tracked whatever sat at the end of the iota block, so appending a new type
+	// there moved the target and the count still matched — the exact addition
+	// this test exists to catch. A sentinel after the block is fixed relative to
+	// the start, so any new constant inserted anywhere before it raises the
+	// count while the hand-written roster stays put.
+	const declared = int(eventTypeSentinelForTest)
+	if got := len(scopedRosterForTest()); got != declared {
+		t.Errorf("roster has %d event types but %d EventType constants are declared; "+
+			"a new event type must be added to the roster or it is never checked "+
+			"for ScopeID", got, declared)
 	}
 }

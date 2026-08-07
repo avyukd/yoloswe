@@ -1235,6 +1235,26 @@ def _has_unresolved_high_deferral(rounds: list[dict[str, Any]]) -> bool:
     return False
 
 
+def _round_counts_as_low_only(
+    top_severity: str | None, *, had_live_reviewer: bool
+) -> bool:
+    """Did this round produce low-only evidence?
+
+    THE single answer to that question. Both writers of ``low_only_streak``
+    (finalize and the backfill reconstruction) route through here — asking it
+    separately is how the same dead-round defect landed twice, once per writer.
+
+    A round no live model reviewer returned produced no evidence at all, so it
+    is not low-only: its ``top_severity`` is None only because nobody reported,
+    and ``severity_rank(None)`` sits below "low", which is exactly the
+    "nobody looked" == "nothing to find" reading this field's consumers were
+    hardened against.
+    """
+    if not had_live_reviewer:
+        return False
+    return severity_rank(top_severity) <= severity_rank("low")
+
+
 def _backfill_low_only_streak(prior_rounds: list[dict[str, Any]]) -> int:
     """Reconstruct the streak ending at the most recent prior round when
     its ``low_only_streak`` field is missing (state file from before the
@@ -1246,15 +1266,48 @@ def _backfill_low_only_streak(prior_rounds: list[dict[str, Any]]) -> int:
     """
     streak = 0
     for rnd in sorted(prior_rounds, key=lambda r: r.get("n") or 0, reverse=True):
-        if severity_rank(rnd.get("top_severity")) <= severity_rank("low"):
+        live = _round_had_live_reviewer(rnd)
+        if not live:
+            # A dead round holds the streak: it neither counts as evidence nor
+            # terminates the run of low-only rounds before it. Same rule the
+            # forward path applies; rounds predating stream_status read as
+            # live, so historical reconstruction is unchanged.
+            continue
+        if _round_counts_as_low_only(rnd.get("top_severity"), had_live_reviewer=live):
             streak += 1
         else:
             break
     return streak
 
 
+def _round_had_live_reviewer(entry: dict[str, Any]) -> bool:
+    """True when at least one MODEL reviewer returned a verdict this round.
+
+    Delegates the live/non-live vocabulary to verdict.py rather than restating
+    it: statuses beyond ok/partial/error/absent exist (``exited-empty``,
+    ``missing``, ``unknown``) and a second copy of the rule would drift.
+    A round with no ``stream_status`` at all is treated as live — "no data" is
+    not "nobody looked", matching ``rounds_without_a_live_stream``.
+    """
+    import verdict as _verdict  # noqa: PLC0415 — lazy: avoid a top-level cycle
+
+    statuses = entry.get("stream_status")
+    if not isinstance(statuses, dict) or not statuses:
+        return True
+    reviewers = {
+        k: v for k, v in statuses.items()
+        if k not in _verdict._NON_REVIEWER_STREAMS
+    }
+    if not reviewers:
+        return True
+    return any(v in _verdict._LIVE_STREAM_STATUSES for v in reviewers.values())
+
+
 def _compute_low_only_streak(
-    prior_rounds: list[dict[str, Any]], this_top_severity: str | None
+    prior_rounds: list[dict[str, Any]],
+    this_top_severity: str | None,
+    *,
+    had_live_reviewer: bool = True,
 ) -> int:
     """Increment the prior round's streak when this round's top severity is
     low/nit/None (zero findings counts as low-only); reset to 0 otherwise.
@@ -1275,8 +1328,28 @@ def _compute_low_only_streak(
     it to inject reviewer-pressure text. Any caller can derive its own
     threshold from the same field.
     """
-    is_low_only = severity_rank(this_top_severity) <= severity_rank("low")
-    if not is_low_only:
+    # A round no live reviewer returned in HOLDS the streak — it neither
+    # advances nor resets it. Its `top_severity` is None, which ranks below
+    # "low", so a dead round used to *increment*: the same "nobody looked"
+    # reading as "nothing to find" this field's consumers were fixed for, one
+    # call upstream at the writer. Holding beats resetting because the round
+    # produced no evidence in either direction.
+    #
+    # This matters most downstream, where nothing suppresses it: the streak
+    # feeds convergence-pressure text into the NEXT round's reviewer goal
+    # ("the last N rounds returned only low-severity findings ... returning
+    # zero findings is the right call"). Inflated by dead rounds, that tells a
+    # healthy reviewer its dead peers found the diff clean — biasing the one
+    # surviving reviewer toward silence, which is the failure this loop exists
+    # to prevent.
+    if not had_live_reviewer:
+        prev = max(prior_rounds, key=lambda r: r.get("n") or 0, default=None)
+        if prev is None:
+            return 0
+        held = prev.get("low_only_streak")
+        return held if isinstance(held, int) else _backfill_low_only_streak(prior_rounds)
+
+    if not _round_counts_as_low_only(this_top_severity, had_live_reviewer=had_live_reviewer):
         return 0
     if not prior_rounds:
         return 1
@@ -1321,6 +1394,11 @@ def state_finalize_round(
         raise RuntimeError(f"round {n} not found in state")
     existing = entry.get("comment_actions") or []
     merged = _merge_actions(existing, actions)
+    # Validate BEFORE any side effect. _post_inline_replies POSTs to GitHub and
+    # cannot be undone; a check that runs after it would leave replies on the PR
+    # with nothing persisted, and the retry would post them again. Every
+    # precondition that can abort this round belongs above this line.
+    _reject_orphan_envelopes(state_dir, n, envelope_overrides or {})
     if auto_reply and pr_number is not None:
         _post_inline_replies(merged, pr_number, head_after)
     entry["comment_actions"] = merged
@@ -1330,8 +1408,16 @@ def state_finalize_round(
     # it must be computed from rounds prior to this one (`r.n < n`) plus
     # the freshly recomputed ``top_severity`` for this round.
     prior_rounds = [r for r in rounds if (r.get("n") or 0) < n]
-    entry["low_only_streak"] = _compute_low_only_streak(prior_rounds, entry.get("top_severity"))
+    # Stream health must be known BEFORE the streak is computed, so persist
+    # this round's findings/stream_status first. Ordering is load-bearing:
+    # computing the streak from a not-yet-populated entry would read every
+    # round as dead.
     _persist_round_findings(state_dir, entry, pr_number, branch, n, envelope_overrides or {})
+    entry["low_only_streak"] = _compute_low_only_streak(
+        prior_rounds,
+        entry.get("top_severity"),
+        had_live_reviewer=_round_had_live_reviewer(entry),
+    )
     atomic_write_json(path, state)
     return state
 
@@ -1436,6 +1522,112 @@ def _post_inline_replies(
             a.pop("reply_error", None)
 
 
+def _reject_orphan_envelopes(
+    state_dir: Path,
+    n: int,
+    envelope_overrides: dict[str, Path],
+) -> None:
+    """Fail loudly when this round's log dir holds an envelope finalize wasn't given.
+
+    Measured on kernel#8682 r1: the orchestrator concluded codex produced
+    nothing, wrote ``ack … no envelope``, and finalized WITHOUT
+    ``--envelope codex=…``. The envelope landed 2m26s later —
+    ``status: ok`` with three findings, one at 0.98 confidence that then cost
+    four more rounds to rediscover. Nothing noticed, because a backend absent
+    from ``envelope_overrides`` is silently skipped (that skip is correct for a
+    reviewer that never launched; it is catastrophic for one that did).
+
+    A finding written to disk and never read is the worst failure this loop
+    has, so it is a hard error rather than a warning: the round is not
+    finalizable until the orchestrator either passes the envelope or removes
+    it. Only backends whose envelope exists AND is non-empty are flagged — a
+    zero-byte file is a reviewer that died mid-write, which the
+    ``stream-missing`` path handles correctly.
+
+    **Scoped to the attempt being finalized.** ``round_bundle`` allocates a
+    FRESH ``a<n>`` dir on resume and deliberately preserves prior attempts
+    (see ``_next_attempt``), so a retried round legitimately has valid
+    envelopes under earlier attempts that this finalize is not about.
+    Scanning the whole ``r<n>`` tree would flag every one of them and make
+    resume impossible — a guard against losing findings must not itself break
+    the retry path that exists to recover them.
+
+    **A zero-envelope finalize is checked against the LATEST attempt, not
+    skipped.** The active attempt is normally derived from the passed envelope
+    paths, but "the orchestrator concluded the reviewers produced nothing and
+    finalized without them" is exactly the #8682 r1 shape this guard exists
+    for — deriving scope only from what was passed would let the motivating
+    case through. Upstream merely *warns* on a zero-envelope finalize, so this
+    is the only thing standing in front of it.
+    """
+    import bramble_ops  # noqa: PLC0415
+
+    log_root = state_dir / f"r{n}"
+    if not log_root.is_dir():
+        return
+    passed = {
+        p.resolve()
+        for p in envelope_overrides.values()
+        if p is not None
+    }
+    # The attempt dirs the orchestrator is actually finalizing. An envelope
+    # elsewhere under r<n> belongs to a different attempt and is out of scope.
+    active_dirs = {p.parent for p in passed}
+    if not active_dirs:
+        attempts = sorted(
+            (p for p in log_root.iterdir()
+             if p.is_dir() and _ATTEMPT_DIR_RE.fullmatch(p.name)),
+            key=lambda p: int(_ATTEMPT_DIR_RE.fullmatch(p.name).group(1)),
+        )
+        if not attempts:
+            return
+        active_dirs = {attempts[-1].resolve()}
+    # A backend whose RECOVERED envelope was passed is accounted for: SKILL
+    # Step 3.b runs `recover-envelope`, which writes a sibling
+    # `<backend>-envelope-recovered.json` and returns THAT path, so finalize
+    # legitimately receives the sibling while the original stays on disk.
+    # Without this the documented recovery flow trips the guard and a recovered
+    # round cannot finalize at all — a check meant to stop findings being
+    # dropped would instead block the mechanism that rescues them.
+    # The override must EXIST and be non-empty to cover anything: a filename
+    # match alone let a stale, missing, or misspelled path silence the guard for
+    # that backend, which is a wider hole than the one the exemption closes —
+    # the guard would then say nothing while a real envelope went unread.
+    covered_backends = set()
+    for b in bramble_ops.BACKENDS:
+        src = envelope_overrides.get(b)
+        if src is None or not src.name.startswith(f"{b}-envelope"):
+            continue
+        try:
+            if src.exists() and src.stat().st_size > 0:
+                covered_backends.add(b)
+        except OSError:
+            continue
+    orphans: list[str] = []
+    for backend in bramble_ops.BACKENDS:
+        if backend in covered_backends:
+            continue
+        for found in sorted(log_root.glob(f"a*/{backend}-envelope.json")):
+            try:
+                resolved = found.resolve()
+                if resolved.parent not in active_dirs:
+                    continue
+                if found.stat().st_size == 0 or resolved in passed:
+                    continue
+            except OSError:
+                continue
+            orphans.append(str(found))
+    if orphans:
+        raise ValueError(
+            f"round {n}: envelope(s) on disk were not passed to finalize: "
+            + ", ".join(orphans)
+            + ". A reviewer that wrote an envelope produced findings — pass it "
+            "with --envelope <backend>=<path>, or delete the file if it is a "
+            "stale attempt. Silently dropping it loses real review work "
+            "(kernel#8682 r1)."
+        )
+
+
 def _persist_round_findings(
     state_dir: Path,
     entry: dict[str, Any],
@@ -1453,6 +1645,8 @@ def _persist_round_findings(
     # pr_ops and bramble_ops.
     import bramble_ops  # noqa: PLC0415
 
+    # NOTE: _reject_orphan_envelopes runs in state_finalize_round BEFORE any
+    # side effect (GitHub replies), not here — see the comment at that call.
     reviews_dir = state_dir / "reviews"
     # Re-finalizing a round with a different envelope set must not leave
     # stale per-backend data behind. Drop any prior `<backend>_findings`,
@@ -1477,7 +1671,7 @@ def _persist_round_findings(
         # initial seed for codex/cursor); don't pop, so consumers
         # that index into the field unconditionally still work.
         entry[f"{backend}_findings"] = []
-        for bucket_key in ("session_ids", "resume_status"):
+        for bucket_key in ("session_ids", "resume_status", "stream_status"):
             bucket = entry.get(bucket_key)
             if isinstance(bucket, dict):
                 bucket.pop(backend, None)
@@ -1493,7 +1687,15 @@ def _persist_round_findings(
             pass
     for backend in bramble_ops.BACKENDS:
         src = envelope_overrides.get(backend)
-        if src is None or not src.exists():
+        if src is None:
+            # Never launched this round: no claim either way.
+            continue
+        if not src.exists():
+            # Launched and wrote nothing — the crashed/never-returned backend.
+            # This is the "absent" half of the live-reviewer rule, and skipping
+            # it silently is what let "nobody looked" keep reading as "nothing
+            # to find": with no key recorded, the gate had nothing to judge.
+            entry.setdefault("stream_status", {})[backend] = "absent"
             continue
         try:
             obj = read_json(src, default=None)
@@ -1505,13 +1707,40 @@ def _persist_round_findings(
         # disk but parses to non-dict / missing keys would let the previous
         # finalize's values survive — same resume-stale-session class
         # of bug as the omitted-backend cleanup above.
-        for bucket_key in ("session_ids", "resume_status", "sufficiency_claims"):
+        for bucket_key in (
+            "session_ids",
+            "resume_status",
+            "sufficiency_claims",
+            "stream_status",
+        ):
             bucket = entry.get(bucket_key)
             if isinstance(bucket, dict):
                 bucket.pop(backend, None)
                 if not bucket:
                     entry.pop(bucket_key, None)
+        if not isinstance(obj, dict):
+            # The file exists but did not parse — a reviewer that died
+            # mid-write. That is a failed stream, not a missing claim, and
+            # leaving no key at all is the same "nobody looked" reads as
+            # "nothing to find" hole the `absent` branch above closes.
+            entry.setdefault("stream_status", {})[backend] = "unreadable"
         if isinstance(obj, dict):
+            # Persist the envelope's own status so downstream consumers can
+            # tell "reviewed and found nothing" from "never reviewed". A bare
+            # `<backend>_findings: []` cannot: on #8682 it meant a DROPPED
+            # envelope in r1 and a real backend error in r2/r3, and any metric
+            # reading the array length conflates the two.
+            #
+            # Consumers: verdict.py (`no_live_reviewer` blocker and the
+            # `silent_reviewer` advisory) and SKILL Step 3.g's convergence
+            # rule. NOT escape_rate.py — an earlier version of this comment
+            # named it, and a comment claiming a consumer that does not exist
+            # is what let this field sit write-only for two rounds. Wiring
+            # escape_rate to split escapes by stream status is worth doing;
+            # until it is, this list stays honest.
+            entry.setdefault("stream_status", {})[backend] = (
+                obj.get("status") or "unknown"
+            )
             if obj.get("session_id"):
                 entry.setdefault("session_ids", {})[backend] = obj.get("session_id")
             if obj.get("resume_status"):
@@ -1946,8 +2175,21 @@ def finalize_and_report(
     # a deferred high must not read as resolved). We scan persisted
     # comment_actions rather than the current round's `actions` arg so a high
     # ack'd several rounds ago still blocks.
+    # "Nobody looked" must not read as "nothing to find" IN THE LOOP. verdict.py
+    # gates on this too, but only at exit — by then the batch has already
+    # pushed, so the in-loop hint has to carry the same rule or the recovery it
+    # exists to trigger never happens.
+    #
+    # Scoped to THIS round, unlike verdict.py's series-wide blocker. The two
+    # answer different questions: "is this batch's record trustworthy" is
+    # rightly permanent, but "may this round converge" must clear when the
+    # reviewers recover — a series-wide read here meant one dead round blocked
+    # convergence for every round after it, so a recovered run could never
+    # signal done and would burn its budget to the cap.
+    no_live_reviewer = not _round_had_live_reviewer(entry)
+
     deferred_high = _has_unresolved_high_deferral(rounds)
-    if deferred_high:
+    if deferred_high or no_live_reviewer:
         converged = None
         exit_reason_hint = None
     elif streak >= 2 and low_top:

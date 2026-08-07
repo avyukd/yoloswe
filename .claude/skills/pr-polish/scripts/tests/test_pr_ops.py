@@ -3108,5 +3108,434 @@ class TestBuildPRSummary(unittest.TestCase):
         self.assertIsNone(out["pr_number"])
 
 
+def _envelope(status="ok", issues=None, session_id="sess-1"):
+    """A minimal bramble review envelope."""
+    return {
+        "status": status,
+        "backend": "codex",
+        "session_id": session_id,
+        "review_mode": "code",
+        "review": {"verdict": "rejected", "issues": issues or []},
+    }
+
+
+class OrphanEnvelopeGuardTests(unittest.TestCase):
+    """finalize must never silently ignore an envelope sitting in the log dir.
+
+    kernel#8682 r1: the orchestrator decided codex produced nothing, wrote
+    `ack ... no envelope`, and finalized without `--envelope codex=...`. The
+    envelope landed 2m26s later with status=ok and three findings, one at 0.98
+    confidence that then took four more rounds to rediscover.
+    """
+
+    def _round_dir(self, sd: Path, n: int) -> Path:
+        d = sd / f"r{n}" / "a1"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def test_rejects_an_envelope_that_was_not_passed(self):
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            d = self._round_dir(sd, 1)
+            (d / "codex-envelope.json").write_text(json.dumps(_envelope()))
+            (d / "cursor-envelope.json").write_text(json.dumps(_envelope()))
+            with self.assertRaises(ValueError) as ctx:
+                pr_ops._reject_orphan_envelopes(
+                    sd, 1, {"cursor": d / "cursor-envelope.json"}
+                )
+            self.assertIn("codex-envelope.json", str(ctx.exception))
+
+    def test_accepts_when_every_envelope_is_passed(self):
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            d = self._round_dir(sd, 1)
+            (d / "codex-envelope.json").write_text(json.dumps(_envelope()))
+            (d / "cursor-envelope.json").write_text(json.dumps(_envelope()))
+            pr_ops._reject_orphan_envelopes(
+                sd,
+                1,
+                {
+                    "codex": d / "codex-envelope.json",
+                    "cursor": d / "cursor-envelope.json",
+                },
+            )
+
+    def test_ignores_a_zero_byte_envelope(self):
+        """A reviewer that died mid-write left no findings to lose.
+
+        That is the genuine stream-missing case, and it must still be
+        finalizable as `ack` — the guard exists to protect real review work,
+        not to block on an empty file.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            d = self._round_dir(sd, 1)
+            (d / "codex-envelope.json").write_text("")
+            pr_ops._reject_orphan_envelopes(sd, 1, {})
+
+    def test_a_prior_attempts_envelope_is_not_an_orphan(self):
+        """Resume must stay possible: round_bundle keeps prior attempt dirs.
+
+        `_next_attempt` allocates a FRESH a<n> on resume and deliberately
+        preserves earlier attempts, so a retried round legitimately has valid
+        envelopes under a1 while finalizing a2. Scanning all of r<n> flagged
+        every one of them and made resume impossible — a guard against losing
+        findings must not break the retry path that exists to recover them.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            a1 = sd / "r1" / "a1"
+            a1.mkdir(parents=True)
+            a2 = sd / "r1" / "a2"
+            a2.mkdir(parents=True)
+            (a1 / "codex-envelope.json").write_text(json.dumps(_envelope()))
+            (a2 / "codex-envelope.json").write_text(json.dumps(_envelope()))
+            # Finalizing a2 must not trip on a1's leftover.
+            pr_ops._reject_orphan_envelopes(
+                sd, 1, {"codex": a2 / "codex-envelope.json"}
+            )
+
+    def test_still_catches_an_orphan_inside_the_active_attempt(self):
+        """Scoping to the active attempt must not blunt the actual guard."""
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            a1 = sd / "r1" / "a1"
+            a1.mkdir(parents=True)
+            a2 = sd / "r1" / "a2"
+            a2.mkdir(parents=True)
+            (a1 / "codex-envelope.json").write_text(json.dumps(_envelope()))
+            # a2 holds BOTH; only cursor is passed, so codex is a real orphan.
+            (a2 / "codex-envelope.json").write_text(json.dumps(_envelope()))
+            (a2 / "cursor-envelope.json").write_text(json.dumps(_envelope()))
+            with self.assertRaises(ValueError) as ctx:
+                pr_ops._reject_orphan_envelopes(
+                    sd, 1, {"cursor": a2 / "cursor-envelope.json"}
+                )
+            msg = str(ctx.exception)
+            self.assertIn("a2", msg)
+            self.assertNotIn("a1", msg)
+
+    def test_a_recovered_envelope_covers_its_original(self):
+        """The documented recovery flow must not trip this guard.
+
+        SKILL Step 3.b runs recover-envelope, which writes a sibling
+        <backend>-envelope-recovered.json and returns THAT path — so finalize
+        legitimately gets the sibling while the original stays on disk. Left
+        alone, a check meant to stop findings being dropped instead blocked the
+        mechanism that rescues them.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            d = sd / "r1" / "a1"
+            d.mkdir(parents=True)
+            (d / "codex-envelope.json").write_text(json.dumps(_envelope()))
+            rec = d / "codex-envelope-recovered.json"
+            rec.write_text(json.dumps(_envelope()))
+            pr_ops._reject_orphan_envelopes(sd, 1, {"codex": rec})
+
+    def test_a_missing_override_cannot_silence_the_guard(self):
+        """The recovered-envelope exemption must require a real file.
+
+        Matching on filename alone let a stale, missing, or misspelled override
+        suppress detection for that backend entirely — a wider hole than the one
+        the exemption closes, since the guard would then say nothing while a
+        real envelope went unread.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            d = sd / "r1" / "a1"
+            d.mkdir(parents=True)
+            (d / "codex-envelope.json").write_text(json.dumps(_envelope()))
+            with self.assertRaises(ValueError):
+                pr_ops._reject_orphan_envelopes(
+                    sd, 1, {"codex": d / "codex-envelope-recovered.json"},
+                )
+
+    def test_ignores_other_rounds(self):
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            d = self._round_dir(sd, 1)
+            (d / "codex-envelope.json").write_text(json.dumps(_envelope()))
+            pr_ops._reject_orphan_envelopes(sd, 2, {})
+
+    def test_finds_an_envelope_in_a_later_attempt_dir(self):
+        """The guard works in any attempt dir, not just a1."""
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            d2 = sd / "r1" / "a2"
+            d2.mkdir(parents=True)
+            (d2 / "codex-envelope.json").write_text(json.dumps(_envelope()))
+            (d2 / "cursor-envelope.json").write_text(json.dumps(_envelope()))
+            with self.assertRaises(ValueError) as ctx:
+                pr_ops._reject_orphan_envelopes(
+                    sd, 1, {"cursor": d2 / "cursor-envelope.json"}
+                )
+            self.assertIn("codex-envelope.json", str(ctx.exception))
+
+    def test_a_zero_envelope_finalize_is_still_checked(self):
+        """The motivating case must not slip through the scoping fix.
+
+        "The orchestrator decided the reviewers produced nothing and finalized
+        without them" IS kernel#8682 r1. Deriving scope only from passed paths
+        would skip exactly that, and upstream merely warns on a zero-envelope
+        finalize rather than rejecting it — so this is the only thing in front
+        of it. Falls back to the latest attempt.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            d1 = sd / "r1" / "a1"
+            d1.mkdir(parents=True)
+            (d1 / "codex-envelope.json").write_text(json.dumps(_envelope()))
+            with self.assertRaises(ValueError) as ctx:
+                pr_ops._reject_orphan_envelopes(sd, 1, {})
+            self.assertIn("codex-envelope.json", str(ctx.exception))
+
+    def test_a_zero_envelope_finalize_checks_only_the_latest_attempt(self):
+        """Still must not resurrect the resume breakage."""
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            (sd / "r1" / "a1").mkdir(parents=True)
+            (sd / "r1" / "a2").mkdir(parents=True)
+            # Only the OLD attempt has an envelope; a2 is the live one.
+            (sd / "r1" / "a1" / "codex-envelope.json").write_text(
+                json.dumps(_envelope())
+            )
+            pr_ops._reject_orphan_envelopes(sd, 1, {})
+
+    def test_no_round_dir_is_not_an_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            pr_ops._reject_orphan_envelopes(Path(td), 1, {})
+
+
+class LowOnlyStreakLivenessTests(unittest.TestCase):
+    """A dead round must not advance the low-only streak.
+
+    top_severity is None for a round no reviewer returned, and None ranks
+    below "low" — so a dead round used to INCREMENT. That is the same
+    "nobody looked" == "nothing to find" conflation, at the writer instead
+    of the reader. Downstream it is unsuppressed: the streak feeds
+    convergence-pressure text into the next round's reviewer goal, telling a
+    healthy reviewer its dead peers found the diff clean.
+    """
+
+    def test_a_dead_round_holds_the_streak(self):
+        prior = [{"n": 1, "low_only_streak": 1, "top_severity": "low"}]
+        got = pr_ops._compute_low_only_streak(prior, None, had_live_reviewer=False)
+        self.assertEqual(got, 1, "a dead round must neither advance nor reset")
+
+    def test_a_dead_round_used_to_increment(self):
+        # The un-fixed behaviour, pinned so the regression is legible.
+        prior = [{"n": 1, "low_only_streak": 1, "top_severity": "low"}]
+        self.assertEqual(pr_ops._compute_low_only_streak(prior, None), 2)
+
+    def test_a_live_low_round_still_advances(self):
+        prior = [{"n": 1, "low_only_streak": 1, "top_severity": "low"}]
+        self.assertEqual(
+            pr_ops._compute_low_only_streak(prior, "low", had_live_reviewer=True), 2
+        )
+
+    def test_a_live_high_round_still_resets(self):
+        prior = [{"n": 1, "low_only_streak": 2, "top_severity": "low"}]
+        self.assertEqual(
+            pr_ops._compute_low_only_streak(prior, "high", had_live_reviewer=True), 0
+        )
+
+    def test_the_backfill_path_applies_the_same_dead_round_rule(self):
+        """Both writers of low_only_streak must answer one question the same way.
+
+        _backfill_low_only_streak reconstructs the streak from top_severity
+        history. Left alone, it re-derived the inflated number the forward path
+        had just been fixed to stop producing — the same defect at the second
+        writer, which is why both now route through _round_counts_as_low_only.
+        """
+        prior = [
+            {"n": 1, "top_severity": "low", "stream_status": {"codex": "ok"}},
+            # Dead: top_severity None only because nobody reported.
+            {"n": 2, "top_severity": None,
+             "stream_status": {"codex": "error", "cursor": "absent"}},
+        ]
+        # Only round 1 is evidence, so the streak is 1 — not 2.
+        self.assertEqual(pr_ops._backfill_low_only_streak(prior), 1)
+
+    def test_the_backfill_path_still_resets_on_a_live_high_round(self):
+        prior = [
+            {"n": 1, "top_severity": "low", "stream_status": {"codex": "ok"}},
+            {"n": 2, "top_severity": "high", "stream_status": {"codex": "ok"}},
+        ]
+        self.assertEqual(pr_ops._backfill_low_only_streak(prior), 0)
+
+    def test_the_backfill_path_is_unchanged_for_pre_stream_status_rounds(self):
+        # No stream_status at all reads as live, so historical reconstruction
+        # behaves exactly as before the field existed.
+        prior = [{"n": 1, "top_severity": "low"}, {"n": 2, "top_severity": "low"}]
+        self.assertEqual(pr_ops._backfill_low_only_streak(prior), 2)
+
+    def test_liveness_is_read_from_stream_status(self):
+        self.assertTrue(pr_ops._round_had_live_reviewer({"stream_status": {"codex": "ok"}}))
+        self.assertTrue(pr_ops._round_had_live_reviewer({"stream_status": {"codex": "partial"}}))
+        self.assertFalse(
+            pr_ops._round_had_live_reviewer(
+                {"stream_status": {"codex": "error", "cursor": "absent", "lint": "ok"}}
+            )
+        )
+        # Statuses beyond the four named ones must read as not-live.
+        self.assertFalse(
+            pr_ops._round_had_live_reviewer({"stream_status": {"codex": "exited-empty"}})
+        )
+        # No data is not "nobody looked".
+        self.assertTrue(pr_ops._round_had_live_reviewer({}))
+
+
+class ConvergedSignalLivenessTests(unittest.TestCase):
+    """The in-loop guard, exercised through finalize_and_report itself.
+
+    _round_had_live_reviewer and verdict.py were each covered alone, so
+    deleting the production guard left both green (codex, r7). This asserts
+    the wiring.
+    """
+
+    def _finalize(self, tmp, stream_files, n=1, prior=None):
+        sd = Path(tmp)
+        d = sd / f"r{n}" / "a1"
+        d.mkdir(parents=True)
+        overrides = {}
+        for backend, status in stream_files.items():
+            f = d / f"{backend}-envelope.json"
+            if status is not None:
+                f.write_text(json.dumps({"status": status, "backend": backend,
+                                         "review": {"verdict": "accepted", "issues": []}}))
+            overrides[backend] = f
+        rounds = list(prior or [])
+        rounds.append({"n": n, "comment_actions": []})
+        (sd / "pr-polish-state.json").write_text(
+            json.dumps({"pr_number": None, "branch": "br", "rounds": rounds})
+        )
+        import unittest.mock as _mock
+        with _mock.patch.object(
+            pr_ops, "state_paths",
+            return_value=(sd, sd / "pr-polish-state.json"),
+        ):
+            return pr_ops.finalize_and_report(
+                "branch:br", n, "deadbeef", [], envelope_overrides=overrides,
+            )
+
+    def test_a_dead_round_cannot_report_converged(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = self._finalize(td, {"codex": "error", "cursor": None, "lint": "ok"})
+            self.assertIsNone(out["converged_signal"])
+            self.assertIsNone(out["exit_reason_hint"])
+
+    def test_a_live_clean_round_may_report_converged(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = self._finalize(td, {"codex": "ok", "lint": "ok"})
+            self.assertTrue(out["converged_signal"])
+
+    def test_a_recovered_round_clears_an_earlier_dead_round(self):
+        """The in-loop gate is per-round, not series-wide.
+
+        A series-wide read meant one dead round blocked convergence for every
+        round after it, so a recovered run could never signal done and would
+        burn its budget to the cap.
+        """
+        prior = [{"n": 1, "comment_actions": [],
+                  "stream_status": {"codex": "error", "cursor": "absent"}}]
+        with tempfile.TemporaryDirectory() as td:
+            out = self._finalize(td, {"codex": "ok", "lint": "ok"}, n=2, prior=prior)
+            self.assertTrue(
+                out["converged_signal"],
+                "a healthy round must be able to converge after an earlier dead one",
+            )
+
+
+class StreamStatusPersistenceTests(unittest.TestCase):
+    """`<backend>_findings: []` cannot distinguish "clean" from "never ran".
+
+    On #8682 an empty array meant a DROPPED envelope in r1 and a real backend
+    error in r2/r3. Persist the envelope's own status so convergence and
+    escape_rate can tell them apart.
+    """
+
+    def test_persists_the_envelope_status_per_backend(self):
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            d = sd / "r1" / "a1"
+            d.mkdir(parents=True)
+            ok = d / "codex-envelope.json"
+            ok.write_text(json.dumps(_envelope(status="ok")))
+            bad = d / "cursor-envelope.json"
+            bad.write_text(
+                json.dumps({"status": "error", "error": "stalled", "backend": "cursor"})
+            )
+            entry: dict = {}
+            pr_ops._persist_round_findings(
+                sd, entry, None, "br", 1,
+                {"codex": ok, "cursor": bad},
+            )
+            self.assertEqual(entry["stream_status"]["codex"], "ok")
+            self.assertEqual(entry["stream_status"]["cursor"], "error")
+
+    def test_a_launched_backend_that_wrote_nothing_records_absent(self):
+        """The 'absent' half of the live-reviewer rule needs a recorded value.
+
+        A backend that was launched and crashed writes no envelope. Skipping it
+        left no key at all, so the gate had nothing to judge and "nobody
+        looked" kept reading as "nothing to find".
+        """
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            d = sd / "r1" / "a1"
+            d.mkdir(parents=True)
+            ok = d / "codex-envelope.json"
+            ok.write_text(json.dumps(_envelope(status="ok")))
+            entry: dict = {}
+            pr_ops._persist_round_findings(
+                sd, entry, None, "br", 1,
+                {"codex": ok, "cursor": d / "cursor-envelope.json"},
+            )
+            self.assertEqual(entry["stream_status"]["cursor"], "absent")
+            self.assertEqual(entry["stream_status"]["codex"], "ok")
+
+    def test_an_unreadable_envelope_records_a_status(self):
+        """A file that exists but does not parse is a failed stream.
+
+        Leaving no key at all is the same "nobody looked" reads as "nothing to
+        find" hole the absent branch closes — and this is the shape a reviewer
+        that died mid-write actually produces.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            d = sd / "r1" / "a1"
+            d.mkdir(parents=True)
+            bad = d / "codex-envelope.json"
+            bad.write_text("{ truncated mid-writ")
+            entry: dict = {}
+            pr_ops._persist_round_findings(sd, entry, None, "br", 1, {"codex": bad})
+            self.assertEqual(entry["stream_status"]["codex"], "unreadable")
+
+    def test_a_backend_never_launched_records_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            d = sd / "r1" / "a1"
+            d.mkdir(parents=True)
+            ok = d / "codex-envelope.json"
+            ok.write_text(json.dumps(_envelope(status="ok")))
+            entry: dict = {}
+            pr_ops._persist_round_findings(sd, entry, None, "br", 1, {"codex": ok})
+            self.assertNotIn("cursor", entry.get("stream_status", {}))
+
+    def test_refinalize_drops_stale_status_for_omitted_backends(self):
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            d = sd / "r1" / "a1"
+            d.mkdir(parents=True)
+            cur = d / "cursor-envelope.json"
+            cur.write_text(json.dumps(_envelope(status="ok")))
+            entry: dict = {"stream_status": {"codex": "ok", "cursor": "error"}}
+            pr_ops._persist_round_findings(sd, entry, None, "br", 1, {"cursor": cur})
+            # codex was not passed this time: its stale "ok" must not survive.
+            self.assertNotIn("codex", entry.get("stream_status", {}))
+            self.assertEqual(entry["stream_status"]["cursor"], "ok")
+
+
 if __name__ == "__main__":
     unittest.main()

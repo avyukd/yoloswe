@@ -299,6 +299,20 @@ func TestEmitVerdictLine_ResumeSuffixOnSuccessAndError(t *testing.T) {
 			},
 			wantLine: "error: auth denied\n",
 		},
+		{
+			// stdout is the surface an orchestrator reads first, and a bare
+			// "error: ..." is the reading that produced `ack ... no envelope`
+			// on kernel#8682 r1 — while the envelope beside it carries
+			// findings. A partial has issues by construction, so say so.
+			name: "partial keeps its findings visible",
+			env: reviewer.ResultEnvelope{
+				Status:        reviewer.StatusPartial,
+				Error:         "codex: review idle: no events for 8m0s (stalled backend)",
+				Review:        reviewer.ReviewBody{Verdict: "rejected", Issues: []reviewer.ReviewIssue{{Severity: "high"}}},
+				SchemaVersion: reviewer.JSONSchemaVersion,
+			},
+			wantLine: "partial: rejected (1 issues kept) after: codex: review idle: no events for 8m0s (stalled backend)\n",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -991,10 +1005,17 @@ func TestCmd_DiffScopeFlagsAreWired(t *testing.T) {
 
 func TestCmd_TimeoutFlagsAreWired(t *testing.T) {
 	// Cobra-level proof that --idle-timeout and --timeout are registered,
-	// carry the new defaults (idle 3m, absolute cap off), and parse into the
+	// carry the new defaults (idle 8m, absolute cap off), and parse into the
 	// globals runCodeReview reads (idle-timeout flows into reviewer.Config.
 	// IdleTimeout; --timeout gates the conditional context.WithTimeout). Guards
 	// the default against a silent regression the reviewer tests can't see.
+	//
+	// Why 8m: codex's own transport carries a server-side ~300s idle timeout,
+	// after which it reconnects and resumes on its own (measured: every
+	// within-turn silence >=5m in a 10-day log was 301-302s and ended in a
+	// responses_retry). A client bound at or below that races the backend's own
+	// recovery and kills a turn that was about to continue. 8m sits clear of
+	// it; --timeout remains the absolute cap for callers that want one.
 	prevTimeout := timeout
 	prevIdle := idleTimeout
 	t.Cleanup(func() {
@@ -1006,8 +1027,8 @@ func TestCmd_TimeoutFlagsAreWired(t *testing.T) {
 	if err := Cmd.ParseFlags([]string{}); err != nil {
 		t.Fatalf("ParseFlags (defaults) failed: %v", err)
 	}
-	if idleTimeout != 3*time.Minute {
-		t.Errorf("--idle-timeout default = %s, want 3m (inactivity bound for bare callers)", idleTimeout)
+	if idleTimeout != 8*time.Minute {
+		t.Errorf("--idle-timeout default = %s, want 8m (clear of the backend's own ~300s keepalive)", idleTimeout)
 	}
 	if timeout != 0 {
 		t.Errorf("--timeout default = %s, want 0 (absolute cap off; rely on idle)", timeout)
@@ -1487,5 +1508,38 @@ func TestDiffScopeReachesPrompt(t *testing.T) {
 	}
 	if !strings.Contains(got, "git diff abc123def..HEAD") {
 		t.Errorf("diff scope did not reach the prompt:\n%s", got)
+	}
+}
+
+// The connecting hunk of the partial chain: bridgeStreamEvents preserves the
+// text, BuildEnvelope turns it into status="partial" — and this is the code in
+// between, which used to synthesize a bare ErrorMessage and throw the text away.
+// Tested at both ends but not in the middle until now.
+func TestFailedReviewResult_KeepsWhatTheReviewerProduced(t *testing.T) {
+	const body = `{"verdict":"rejected","summary":"s","issues":[` +
+		`{"severity":"high","file":"a.go","line":1,"message":"boom"}]}`
+	streamed := &reviewer.ReviewResult{ResponseText: body}
+	got := failedReviewResult(streamed, errors.New("review idle: no events for 8m0s"),
+		reviewer.ResumeStatusOK)
+	if got.ResponseText != body {
+		t.Fatalf("ResponseText = %q, want the streamed body preserved", got.ResponseText)
+	}
+	env := reviewer.BuildEnvelope(got, reviewer.BackendCodex, "m", "s1", "")
+	if env.Status != reviewer.StatusPartial {
+		t.Errorf("envelope status = %s, want partial", env.Status)
+	}
+	if len(env.Review.Issues) != 1 {
+		t.Errorf("issues = %d, want the finding preserved", len(env.Review.Issues))
+	}
+}
+
+func TestFailedReviewResult_NilResultStillYieldsAnErrorEnvelope(t *testing.T) {
+	got := failedReviewResult(nil, errors.New("backend unreachable"), reviewer.ResumeStatusUnverified)
+	if got == nil || got.ErrorMessage != "backend unreachable" {
+		t.Fatalf("nil result must degrade to a reportable error shape, got %+v", got)
+	}
+	env := reviewer.BuildEnvelope(got, reviewer.BackendCodex, "m", "", "")
+	if env.Status != reviewer.StatusError {
+		t.Errorf("nothing was produced, so status = %s, want error", env.Status)
 	}
 }

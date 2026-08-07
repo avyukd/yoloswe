@@ -108,15 +108,22 @@ func (b *geminiBackend) RunPrompt(ctx context.Context, prompt string, handler Ev
 
 	// Prompt blocks until turn complete while events are delivered through
 	// the event channel, so the bridge must drain concurrently.
-	bridged := make(chan *bridgeResult, 1)
-	bridgeErr := make(chan error, 1)
+	// ONE channel carrying the bridge's whole outcome. Splitting result from
+	// error across two channels forced the reader to reassemble them, and a
+	// non-blocking drain cannot observe a value the goroutine has not sent yet:
+	// on SIGTERM, signal.NotifyContext cancels ctx and the derived adapterCtx in
+	// the same call, so the reader's ctx.Done is ready before the bridge
+	// goroutine is even scheduled. The drain returned nil and the preserved text
+	// was discarded on precisely the path it was added for. With one channel
+	// there are no halves to race.
+	type bridgeOutcome struct {
+		res *bridgeResult
+		err error
+	}
+	outcome := make(chan bridgeOutcome, 1)
 	go func() {
 		r, err := bridgeStreamEvents(adapterCtx, filterGeminiEvents(adapterCtx, b.client.Events()), handler, "", b.config.IdleTimeout)
-		if err != nil {
-			bridgeErr <- err
-		} else {
-			bridged <- r
-		}
+		outcome <- bridgeOutcome{res: r, err: err}
 	}()
 
 	_, promptErr := session.Prompt(ctx, prompt)
@@ -128,15 +135,29 @@ func (b *geminiBackend) RunPrompt(ctx context.Context, prompt string, handler Ev
 	}
 
 	var r *bridgeResult
+	// On cancellation, WAIT for the bridge instead of racing it. Cancelling ctx
+	// also cancels adapterCtx, so the bridge is already unblocked and about to
+	// send — polling for its value the instant we notice the cancellation is
+	// what threw the partial text away. adapterCancel() is called explicitly so
+	// this holds even for a cancellation that did not derive from ctx.
 	select {
-	case r = <-bridged:
-	case err := <-bridgeErr:
-		if promptErr != nil {
-			return reviewErrorResult(resumeStatus, fmt.Errorf("gemini: prompt failed: %w (bridge: %v)", promptErr, err))
-		}
-		return reviewErrorResult(resumeStatus, fmt.Errorf("gemini: %w", err))
 	case <-ctx.Done():
-		return reviewErrorResult(resumeStatus, ctx.Err())
+		adapterCancel()
+		out := <-outcome
+		if out.err != nil {
+			return reviewPartialResult(resumeStatus, out.res, ctx.Err())
+		}
+		// The bridge finished cleanly in the same instant the context died.
+		// The review is complete, so keep it rather than reporting a failure.
+		r = out.res
+	case out := <-outcome:
+		if out.err != nil {
+			if promptErr != nil {
+				return reviewPartialResult(resumeStatus, out.res, fmt.Errorf("gemini: prompt failed: %w (bridge: %v)", promptErr, out.err))
+			}
+			return reviewPartialResult(resumeStatus, out.res, fmt.Errorf("gemini: %w", out.err))
+		}
+		r = out.res
 	}
 
 	if promptErr != nil {

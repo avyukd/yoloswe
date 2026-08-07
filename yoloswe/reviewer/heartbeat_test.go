@@ -2,6 +2,7 @@ package reviewer
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -385,5 +386,493 @@ func TestFormatHeartbeat(t *testing.T) {
 	}
 	if !strings.Contains(active, "+400 reasoning") {
 		t.Errorf("expected reasoning char count, got: %q", active)
+	}
+}
+
+// --- Liveness is a transport fact, not a semantic one --------------------
+//
+// Regression tests for kernel#8682: the bridge only reset the idle clock on
+// events it could RENDER, so a backend that was demonstrably alive — sending
+// events the agentstream subset doesn't cover — was killed as "stalled". These
+// pin the corrected contract: scopeID alone decides liveness.
+
+// testNonStreamEvent implements NO agentstream interface at all — the shape of
+// codex.ItemStartedEvent / ItemCompletedEvent / TokenUsageEvent /
+// CommandOutputEvent, which agentstream/doc.go deliberately excludes from the
+// common subset. Arrival still proves the backend is alive.
+type testNonStreamEvent struct{ note string }
+
+// testScopedUnknownEvent returns KindUnknown but carries a scope — the shape of
+// a conditional event (e.g. ACP ToolCallUpdateEvent mid-status).
+type testScopedUnknownEvent struct{ scopeID string }
+
+func (e testScopedUnknownEvent) StreamEventKind() agentstream.EventKind {
+	return agentstream.KindUnknown
+}
+func (e testScopedUnknownEvent) ScopeID() string { return e.scopeID }
+
+// The r3 gap: item/started and item/completed were the ONLY events for 132s.
+// Neither implements agentstream.Event, so the old bridge saw dead air and
+// killed a working review.
+func TestBridgeStreamEvents_UnrenderableEventsKeepStreamAlive(t *testing.T) {
+	withHeartbeat(t, 5*time.Millisecond)
+
+	ch := make(chan interface{})
+	handler := &recordingHandler{}
+	done := make(chan struct{})
+	var result *bridgeResult
+	var err error
+	go func() {
+		result, err = bridgeStreamEvents(context.Background(), ch, handler, "", 200*time.Millisecond)
+		close(done)
+	}()
+
+	// Drip unrenderable events for well over the idle window. Each must reset
+	// the clock even though none of them can be displayed.
+	for i := 0; i < 8; i++ {
+		ch <- testNonStreamEvent{note: "item/started"}
+		time.Sleep(20 * time.Millisecond)
+		select {
+		case <-done:
+			t.Fatalf("bridge died at drip %d: an unrenderable in-scope event must reset the idle clock (err=%v)", i, err)
+		default:
+		}
+	}
+	ch <- testTurnCompleteEvent{success: true, durationMs: 1}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bridgeStreamEvents did not return after the terminal event")
+	}
+	if err != nil {
+		t.Fatalf("unrenderable events must not produce an idle error, got: %v", err)
+	}
+	if result == nil || !result.success {
+		t.Fatal("expected a successful result")
+	}
+	// Liveness only — they must still never be rendered.
+	if len(handler.texts) != 0 || len(handler.toolStarts) != 0 {
+		t.Errorf("unrenderable events must not reach the handler: texts=%d toolStarts=%d",
+			len(handler.texts), len(handler.toolStarts))
+	}
+}
+
+// A KindUnknown event that passes the scope check is also proof of life.
+func TestBridgeStreamEvents_UnknownKindKeepsStreamAlive(t *testing.T) {
+	withHeartbeat(t, 5*time.Millisecond)
+
+	ch := make(chan agentstream.Event)
+	handler := &recordingHandler{}
+	done := make(chan struct{})
+	var err error
+	go func() {
+		_, err = bridgeStreamEvents(context.Background(), ch, handler, "thread-1", 200*time.Millisecond)
+		close(done)
+	}()
+
+	for i := 0; i < 6; i++ {
+		ch <- testScopedUnknownEvent{scopeID: "thread-1"}
+		time.Sleep(20 * time.Millisecond)
+		select {
+		case <-done:
+			t.Fatalf("bridge died at drip %d: an in-scope KindUnknown event must reset the idle clock (err=%v)", i, err)
+		default:
+		}
+	}
+	ch <- testTurnCompleteEvent{success: true, durationMs: 1}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bridgeStreamEvents did not return after the terminal event")
+	}
+	if err != nil {
+		t.Fatalf("in-scope KindUnknown must not produce an idle error, got: %v", err)
+	}
+}
+
+// The multiplex guard must SURVIVE the fix: another thread's traffic still must
+// not keep a stalled thread alive, whether or not it is renderable.
+func TestBridgeStreamEvents_OutOfScopeEventsStillTripIdle(t *testing.T) {
+	withHeartbeat(t, 5*time.Millisecond)
+
+	ch := make(chan agentstream.Event)
+	handler := &recordingHandler{}
+	done := make(chan struct{})
+	var err error
+	go func() {
+		_, err = bridgeStreamEvents(context.Background(), ch, handler, "thread-1", 200*time.Millisecond)
+		close(done)
+	}()
+
+	// Our thread speaks once, then only OTHER threads talk. The idle timer must
+	// still trip — out-of-scope noise is not our liveness.
+	ch <- testScopedTextEvent{testTextEvent: testTextEvent{delta: "ours"}, scopeID: "thread-1"}
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			select {
+			case ch <- testScopedUnknownEvent{scopeID: "thread-2"}:
+			case <-done:
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("out-of-scope traffic suppressed the idle trip — the multiplex guard regressed")
+	}
+	if err == nil || !strings.Contains(err.Error(), "review idle") {
+		t.Fatalf("expected an idle-timeout error despite out-of-scope traffic, got: %v", err)
+	}
+}
+
+// A stream that genuinely emits NOTHING must still be killed — the fix must not
+// disable the timeout wholesale.
+func TestBridgeStreamEvents_TrueSilenceStillTripsIdle(t *testing.T) {
+	withHeartbeat(t, 5*time.Millisecond)
+
+	ch := make(chan agentstream.Event)
+	handler := &recordingHandler{}
+	done := make(chan struct{})
+	var err error
+	go func() {
+		_, err = bridgeStreamEvents(context.Background(), ch, handler, "", 40*time.Millisecond)
+		close(done)
+	}()
+
+	ch <- testTextEvent{delta: "hello"}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("true silence must still trip the idle timeout")
+	}
+	if err == nil || !strings.Contains(err.Error(), "review idle") {
+		t.Fatalf("expected an idle-timeout error, got: %v", err)
+	}
+}
+
+// Replay of the kernel#8682 r2 timing, scaled down 1000x. Real numbers:
+// agentMessage/delta at t, item/started at t+17s, kill at t+309s on a 300s
+// timer. Bramble measured 309s of silence; the wire had 293s. With item/started
+// counted the turn survives.
+func TestBridgeStreamEvents_Kernel8682R2TimingSurvives(t *testing.T) {
+	withHeartbeat(t, 3*time.Millisecond)
+
+	// Margins are wide on purpose: the point is the ORDERING (item/started
+	// resets the clock), not tight timing. A 30ms gap against a 300ms bound
+	// made this a scheduler race under parallel `bazel test`.
+	const idle = 900 * time.Millisecond // stands in for 300s
+	ch := make(chan interface{})
+	handler := &recordingHandler{}
+	done := make(chan struct{})
+	var err error
+	go func() {
+		_, err = bridgeStreamEvents(context.Background(), ch, handler, "", idle)
+		close(done)
+	}()
+
+	ch <- testTextEvent{delta: "agentMessage/delta"} // t
+	time.Sleep(180 * time.Millisecond)               // +17s, scaled up for timer slack
+	ch <- testNonStreamEvent{note: "item/started"}   // the event the old code discarded
+
+	// Now wait past the point where the OLD code would have died. The old clock
+	// ran from agentMessage/delta, so it trips at t+900ms; the corrected clock
+	// runs from item/started and does not trip until t+1080ms. Sleeping to
+	// ~t+990ms straddles the two: dead under the old rule, alive under the new,
+	// with a 90ms cushion on each side rather than 30ms.
+	// (Bounded by the terminal event below, so a slow machine cannot flake into
+	// a false pass — it would time out at the select instead.)
+	time.Sleep(810 * time.Millisecond)
+	select {
+	case <-done:
+		t.Fatalf("regressed: killed at the 8682 r2 timing — item/started must reset the clock (err=%v)", err)
+	default:
+	}
+
+	ch <- testTurnCompleteEvent{success: true, durationMs: 1}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bridgeStreamEvents did not return after the terminal event")
+	}
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// testUnscopedThreadEvent is the pre-fix shape of codex's ItemStartedEvent &
+// friends: carries a thread id in a plain field, implements neither
+// agentstream.Event nor agentstream.Scoped. Before ScopeID() was added to those
+// types, the bridge could not tell whose traffic this was — and once ANY
+// arriving event counted as liveness, another thread's chatter kept a stalled
+// thread alive. Consensus finding (cursor + claude) on PR #314.
+type testUnscopedThreadEvent struct{ threadID string }
+
+// testScopedNonStreamEvent is the POST-fix shape: still outside the
+// agentstream.Event subset, but scoped, so the bridge can attribute it.
+type testScopedNonStreamEvent struct{ scopeID string }
+
+func (e testScopedNonStreamEvent) ScopeID() string { return e.scopeID }
+
+// The multiplex guard must hold for unrenderable events too: an event scoped to
+// ANOTHER thread must not reset our idle clock, even though it is now liveness
+// evidence for its own thread.
+func TestBridgeStreamEvents_UnrenderableOutOfScopeDoesNotKeepUsAlive(t *testing.T) {
+	withHeartbeat(t, 5*time.Millisecond)
+
+	ch := make(chan interface{})
+	handler := &recordingHandler{}
+	done := make(chan struct{})
+	var err error
+	go func() {
+		_, err = bridgeStreamEvents(context.Background(), ch, handler, "thread-1", 200*time.Millisecond)
+		close(done)
+	}()
+
+	// Our thread speaks once, then only thread-2's unrenderable traffic flows.
+	ch <- testScopedTextEvent{testTextEvent: testTextEvent{delta: "ours"}, scopeID: "thread-1"}
+	go func() {
+		for {
+			select {
+			case ch <- testScopedNonStreamEvent{scopeID: "thread-2"}:
+			case <-done:
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("another thread's unrenderable traffic suppressed the idle trip")
+	}
+	if err == nil || !strings.Contains(err.Error(), "review idle") {
+		t.Fatalf("expected an idle-timeout error, got: %v", err)
+	}
+}
+
+// Documents the residual hole this design accepts: an event carrying a thread
+// id that does NOT implement Scoped is unattributable, so it counts as liveness
+// for every bridge on a shared channel. The fix is at the producer — every
+// multiplexed codex event now implements ScopeID() — and
+// TestEveryThreadedCodexEventIsScoped in the codex package is what keeps that
+// true. This test pins the bridge's half of the contract so the two cannot
+// drift apart silently.
+func TestBridgeStreamEvents_UnscopedEventCountsAsLivenessByDesign(t *testing.T) {
+	withHeartbeat(t, 5*time.Millisecond)
+
+	ch := make(chan interface{})
+	handler := &recordingHandler{}
+	done := make(chan struct{})
+	go func() {
+		_, _ = bridgeStreamEvents(context.Background(), ch, handler, "thread-1", 200*time.Millisecond)
+		close(done)
+	}()
+
+	for i := 0; i < 5; i++ {
+		ch <- testUnscopedThreadEvent{threadID: "thread-2"}
+		time.Sleep(20 * time.Millisecond)
+		select {
+		case <-done:
+			t.Fatalf("drip %d: an unscoped event cannot be attributed, so it counts "+
+				"as liveness — if this now trips, the bridge changed and the "+
+				"producer-side ScopeID() contract needs revisiting", i)
+		default:
+		}
+	}
+	ch <- testTurnCompleteEvent{success: true, durationMs: 1}
+	<-done
+}
+
+// Partial preservation must apply on BOTH terminal paths. The idle timeout
+// returns accumulated text; a channel close without TurnComplete has to do the
+// same, or the same rule holds on one sibling and not the other (cursor, r2).
+func TestBridgeStreamEvents_ChannelCloseKeepsPartialText(t *testing.T) {
+	withHeartbeat(t, 10*time.Millisecond)
+
+	body := `{"verdict":"rejected","summary":"s","issues":[]}`
+	ch := make(chan agentstream.Event, 2)
+	ch <- testTextEvent{delta: body}
+	close(ch) // stream drops before TurnComplete
+
+	res, err := bridgeStreamEvents(context.Background(), ch, &recordingHandler{}, "", 0)
+	if err == nil {
+		t.Fatal("a close without TurnComplete must still be an error")
+	}
+	if res == nil {
+		t.Fatal("streamed text must be returned with the error, not only counted in it")
+	}
+	if res.responseText != body {
+		t.Errorf("responseText = %q, want the streamed body", res.responseText)
+	}
+}
+
+func TestBridgeStreamEvents_ChannelCloseWithNoTextReturnsNil(t *testing.T) {
+	withHeartbeat(t, 10*time.Millisecond)
+	ch := make(chan agentstream.Event)
+	close(ch)
+	res, err := bridgeStreamEvents(context.Background(), ch, &recordingHandler{}, "", 0)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if res != nil {
+		t.Errorf("nothing was streamed, so there is nothing to preserve; got %+v", res)
+	}
+}
+
+// Every terminal path preserves partial work — asserted as ONE rule, not per
+// exit. Three consecutive review rounds each found a different exit that
+// dropped accumulated text (idle timeout, channel close, ctx cancellation)
+// because each decided the question for itself. This table is the rule.
+//
+// The ctx case is the one that fires in production: SKILL Step 3.b wraps every
+// reviewer in `timeout 2400`, GNU timeout sends SIGTERM, and codereview.go
+// installs signal.NotifyContext(SIGINT, SIGTERM) on the review context — so
+// the absolute backstop cancels here, not at the idle timeout.
+func TestBridgeStreamEvents_EveryFailurePathPreservesPartialWork(t *testing.T) {
+	const body = `{"verdict":"rejected","summary":"s","issues":[]}`
+
+	t.Run("ctx cancelled", func(t *testing.T) {
+		withHeartbeat(t, 10*time.Millisecond)
+		ctx, cancel := context.WithCancel(context.Background())
+		ch := make(chan agentstream.Event)
+		done := make(chan struct{})
+		var res *bridgeResult
+		var err error
+		go func() {
+			res, err = bridgeStreamEvents(ctx, ch, &recordingHandler{}, "", 0)
+			close(done)
+		}()
+		ch <- testTextEvent{delta: body}
+		cancel()
+		<-done
+		if err == nil {
+			t.Fatal("cancellation must still be an error")
+		}
+		if res == nil || res.responseText != body {
+			t.Fatalf("ctx cancellation dropped the streamed body: %+v", res)
+		}
+	})
+
+	t.Run("idle timeout", func(t *testing.T) {
+		withHeartbeat(t, 5*time.Millisecond)
+		ch := make(chan agentstream.Event)
+		done := make(chan struct{})
+		var res *bridgeResult
+		go func() {
+			res, _ = bridgeStreamEvents(context.Background(), ch, &recordingHandler{}, "", 40*time.Millisecond)
+			close(done)
+		}()
+		ch <- testTextEvent{delta: body}
+		<-done
+		if res == nil || res.responseText != body {
+			t.Fatalf("idle timeout dropped the streamed body: %+v", res)
+		}
+	})
+
+	t.Run("channel closed", func(t *testing.T) {
+		withHeartbeat(t, 10*time.Millisecond)
+		ch := make(chan agentstream.Event, 1)
+		ch <- testTextEvent{delta: body}
+		close(ch)
+		res, err := bridgeStreamEvents(context.Background(), ch, &recordingHandler{}, "", 0)
+		if err == nil {
+			t.Fatal("a close without TurnComplete must still be an error")
+		}
+		if res == nil || res.responseText != body {
+			t.Fatalf("channel close dropped the streamed body: %+v", res)
+		}
+	})
+
+	t.Run("backend error event", func(t *testing.T) {
+		// The arm that stayed nil for one round after the consolidation, while
+		// the helper's comment already claimed totality. Triple consensus
+		// (codex + cursor + claude), PR #314 r4.
+		withHeartbeat(t, 10*time.Millisecond)
+		ch := make(chan agentstream.Event, 2)
+		ch <- testTextEvent{delta: body}
+		ch <- testErrorEvent{err: errors.New("transport reset"), ctx: "stream"}
+		res, err := bridgeStreamEvents(context.Background(), ch, &recordingHandler{}, "", 0)
+		if err == nil {
+			t.Fatal("a backend error event must still be an error")
+		}
+		if res == nil || res.responseText != body {
+			t.Fatalf("KindError dropped the streamed body: %+v", res)
+		}
+	})
+
+	t.Run("nothing streamed yields nil on every path", func(t *testing.T) {
+		withHeartbeat(t, 5*time.Millisecond)
+		ch := make(chan agentstream.Event)
+		done := make(chan struct{})
+		var res *bridgeResult
+		go func() {
+			res, _ = bridgeStreamEvents(context.Background(), ch, &recordingHandler{}, "", 30*time.Millisecond)
+			close(done)
+		}()
+		<-done
+		if res != nil {
+			t.Errorf("no text accumulated, so there is nothing to preserve; got %+v", res)
+		}
+	})
+}
+
+// A partial result must report how long it actually ran. Token counts live on
+// the TurnComplete event that never arrives on this path, but elapsed time is
+// known — and "duration_ms: 0" on a review that ran for minutes before stalling
+// is the exact misreading this change exists to prevent.
+func TestBridgeStreamEvents_PartialResultCarriesElapsedTime(t *testing.T) {
+	withHeartbeat(t, 5*time.Millisecond)
+	ch := make(chan agentstream.Event)
+	done := make(chan struct{})
+	var res *bridgeResult
+	go func() {
+		res, _ = bridgeStreamEvents(context.Background(), ch, &recordingHandler{}, "", 40*time.Millisecond)
+		close(done)
+	}()
+	ch <- testTextEvent{delta: `{"verdict":"accepted","summary":"s","issues":[]}`}
+	<-done
+	if res == nil {
+		t.Fatal("expected the partial result")
+	}
+	if res.durationMs <= 0 {
+		t.Errorf("durationMs = %d, want the elapsed time of the run", res.durationMs)
+	}
+}
+
+// A terminal condition can win the select while a wave of already-emitted
+// events is still queued — the SDK channels are buffered (codex
+// EventBufferSize defaults to 100). The idle arm drained for exactly this
+// reason; ctx.Done did not, so a review that finished in the same instant the
+// context died was discarded along with the TurnComplete that would have made
+// it a success.
+func TestBridgeStreamEvents_CancellationDrainsQueuedEvents(t *testing.T) {
+	withHeartbeat(t, 10*time.Millisecond)
+
+	// Buffer the whole turn, then cancel before the loop reads any of it.
+	ch := make(chan agentstream.Event, 4)
+	ch <- testTextEvent{delta: `{"verdict":"accepted","summary":"s","issues":[]}`}
+	ch <- testTurnCompleteEvent{success: true, durationMs: 7}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	res, err := bridgeStreamEvents(ctx, ch, &recordingHandler{}, "", 0)
+	if err != nil {
+		t.Fatalf("a completed turn sitting in the buffer must be delivered, got: %v", err)
+	}
+	if res == nil || !res.success {
+		t.Fatalf("expected the queued TurnComplete to win, got %+v", res)
 	}
 }

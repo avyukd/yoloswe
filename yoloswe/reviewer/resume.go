@@ -31,6 +31,32 @@ func reviewErrorResult(resumeStatus ResumeStatus, err error) (*ReviewResult, err
 	}, err
 }
 
+// reviewPartialResult is reviewErrorResult that keeps whatever the reviewer
+// streamed before failing. A run killed mid-stream (idle timeout) may already
+// have emitted a complete, schema-valid review body; BuildEnvelope turns that
+// into status="partial" so the findings reach the caller instead of being
+// discarded with the error. bridged may be nil — failures before the stream
+// opened have nothing to preserve and degrade to reviewErrorResult.
+func reviewPartialResult(resumeStatus ResumeStatus, bridged *bridgeResult, err error) (*ReviewResult, error) {
+	if bridged == nil || bridged.responseText == "" {
+		return reviewErrorResult(resumeStatus, err)
+	}
+	return &ReviewResult{
+		Success:      false,
+		ResponseText: bridged.responseText,
+		// Carry the elapsed time the bridge measured. Setting it on the
+		// bridgeResult and dropping it here left the envelope reporting 0ms
+		// anyway — the fix has to reach the layer the metric is read from.
+		// Token counts stay zero: they live on the TurnComplete event that by
+		// definition never arrived, and codex's TokenUsageEvent is outside the
+		// agentstream subset, so plumbing them is a cross-backend interface
+		// change rather than a carry-through.
+		DurationMs:   bridged.durationMs,
+		ErrorMessage: err.Error(),
+		ResumeStatus: resumeStatus,
+	}, err
+}
+
 func resumeStatusAfterSessionReady(status ResumeStatus, requestedID, actualID string) ResumeStatus {
 	if requestedID == "" {
 		return status

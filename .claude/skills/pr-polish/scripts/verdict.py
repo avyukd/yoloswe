@@ -56,6 +56,11 @@ _ABNORMAL_EXITS = {
     "dirty-tree-preflight",
     "user-paused",
     "abandoned",
+    # Every reviewer failed to return a verdict, so the local bar was never
+    # actually held. The work may be fine — but nothing here checked it, and
+    # under the batch protocol that means the external reviewers are the first
+    # real review this diff gets.
+    "reviewers-unavailable",
 }
 
 # A high/critical wont_fix currently clears its block on ANY non-empty
@@ -174,6 +179,55 @@ def _claim_matches(claim: str, touched: set[str]) -> bool:
         elif claim_parts[-len(t_parts):] == t_parts:
             return True
     return False
+
+
+def refuted_class_claims(state: dict) -> list[dict]:
+    """Class-level fix claims that a later round contradicted.
+
+    A ``fixed`` action carrying an ``invariant`` claims more than "this
+    line is fixed" — it claims the *rule* now holds. The cheapest
+    falsifier costs nothing to collect and cannot be gamed by writing
+    prose: if a later round fixes the same file again, the claimed rule
+    did not cover its class. The refuting evidence is produced by a
+    subsequent round's own behaviour, not by the claiming round's
+    self-report, which is exactly what ``sites_found`` could never be.
+
+    Same design as :func:`verify_fix_claims`: a *necessary* condition,
+    not a sufficient one. A later fix in the same file may be an
+    unrelated defect, so this is an advisory — it says where to look,
+    never that the run failed. Measured across the 641 runs on disk,
+    173 of 726 invariant-bearing claims (23.8%) are refuted this way.
+
+    Claims are keyed ``(path, invariant)``, not by path alone: one file
+    can carry two distinct invariants, and collapsing them would hide a
+    refutation of the second behind a claim about the first.
+
+    Deliberately keyed on ``invariant`` rather than ``sites_found``:
+    the former is populated on ~1000 rows, the latter on ~20.
+    """
+    claims: dict[tuple[str, str], dict] = {}
+    out: list[dict] = []
+    for rnd in sorted(state.get("rounds") or [], key=lambda r: r.get("n") or 0):
+        n = rnd.get("n")
+        fixed_here = {
+            a["path"]
+            for a in rnd.get("comment_actions") or []
+            if a.get("action") == "fixed" and a.get("path")
+        }
+        # Refute against claims standing *before* this round, so a class
+        # fixed across several sites in one round never refutes itself.
+        for key, claim in list(claims.items()):
+            if claim["path"] in fixed_here:
+                out.append({**claim, "refuted_by_round": n})
+                del claims[key]
+        for a in rnd.get("comment_actions") or []:
+            if a.get("action") != "fixed" or not a.get("path") or not a.get("invariant"):
+                continue
+            claims.setdefault(
+                (a["path"], a["invariant"]),
+                {"round": n, "path": a["path"], "invariant": a["invariant"]},
+            )
+    return out
 
 
 def verify_fix_claims(state: dict, repo_root: Optional[Path]) -> dict:
@@ -316,6 +370,24 @@ def compute_verdict(state: dict, *, repo_root: Optional[Path] = None) -> dict:
             }
         )
 
+    # "Nobody looked" is not "nothing to find". A round whose every stream is
+    # error/absent reviewed nothing, so its empty finding list cannot support a
+    # ready verdict — and under the batch protocol the batch has already pushed
+    # on it. This is the automated half of the stream_status contract: without
+    # it the field is written and never read, and "reviewed clean" stays
+    # indistinguishable from "never reviewed" in the verdict.
+    dead_rounds = rounds_without_a_live_stream(state)
+    if dead_rounds:
+        blockers.append(
+            {
+                "code": "no_live_reviewer",
+                "detail": "round(s) "
+                + ", ".join(str(n) for n in dead_rounds)
+                + " had no reviewer return a verdict (all streams error/absent)",
+                "severity": "high",
+            }
+        )
+
     fix_claims = verify_fix_claims(state, repo_root)
     for row in fix_claims["unverified_rows"]:
         if severity_rank(row.get("severity")) >= severity_rank("high"):
@@ -343,6 +415,19 @@ def compute_verdict(state: dict, *, repo_root: Optional[Path] = None) -> dict:
             }
         )
 
+    # A class claim a later round contradicted. Advisory by construction:
+    # making it a blocker would push the loop to stop labelling invariants,
+    # which would cost the signal that makes this check possible at all.
+    for row in refuted_class_claims(state):
+        advisories.append(
+            {
+                "code": "class_claim_refuted",
+                "detail": f"round {row['round']} claimed invariant "
+                f"'{row['invariant']}' at {row['path']}; round "
+                f"{row['refuted_by_round']} fixed that file again",
+            }
+        )
+
     # Reviewer self-assessment: surfaced, never gating.
     for rnd in state.get("rounds") or []:
         for backend, claim in (rnd.get("sufficiency_claims") or {}).items():
@@ -356,15 +441,26 @@ def compute_verdict(state: dict, *, repo_root: Optional[Path] = None) -> dict:
                 )
 
     streams = reviewer_stream_health(state)
+    stream_statuses = reviewer_stream_statuses(state)
     for backend, count in streams.items():
-        if count == 0:
-            advisories.append(
-                {
-                    "code": "silent_reviewer",
-                    "detail": f"{backend} produced zero findings in every "
-                    "round — consensus was structurally impossible",
-                }
+        if count != 0:
+            continue
+        # Say WHY it was silent when the envelope statuses are on record.
+        # "codex found nothing" and "codex never returned" warrant opposite
+        # responses, and the bare count cannot tell them apart.
+        seen = stream_statuses.get(backend) or {}
+        live = sum(n for s, n in seen.items() if s in _LIVE_STREAM_STATUSES)
+        if seen and live == 0:
+            detail = (
+                f"{backend} never returned a verdict "
+                f"({', '.join(f'{s}x{n}' for s, n in sorted(seen.items()))})"
             )
+        else:
+            detail = (
+                f"{backend} produced zero findings in every "
+                "round — consensus was structurally impossible"
+            )
+        advisories.append({"code": "silent_reviewer", "detail": detail})
 
     if blockers:
         verdict = "not_ready"
@@ -387,6 +483,7 @@ def compute_verdict(state: dict, *, repo_root: Optional[Path] = None) -> dict:
                 k: v for k, v in fix_claims.items() if k != "unverified_rows"
             },
             "reviewer_streams": streams,
+            "reviewer_stream_statuses": stream_statuses,
             "open_high_deferrals": len(open_high_deferrals(state)),
         },
     }
@@ -417,6 +514,77 @@ def reviewer_stream_health(state: dict) -> dict[str, int]:
                 count += len(rnd.get(key) or [])
         if seen:
             out[backend] = count
+    return out
+
+
+def reviewer_stream_statuses(state: dict) -> dict[str, dict[str, int]]:
+    """Per-backend tally of persisted envelope statuses across all rounds.
+
+    The count-based view above cannot separate "ran and found nothing" from
+    "never ran" — a zero is produced by both. ``stream_status`` records the
+    envelope's own status, so report it alongside: ``{"codex": {"ok": 3,
+    "error": 2}}``. Backends with no recorded status in any round are omitted,
+    matching ``reviewer_stream_health``'s absent-key convention.
+    """
+    out: dict[str, dict[str, int]] = {}
+    for rnd in state.get("rounds") or []:
+        statuses = rnd.get("stream_status")
+        if not isinstance(statuses, dict):
+            continue
+        for backend, status in statuses.items():
+            out.setdefault(backend, {})
+            key = str(status)
+            out[backend][key] = out[backend].get(key, 0) + 1
+    return out
+
+
+#: Envelope statuses that mean a reviewer actually returned a verdict.
+#: Derived from bramble_ops.STATUSES_WITH_BODY, not restated: that constant
+#: exists so a future body-carrying status is added once and every consumer
+#: follows. A second literal with the same membership is the drift it was
+#: introduced to prevent — this module was the first place to reintroduce it.
+_LIVE_STREAM_STATUSES = frozenset(bramble_ops.STATUSES_WITH_BODY)
+
+#: Streams in ``BACKENDS`` that are NOT model reviewers and therefore cannot
+#: stand in for one. ``lint`` is a static diff pass: ``lint_gate.py`` writes
+#: ``"status": "ok"`` unconditionally and SKILL Step 3.f always passes its
+#: envelope, so counting it as coverage made the no-live-reviewer gate
+#: unreachable — it fired on a set that always contained a live member.
+#: Derived by exclusion from ``bramble_ops.BACKENDS`` so a NEW model backend is
+#: counted automatically; only a new non-reviewer stream needs adding here.
+_NON_REVIEWER_STREAMS = frozenset({"lint"})
+
+
+def rounds_without_a_live_stream(state: dict) -> list[int]:
+    """Rounds where no reviewer returned a verdict, newest-relevant first.
+
+    A round whose streams are all ``error``/``absent`` reviewed nothing. Its
+    empty finding list is produced equally by a clean diff and by a backend
+    that never returned, and under the batch protocol the batch pushes on it —
+    handing the first real review to the external reviewers.
+
+    Only rounds that recorded ``stream_status`` at all are judged. Rounds
+    written before the field existed are skipped rather than assumed broken:
+    treating "no data" as "nobody looked" is the same absent-vs-empty
+    conflation this function exists to end.
+    """
+    out: list[int] = []
+    for rnd in state.get("rounds") or []:
+        statuses = rnd.get("stream_status")
+        if not isinstance(statuses, dict) or not statuses:
+            continue
+        # Only model reviewers count. lint is always present and always "ok",
+        # so including it made this predicate unsatisfiable.
+        reviewers = {
+            k: v for k, v in statuses.items() if k not in _NON_REVIEWER_STREAMS
+        }
+        if not reviewers:
+            continue
+        if any(v in _LIVE_STREAM_STATUSES for v in reviewers.values()):
+            continue
+        n = rnd.get("n")
+        if isinstance(n, int):
+            out.append(n)
     return out
 
 

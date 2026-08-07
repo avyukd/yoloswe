@@ -108,6 +108,27 @@ class CommentSourceTests(unittest.TestCase):
             )
             self.assertEqual(len(er.load_comments(sd, None)), 1)
 
+    def test_reads_the_legacy_bare_list_snapshot(self):
+        """Both shapes are live on disk; only the wrapped one used to parse.
+
+        ``fetch-comments`` emits the wrapped object today, but 7 state dirs
+        (newest 2026-07-18) still hold the legacy bare list. Since ``--all``
+        had no per-dir guard, one of those aborted the whole fleet scan — which
+        is why the escape rate had never been measured across the corpus.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            (sd / "pp-comments.json").write_text(
+                json.dumps([_comment(body="legacy")])
+            )
+            got = er.load_comments(sd, None)
+            self.assertEqual(len(got), 1)
+            self.assertEqual(got[0]["body"], "legacy")
+
+    def test_missing_snapshot_yields_no_comments(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(er.load_comments(Path(td), None), [])
+
 
 class ComputeEscapeRateTests(unittest.TestCase):
     def _run(self, state, record):

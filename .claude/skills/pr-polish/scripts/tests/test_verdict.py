@@ -112,6 +112,82 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(out["verdict"], "not_ready")
         self.assertIn("abnormal_exit", [b["code"] for b in out["blockers"]])
 
+    def test_reviewers_unavailable_can_never_be_ready(self):
+        # A batch where every reviewer failed to return a verdict never held
+        # the local bar. The diff may be fine, but nothing here checked it —
+        # and under the batch protocol that hands the first real review to the
+        # external reviewers. kernel#8682 b1 pushed exactly this way.
+        out = v.compute_verdict(_state(exit_reason="reviewers-unavailable"))
+        self.assertEqual(out["verdict"], "not_ready")
+        self.assertIn("abnormal_exit", [b["code"] for b in out["blockers"]])
+
+    def test_a_round_with_no_live_stream_blocks_ready(self):
+        # The automated half of the stream_status contract. Without it the
+        # field is written and never read, and a completed+converged run whose
+        # every stream errored still reports ready — "nobody looked" reading as
+        # "nothing to find".
+        st = _state(rounds=[{
+            "n": 1,
+            "comment_actions": [],
+            "stream_status": {"codex": "error", "cursor": "error"},
+        }])
+        out = v.compute_verdict(st)
+        self.assertEqual(out["verdict"], "not_ready")
+        self.assertIn("no_live_reviewer", [b["code"] for b in out["blockers"]])
+
+    def test_a_partial_stream_counts_as_a_live_reviewer(self):
+        # partial carries real findings alongside the failure that ended the
+        # run, so it is review coverage — not a dead round.
+        st = _state(rounds=[{
+            "n": 1,
+            "comment_actions": [],
+            "stream_status": {"codex": "partial", "cursor": "error"},
+        }])
+        out = v.compute_verdict(st)
+        self.assertNotIn("no_live_reviewer", [b["code"] for b in out["blockers"]])
+
+    def test_rounds_predating_stream_status_are_not_judged(self):
+        # No recorded status is "no data", not "nobody looked". Assuming the
+        # latter is the same absent-vs-empty conflation this field ends.
+        st = _state(rounds=[{"n": 1, "comment_actions": []}])
+        self.assertEqual(v.rounds_without_a_live_stream(st), [])
+        self.assertEqual(v.compute_verdict(st)["verdict"], "ready")
+
+    def test_silent_reviewer_advisory_names_the_cause_when_known(self):
+        st = _state(rounds=[{
+            "n": 1,
+            "comment_actions": [],
+            "codex_findings": [],
+            "cursor_findings": [],
+            "stream_status": {"codex": "error", "cursor": "ok"},
+        }])
+        out = v.compute_verdict(st)
+        details = [a["detail"] for a in out["advisories"] if a["code"] == "silent_reviewer"]
+        self.assertTrue(
+            any("never returned a verdict" in d for d in details),
+            f"expected codex's silence attributed to its error status, got {details}",
+        )
+
+    def test_lint_alone_is_not_a_live_reviewer(self):
+        # lint is in BACKENDS, lint_gate hardcodes status "ok", and SKILL always
+        # passes its envelope — so counting it as coverage made this gate
+        # unsatisfiable. Consensus finding (codex + claude), PR #314 r2.
+        st = _state(rounds=[{
+            "n": 1,
+            "comment_actions": [],
+            "stream_status": {"codex": "error", "cursor": "error", "lint": "ok"},
+        }])
+        out = v.compute_verdict(st)
+        self.assertEqual(out["verdict"], "not_ready")
+        self.assertIn("no_live_reviewer", [b["code"] for b in out["blockers"]])
+
+    def test_a_lint_only_round_is_not_judged(self):
+        # No model reviewer ran at all in the record: nothing to conclude from.
+        st = _state(rounds=[{
+            "n": 1, "comment_actions": [], "stream_status": {"lint": "ok"},
+        }])
+        self.assertEqual(v.rounds_without_a_live_stream(st), [])
+
     def test_clean_converged_run_is_ready(self):
         self.assertEqual(v.compute_verdict(_state())["verdict"], "ready")
 
@@ -328,6 +404,96 @@ class ReviewerStreamRosterTests(unittest.TestCase):
         self.assertEqual(v.reviewer_stream_health(st).get("claude"), 2)
 
 
+def _fix(path, invariant=None, **kw):
+    a = {"action": "fixed", "path": path, "severity": "medium"}
+    if invariant:
+        a["invariant"] = invariant
+    a.update(kw)
+    return a
+
+
+class RefutedClassClaimTests(unittest.TestCase):
+    """A class claim is refuted by a later round fixing the same file.
+
+    The point of the check is that the refuting evidence comes from a
+    *later round's* behaviour, so it cannot be satisfied by prose in the
+    claiming round — the failure mode that made ``sites_found`` useless.
+    """
+
+    def test_later_round_touching_the_file_refutes_the_claim(self):
+        st = _state(rounds=[
+            {"n": 1, "comment_actions": [_fix("a.go", "every path drains")]},
+            {"n": 2, "comment_actions": [_fix("a.go")]},
+        ])
+        rows = v.refuted_class_claims(st)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["round"], 1)
+        self.assertEqual(rows[0]["refuted_by_round"], 2)
+        self.assertEqual(rows[0]["invariant"], "every path drains")
+
+    def test_claim_that_holds_is_not_refuted(self):
+        st = _state(rounds=[
+            {"n": 1, "comment_actions": [_fix("a.go", "every path drains")]},
+            {"n": 2, "comment_actions": [_fix("b.go")]},
+        ])
+        self.assertEqual(v.refuted_class_claims(st), [])
+
+    def test_several_sites_in_the_claiming_round_do_not_self_refute(self):
+        # A class fixed at three sites in one round is the GOOD case —
+        # counting it as a refutation would penalise exactly the
+        # behaviour the skill asks for.
+        st = _state(rounds=[{"n": 1, "comment_actions": [
+            _fix("a.go", "every path drains"),
+            _fix("a.go"),
+            _fix("a.go"),
+        ]}])
+        self.assertEqual(v.refuted_class_claims(st), [])
+
+    def test_fix_without_an_invariant_makes_no_class_claim(self):
+        st = _state(rounds=[
+            {"n": 1, "comment_actions": [_fix("a.go")]},
+            {"n": 2, "comment_actions": [_fix("a.go")]},
+        ])
+        self.assertEqual(v.refuted_class_claims(st), [])
+
+    def test_two_invariants_on_one_file_are_separate_claims(self):
+        # Keying by path alone would hide the second refutation behind
+        # the first claim.
+        st = _state(rounds=[
+            {"n": 1, "comment_actions": [
+                _fix("a.go", "drains"), _fix("a.go", "fails closed"),
+            ]},
+            {"n": 2, "comment_actions": [_fix("a.go")]},
+        ])
+        self.assertEqual(
+            sorted(r["invariant"] for r in v.refuted_class_claims(st)),
+            ["drains", "fails closed"],
+        )
+
+    def test_a_claim_is_reported_once_not_every_later_round(self):
+        st = _state(rounds=[
+            {"n": 1, "comment_actions": [_fix("a.go", "drains")]},
+            {"n": 2, "comment_actions": [_fix("a.go")]},
+            {"n": 3, "comment_actions": [_fix("a.go")]},
+        ])
+        self.assertEqual(len(v.refuted_class_claims(st)), 1)
+
+    def test_surfaces_as_an_advisory_and_never_blocks(self):
+        st = _state(rounds=[
+            {"n": 1, "comment_actions": [_fix("a.go", "drains")]},
+            {"n": 2, "comment_actions": [_fix("a.go")]},
+        ])
+        out = v.compute_verdict(st)
+        codes = [a["code"] for a in out["advisories"]]
+        self.assertIn("class_claim_refuted", codes)
+        self.assertNotIn(
+            "class_claim_refuted", [b["code"] for b in out["blockers"]],
+            "made a blocker, the check would push the loop to stop "
+            "labelling invariants — losing the signal it runs on",
+        )
+        self.assertEqual(out["verdict"], "ready")
+
+
 class WritePersistsToStateTests(unittest.TestCase):
     """``--write`` must update the state file, not only the sidecar.
 
@@ -395,3 +561,30 @@ class Step5InvocationContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StatusVocabularySharingTests(unittest.TestCase):
+    """One definition of "this envelope carries a body", not two.
+
+    STATUSES_WITH_BODY says a future body-carrying status joins there and every
+    consumer follows. A parallel literal in verdict.py made that false the round
+    after it was written.
+    """
+
+    def test_live_statuses_derive_from_the_shared_constant(self):
+        import bramble_ops
+        self.assertEqual(
+            set(v._LIVE_STREAM_STATUSES), set(bramble_ops.STATUSES_WITH_BODY)
+        )
+
+    def test_a_new_body_carrying_status_propagates(self):
+        import bramble_ops
+        import importlib
+        orig = bramble_ops.STATUSES_WITH_BODY
+        try:
+            bramble_ops.STATUSES_WITH_BODY = ("ok", "partial", "truncated")
+            importlib.reload(v)
+            self.assertIn("truncated", v._LIVE_STREAM_STATUSES)
+        finally:
+            bramble_ops.STATUSES_WITH_BODY = orig
+            importlib.reload(v)

@@ -199,6 +199,14 @@ const (
 	// StatusError means bramble or the reviewer backend failed. review may
 	// still carry raw_text if any response was produced.
 	StatusError EnvelopeStatus = "error"
+	// StatusPartial means the run failed (Error is set) but nonetheless
+	// produced a well-formed, schema-valid review body — the shape of a
+	// reviewer that named real defects and THEN died, e.g. the idle timeout
+	// firing mid-stream. Both halves are load-bearing: the findings are
+	// genuine review work and must not be discarded, and the failure is still
+	// something the caller has to see. Consumers that only understand ok/error
+	// degrade safely, since "partial" is not "ok".
+	StatusPartial EnvelopeStatus = "partial"
 )
 
 // ResultEnvelope is the structured result written on every exit path. It goes
@@ -269,6 +277,14 @@ func BuildEnvelope(result *ReviewResult, backend BackendType, model, sessionID s
 	schemaErr := validateReviewBody(&env.Review, mode)
 
 	switch {
+	// A failed run that still parsed a schema-valid body is PARTIAL, not a
+	// total loss: the reviewer found things before it died. Checked ahead of
+	// the plain-error arm so an idle timeout mid-stream delivers its findings
+	// instead of discarding them. Measured on kernel#8682 r2, a review holding
+	// ~2M input tokens and real defects was thrown away because the last
+	// stretch of the stream was quiet.
+	case result.ErrorMessage != "" && parseErr == nil && schemaErr == nil:
+		env.Status = StatusPartial
 	case result.ErrorMessage != "":
 		env.Status = StatusError
 	case !result.Success:
