@@ -823,3 +823,26 @@ func TestBridgeStreamEvents_EveryFailurePathPreservesPartialWork(t *testing.T) {
 		}
 	})
 }
+
+// A partial result must report how long it actually ran. Token counts live on
+// the TurnComplete event that never arrives on this path, but elapsed time is
+// known — and "duration_ms: 0" on a review that ran for minutes before stalling
+// is the exact misreading this change exists to prevent.
+func TestBridgeStreamEvents_PartialResultCarriesElapsedTime(t *testing.T) {
+	withHeartbeat(t, 5*time.Millisecond)
+	ch := make(chan agentstream.Event)
+	done := make(chan struct{})
+	var res *bridgeResult
+	go func() {
+		res, _ = bridgeStreamEvents(context.Background(), ch, &recordingHandler{}, "", 40*time.Millisecond)
+		close(done)
+	}()
+	ch <- testTextEvent{delta: `{"verdict":"accepted","summary":"s","issues":[]}`}
+	<-done
+	if res == nil {
+		t.Fatal("expected the partial result")
+	}
+	if res.durationMs <= 0 {
+		t.Errorf("durationMs = %d, want the elapsed time of the run", res.durationMs)
+	}
+}

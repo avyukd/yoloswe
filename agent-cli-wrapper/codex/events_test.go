@@ -352,12 +352,14 @@ func TestEventInterface(t *testing.T) {
 // that isn't reachable through the interface is invisible to that filter: the
 // event arrives unattributable, and a consumer treating arrival as proof of
 // life keeps a stalled thread alive on another thread's traffic. That was a real
-// regression (PR #314, found independently by two reviewers), and it returns the
-// moment someone adds a threaded event type without ScopeID. Reflection over the
-// struct field is deliberate — an enumerated list would go stale exactly when it
-// matters.
-func TestEveryThreadedCodexEventIsScoped(t *testing.T) {
-	events := []Event{
+// regression (PR #314, found independently by two reviewers).
+//
+// The ThreadID check is reflective, but the roster below is hand-written, so a
+// NEW event type is invisible here until someone adds it —
+// TestEventTypeRosterIsComplete pins the roster against the EventType constants
+// so that gap fails loudly instead of silently.
+func scopedRosterForTest() []Event {
+	return []Event{
 		ClientReadyEvent{},
 		ThreadStartedEvent{},
 		ThreadReadyEvent{},
@@ -374,7 +376,10 @@ func TestEveryThreadedCodexEventIsScoped(t *testing.T) {
 		CommandEndEvent{},
 		ReasoningDeltaEvent{},
 	}
-	for _, e := range events {
+}
+
+func TestEveryThreadedCodexEventIsScoped(t *testing.T) {
+	for _, e := range scopedRosterForTest() {
 		v := reflect.ValueOf(e)
 		if _, hasField := v.Type().FieldByName("ThreadID"); !hasField {
 			continue
@@ -400,5 +405,21 @@ func TestScopeIDReportsTheOwningThread(t *testing.T) {
 		if got := e.ScopeID(); got != "t-1" {
 			t.Errorf("%T.ScopeID() = %q, want t-1", e, got)
 		}
+	}
+}
+
+// The roster in TestEveryThreadedCodexEventIsScoped is hand-written, which is
+// the one thing reflection cannot cover: an event type nobody listed is an
+// event type nobody checks. Pin its size against the EventType constants so
+// adding a type without adding it to the roster fails here rather than silently
+// widening the multiplex hole.
+func TestEventTypeRosterIsComplete(t *testing.T) {
+	// EventTypeReasoningDelta is the last constant in the iota block; the count
+	// is therefore its value + 1.
+	const declared = int(EventTypeReasoningDelta) + 1
+	if got := len(scopedRosterForTest()); got != declared {
+		t.Errorf("roster has %d event types but %d EventType constants are declared; "+
+			"a new event type must be added to the roster or it is never checked "+
+			"for ScopeID", got, declared)
 	}
 }

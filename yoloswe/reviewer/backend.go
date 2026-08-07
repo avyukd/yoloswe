@@ -222,7 +222,15 @@ func bridgeStreamEvents[E any](
 			// non-nil empty result would make BuildEnvelope try to parse "".
 			return nil, err
 		}
-		return &bridgeResult{responseText: text}, err
+		// Carry elapsed time. Token counts are only on the TurnComplete event,
+		// which by definition never arrived here, so they stay zero — but the
+		// wall time is known, and reporting 0ms for a review that ran twelve
+		// minutes before stalling is the misreading this whole change exists to
+		// stop. A partial envelope should say how long it got.
+		return &bridgeResult{
+			responseText: text,
+			durationMs:   time.Since(start).Milliseconds(),
+		}, err
 	}
 
 	// applyEvent processes one received event. done reports a terminal result

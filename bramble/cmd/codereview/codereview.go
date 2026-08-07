@@ -365,13 +365,6 @@ func effectiveResumeStatus(r *reviewer.Reviewer, requestedResumeSessionID string
 	return ""
 }
 
-// emitVerdictLine prints a single human-readable summary to stdout so the
-// Monitor tool can surface the outcome to Claude before the envelope file is
-// flushed. When --resume-session-id was set, the line ends with a
-// [resume=ok|fallback|unverified] suffix so callers streaming stdout can see
-// resume health without parsing the envelope. Both the success path
-// ("verdict: ...") and the bramble-level failure path ("error: ...") share
-// this so resume signal isn't lost on early errors.
 // failedReviewResult builds the ReviewResult for a failed review, keeping
 // whatever the reviewer managed to produce. A run that streamed a schema-valid
 // body before dying — the shape of an idle timeout firing after real findings —
@@ -389,6 +382,14 @@ func failedReviewResult(result *reviewer.ReviewResult, err error, resume reviewe
 	return failed
 }
 
+// emitVerdictLine prints a single human-readable summary to stdout so the
+// Monitor tool can surface the outcome to Claude before the envelope file is
+// flushed. When --resume-session-id was set, the line ends with a
+// [resume=ok|fallback|unverified] suffix so callers streaming stdout can see
+// resume health without parsing the envelope. All three outcomes share this so
+// resume signal isn't lost on early errors: success ("verdict: ..."), a run
+// that produced findings and then failed ("partial: ..."), and a bramble-level
+// failure ("error: ...").
 func emitVerdictLine(env reviewer.ResultEnvelope) {
 	resumeSuffix := ""
 	if env.ResumeStatus != "" {
