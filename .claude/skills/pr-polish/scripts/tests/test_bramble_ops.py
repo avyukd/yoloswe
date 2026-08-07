@@ -194,7 +194,7 @@ class TestGoalForRound(unittest.TestCase):
         }
         goal = bramble_ops.goal_for_round(4, "PR_SUMMARY", state)
         self.assertIn("do not re-raise these", goal)
-        self.assertIn("a.go:5 wont_fix (deferred, not fixed): not in this PR's diff", goal)
+        self.assertIn("a.go:5 wont_fix: not in this PR's diff", goal)
         self.assertIn("b.go:7 false_positive: caller already validates", goal)
 
     def test_later_fix_supersedes_an_earlier_decline(self) -> None:
@@ -225,6 +225,40 @@ class TestGoalForRound(unittest.TestCase):
         }
         goal = bramble_ops.goal_for_round(2, "PR_SUMMARY", state)
         self.assertNotIn("do not re-raise these", goal)
+
+    def test_reasonless_decline_is_not_frozen(self) -> None:
+        # A decline with no recorded reason is a protocol violation, and
+        # freezing it would suppress the finding for every remaining round on
+        # no stated grounds. It stays in the per-turn briefing as still-open
+        # work, so the next reviewer may raise it again.
+        state = {
+            "rounds": [
+                {"n": 1, "comment_actions": [
+                    {"action": "wont_fix", "path": "a.go", "line": 5, "topic": "unused param"},
+                    {"action": "false_positive", "path": "b.go", "line": 7},
+                ]},
+            ]
+        }
+        goal = bramble_ops.goal_for_round(2, "PR_SUMMARY", state)
+        self.assertNotIn("do not re-raise these", goal)
+        # Still visible for the one round, and marked as open.
+        self.assertIn("a.go:5 wont_fix (deferred, not fixed): unused param", goal)
+        self.assertIn("b.go:7 false_positive", goal)
+
+    def test_frozen_declines_drop_the_deferred_gloss(self) -> None:
+        # Inside a block headed "do not re-raise these", "(deferred, not
+        # fixed)" reads as a contradiction — it invites the reviewer to treat
+        # a closed decision as open work.
+        state = {
+            "rounds": [
+                {"n": 1, "comment_actions": [
+                    {"action": "wont_fix", "path": "a.go", "line": 5, "reason": "out of scope"},
+                ]},
+            ]
+        }
+        goal = bramble_ops.goal_for_round(2, "PR_SUMMARY", state)
+        self.assertIn("a.go:5 wont_fix: out of scope", goal)
+        self.assertNotIn("deferred, not fixed", goal)
 
     def test_frozen_declines_deduped_by_address(self) -> None:
         # The same finding declined in three rounds is one line, carrying the

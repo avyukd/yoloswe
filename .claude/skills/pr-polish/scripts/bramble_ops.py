@@ -232,8 +232,13 @@ def action_history_goal(
             label = _action_label(action)
             if label:
                 fixed.append(label)
-        elif verb in _HISTORY_SKIP_VERBS:
-            # _HISTORY_SKIP_VERBS excludes ``stale``: stale entries are bot
+        elif verb in _GOAL_SKIP_VERBS and not _is_frozen_decline(action):
+            # A settled decline that recorded its reason belongs to the
+            # cumulative block instead (``_frozen_declines_note``); one that
+            # did NOT is still open as far as anyone can tell, so it stays
+            # here and gets the deferral gloss.
+            #
+            # _GOAL_SKIP_VERBS excludes ``stale``: stale entries are bot
             # comments anchored to superseded code the resumed model doesn't
             # see in its worktree snapshot, so surfacing them adds bot-comment
             # body without changing model behavior. The orchestrator still
@@ -333,19 +338,46 @@ def _action_label(action: dict[str, Any]) -> str:
     return base
 
 
-# Verbs that settle a finding: a decision was made and recorded with a
-# reason, so the item is closed for the rest of the run (SKILL.md Step 3.g
-# treats either, with a rationale, as a resolution). They leave the per-turn
-# briefing for their own cumulative block — see ``_frozen_declines_note``.
+# Verbs that CAN settle a finding: closed for the rest of the run, so the
+# item leaves the per-turn briefing for the cumulative block. Whether a given
+# action actually settles depends on it carrying a reason — SKILL.md Step 3.g
+# treats either verb *with a rationale* as a resolution, and the rationale is
+# what makes it one. See ``_is_frozen_decline``.
 _SETTLED_VERBS = frozenset({"wont_fix", "false_positive"})
 
-# Skip verbs that reach the per-turn "Skipped:" briefing: every skip verb
-# except ``stale``, whose cited code isn't in the resumed model's worktree
-# snapshot (see the comment in action_history_goal), and the settled verbs,
-# which the cumulative block carries instead. What remains is the deferrals —
-# items still open in the code. Derived from the shared SKIPPED_ACTIONS so a
-# new skip verb propagates here automatically.
-_HISTORY_SKIP_VERBS = SKIPPED_ACTIONS - {"stale"} - _SETTLED_VERBS
+# Skip verbs that reach the goal channel at all: every skip verb except
+# ``stale``, whose cited code isn't in the resumed model's worktree snapshot
+# (see the comment in action_history_goal). Derived from the shared
+# SKIPPED_ACTIONS so a new skip verb propagates here automatically. Which of
+# the two blocks a given action lands in is ``_is_frozen_decline``, not the
+# verb alone.
+_GOAL_SKIP_VERBS = SKIPPED_ACTIONS - {"stale"}
+
+
+def _decline_rationale(action: dict[str, Any]) -> str:
+    """The reason recorded for a decline, or "" when none was.
+
+    Deliberately reads ``reason`` only, never falling back to ``topic`` the
+    way ``_skipped_label`` does: the topic is the *finding's* description,
+    restated from the reviewer, while the reason is the orchestrator's
+    decision. Freezing on a topic would tell the next reviewer not to
+    re-raise "unused param" without ever saying why it was declined.
+    """
+    return (action.get("reason") or "").strip()
+
+
+def _is_frozen_decline(action: dict[str, Any]) -> bool:
+    """True when an action is a settled decline that recorded its rationale.
+
+    Only these reach the cumulative block. A decline with no reason is a
+    protocol violation (SKILL.md: "record it as ``wont_fix`` with the
+    reason") and must NOT be frozen — freezing suppresses the finding for
+    every remaining round of the run, so a reasonless decline would bury it
+    permanently on no stated grounds. Those fall through to the per-turn
+    briefing instead, where they surface for one round as still-open work
+    and the next reviewer is free to raise them again.
+    """
+    return action.get("action") in _SETTLED_VERBS and bool(_decline_rationale(action))
 
 # Deferral-class verbs mean "the author has NOT fixed this" — the finding is
 # still open in the code. We annotate them in the goal text so a resumed
@@ -356,7 +388,7 @@ _HISTORY_SKIP_VERBS = SKIPPED_ACTIONS - {"stale"} - _SETTLED_VERBS
 _DEFERRED_VERBS = SKIPPED_ACTIONS - {"stale", "false_positive"}
 
 
-def _skipped_label(action: dict[str, Any], verb: str) -> str:
+def _skipped_label(action: dict[str, Any], verb: str, *, settled: bool = False) -> str:
     """Format a skipped action: ``<address> verb: <description>``.
 
     Reason takes precedence over topic when both are present — the
@@ -370,11 +402,18 @@ def _skipped_label(action: dict[str, Any], verb: str) -> str:
     fixed)`` gloss so the resumed reviewer reads them as still-open rather
     than resolved — this is the orchestrator-side half of the "acknowledged
     is not resolved" rule (the reviewer prompt carries the other half).
+
+    ``settled`` suppresses that gloss: in the cumulative declines block the
+    heading already says the item was decided, so "(deferred, not fixed)"
+    reads as a contradiction — it invites the reviewer to treat a closed
+    decision as open work, which is the one thing that block exists to stop.
+    The gloss stays for the per-turn briefing, where the item really is open.
     """
     base = _action_address(action)
     if not base:
         return ""
-    label_verb = f"{verb} (deferred, not fixed)" if verb in _DEFERRED_VERBS else verb
+    glossed = verb in _DEFERRED_VERBS and not settled
+    label_verb = f"{verb} (deferred, not fixed)" if glossed else verb
     description = (action.get("reason") or action.get("topic") or "").strip()
     if description:
         return f"{base} {label_verb}: {_truncate(description)}"
@@ -394,8 +433,10 @@ def _frozen_declines_note(state: dict[str, Any] | None, round_: int) -> str:
     settled items stopped the round this block was introduced, and none of
     the five frozen items returned across the six rounds after.
 
-    Each entry keeps the reason (``_skipped_label``) — the reason is the
-    whole point, since a bare "declined" invites the reviewer to re-argue.
+    Only declines that recorded a reason are frozen (``_is_frozen_decline``);
+    the reason is the whole point, since a bare "declined" invites the
+    reviewer to re-argue — and freezing a reasonless one would bury the
+    finding for the rest of the run on no stated grounds.
 
     A later ``fixed`` on the same address supersedes the decline: the
     orchestrator changed its mind, so the item is no longer settled.
@@ -412,12 +453,11 @@ def _frozen_declines_note(state: dict[str, Any] | None, round_: int) -> str:
             address = _action_address(action)
             if not address:
                 continue
-            verb = action.get("action")
-            if verb in _SETTLED_VERBS:
-                label = _skipped_label(action, verb)
+            if _is_frozen_decline(action):
+                label = _skipped_label(action, action["action"], settled=True)
                 if label:
                     settled[address] = label
-            elif verb == "fixed":
+            elif action.get("action") == "fixed":
                 settled.pop(address, None)
     if not settled:
         return ""
