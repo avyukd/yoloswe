@@ -712,3 +712,36 @@ func TestClaudeUsageTokens_IncludesCacheTokens(t *testing.T) {
 		t.Errorf("output = %d, want 42", out)
 	}
 }
+
+// The backend must carry streamed text into the ReviewResult when the bridge
+// fails, not just when it succeeds — that is what turns an idle-timeout kill
+// into status="partial" instead of a discarded review. Unit-testing
+// reviewPartialResult alone leaves the call site free to regress: swapping it
+// back to reviewErrorResult keeps every other test green.
+func TestClaudeBackend_PartialTextSurvivesABridgeFailure(t *testing.T) {
+	// A schema-valid body: `rejected` requires at least one issue, and a code
+	// -mode issue requires file+line+severity+message.
+	const body = `{"verdict":"rejected","summary":"s","issues":[` +
+		`{"severity":"high","file":"a.go","line":1,"message":"boom"}]}`
+	// A stream that says something real and then dies without TurnComplete.
+	calls := stubClaudeQueryStream(t, claudeAttempt{events: []claude.Event{
+		claude.ReadyEvent{Info: claude.SessionInfo{SessionID: "s1", Model: "opus"}},
+		claude.TextEvent{Text: body},
+	}})
+	_ = calls
+
+	b := newClaudeBackend(Config{BackendType: BackendClaude})
+	result, err := b.RunPrompt(context.Background(), "review", nil)
+	if err == nil {
+		t.Fatal("a stream ending without TurnComplete must still be an error")
+	}
+	if result == nil || result.ResponseText != body {
+		t.Fatalf("the backend dropped the streamed body on the failure path: %+v", result)
+	}
+	// And the envelope built from it must be partial, not error — the whole
+	// point of preserving the text.
+	env := BuildEnvelope(result, BackendClaude, "opus", "s1", "")
+	if env.Status != StatusPartial {
+		t.Errorf("envelope status = %s, want partial", env.Status)
+	}
+}

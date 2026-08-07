@@ -309,19 +309,8 @@ func runCodeReview(cmd *cobra.Command, args []string) (retErr error) {
 		// r.resumeStatus was repopulated still surfaces Unverified
 		// when resume was requested — same fallback the deferred
 		// guard applies on the panic/silent-exit path.
-		// Keep whatever the reviewer managed to produce. A failed run that
-		// still emitted a schema-valid body (the shape of an idle timeout
-		// firing after real findings) becomes status="partial" in
-		// BuildEnvelope rather than discarding the work — synthesizing a
-		// bare ErrorMessage here threw away everything the reviewer had
-		// said. `result` is nil on most error paths, so fall back to the
-		// synthesized shape when there is genuinely nothing to keep.
-		failed := result
-		if failed == nil {
-			failed = &reviewer.ReviewResult{}
-		}
-		failed.ErrorMessage = err.Error()
-		failed.ResumeStatus = effectiveResumeStatus(activeReviewer, resumeSessionID)
+		failed := failedReviewResult(result, err,
+			effectiveResumeStatus(activeReviewer, resumeSessionID))
 		env := reviewer.BuildEnvelope(failed,
 			reviewer.BackendType(backend), r.EffectiveModel(), r.LastSessionID(), mode)
 		emitVerdictLine(env)
@@ -383,6 +372,23 @@ func effectiveResumeStatus(r *reviewer.Reviewer, requestedResumeSessionID string
 // resume health without parsing the envelope. Both the success path
 // ("verdict: ...") and the bramble-level failure path ("error: ...") share
 // this so resume signal isn't lost on early errors.
+// failedReviewResult builds the ReviewResult for a failed review, keeping
+// whatever the reviewer managed to produce. A run that streamed a schema-valid
+// body before dying — the shape of an idle timeout firing after real findings —
+// becomes status="partial" in BuildEnvelope instead of a discarded review;
+// synthesizing a bare ErrorMessage here threw away everything it had said.
+// result is nil on most error paths, so fall back to an empty shape when there
+// is genuinely nothing to keep.
+func failedReviewResult(result *reviewer.ReviewResult, err error, resume reviewer.ResumeStatus) *reviewer.ReviewResult {
+	failed := result
+	if failed == nil {
+		failed = &reviewer.ReviewResult{}
+	}
+	failed.ErrorMessage = err.Error()
+	failed.ResumeStatus = resume
+	return failed
+}
+
 func emitVerdictLine(env reviewer.ResultEnvelope) {
 	resumeSuffix := ""
 	if env.ResumeStatus != "" {

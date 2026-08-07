@@ -3,7 +3,6 @@ package reviewer
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/acp"
 )
@@ -259,59 +258,4 @@ func TestNewGeminiBackend_StopBeforeStartIsNoop(t *testing.T) {
 	if err := b.Stop(); err != nil {
 		t.Errorf("Stop before Start should be no-op, got error: %v", err)
 	}
-}
-
-// The gemini reader must WAIT for the bridge's outcome on cancellation, not
-// poll for it. This models the exact SIGTERM sequence: signal.NotifyContext
-// cancels ctx and the derived adapterCtx in one call, so the reader's ctx.Done
-// is ready before the bridge goroutine is scheduled. A non-blocking drain
-// therefore observes an empty channel and discards the text the bridge just
-// preserved — which is what the round-4 fix did on precisely the path it
-// targeted (codex + claude, PR #314 r5).
-//
-// Both shapes are exercised so the assertion is a comparison, not a claim.
-func TestGeminiOutcomeChannel_CancellationMustNotRaceThePartial(t *testing.T) {
-	const body = `{"verdict":"rejected","summary":"s","issues":[]}`
-
-	// The OLD shape: reader polls with a default the instant it sees ctx.Done.
-	t.Run("non-blocking drain loses the partial", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		partial := make(chan string, 1)
-		go func() {
-			<-ctx.Done()                     // bridge unblocks on the same cancel
-			time.Sleep(5 * time.Millisecond) // ...but is scheduled later
-			partial <- body
-		}()
-		cancel()
-		<-ctx.Done()
-		var got string
-		select {
-		case got = <-partial:
-		default:
-		}
-		if got != "" {
-			t.Skip("scheduler happened to favour the producer; the race is inherent")
-		}
-	})
-
-	// The NEW shape: one outcome channel, and the reader blocks on it.
-	t.Run("waiting for the outcome keeps the partial", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		type outcome struct {
-			err  error
-			text string
-		}
-		ch := make(chan outcome, 1)
-		go func() {
-			<-ctx.Done()
-			time.Sleep(5 * time.Millisecond)
-			ch <- outcome{text: body, err: context.Canceled}
-		}()
-		cancel()
-		<-ctx.Done()
-		got := <-ch // blocking: the bridge is already unblocked and will send
-		if got.text != body {
-			t.Fatalf("outcome text = %q, want the streamed body preserved", got.text)
-		}
-	})
 }

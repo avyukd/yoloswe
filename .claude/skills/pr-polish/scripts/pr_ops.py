@@ -1321,6 +1321,11 @@ def state_finalize_round(
         raise RuntimeError(f"round {n} not found in state")
     existing = entry.get("comment_actions") or []
     merged = _merge_actions(existing, actions)
+    # Validate BEFORE any side effect. _post_inline_replies POSTs to GitHub and
+    # cannot be undone; a check that runs after it would leave replies on the PR
+    # with nothing persisted, and the retry would post them again. Every
+    # precondition that can abort this round belongs above this line.
+    _reject_orphan_envelopes(state_dir, n, envelope_overrides or {})
     if auto_reply and pr_number is not None:
         _post_inline_replies(merged, pr_number, head_after)
     entry["comment_actions"] = merged
@@ -1536,8 +1541,8 @@ def _persist_round_findings(
     # pr_ops and bramble_ops.
     import bramble_ops  # noqa: PLC0415
 
-    _reject_orphan_envelopes(state_dir, n, envelope_overrides)
-
+    # NOTE: _reject_orphan_envelopes runs in state_finalize_round BEFORE any
+    # side effect (GitHub replies), not here — see the comment at that call.
     reviews_dir = state_dir / "reviews"
     # Re-finalizing a round with a different envelope set must not leave
     # stale per-backend data behind. Drop any prior `<backend>_findings`,
@@ -1578,7 +1583,15 @@ def _persist_round_findings(
             pass
     for backend in bramble_ops.BACKENDS:
         src = envelope_overrides.get(backend)
-        if src is None or not src.exists():
+        if src is None:
+            # Never launched this round: no claim either way.
+            continue
+        if not src.exists():
+            # Launched and wrote nothing — the crashed/never-returned backend.
+            # This is the "absent" half of the live-reviewer rule, and skipping
+            # it silently is what let "nobody looked" keep reading as "nothing
+            # to find": with no key recorded, the gate had nothing to judge.
+            entry.setdefault("stream_status", {})[backend] = "absent"
             continue
         try:
             obj = read_json(src, default=None)
@@ -2052,8 +2065,16 @@ def finalize_and_report(
     # a deferred high must not read as resolved). We scan persisted
     # comment_actions rather than the current round's `actions` arg so a high
     # ack'd several rounds ago still blocks.
+    # "Nobody looked" must not read as "nothing to find" IN THE LOOP. verdict.py
+    # gates on this too, but only at exit — by then the batch has already
+    # pushed, so the in-loop hint has to carry the same rule or the recovery it
+    # exists to trigger never happens.
+    import verdict as _verdict  # noqa: PLC0415 — lazy: avoid a top-level cycle
+
+    no_live_reviewer = bool(_verdict.rounds_without_a_live_stream(state))
+
     deferred_high = _has_unresolved_high_deferral(rounds)
-    if deferred_high:
+    if deferred_high or no_live_reviewer:
         converged = None
         exit_reason_hint = None
     elif streak >= 2 and low_top:

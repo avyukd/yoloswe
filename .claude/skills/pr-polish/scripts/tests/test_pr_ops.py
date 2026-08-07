@@ -3298,6 +3298,38 @@ class StreamStatusPersistenceTests(unittest.TestCase):
             self.assertEqual(entry["stream_status"]["codex"], "ok")
             self.assertEqual(entry["stream_status"]["cursor"], "error")
 
+    def test_a_launched_backend_that_wrote_nothing_records_absent(self):
+        """The 'absent' half of the live-reviewer rule needs a recorded value.
+
+        A backend that was launched and crashed writes no envelope. Skipping it
+        left no key at all, so the gate had nothing to judge and "nobody
+        looked" kept reading as "nothing to find".
+        """
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            d = sd / "r1" / "a1"
+            d.mkdir(parents=True)
+            ok = d / "codex-envelope.json"
+            ok.write_text(json.dumps(_envelope(status="ok")))
+            entry: dict = {}
+            pr_ops._persist_round_findings(
+                sd, entry, None, "br", 1,
+                {"codex": ok, "cursor": d / "cursor-envelope.json"},
+            )
+            self.assertEqual(entry["stream_status"]["cursor"], "absent")
+            self.assertEqual(entry["stream_status"]["codex"], "ok")
+
+    def test_a_backend_never_launched_records_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            d = sd / "r1" / "a1"
+            d.mkdir(parents=True)
+            ok = d / "codex-envelope.json"
+            ok.write_text(json.dumps(_envelope(status="ok")))
+            entry: dict = {}
+            pr_ops._persist_round_findings(sd, entry, None, "br", 1, {"codex": ok})
+            self.assertNotIn("cursor", entry.get("stream_status", {}))
+
     def test_refinalize_drops_stale_status_for_omitted_backends(self):
         with tempfile.TemporaryDirectory() as td:
             sd = Path(td)

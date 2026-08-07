@@ -1510,3 +1510,36 @@ func TestDiffScopeReachesPrompt(t *testing.T) {
 		t.Errorf("diff scope did not reach the prompt:\n%s", got)
 	}
 }
+
+// The connecting hunk of the partial chain: bridgeStreamEvents preserves the
+// text, BuildEnvelope turns it into status="partial" — and this is the code in
+// between, which used to synthesize a bare ErrorMessage and throw the text away.
+// Tested at both ends but not in the middle until now.
+func TestFailedReviewResult_KeepsWhatTheReviewerProduced(t *testing.T) {
+	const body = `{"verdict":"rejected","summary":"s","issues":[` +
+		`{"severity":"high","file":"a.go","line":1,"message":"boom"}]}`
+	streamed := &reviewer.ReviewResult{ResponseText: body}
+	got := failedReviewResult(streamed, errors.New("review idle: no events for 8m0s"),
+		reviewer.ResumeStatusOK)
+	if got.ResponseText != body {
+		t.Fatalf("ResponseText = %q, want the streamed body preserved", got.ResponseText)
+	}
+	env := reviewer.BuildEnvelope(got, reviewer.BackendCodex, "m", "s1", "")
+	if env.Status != reviewer.StatusPartial {
+		t.Errorf("envelope status = %s, want partial", env.Status)
+	}
+	if len(env.Review.Issues) != 1 {
+		t.Errorf("issues = %d, want the finding preserved", len(env.Review.Issues))
+	}
+}
+
+func TestFailedReviewResult_NilResultStillYieldsAnErrorEnvelope(t *testing.T) {
+	got := failedReviewResult(nil, errors.New("backend unreachable"), reviewer.ResumeStatusUnverified)
+	if got == nil || got.ErrorMessage != "backend unreachable" {
+		t.Fatalf("nil result must degrade to a reportable error shape, got %+v", got)
+	}
+	env := reviewer.BuildEnvelope(got, reviewer.BackendCodex, "m", "", "")
+	if env.Status != reviewer.StatusError {
+		t.Errorf("nothing was produced, so status = %s, want error", env.Status)
+	}
+}
