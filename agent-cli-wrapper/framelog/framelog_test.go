@@ -136,11 +136,53 @@ func TestRender_BoundsBeforeRedacting(t *testing.T) {
 	assert.LessOrEqual(t, len(got), MaxLen+len("...[truncated]"))
 	assert.Contains(t, got, "truncated")
 
-	// Bounding must not cost more than the bound: allocation is proportional to
-	// MaxLen, not to the input. A full-frame scan would show up as a large
-	// allocation here.
-	allocs := testing.AllocsPerRun(10, func() { _, _ = Render(huge) })
-	assert.Less(t, allocs, 50.0, "rendering must not allocate per input byte")
+	// Assert on BYTES allocated, not allocation COUNT: a redact-first
+	// implementation allocates one big builder, which a count threshold waves
+	// through. The bound must hold in bytes.
+	assertBoundedAlloc(t, "Render", func() { _, _ = Render(huge) })
+}
+
+// assertBoundedAlloc fails if fn allocates on the order of its input rather
+// than on the order of MaxLen. Uses AllocedBytesPerOp because the regression
+// being guarded is one large allocation, which an allocation COUNT cannot see.
+func assertBoundedAlloc(t *testing.T, name string, fn func()) {
+	t.Helper()
+	res := testing.Benchmark(func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			fn()
+		}
+	})
+	const budget = 16 * MaxLen // generous headroom; still orders below a 4MB frame
+	assert.Less(t, int(res.AllocedBytesPerOp()), budget,
+		"%s must allocate on the order of MaxLen, not of the input frame (got %d bytes/op)",
+		name, res.AllocedBytesPerOp())
+}
+
+// The SDK hot paths all enter through RenderBytes, so the bound must hold
+// there. Converting []byte->string before bounding copied the whole frame:
+// measured 4.2MB/op through RenderBytes against 2KB/op through Render, which
+// meant round 3's fix reached only the reviewer's cold path.
+func TestRenderBytes_BoundsBeforeConverting(t *testing.T) {
+	huge := []byte(`{"type":"result","blob":"` + strings.Repeat("x", 4*1024*1024) + `"}`)
+
+	got, n := RenderBytes(huge)
+	assert.Equal(t, len(huge), n, "the true frame length must still be reported")
+	assert.LessOrEqual(t, len(got), MaxLen+len("...[truncated]"))
+	assert.Contains(t, got, "truncated")
+	assert.Contains(t, got, `"type":"result"`, "the discriminator must survive bounding")
+
+	assertBoundedAlloc(t, "RenderBytes", func() { _, _ = RenderBytes(huge) })
+}
+
+// A short frame through RenderBytes is unchanged and reports no truncation.
+func TestRenderBytes_ShortFrameUnchanged(t *testing.T) {
+	line := []byte(`{"type":"result","x":"secret"}`)
+	got, n := RenderBytes(line)
+	assert.Equal(t, len(line), n)
+	assert.Contains(t, got, `"type":"result"`)
+	assert.NotContains(t, got, "secret")
+	assert.NotContains(t, got, "truncated")
 }
 
 // A cut mid-token is safe: it lands in the unterminated-string branch and is
