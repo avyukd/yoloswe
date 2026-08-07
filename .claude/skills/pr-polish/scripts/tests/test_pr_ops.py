@@ -3271,6 +3271,55 @@ class OrphanEnvelopeGuardTests(unittest.TestCase):
             pr_ops._reject_orphan_envelopes(Path(td), 1, {})
 
 
+class LowOnlyStreakLivenessTests(unittest.TestCase):
+    """A dead round must not advance the low-only streak.
+
+    top_severity is None for a round no reviewer returned, and None ranks
+    below "low" — so a dead round used to INCREMENT. That is the same
+    "nobody looked" == "nothing to find" conflation, at the writer instead
+    of the reader. Downstream it is unsuppressed: the streak feeds
+    convergence-pressure text into the next round's reviewer goal, telling a
+    healthy reviewer its dead peers found the diff clean.
+    """
+
+    def test_a_dead_round_holds_the_streak(self):
+        prior = [{"n": 1, "low_only_streak": 1, "top_severity": "low"}]
+        got = pr_ops._compute_low_only_streak(prior, None, had_live_reviewer=False)
+        self.assertEqual(got, 1, "a dead round must neither advance nor reset")
+
+    def test_a_dead_round_used_to_increment(self):
+        # The un-fixed behaviour, pinned so the regression is legible.
+        prior = [{"n": 1, "low_only_streak": 1, "top_severity": "low"}]
+        self.assertEqual(pr_ops._compute_low_only_streak(prior, None), 2)
+
+    def test_a_live_low_round_still_advances(self):
+        prior = [{"n": 1, "low_only_streak": 1, "top_severity": "low"}]
+        self.assertEqual(
+            pr_ops._compute_low_only_streak(prior, "low", had_live_reviewer=True), 2
+        )
+
+    def test_a_live_high_round_still_resets(self):
+        prior = [{"n": 1, "low_only_streak": 2, "top_severity": "low"}]
+        self.assertEqual(
+            pr_ops._compute_low_only_streak(prior, "high", had_live_reviewer=True), 0
+        )
+
+    def test_liveness_is_read_from_stream_status(self):
+        self.assertTrue(pr_ops._round_had_live_reviewer({"stream_status": {"codex": "ok"}}))
+        self.assertTrue(pr_ops._round_had_live_reviewer({"stream_status": {"codex": "partial"}}))
+        self.assertFalse(
+            pr_ops._round_had_live_reviewer(
+                {"stream_status": {"codex": "error", "cursor": "absent", "lint": "ok"}}
+            )
+        )
+        # Statuses beyond the four named ones must read as not-live.
+        self.assertFalse(
+            pr_ops._round_had_live_reviewer({"stream_status": {"codex": "exited-empty"}})
+        )
+        # No data is not "nobody looked".
+        self.assertTrue(pr_ops._round_had_live_reviewer({}))
+
+
 class StreamStatusPersistenceTests(unittest.TestCase):
     """`<backend>_findings: []` cannot distinguish "clean" from "never ran".
 

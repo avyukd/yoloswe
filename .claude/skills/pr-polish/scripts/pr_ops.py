@@ -1253,8 +1253,34 @@ def _backfill_low_only_streak(prior_rounds: list[dict[str, Any]]) -> int:
     return streak
 
 
+def _round_had_live_reviewer(entry: dict[str, Any]) -> bool:
+    """True when at least one MODEL reviewer returned a verdict this round.
+
+    Delegates the live/non-live vocabulary to verdict.py rather than restating
+    it: statuses beyond ok/partial/error/absent exist (``exited-empty``,
+    ``missing``, ``unknown``) and a second copy of the rule would drift.
+    A round with no ``stream_status`` at all is treated as live — "no data" is
+    not "nobody looked", matching ``rounds_without_a_live_stream``.
+    """
+    import verdict as _verdict  # noqa: PLC0415 — lazy: avoid a top-level cycle
+
+    statuses = entry.get("stream_status")
+    if not isinstance(statuses, dict) or not statuses:
+        return True
+    reviewers = {
+        k: v for k, v in statuses.items()
+        if k not in _verdict._NON_REVIEWER_STREAMS
+    }
+    if not reviewers:
+        return True
+    return any(v in _verdict._LIVE_STREAM_STATUSES for v in reviewers.values())
+
+
 def _compute_low_only_streak(
-    prior_rounds: list[dict[str, Any]], this_top_severity: str | None
+    prior_rounds: list[dict[str, Any]],
+    this_top_severity: str | None,
+    *,
+    had_live_reviewer: bool = True,
 ) -> int:
     """Increment the prior round's streak when this round's top severity is
     low/nit/None (zero findings counts as low-only); reset to 0 otherwise.
@@ -1275,6 +1301,27 @@ def _compute_low_only_streak(
     it to inject reviewer-pressure text. Any caller can derive its own
     threshold from the same field.
     """
+    # A round no live reviewer returned in HOLDS the streak — it neither
+    # advances nor resets it. Its `top_severity` is None, which ranks below
+    # "low", so a dead round used to *increment*: the same "nobody looked"
+    # reading as "nothing to find" this field's consumers were fixed for, one
+    # call upstream at the writer. Holding beats resetting because the round
+    # produced no evidence in either direction.
+    #
+    # This matters most downstream, where nothing suppresses it: the streak
+    # feeds convergence-pressure text into the NEXT round's reviewer goal
+    # ("the last N rounds returned only low-severity findings ... returning
+    # zero findings is the right call"). Inflated by dead rounds, that tells a
+    # healthy reviewer its dead peers found the diff clean — biasing the one
+    # surviving reviewer toward silence, which is the failure this loop exists
+    # to prevent.
+    if not had_live_reviewer:
+        prev = max(prior_rounds, key=lambda r: r.get("n") or 0, default=None)
+        if prev is None:
+            return 0
+        held = prev.get("low_only_streak")
+        return held if isinstance(held, int) else _backfill_low_only_streak(prior_rounds)
+
     is_low_only = severity_rank(this_top_severity) <= severity_rank("low")
     if not is_low_only:
         return 0
@@ -1335,8 +1382,16 @@ def state_finalize_round(
     # it must be computed from rounds prior to this one (`r.n < n`) plus
     # the freshly recomputed ``top_severity`` for this round.
     prior_rounds = [r for r in rounds if (r.get("n") or 0) < n]
-    entry["low_only_streak"] = _compute_low_only_streak(prior_rounds, entry.get("top_severity"))
+    # Stream health must be known BEFORE the streak is computed, so persist
+    # this round's findings/stream_status first. Ordering is load-bearing:
+    # computing the streak from a not-yet-populated entry would read every
+    # round as dead.
     _persist_round_findings(state_dir, entry, pr_number, branch, n, envelope_overrides or {})
+    entry["low_only_streak"] = _compute_low_only_streak(
+        prior_rounds,
+        entry.get("top_severity"),
+        had_live_reviewer=_round_had_live_reviewer(entry),
+    )
     atomic_write_json(path, state)
     return state
 
