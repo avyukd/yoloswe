@@ -91,6 +91,30 @@ holds at 95.5% on 777, across a corpus 25× larger. Widening scope cannot fix a 
 file already in scope — this is a depth problem, and it is the most robustly supported
 claim in this document.
 
+### Open experiment: a coverage ledger at the orchestrator layer (2026-08-07)
+
+The 95.5% finding says the loss is depth on files already in scope. Every rule in
+`/pr-polish` Step 3.c operates on findings that *exist*, and an escape by definition
+was never a finding — so triage cannot move this metric except second-order. The
+untested hypothesis is to move `coverage-ledger`'s per-file-conclusion obligation out
+of the reviewer prompt and into the orchestrator, as a round-level artifact: which
+changed hunks did no finding touch, recorded in the actions file, with convergence
+gated on it.
+
+**Why it is not shipped.** `coverage-ledger`'s measured advantage inverted once
+`--diff-base` landed (0.20 → 0.10 while the baseline went 0.10 → 0.20), and the
+reading above is that the two were confounded — the ledger was compensating for a
+15×-too-large diff. `/pr-polish` now pins `--diff-base`, which is precisely the
+condition under which the ledger stopped paying. Promoting it here would be
+promoting on the pre-fix numbers this document says not to trust.
+
+**Pre-registration.** Before any implementation: `escape_rate.py --all`, quoting the
+**judged** rate and `escaped_in_scope`. After one measurement cycle, re-run. The
+revert rule applies unchanged — if `escaped_in_scope` does not move, revert rather
+than keep it for appearances. Note the baseline is not yet measurable: zero
+pr-polish runs had completed under `--diff-base` + `verdict.py` as of 2026-08-06, so
+the first task is a clean post-change baseline, not the experiment.
+
 ## Data boundary
 
 The dataset lives **outside the repository**, at `~/.bramble/code-review-eval/`:

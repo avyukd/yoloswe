@@ -404,6 +404,96 @@ class ReviewerStreamRosterTests(unittest.TestCase):
         self.assertEqual(v.reviewer_stream_health(st).get("claude"), 2)
 
 
+def _fix(path, invariant=None, **kw):
+    a = {"action": "fixed", "path": path, "severity": "medium"}
+    if invariant:
+        a["invariant"] = invariant
+    a.update(kw)
+    return a
+
+
+class RefutedClassClaimTests(unittest.TestCase):
+    """A class claim is refuted by a later round fixing the same file.
+
+    The point of the check is that the refuting evidence comes from a
+    *later round's* behaviour, so it cannot be satisfied by prose in the
+    claiming round — the failure mode that made ``sites_found`` useless.
+    """
+
+    def test_later_round_touching_the_file_refutes_the_claim(self):
+        st = _state(rounds=[
+            {"n": 1, "comment_actions": [_fix("a.go", "every path drains")]},
+            {"n": 2, "comment_actions": [_fix("a.go")]},
+        ])
+        rows = v.refuted_class_claims(st)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["round"], 1)
+        self.assertEqual(rows[0]["refuted_by_round"], 2)
+        self.assertEqual(rows[0]["invariant"], "every path drains")
+
+    def test_claim_that_holds_is_not_refuted(self):
+        st = _state(rounds=[
+            {"n": 1, "comment_actions": [_fix("a.go", "every path drains")]},
+            {"n": 2, "comment_actions": [_fix("b.go")]},
+        ])
+        self.assertEqual(v.refuted_class_claims(st), [])
+
+    def test_several_sites_in_the_claiming_round_do_not_self_refute(self):
+        # A class fixed at three sites in one round is the GOOD case —
+        # counting it as a refutation would penalise exactly the
+        # behaviour the skill asks for.
+        st = _state(rounds=[{"n": 1, "comment_actions": [
+            _fix("a.go", "every path drains"),
+            _fix("a.go"),
+            _fix("a.go"),
+        ]}])
+        self.assertEqual(v.refuted_class_claims(st), [])
+
+    def test_fix_without_an_invariant_makes_no_class_claim(self):
+        st = _state(rounds=[
+            {"n": 1, "comment_actions": [_fix("a.go")]},
+            {"n": 2, "comment_actions": [_fix("a.go")]},
+        ])
+        self.assertEqual(v.refuted_class_claims(st), [])
+
+    def test_two_invariants_on_one_file_are_separate_claims(self):
+        # Keying by path alone would hide the second refutation behind
+        # the first claim.
+        st = _state(rounds=[
+            {"n": 1, "comment_actions": [
+                _fix("a.go", "drains"), _fix("a.go", "fails closed"),
+            ]},
+            {"n": 2, "comment_actions": [_fix("a.go")]},
+        ])
+        self.assertEqual(
+            sorted(r["invariant"] for r in v.refuted_class_claims(st)),
+            ["drains", "fails closed"],
+        )
+
+    def test_a_claim_is_reported_once_not_every_later_round(self):
+        st = _state(rounds=[
+            {"n": 1, "comment_actions": [_fix("a.go", "drains")]},
+            {"n": 2, "comment_actions": [_fix("a.go")]},
+            {"n": 3, "comment_actions": [_fix("a.go")]},
+        ])
+        self.assertEqual(len(v.refuted_class_claims(st)), 1)
+
+    def test_surfaces_as_an_advisory_and_never_blocks(self):
+        st = _state(rounds=[
+            {"n": 1, "comment_actions": [_fix("a.go", "drains")]},
+            {"n": 2, "comment_actions": [_fix("a.go")]},
+        ])
+        out = v.compute_verdict(st)
+        codes = [a["code"] for a in out["advisories"]]
+        self.assertIn("class_claim_refuted", codes)
+        self.assertNotIn(
+            "class_claim_refuted", [b["code"] for b in out["blockers"]],
+            "made a blocker, the check would push the loop to stop "
+            "labelling invariants — losing the signal it runs on",
+        )
+        self.assertEqual(out["verdict"], "ready")
+
+
 class WritePersistsToStateTests(unittest.TestCase):
     """``--write`` must update the state file, not only the sidecar.
 

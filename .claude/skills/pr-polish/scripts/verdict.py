@@ -181,6 +181,55 @@ def _claim_matches(claim: str, touched: set[str]) -> bool:
     return False
 
 
+def refuted_class_claims(state: dict) -> list[dict]:
+    """Class-level fix claims that a later round contradicted.
+
+    A ``fixed`` action carrying an ``invariant`` claims more than "this
+    line is fixed" — it claims the *rule* now holds. The cheapest
+    falsifier costs nothing to collect and cannot be gamed by writing
+    prose: if a later round fixes the same file again, the claimed rule
+    did not cover its class. The refuting evidence is produced by a
+    subsequent round's own behaviour, not by the claiming round's
+    self-report, which is exactly what ``sites_found`` could never be.
+
+    Same design as :func:`verify_fix_claims`: a *necessary* condition,
+    not a sufficient one. A later fix in the same file may be an
+    unrelated defect, so this is an advisory — it says where to look,
+    never that the run failed. Measured across the 641 runs on disk,
+    173 of 726 invariant-bearing claims (23.8%) are refuted this way.
+
+    Claims are keyed ``(path, invariant)``, not by path alone: one file
+    can carry two distinct invariants, and collapsing them would hide a
+    refutation of the second behind a claim about the first.
+
+    Deliberately keyed on ``invariant`` rather than ``sites_found``:
+    the former is populated on ~1000 rows, the latter on ~20.
+    """
+    claims: dict[tuple[str, str], dict] = {}
+    out: list[dict] = []
+    for rnd in sorted(state.get("rounds") or [], key=lambda r: r.get("n") or 0):
+        n = rnd.get("n")
+        fixed_here = {
+            a["path"]
+            for a in rnd.get("comment_actions") or []
+            if a.get("action") == "fixed" and a.get("path")
+        }
+        # Refute against claims standing *before* this round, so a class
+        # fixed across several sites in one round never refutes itself.
+        for key, claim in list(claims.items()):
+            if claim["path"] in fixed_here:
+                out.append({**claim, "refuted_by_round": n})
+                del claims[key]
+        for a in rnd.get("comment_actions") or []:
+            if a.get("action") != "fixed" or not a.get("path") or not a.get("invariant"):
+                continue
+            claims.setdefault(
+                (a["path"], a["invariant"]),
+                {"round": n, "path": a["path"], "invariant": a["invariant"]},
+            )
+    return out
+
+
 def verify_fix_claims(state: dict, repo_root: Optional[Path]) -> dict:
     """Check each ``fixed`` claim against what the round actually changed.
 
@@ -363,6 +412,19 @@ def compute_verdict(state: dict, *, repo_root: Optional[Path] = None) -> dict:
             {
                 "code": "fix_claims_unchecked",
                 "detail": "no repo root supplied; fixed-claims not verified",
+            }
+        )
+
+    # A class claim a later round contradicted. Advisory by construction:
+    # making it a blocker would push the loop to stop labelling invariants,
+    # which would cost the signal that makes this check possible at all.
+    for row in refuted_class_claims(state):
+        advisories.append(
+            {
+                "code": "class_claim_refuted",
+                "detail": f"round {row['round']} claimed invariant "
+                f"'{row['invariant']}' at {row['path']}; round "
+                f"{row['refuted_by_round']} fixed that file again",
             }
         )
 
