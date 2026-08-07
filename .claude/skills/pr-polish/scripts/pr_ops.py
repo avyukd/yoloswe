@@ -1606,8 +1606,15 @@ def _persist_round_findings(
             # tell "reviewed and found nothing" from "never reviewed". A bare
             # `<backend>_findings: []` cannot: on #8682 it meant a DROPPED
             # envelope in r1 and a real backend error in r2/r3, and any metric
-            # reading the array length conflates the two. Convergence
-            # (Step 3.g) and escape_rate both key off this instead.
+            # reading the array length conflates the two.
+            #
+            # Consumers: verdict.py (`no_live_reviewer` blocker and the
+            # `silent_reviewer` advisory) and SKILL Step 3.g's convergence
+            # rule. NOT escape_rate.py — an earlier version of this comment
+            # named it, and a comment claiming a consumer that does not exist
+            # is what let this field sit write-only for two rounds. Wiring
+            # escape_rate to split escapes by stream status is worth doing;
+            # until it is, this list stays honest.
             entry.setdefault("stream_status", {})[backend] = (
                 obj.get("status") or "unknown"
             )
