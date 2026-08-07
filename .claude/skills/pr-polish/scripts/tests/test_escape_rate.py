@@ -120,6 +120,18 @@ class ComputeEscapeRateTests(unittest.TestCase):
             (ds / "kernel-1.json").write_text(json.dumps(record))
             return er.compute_escape_rate(sd, ds)
 
+    def test_emits_verdict_from_state(self):
+        # The aggregate split can only bucket on what this function emits.
+        rec = _record([_comment(created_at="2026-07-30T11:00:00Z")])
+        out = self._run(
+            _state(verdict={"verdict": "not_ready", "blockers": []}), rec
+        )
+        self.assertEqual(out["verdict"], "not_ready")
+
+    def test_verdict_is_none_when_state_has_no_verdict(self):
+        rec = _record([_comment(created_at="2026-07-30T11:00:00Z")])
+        self.assertIsNone(self._run(_state(), rec)["verdict"])
+
     def test_comment_before_completion_is_not_an_escape(self):
         # It was available as round input, so missing it is not an escape.
         rec = _record([_comment(created_at="2026-07-30T09:00:00Z")])
@@ -214,6 +226,37 @@ class AggregateTests(unittest.TestCase):
         self.assertEqual(agg["by_exit_reason"]["converged"]["escape_rate"], 0.25)
         self.assertEqual(
             agg["by_exit_reason"]["capped-at-max"]["escape_rate"], 0.75)
+
+    def test_by_verdict_splits_independently_of_exit_reason(self):
+        # Both runs exited `converged`; the verdict disagrees on one. Bucketing
+        # on exit_reason alone collapses them and hides that the not_ready run
+        # is the one leaking escapes — which is the whole point of the split.
+        rows = [
+            {"bot_findings_substantive": 4, "escaped": 1, "escaped_p1": 0,
+             "escaped_in_scope": 1, "escape_rate": 0.25,
+             "exit_reason": "converged", "verdict": "ready",
+             "has_ground_truth": False, "escaped_judged": None},
+            {"bot_findings_substantive": 4, "escaped": 3, "escaped_p1": 0,
+             "escaped_in_scope": 2, "escape_rate": 0.75,
+             "exit_reason": "converged", "verdict": "not_ready",
+             "has_ground_truth": False, "escaped_judged": None},
+        ]
+        agg = er.aggregate(rows)
+        self.assertEqual(agg["by_exit_reason"]["converged"]["runs"], 2)
+        self.assertEqual(agg["by_verdict"]["ready"]["escape_rate"], 0.25)
+        self.assertEqual(agg["by_verdict"]["not_ready"]["escape_rate"], 0.75)
+
+    def test_runs_without_a_verdict_bucket_as_unknown(self):
+        # Runs predating the verdict work carry no `verdict` key; they must
+        # still be counted, not dropped from the split.
+        rows = [
+            {"bot_findings_substantive": 4, "escaped": 1, "escaped_p1": 0,
+             "escaped_in_scope": 1, "escape_rate": 0.25,
+             "exit_reason": "converged", "has_ground_truth": False,
+             "escaped_judged": None},
+        ]
+        agg = er.aggregate(rows)
+        self.assertEqual(agg["by_verdict"]["unknown"]["runs"], 1)
 
 
 class BackendRosterTests(unittest.TestCase):

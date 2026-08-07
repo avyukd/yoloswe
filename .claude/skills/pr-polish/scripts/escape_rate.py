@@ -252,6 +252,10 @@ def compute_escape_rate(
         "state_dir": str(state_dir),
         "pr": state.get("pr_number"),
         "exit_reason": state.get("exit_reason"),
+        # The computed verdict, when the run wrote one. Distinct from
+        # exit_reason: a run can exit `converged` and still be `not_ready`
+        # (e.g. an unverified fix claim), so the two must be bucketed apart.
+        "verdict": (state.get("verdict") or {}).get("verdict"),
         "completed_at": completed_at,
         "bot_findings_substantive": total,
         "caught_locally": total - len(escaped),
@@ -270,27 +274,37 @@ def compute_escape_rate(
     }
 
 
-def aggregate(rows: list[dict]) -> dict:
-    """Fleet-wide totals, plus a split by exit reason.
-
-    The split is the acceptance test for the verdict work: escapes among
-    runs that exited cleanly should be materially rarer than among runs
-    that hit the budget wall. If they are not, the exit reason is not
-    carrying signal.
-    """
-    scored = [r for r in rows if r.get("escape_rate") is not None]
-    total = sum(r["bot_findings_substantive"] for r in scored)
-    escaped = sum(r["escaped"] for r in scored)
-    by_reason: dict[str, dict] = {}
-    for r in scored:
-        b = by_reason.setdefault(
-            r.get("exit_reason") or "unknown", {"runs": 0, "total": 0, "escaped": 0}
+def _split_by(rows: list[dict], key: str) -> dict[str, dict]:
+    """Bucket scored rows by ``key``, with an escape rate per bucket."""
+    out: dict[str, dict] = {}
+    for r in rows:
+        b = out.setdefault(
+            r.get(key) or "unknown", {"runs": 0, "total": 0, "escaped": 0}
         )
         b["runs"] += 1
         b["total"] += r["bot_findings_substantive"]
         b["escaped"] += r["escaped"]
-    for b in by_reason.values():
+    for b in out.values():
         b["escape_rate"] = (b["escaped"] / b["total"]) if b["total"] else None
+    return out
+
+
+def aggregate(rows: list[dict]) -> dict:
+    """Fleet-wide totals, split by computed verdict and by exit reason.
+
+    ``by_verdict`` is the acceptance test for the verdict work: escapes
+    among runs the verdict called ``ready`` should be materially rarer than
+    among the rest. ``by_exit_reason`` is the older proxy for the same
+    question, kept because it is the only signal available for runs that
+    predate the verdict (they bucket as ``unknown``) — and because the two
+    diverging is itself the finding: a run can exit ``converged`` while its
+    verdict is ``not_ready``.
+    """
+    scored = [r for r in rows if r.get("escape_rate") is not None]
+    total = sum(r["bot_findings_substantive"] for r in scored)
+    escaped = sum(r["escaped"] for r in scored)
+    by_reason = _split_by(scored, "exit_reason")
+    by_verdict = _split_by(scored, "verdict")
     gt_rows = [r for r in scored if r.get("has_ground_truth")]
     gt_total = sum(r["bot_findings_substantive"] for r in gt_rows)
     gt_escaped = sum(r["escaped_judged"] or 0 for r in gt_rows)
@@ -311,6 +325,7 @@ def aggregate(rows: list[dict]) -> dict:
         "escaped_in_scope": sum(r["escaped_in_scope"] for r in scored),
         "escape_rate": (escaped / total) if total else None,
         "by_exit_reason": by_reason,
+        "by_verdict": by_verdict,
     }
 
 

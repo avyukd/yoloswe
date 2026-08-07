@@ -362,5 +362,36 @@ class WritePersistsToStateTests(unittest.TestCase):
         self.assertFalse((self.d / "verdict.json").exists())
 
 
+class Step5InvocationContractTests(unittest.TestCase):
+    """SKILL.md must actually invoke verdict.py at exit.
+
+    This script shipped complete and tested while nothing called it — the
+    whole defect this wiring fixes. Every other test here drives ``v.main``
+    directly, so deleting the Step 5 invocation, or dropping ``--repo-root``
+    (which silently disables fix-claim verification) or ``--write``, leaves
+    the suite green and restores the original no-op.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.skill_md = (SCRIPTS.parent / "SKILL.md").read_text()
+        cls.invocation = next(
+            (ln for ln in cls.skill_md.splitlines() if "scripts/verdict.py" in ln),
+            None,
+        )
+
+    def test_skill_md_invokes_verdict_py(self):
+        self.assertIsNotNone(
+            self.invocation, "SKILL.md no longer runs verdict.py — the verdict "
+            "is unreachable and the run reports prose again")
+
+    def test_invocation_passes_repo_root_and_write(self):
+        for flag in ("--repo-root", "--write"):
+            self.assertIn(
+                flag, self.invocation,
+                f"Step 5 dropped {flag}; without --repo-root fix-claim "
+                f"verification silently skips, without --write nothing persists")
+
+
 if __name__ == "__main__":
     unittest.main()
