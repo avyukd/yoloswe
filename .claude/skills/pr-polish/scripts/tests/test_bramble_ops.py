@@ -957,6 +957,37 @@ class TestParseEnvelope(unittest.TestCase):
         self.assertEqual(got[0]["severity"], "high")
         self.assertIn("backend crashed", got[0]["message"])
 
+    def test_recover_envelope_never_rewrites_a_partial(self) -> None:
+        """Recovery must not delete the failure half of a partial envelope.
+
+        A partial already carries BOTH halves — real findings and the failure
+        that ended the run. Recovery rewrites status to "ok" and clears error,
+        so applying it here would make a truncated review read as a complete
+        one. The findings need no rescuing: parse_envelope handles partial
+        directly. (codex, PR #314 r3.)
+        """
+        import tempfile
+        from pathlib import Path as _P
+        with tempfile.TemporaryDirectory() as td:
+            p = _P(td) / "codex-envelope.json"
+            env = {
+                "status": "partial",
+                # Contains a recovery token ("changes"), which is exactly what
+                # would have tripped the rewrite.
+                "error": "codex: review idle: request_changes pending",
+                "review": {
+                    "verdict": "rejected",
+                    "issues": [{"severity": "high", "file": "a.py", "line": 1,
+                                "message": "m"}],
+                },
+            }
+            p.write_text(json.dumps(env))
+            out = bramble_ops.recover_envelope(p)
+            self.assertEqual(out, p, "partial must not be rewritten to a new path")
+            after = json.loads(p.read_text())
+            self.assertEqual(after["status"], "partial")
+            self.assertTrue(after["error"], "the failure half must survive")
+
     def test_missing_envelope_yields_empty_list(self) -> None:
         self.assertEqual(bramble_ops.parse_envelope(None, source="codex"), [])
 

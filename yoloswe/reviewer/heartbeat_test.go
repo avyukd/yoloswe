@@ -725,3 +725,83 @@ func TestBridgeStreamEvents_ChannelCloseWithNoTextReturnsNil(t *testing.T) {
 		t.Errorf("nothing was streamed, so there is nothing to preserve; got %+v", res)
 	}
 }
+
+// Every terminal path preserves partial work — asserted as ONE rule, not per
+// exit. Three consecutive review rounds each found a different exit that
+// dropped accumulated text (idle timeout, channel close, ctx cancellation)
+// because each decided the question for itself. This table is the rule.
+//
+// The ctx case is the one that fires in production: SKILL Step 3.b wraps every
+// reviewer in `timeout 2400`, GNU timeout sends SIGTERM, and codereview.go
+// installs signal.NotifyContext(SIGINT, SIGTERM) on the review context — so
+// the absolute backstop cancels here, not at the idle timeout.
+func TestBridgeStreamEvents_EveryFailurePathPreservesPartialWork(t *testing.T) {
+	const body = `{"verdict":"rejected","summary":"s","issues":[]}`
+
+	t.Run("ctx cancelled", func(t *testing.T) {
+		withHeartbeat(t, 10*time.Millisecond)
+		ctx, cancel := context.WithCancel(context.Background())
+		ch := make(chan agentstream.Event)
+		done := make(chan struct{})
+		var res *bridgeResult
+		var err error
+		go func() {
+			res, err = bridgeStreamEvents(ctx, ch, &recordingHandler{}, "", 0)
+			close(done)
+		}()
+		ch <- testTextEvent{delta: body}
+		cancel()
+		<-done
+		if err == nil {
+			t.Fatal("cancellation must still be an error")
+		}
+		if res == nil || res.responseText != body {
+			t.Fatalf("ctx cancellation dropped the streamed body: %+v", res)
+		}
+	})
+
+	t.Run("idle timeout", func(t *testing.T) {
+		withHeartbeat(t, 5*time.Millisecond)
+		ch := make(chan agentstream.Event)
+		done := make(chan struct{})
+		var res *bridgeResult
+		go func() {
+			res, _ = bridgeStreamEvents(context.Background(), ch, &recordingHandler{}, "", 40*time.Millisecond)
+			close(done)
+		}()
+		ch <- testTextEvent{delta: body}
+		<-done
+		if res == nil || res.responseText != body {
+			t.Fatalf("idle timeout dropped the streamed body: %+v", res)
+		}
+	})
+
+	t.Run("channel closed", func(t *testing.T) {
+		withHeartbeat(t, 10*time.Millisecond)
+		ch := make(chan agentstream.Event, 1)
+		ch <- testTextEvent{delta: body}
+		close(ch)
+		res, err := bridgeStreamEvents(context.Background(), ch, &recordingHandler{}, "", 0)
+		if err == nil {
+			t.Fatal("a close without TurnComplete must still be an error")
+		}
+		if res == nil || res.responseText != body {
+			t.Fatalf("channel close dropped the streamed body: %+v", res)
+		}
+	})
+
+	t.Run("nothing streamed yields nil on every path", func(t *testing.T) {
+		withHeartbeat(t, 5*time.Millisecond)
+		ch := make(chan agentstream.Event)
+		done := make(chan struct{})
+		var res *bridgeResult
+		go func() {
+			res, _ = bridgeStreamEvents(context.Background(), ch, &recordingHandler{}, "", 30*time.Millisecond)
+			close(done)
+		}()
+		<-done
+		if res != nil {
+			t.Errorf("no text accumulated, so there is nothing to preserve; got %+v", res)
+		}
+	})
+}

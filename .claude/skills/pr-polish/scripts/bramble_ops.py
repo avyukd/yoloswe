@@ -1833,7 +1833,14 @@ def recover_envelope(path: Path, *, suffix: str = "-recovered") -> Path:
     obj = read_json(path, default=None)
     if not isinstance(obj, dict):
         return path
-    if obj.get("status") == "ok":
+    # "ok" needs no recovery; "partial" must not RECEIVE it. Recovery exists to
+    # rescue a run whose verdict was lost to a vocabulary mismatch, and it does
+    # that by rewriting status to "ok" and clearing error. A partial envelope
+    # already carries both halves — real findings AND the failure that ended
+    # the run — so rewriting it would silently delete the failure half and make
+    # a truncated review read as a complete one. Its findings are already
+    # reachable: parse_envelope handles partial directly.
+    if obj.get("status") in ("ok", "partial"):
         return path
     error_text = obj.get("error") or ""
     verdict = _classify_recovery_verdict(error_text)

@@ -196,6 +196,30 @@ func bridgeStreamEvents[E any](
 	var window heartbeatWindow
 	toolsInFlight := 0
 
+	// failed is the ONLY way this function reports a failure. Every terminal
+	// error path routes through it, so "does this exit preserve partial work?"
+	// has exactly one answer for all of them: yes, always. Three consecutive
+	// review rounds each found a different exit that dropped accumulated text
+	// (idle timeout, channel close, then ctx cancellation) because each was
+	// deciding that question for itself — the fix is one rule, not a fourth
+	// case. A caller that ignores the result is unaffected; the error is
+	// unchanged.
+	//
+	// The ctx path is the one that matters most in production: SKILL Step 3.b
+	// wraps every reviewer in `timeout 2400`, GNU timeout sends SIGTERM, and
+	// codereview.go installs signal.NotifyContext(SIGINT, SIGTERM) on the
+	// review context — so the absolute backstop cancels here, not at the idle
+	// timeout.
+	failed := func(err error) (*bridgeResult, error) {
+		text := responseText.String()
+		if text == "" {
+			// Nothing accumulated: there is no partial work to preserve, and a
+			// non-nil empty result would make BuildEnvelope try to parse "".
+			return nil, err
+		}
+		return &bridgeResult{responseText: text}, err
+	}
+
 	// applyEvent processes one received event. done reports a terminal result
 	// (TurnComplete/Error or a closed/invalid stream); inScope reports whether
 	// the event counts toward liveness (only in-scope events reset the idle
@@ -203,15 +227,13 @@ func bridgeStreamEvents[E any](
 	// a stalled thread alive). It mutates the enclosing accumulators directly.
 	applyEvent := func(ev E, ok bool) (res *bridgeResult, done bool, inScope bool, err error) {
 		if !ok {
-			// Channel closed without TurnComplete. Same partial-preservation
-			// rule as the idle timeout below: a reviewer that streamed a
-			// complete body and then had its stream drop produced real work,
-			// so return the text with the error rather than only counting its
-			// characters in a message.
+			// Channel closed without TurnComplete. Preservation is decided by
+			// the single `failed` rule below, not here.
 			text := responseText.String()
 			if text != "" {
-				return &bridgeResult{responseText: text}, true, false,
-					fmt.Errorf("session ended unexpectedly (partial response: %d chars)", len(text))
+				res, ferr := failed(fmt.Errorf(
+					"session ended unexpectedly (partial response: %d chars)", len(text)))
+				return res, true, false, ferr
 			}
 			return nil, true, false, fmt.Errorf("session ended without result")
 		}
@@ -327,7 +349,7 @@ func bridgeStreamEvents[E any](
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return failed(ctx.Err())
 		case <-ticker.C:
 			// Before declaring the review stalled, drain every event already
 			// queued: select can pick the ticker over a ready events case, so a
@@ -354,14 +376,7 @@ func bridgeStreamEvents[E any](
 				break
 			}
 			if idleTimeout > 0 && time.Since(lastEvent) >= idleTimeout {
-				// Return what the reviewer already streamed alongside the
-				// error. A stalled review that had named real defects is
-				// partial work, not zero work, and callers that plumb this
-				// into BuildEnvelope surface it as status="partial" instead
-				// of discarding it. The error is unchanged, so a caller that
-				// ignores the result behaves exactly as before.
-				return &bridgeResult{responseText: responseText.String()},
-					fmt.Errorf("review idle: no events for %s (stalled backend)", idleTimeout)
+				return failed(fmt.Errorf("review idle: no events for %s (stalled backend)", idleTimeout))
 			}
 			// Emit a heartbeat line at most every heartbeatInterval even if the
 			// ticker fires more often for idle-check precision.
