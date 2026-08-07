@@ -3236,18 +3236,34 @@ class OrphanEnvelopeGuardTests(unittest.TestCase):
                 )
             self.assertIn("codex-envelope.json", str(ctx.exception))
 
-    def test_passing_no_envelopes_checks_nothing(self):
-        """No passed envelope means no attempt to scope to.
+    def test_a_zero_envelope_finalize_is_still_checked(self):
+        """The motivating case must not slip through the scoping fix.
 
-        finalize already rejects a zero-envelope call upstream (SKILL Step 3.f
-        always passes at least codex/cursor/lint), so there is no case where
-        this silently swallows a real orphan.
+        "The orchestrator decided the reviewers produced nothing and finalized
+        without them" IS kernel#8682 r1. Deriving scope only from passed paths
+        would skip exactly that, and upstream merely warns on a zero-envelope
+        finalize rather than rejecting it — so this is the only thing in front
+        of it. Falls back to the latest attempt.
         """
         with tempfile.TemporaryDirectory() as td:
             sd = Path(td)
             d1 = sd / "r1" / "a1"
             d1.mkdir(parents=True)
             (d1 / "codex-envelope.json").write_text(json.dumps(_envelope()))
+            with self.assertRaises(ValueError) as ctx:
+                pr_ops._reject_orphan_envelopes(sd, 1, {})
+            self.assertIn("codex-envelope.json", str(ctx.exception))
+
+    def test_a_zero_envelope_finalize_checks_only_the_latest_attempt(self):
+        """Still must not resurrect the resume breakage."""
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td)
+            (sd / "r1" / "a1").mkdir(parents=True)
+            (sd / "r1" / "a2").mkdir(parents=True)
+            # Only the OLD attempt has an envelope; a2 is the live one.
+            (sd / "r1" / "a1" / "codex-envelope.json").write_text(
+                json.dumps(_envelope())
+            )
             pr_ops._reject_orphan_envelopes(sd, 1, {})
 
     def test_no_round_dir_is_not_an_error(self):

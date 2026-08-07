@@ -168,6 +168,26 @@ class VerdictTests(unittest.TestCase):
             f"expected codex's silence attributed to its error status, got {details}",
         )
 
+    def test_lint_alone_is_not_a_live_reviewer(self):
+        # lint is in BACKENDS, lint_gate hardcodes status "ok", and SKILL always
+        # passes its envelope — so counting it as coverage made this gate
+        # unsatisfiable. Consensus finding (codex + claude), PR #314 r2.
+        st = _state(rounds=[{
+            "n": 1,
+            "comment_actions": [],
+            "stream_status": {"codex": "error", "cursor": "error", "lint": "ok"},
+        }])
+        out = v.compute_verdict(st)
+        self.assertEqual(out["verdict"], "not_ready")
+        self.assertIn("no_live_reviewer", [b["code"] for b in out["blockers"]])
+
+    def test_a_lint_only_round_is_not_judged(self):
+        # No model reviewer ran at all in the record: nothing to conclude from.
+        st = _state(rounds=[{
+            "n": 1, "comment_actions": [], "stream_status": {"lint": "ok"},
+        }])
+        self.assertEqual(v.rounds_without_a_live_stream(st), [])
+
     def test_clean_converged_run_is_ready(self):
         self.assertEqual(v.compute_verdict(_state())["verdict"], "ready")
 

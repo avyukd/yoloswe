@@ -481,6 +481,15 @@ def reviewer_stream_statuses(state: dict) -> dict[str, dict[str, int]]:
 #: ended the run.
 _LIVE_STREAM_STATUSES = frozenset({"ok", "partial"})
 
+#: Streams in ``BACKENDS`` that are NOT model reviewers and therefore cannot
+#: stand in for one. ``lint`` is a static diff pass: ``lint_gate.py`` writes
+#: ``"status": "ok"`` unconditionally and SKILL Step 3.f always passes its
+#: envelope, so counting it as coverage made the no-live-reviewer gate
+#: unreachable — it fired on a set that always contained a live member.
+#: Derived by exclusion from ``bramble_ops.BACKENDS`` so a NEW model backend is
+#: counted automatically; only a new non-reviewer stream needs adding here.
+_NON_REVIEWER_STREAMS = frozenset({"lint"})
+
 
 def rounds_without_a_live_stream(state: dict) -> list[int]:
     """Rounds where no reviewer returned a verdict, newest-relevant first.
@@ -500,7 +509,14 @@ def rounds_without_a_live_stream(state: dict) -> list[int]:
         statuses = rnd.get("stream_status")
         if not isinstance(statuses, dict) or not statuses:
             continue
-        if any(v in _LIVE_STREAM_STATUSES for v in statuses.values()):
+        # Only model reviewers count. lint is always present and always "ok",
+        # so including it made this predicate unsatisfiable.
+        reviewers = {
+            k: v for k, v in statuses.items() if k not in _NON_REVIEWER_STREAMS
+        }
+        if not reviewers:
+            continue
+        if any(v in _LIVE_STREAM_STATUSES for v in reviewers.values()):
             continue
         n = rnd.get("n")
         if isinstance(n, int):

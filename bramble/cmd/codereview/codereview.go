@@ -388,9 +388,18 @@ func emitVerdictLine(env reviewer.ResultEnvelope) {
 	if env.ResumeStatus != "" {
 		resumeSuffix = fmt.Sprintf(" [resume=%s]", env.ResumeStatus)
 	}
-	if env.Status == reviewer.StatusOK {
+	switch env.Status {
+	case reviewer.StatusOK:
 		fmt.Fprintf(os.Stdout, "verdict: %s (%d issues)%s\n", env.Review.Verdict, len(env.Review.Issues), resumeSuffix)
-	} else {
+	case reviewer.StatusPartial:
+		// stdout is the surface an orchestrator reads first, and "error: …"
+		// alone is what produced `ack … no envelope` on kernel#8682 r1. A
+		// partial run has findings by construction (BuildEnvelope only assigns
+		// StatusPartial when the body parsed and validated), so say so here
+		// too — otherwise the line contradicts the envelope beside it.
+		fmt.Fprintf(os.Stdout, "partial: %s (%d issues kept) after: %s%s\n",
+			env.Review.Verdict, len(env.Review.Issues), env.Error, resumeSuffix)
+	default:
 		fmt.Fprintf(os.Stdout, "error: %s%s\n", env.Error, resumeSuffix)
 	}
 }

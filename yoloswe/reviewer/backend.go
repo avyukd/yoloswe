@@ -203,10 +203,15 @@ func bridgeStreamEvents[E any](
 	// a stalled thread alive). It mutates the enclosing accumulators directly.
 	applyEvent := func(ev E, ok bool) (res *bridgeResult, done bool, inScope bool, err error) {
 		if !ok {
-			// Channel closed without TurnComplete.
+			// Channel closed without TurnComplete. Same partial-preservation
+			// rule as the idle timeout below: a reviewer that streamed a
+			// complete body and then had its stream drop produced real work,
+			// so return the text with the error rather than only counting its
+			// characters in a message.
 			text := responseText.String()
 			if text != "" {
-				return nil, true, false, fmt.Errorf("session ended unexpectedly (partial response: %d chars)", len(text))
+				return &bridgeResult{responseText: text}, true, false,
+					fmt.Errorf("session ended unexpectedly (partial response: %d chars)", len(text))
 			}
 			return nil, true, false, fmt.Errorf("session ended without result")
 		}

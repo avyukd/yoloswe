@@ -299,6 +299,20 @@ func TestEmitVerdictLine_ResumeSuffixOnSuccessAndError(t *testing.T) {
 			},
 			wantLine: "error: auth denied\n",
 		},
+		{
+			// stdout is the surface an orchestrator reads first, and a bare
+			// "error: ..." is the reading that produced `ack ... no envelope`
+			// on kernel#8682 r1 — while the envelope beside it carries
+			// findings. A partial has issues by construction, so say so.
+			name: "partial keeps its findings visible",
+			env: reviewer.ResultEnvelope{
+				Status:        reviewer.StatusPartial,
+				Error:         "codex: review idle: no events for 8m0s (stalled backend)",
+				Review:        reviewer.ReviewBody{Verdict: "rejected", Issues: []reviewer.ReviewIssue{{Severity: "high"}}},
+				SchemaVersion: reviewer.JSONSchemaVersion,
+			},
+			wantLine: "partial: rejected (1 issues kept) after: codex: review idle: no events for 8m0s (stalled backend)\n",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

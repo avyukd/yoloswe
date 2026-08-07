@@ -1464,9 +1464,15 @@ def _reject_orphan_envelopes(
     envelopes under earlier attempts that this finalize is not about.
     Scanning the whole ``r<n>`` tree would flag every one of them and make
     resume impossible — a guard against losing findings must not itself break
-    the retry path that exists to recover them. The active attempt is derived
-    from the passed envelope paths; with none passed there is nothing to scope
-    to and nothing to check.
+    the retry path that exists to recover them.
+
+    **A zero-envelope finalize is checked against the LATEST attempt, not
+    skipped.** The active attempt is normally derived from the passed envelope
+    paths, but "the orchestrator concluded the reviewers produced nothing and
+    finalized without them" is exactly the #8682 r1 shape this guard exists
+    for — deriving scope only from what was passed would let the motivating
+    case through. Upstream merely *warns* on a zero-envelope finalize, so this
+    is the only thing standing in front of it.
     """
     import bramble_ops  # noqa: PLC0415
 
@@ -1482,7 +1488,14 @@ def _reject_orphan_envelopes(
     # elsewhere under r<n> belongs to a different attempt and is out of scope.
     active_dirs = {p.parent for p in passed}
     if not active_dirs:
-        return
+        attempts = sorted(
+            (p for p in log_root.iterdir()
+             if p.is_dir() and _ATTEMPT_DIR_RE.fullmatch(p.name)),
+            key=lambda p: int(_ATTEMPT_DIR_RE.fullmatch(p.name).group(1)),
+        )
+        if not attempts:
+            return
+        active_dirs = {attempts[-1].resolve()}
     orphans: list[str] = []
     for backend in bramble_ops.BACKENDS:
         for found in sorted(log_root.glob(f"a*/{backend}-envelope.json")):

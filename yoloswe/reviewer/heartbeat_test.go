@@ -689,3 +689,39 @@ func TestBridgeStreamEvents_UnscopedEventCountsAsLivenessByDesign(t *testing.T) 
 	ch <- testTurnCompleteEvent{success: true, durationMs: 1}
 	<-done
 }
+
+// Partial preservation must apply on BOTH terminal paths. The idle timeout
+// returns accumulated text; a channel close without TurnComplete has to do the
+// same, or the same rule holds on one sibling and not the other (cursor, r2).
+func TestBridgeStreamEvents_ChannelCloseKeepsPartialText(t *testing.T) {
+	withHeartbeat(t, 10*time.Millisecond)
+
+	body := `{"verdict":"rejected","summary":"s","issues":[]}`
+	ch := make(chan agentstream.Event, 2)
+	ch <- testTextEvent{delta: body}
+	close(ch) // stream drops before TurnComplete
+
+	res, err := bridgeStreamEvents(context.Background(), ch, &recordingHandler{}, "", 0)
+	if err == nil {
+		t.Fatal("a close without TurnComplete must still be an error")
+	}
+	if res == nil {
+		t.Fatal("streamed text must be returned with the error, not only counted in it")
+	}
+	if res.responseText != body {
+		t.Errorf("responseText = %q, want the streamed body", res.responseText)
+	}
+}
+
+func TestBridgeStreamEvents_ChannelCloseWithNoTextReturnsNil(t *testing.T) {
+	withHeartbeat(t, 10*time.Millisecond)
+	ch := make(chan agentstream.Event)
+	close(ch)
+	res, err := bridgeStreamEvents(context.Background(), ch, &recordingHandler{}, "", 0)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if res != nil {
+		t.Errorf("nothing was streamed, so there is nothing to preserve; got %+v", res)
+	}
+}
