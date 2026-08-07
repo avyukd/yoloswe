@@ -125,6 +125,8 @@ When the PR has a usable description, **that description is the summary** — th
 
 Round 1 `--goal` = `$PR_SUMMARY`; later rounds use `round-bundle` / `bramble_ops.py goal`, which **leads with the frozen `$PR_SUMMARY`** and appends the action-history briefing (prior fixed/skipped + the PR's own file list, plus any invariant/streak notes). No inter-round diff is embedded — a diff pinned to the prior round's HEAD is wrong after a rebase, and bramble re-reads the working tree anyway.
 
+**Every round after the first also carries a FROZEN block in its `$GOAL`:** every `wont_fix`/`false_positive` settled so far this run, one line each *with its reason*, under a heading saying do not re-raise these. A decline whose rationale the next reviewer can't see is indistinguishable from an unnoticed one, so it returns every round, costing a triage slot and tempting a re-fix of something already decided. Measured on #8374: re-litigation stopped the round this block appeared, and none of the five frozen items came back over the six rounds after.
+
 Pass this same `<base>` to `state-append-round --base-branch` (Step 3.a0): the file list is measured `origin/<base>...HEAD` and must share the merge base `$PR_SUMMARY` was built from.
 
 ## Step 2: Fetch PR comments + CI
@@ -315,14 +317,19 @@ jq '.action_plan | {must_fix: (.must_fix|length), consider_fix: (.consider_fix|l
 **Scope contract — the PR's remit is fixed at round 1.** "Touched files" means files the PR touched when you *first saw it*, not files a later round dragged in. Otherwise ownership ratchets: each round's fix touches new files that the next round then owns, and the PR grows without limit while every round still looks productive. Before fixing anything outside the round-1 file set, ask whether it is *this PR's job*:
 
 - **Outside the round-1 files** → `wont_fix`, naming where it belongs ("not in this PR's diff — worth a ticket against `<owner>`").
-- **A flaw in a fix an earlier round of this run made** → genuinely yours, fix it. But a *third* correction to the same subsystem means the design is wrong: stop and escalate, because the fourth commit will not settle it.
+- **A flaw in a fix an earlier round of this run made** → genuinely yours, fix it. But count the rounds that have now touched that mechanism, and act on the **second** one — see below.
 - **New machinery to support a fix** (a cache, a latch, a reaper) → prefer the smaller change that needs none; new machinery draws new findings, which is how a two-file fix becomes a thirteen-file one.
+- **A fix guarding a destructive action** (unlink, overwrite, kill, revoke, force-push) → state what must be **true** for it to be safe, never which inputs are unsafe; a blocklist draws one finding per bad shape a reviewer can still imagine. Measured on #8374: five consecutive rounds each blocked one more malformed `.git` pointer, ending the round the check became "require the marker git itself writes".
+
+**Rule, not citation — the largest single cycle cost.** A second round flagging the same predicate means it is written in examples, not in a rule, and examples are inexhaustible. Don't add another regex shape or another arm: answer the question the code is actually asking, once, with a test for the case that made you ask. Measured on #8374: one predicate ate **twelve rounds** while each fix answered "which stderr shape latches?", and **zero** after one round answered "is this failure the pod's own passing state?".
 
 A scope decline is a real outcome, not a gap: record it as `wont_fix` with the reason.
 
 **Invariants:** same `invariant` from ≥2 reviewers → consensus on all sites. Prefer producer-side fix.
 
 **Spirals:** single-source may auto-demote to stale if evidence gone (±10 lines) or cited line was in prior round's diff. Multi-source → escalate. Default (no `--ask`): re-fix once (`spiral_refix: true`), stop on 2nd recurrence.
+
+**Escalate only for what a human holds:** a priority call, a risk appetite, a product decision, an ops tradeoff you cannot observe. Reviewers contradicting each other is **not** that — two backends disagreeing about your own code's semantics is settled by reading the code, and "this is hard" is a reason to think, not to hand it back. Write the one sentence naming what you need *from the human*; if you cannot, you are not blocked — check instead whether the two positions approximate one rule from opposite sides, which is what disagreement about a predicate usually means. Measured on #8374: an escalation billed as a human design call was two camps patching opposite legs of one predicate, and resolved in a single round.
 
 Empty plan (`.action_plan.must_fix` and `.action_plan.consider_fix` both empty, **and** the stderr census agrees — `total=0`, or every finding accounted for in `batch_ack`/`batch_stale`) → converged, Step 3.g.
 
