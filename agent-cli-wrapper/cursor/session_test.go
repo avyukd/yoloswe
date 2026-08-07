@@ -165,6 +165,97 @@ func TestSession_TruncatedResultFrameIsFatal(t *testing.T) {
 	assert.Equal(t, "parse_message", errEvt.Context)
 }
 
+// A truncated result frame carrying an EARLIER nested "type" must still be
+// recognized as terminal. Scanning only the first "type" occurrence read this as
+// non-terminal and silently skipped it, dropping the sole completion signal —
+// the exact failure isTerminalFrame exists to prevent.
+func TestSession_TruncatedResultFrameWithNestedTypeIsFatal(t *testing.T) {
+	lines := []string{
+		`{"session_id":"s1","meta":{"type":"x"},"type":"result","duration_ms":12`,
+	}
+
+	events := fakeSession(t, lines)
+	require.Len(t, events, 1)
+
+	errEvt, ok := events[0].(ErrorEvent)
+	require.True(t, ok, "a truncated result frame must be fatal even behind a nested \"type\"")
+	assert.Equal(t, "parse_message", errEvt.Context)
+}
+
+// hasResultTypeDiscriminator is the byte-level fallback used only after a decode
+// failure. It must catch a truncated result frame wherever the discriminator
+// sits, without promoting non-result frames to terminal — a false positive turns
+// a survivable skip into an aborted review.
+func TestHasResultTypeDiscriminator(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{
+			name: "plain truncated result frame",
+			line: `{"type":"result","duration_ms":`,
+			want: true,
+		},
+		{
+			name: "result frame behind a nested type",
+			line: `{"session_id":"s","meta":{"type":"x"},"type":"result","dur`,
+			want: true,
+		},
+		{
+			name: "whitespace around the colon",
+			line: `{"type" : "result","duration_ms":`,
+			want: true,
+		},
+		{
+			name: "escaped type:result inside a string is not terminal",
+			line: `{"payload":"{\"type\":\"result\"}","type":"assistant"`,
+			want: false,
+		},
+		{
+			// The direction the every-occurrence scan got wrong. An UNESCAPED
+			// nested "type":"result" must not promote a progress frame: in the
+			// reviewer a spurious terminal frame becomes an ErrorEvent, which
+			// discards the whole review — the outcome this change prevents.
+			name: "unescaped nested type:result in a tool_call frame is not terminal",
+			line: `{"type":"tool_call","tool_call":{"x":{"type":"result"}},"call_`,
+			want: false,
+		},
+		{
+			name: "unescaped nested type:result in an assistant content block is not terminal",
+			line: `{"type":"assistant","message":{"content":[{"type":"result"}]},"ses`,
+			want: false,
+		},
+		{
+			// Depth tracking must not be fooled by braces inside string values.
+			name: "braces inside a string value do not shift depth",
+			line: `{"note":"{{{","type":"result","duration_ms":`,
+			want: true,
+		},
+		{
+			name: "non-result frame",
+			line: `{"type":"assistant","message":{"role":"assistant"}`,
+			want: false,
+		},
+		{
+			name: "type key with no value",
+			line: `{"type"`,
+			want: false,
+		},
+		{
+			name: "no type key at all",
+			line: `{"session_id":"s1"`,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, hasResultTypeDiscriminator([]byte(tt.line)))
+		})
+	}
+}
+
 // A malformed non-terminal frame (here, assistant) is skipped — only the result
 // frame is fatal. Losing one assistant delta is better than aborting the run.
 func TestSession_MalformedAssistantFrameIsSkipped(t *testing.T) {

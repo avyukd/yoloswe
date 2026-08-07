@@ -1,8 +1,16 @@
 package reviewer
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/acp"
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude"
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/codex"
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/cursor"
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/framelog"
 )
 
 func TestSummarizeToolInput_RedactsSensitiveValues(t *testing.T) {
@@ -92,4 +100,110 @@ func TestSummarizeToolInput_Empty(t *testing.T) {
 	if got := summarizeToolInput(map[string]interface{}{}); got != "" {
 		t.Errorf("summarizeToolInput({}) = %q, want empty", got)
 	}
+}
+
+// The raw frame that failed to parse must reach the log. Without it the record
+// names a Go struct field but never what the backend actually sent — the gap
+// that forced the cursor protocol-error investigation to infer the wire shape
+// from a decode error instead of reading the frame.
+func TestProtocolErrorLine_ExtractsAndBounds(t *testing.T) {
+	t.Run("extracts from a wrapped error", func(t *testing.T) {
+		inner := &cursor.ProtocolError{
+			Message: "failed to parse message",
+			Line:    `{"type":"tool_call","tool_call":[{"readToolCall":{}}]}`,
+		}
+		line, n, ok := protocolErrorLine(fmt.Errorf("cursor: %w", inner))
+		if !ok {
+			t.Fatal("expected the offending line to be recovered through the wrap")
+		}
+		if !strings.Contains(line, `"readToolCall"`) {
+			t.Errorf("line lost the offending shape: %q", line)
+		}
+		if n != len(inner.Line) {
+			t.Errorf("line_len = %d, want %d", n, len(inner.Line))
+		}
+	})
+
+	t.Run("truncates an oversized frame but reports true length", func(t *testing.T) {
+		full := strings.Repeat("x", framelog.MaxLen*3)
+		line, n, ok := protocolErrorLine(&codex.ProtocolError{Message: "boom", Line: full})
+		if !ok {
+			t.Fatal("expected ok")
+		}
+		if len(line) >= len(full) {
+			t.Errorf("oversized frame was not truncated: got %d bytes", len(line))
+		}
+		if !strings.HasSuffix(line, "...[truncated]") {
+			t.Errorf("truncation must be visible in the log, got suffix %q", line[len(line)-20:])
+		}
+		if n != len(full) {
+			t.Errorf("line_len = %d, want the untruncated %d", n, len(full))
+		}
+	})
+
+	t.Run("covers all four backends", func(t *testing.T) {
+		// The contract is only useful if every backend that carries a Line
+		// implements it. claude was missed on the first pass and its parse
+		// errors reach the same sink, so pin all four.
+		for name, err := range map[string]error{
+			"cursor": &cursor.ProtocolError{Message: "m", Line: `{"k":1}`},
+			"codex":  &codex.ProtocolError{Message: "m", Line: `{"k":1}`},
+			"acp":    &acp.ProtocolError{Message: "m", Line: `{"k":1}`},
+			"claude": &claude.ProtocolError{Message: "m", Line: `{"k":1}`},
+		} {
+			if _, _, ok := protocolErrorLine(err); !ok {
+				t.Errorf("%s: ProtocolLine not reachable — that backend's frames are still lost", name)
+			}
+		}
+	})
+
+	t.Run("redacts string values but keeps structure", func(t *testing.T) {
+		// tool_call frames are the ones that fail to parse, and they carry
+		// command/file_path/content — the values sensitiveToolInputKeys exists
+		// to keep out of the log. Shape is what makes a frame diagnostic.
+		err := &cursor.ProtocolError{
+			Message: "failed to parse message",
+			Line:    `{"type":"tool_call","tool_call":[{"readToolCall":{"args":{"path":"/home/alice/.ssh/id_rsa"}}}]}`,
+		}
+		line, _, ok := protocolErrorLine(err)
+		if !ok {
+			t.Fatal("expected a line")
+		}
+		if strings.Contains(line, "/home/alice/.ssh/id_rsa") {
+			t.Errorf("secret value leaked into the log: %s", line)
+		}
+		for _, key := range []string{"tool_call", "readToolCall", "args", "path"} {
+			if !strings.Contains(line, key) {
+				t.Errorf("key %q was redacted away — the frame is no longer diagnostic: %s", key, line)
+			}
+		}
+		if !strings.Contains(line, "[") {
+			t.Errorf("array shape lost — that shape IS the bug being diagnosed: %s", line)
+		}
+		// The frame-kind discriminator is the single most diagnostic value in
+		// the frame; redacting it to "<str:9>" would defeat the logging.
+		if !strings.Contains(line, `"type":"tool_call"`) {
+			t.Errorf("frame-kind discriminator was redacted away: %s", line)
+		}
+	})
+
+	t.Run("redacts a truncated trailing string", func(t *testing.T) {
+		err := &cursor.ProtocolError{Message: "m", Line: `{"content":"SECRET_TOKEN=abcdef`}
+		line, _, ok := protocolErrorLine(err)
+		if !ok {
+			t.Fatal("expected a line")
+		}
+		if strings.Contains(line, "SECRET_TOKEN") {
+			t.Errorf("truncated string value leaked: %s", line)
+		}
+	})
+
+	t.Run("absent for errors carrying no line", func(t *testing.T) {
+		if _, _, ok := protocolErrorLine(errors.New("plain")); ok {
+			t.Error("a non-protocol error must not report a line")
+		}
+		if _, _, ok := protocolErrorLine(&acp.ProtocolError{Message: "no line"}); ok {
+			t.Error("an empty Line must be reported absent, not as an empty field")
+		}
+	})
 }

@@ -24,6 +24,7 @@ go_library(
         "//agent-cli-wrapper/claude/render",
         "//agent-cli-wrapper/codex",
         "//agent-cli-wrapper/cursor",
+        "//agent-cli-wrapper/framelog",
         "//logging/klogfmt",
     ],
 )
@@ -51,5 +52,7 @@ go_test(
         "//agent-cli-wrapper/claude",
         "//agent-cli-wrapper/claude/render",
         "//agent-cli-wrapper/codex",
+        "//agent-cli-wrapper/cursor",
+        "//agent-cli-wrapper/framelog",
     ],
 )

@@ -2,6 +2,7 @@ package reviewer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/agentstream"
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude/render"
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/framelog"
 )
 
 // heartbeatInterval bounds how often bridgeStreamEvents emits a liveness line
@@ -501,9 +503,43 @@ func (h *rendererEventHandler) OnTurnComplete(success bool, durationMs int64) {
 
 func (h *rendererEventHandler) OnError(err error, context string) {
 	h.r.Error(err, context)
-	slog.Error("reviewer error",
+	attrs := []any{
 		"context", context,
-		"error", err.Error())
+		"error", err.Error(),
+	}
+	// Preserve the frame that failed to parse. Without it the log records only
+	// the Go decode error, which names a struct field but not what the backend
+	// actually sent — the gap that forced the 102-failure cursor investigation
+	// to infer the wire shape from a type error instead of reading it.
+	if line, n, ok := protocolErrorLine(err); ok {
+		attrs = append(attrs, "line", line, "line_len", n)
+	}
+	slog.Error("reviewer error", attrs...)
+}
+
+// protocolLiner is implemented by each backend's ProtocolError. It is declared
+// here, at the consumer, because the backends are independent packages with no
+// shared error type — a structural interface avoids one type assertion per
+// backend and picks up any future backend for free.
+type protocolLiner interface {
+	ProtocolLine() string
+}
+
+// protocolErrorLine extracts the raw offending frame from err or anything it
+// wraps, returning a bounded, redacted rendering and the untruncated length.
+// The bound-and-redact rule itself lives in framelog, which is also what the
+// SDK-side debug logs use — one rule, one implementation.
+func protocolErrorLine(err error) (string, int, bool) {
+	var pl protocolLiner
+	if !errors.As(err, &pl) {
+		return "", 0, false
+	}
+	line := pl.ProtocolLine()
+	if line == "" {
+		return "", 0, false
+	}
+	rendered, n := framelog.Render(line)
+	return rendered, n, true
 }
 
 // sensitiveToolInputKeys names keys whose values may contain shell commands,

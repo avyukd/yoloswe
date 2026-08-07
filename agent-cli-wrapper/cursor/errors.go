@@ -30,6 +30,16 @@ func (e *ProtocolError) Unwrap() error {
 	return e.Cause
 }
 
+// ProtocolLine returns the raw line that failed to parse.
+//
+// Deliberately NOT folded into Error(): the offending frame can be megabytes and
+// can carry file contents, so it must be logged as its own bounded field rather
+// than inflating every string this error is wrapped into. Consumers discover it
+// via a structural interface — see the reviewer's protocolLiner.
+func (e *ProtocolError) ProtocolLine() string {
+	return e.Line
+}
+
 // ProcessError represents a process-level error.
 type ProcessError struct {
 	Cause    error
