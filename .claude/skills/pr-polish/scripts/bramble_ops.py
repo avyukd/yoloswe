@@ -68,10 +68,12 @@ def bramble_bin() -> str:
     return os.environ.get("BRAMBLE_BIN") or "bramble"
 
 
-# Cap on number of action entries surfaced in the goal text. We emit only
-# the immediately-prior round's actions (not a walk across all rounds), so
-# 20 covers a fairly busy round; pathological rounds get truncated with a
-# "(K more)" suffix. The full audit trail lives in rounds[*].comment_actions.
+# Cap on number of action entries surfaced in the goal text. The per-turn
+# briefing emits only the immediately-prior round's actions, so 20 covers a
+# fairly busy round; pathological rounds get truncated with a "(K more)"
+# suffix. The settled-declines block (``_frozen_declines_note``) does walk
+# every round, but dedupes by address, so the same cap holds there.
+# The full audit trail lives in rounds[*].comment_actions.
 _ACTION_HISTORY_CAP = 20
 
 # Per-entry topic length cap. Topics from triage already pass through
@@ -192,8 +194,7 @@ def action_history_goal(
 
         Round 6. Prior round fixed: a.go:10 — null check missing on BUILDER_LITE;
         b.py:42 — race in cache invalidation.
-        Skipped: c.go:8 wont_fix (deferred, not fixed): caller already validates;
-        d.go:5 ack (deferred, not fixed): rename helper.
+        Skipped: d.go:5 ack (deferred, not fixed): rename helper.
         Files changed since round 5: a.go, b.py.
 
     Bramble's BuildFollowUpJSONPromptWithScope embeds this as
@@ -202,7 +203,11 @@ def action_history_goal(
 
     Only the immediately-prior round's actions are surfaced — the model
     has earlier turns in conversation context, so re-listing them is
-    wasted tokens. ``stale`` actions are excluded entirely: bot comments
+    wasted tokens. The one exception is settled declines, which
+    ``_frozen_declines_note`` carries cumulatively for the whole run:
+    those are decisions rather than context, and a decision that scrolls
+    out of the goal comes back as a fresh finding. ``stale`` actions are
+    excluded entirely: bot comments
     anchored to superseded code aren't actionable for the resumed model
     (their cited code isn't in the worktree snapshot). The "Files
     changed since round N-1" line is the diff between the prior round's
@@ -328,18 +333,27 @@ def _action_label(action: dict[str, Any]) -> str:
     return base
 
 
-# Skip verbs that reach the goal channel: every skip verb except ``stale``,
-# which is excluded because its cited code isn't in the resumed model's
-# worktree snapshot (see the comment in action_history_goal). Derived from
-# the shared SKIPPED_ACTIONS so a new skip verb propagates here automatically.
-_HISTORY_SKIP_VERBS = SKIPPED_ACTIONS - {"stale"}
+# Verbs that settle a finding: a decision was made and recorded with a
+# reason, so the item is closed for the rest of the run (SKILL.md Step 3.g
+# treats either, with a rationale, as a resolution). They leave the per-turn
+# briefing for their own cumulative block — see ``_frozen_declines_note``.
+_SETTLED_VERBS = frozenset({"wont_fix", "false_positive"})
+
+# Skip verbs that reach the per-turn "Skipped:" briefing: every skip verb
+# except ``stale``, whose cited code isn't in the resumed model's worktree
+# snapshot (see the comment in action_history_goal), and the settled verbs,
+# which the cumulative block carries instead. What remains is the deferrals —
+# items still open in the code. Derived from the shared SKIPPED_ACTIONS so a
+# new skip verb propagates here automatically.
+_HISTORY_SKIP_VERBS = SKIPPED_ACTIONS - {"stale"} - _SETTLED_VERBS
 
 # Deferral-class verbs mean "the author has NOT fixed this" — the finding is
 # still open in the code. We annotate them in the goal text so a resumed
 # reviewer doesn't read the bare verb (``ack``) as "resolved" and drop the
-# finding. ``false_positive`` is deliberately excluded: it genuinely removes
-# the item from scope, so it needs no "still open" gloss.
-_DEFERRED_VERBS = _HISTORY_SKIP_VERBS - {"false_positive"}
+# finding. Includes ``wont_fix``, which settles the decision but leaves the
+# code as-is. ``false_positive`` is deliberately excluded: it genuinely
+# removes the item from scope, so it needs no "still open" gloss.
+_DEFERRED_VERBS = SKIPPED_ACTIONS - {"stale", "false_positive"}
 
 
 def _skipped_label(action: dict[str, Any], verb: str) -> str:
@@ -365,6 +379,56 @@ def _skipped_label(action: dict[str, Any], verb: str) -> str:
     if description:
         return f"{base} {label_verb}: {_truncate(description)}"
     return f"{base} {label_verb}"
+
+
+def _frozen_declines_note(state: dict[str, Any] | None, round_: int) -> str:
+    """Return the cumulative "settled, do not re-raise" block, or "".
+
+    The only goal section that walks *every* prior round rather than the
+    immediately-prior one. The rest of the briefing is per-turn context the
+    resumed model also holds in conversation history; a decline is not
+    context, it is a decision — and a decision the next reviewer cannot see
+    is indistinguishable from an unnoticed one. It returns as a fresh
+    finding every round, costs a triage slot, and tempts a re-fix of
+    something already settled. Measured on kernel#8374: re-litigation of
+    settled items stopped the round this block was introduced, and none of
+    the five frozen items returned across the six rounds after.
+
+    Each entry keeps the reason (``_skipped_label``) — the reason is the
+    whole point, since a bare "declined" invites the reviewer to re-argue.
+
+    A later ``fixed`` on the same address supersedes the decline: the
+    orchestrator changed its mind, so the item is no longer settled.
+    """
+    if not state or round_ < 2:
+        return ""
+    settled: dict[str, str] = {}
+    prior = sorted(
+        (r for r in state.get("rounds") or [] if (r.get("n") or 0) < round_),
+        key=lambda r: r.get("n") or 0,
+    )
+    for entry in prior:
+        for action in entry.get("comment_actions") or []:
+            address = _action_address(action)
+            if not address:
+                continue
+            verb = action.get("action")
+            if verb in _SETTLED_VERBS:
+                label = _skipped_label(action, verb)
+                if label:
+                    settled[address] = label
+            elif verb == "fixed":
+                settled.pop(address, None)
+    if not settled:
+        return ""
+    labels = list(settled.values())
+    shown = labels[:_ACTION_HISTORY_CAP]
+    tail = f"\n- ({len(labels) - len(shown)} more)" if len(labels) > len(shown) else ""
+    bulleted = "".join(f"\n- {label}" for label in shown)
+    return (
+        "Settled earlier this run — each was triaged and declined for the "
+        f"reason given, so do not re-raise these:{bulleted}{tail}"
+    )
 
 
 # Streak threshold above which the goal channel injects a one-sentence
@@ -471,6 +535,8 @@ def goal_for_round(
     has no basis for calling a finding out of scope.
 
     Round 2+ also gets:
+      - Every ``wont_fix``/``false_positive`` settled so far this run, with
+        its reason, under a "do not re-raise" heading (``_frozen_declines_note``).
       - When the prior round's ``low_only_streak`` is >= 2, a one-line
         convergence-pressure sentence appended (B1).
       - No inter-round diff. Bramble snapshots the working tree at launch
@@ -503,6 +569,9 @@ def goal_for_round(
     parts = [p for p in (pr_summary, history) if p]
     if not parts:
         return ""
+    frozen = _frozen_declines_note(state, round_)
+    if frozen:
+        parts.append(frozen)
     invariants = _prior_invariants_note(state, round_)
     if invariants:
         parts.append(invariants)
