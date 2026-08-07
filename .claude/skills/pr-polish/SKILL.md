@@ -381,11 +381,20 @@ Use `remote-head` not `git rev-parse origin/<branch>` (worktree lag).
 
 ```bash
 python3 $SKILL_DIR/scripts/pr_ops.py state-mark-complete $CTX <reason>
+
+# --repo-root is load-bearing: without it fix-claim verification silently
+# SKIPS, reporting `fix_claims: {}` with no blocker, and every
+# `action: "fixed"` row is taken on faith.
+python3 $SKILL_DIR/scripts/verdict.py "$STATE_DIR" --repo-root "$(pwd)" --write || true
 ```
 
 Reasons: `converged`, `all-low`, `false-positive-top`, `capped-at-max`, `spiral-escalated`, `pr-mismatch-abort`, `sync-conflict`, `dirty-tree-preflight`, `user-paused`, `abandoned`.
 
-Print: metrics, round table, full `comment_actions` table (`Round | Source | Path:Line | Severity | Action | Notes`), state file path, ready/not-ready verdict.
+Print: metrics, round table, full `comment_actions` table (`Round | Source | Path:Line | Severity | Action | Notes`), state file path.
+
+**Report `verdict.py`'s output, do not re-derive it.** Its `blockers` are checkable
+facts; prose that contradicts one is the failure this replaces. `|| true` keeps the
+non-zero exit from aborting the summary — the verdict itself carries the signal.
 
 ## Measuring this loop's quality
 

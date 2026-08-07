@@ -38,7 +38,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _common import severity_rank  # noqa: E402
+from _common import atomic_write_json, severity_rank  # noqa: E402
 
 # Producer-side backend roster; ``reviewer_stream_health`` derives its
 # state keys from it so a new backend cannot go unreported.
@@ -431,7 +431,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument(
         "--write",
         action="store_true",
-        help="Persist to <state_dir>/verdict.json.",
+        help="Persist to <state_dir>/verdict.json and state['verdict'].",
     )
     args = p.parse_args(argv)
 
@@ -444,7 +444,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     result = compute_verdict(state, repo_root=args.repo_root)
     if args.write:
-        (args.state_dir / "verdict.json").write_text(json.dumps(result, indent=2))
+        atomic_write_json(args.state_dir / "verdict.json", result)
+        # Consumers — the harvester, escape_rate.py, anything auditing a past
+        # run — read the state file, not the sidecar. A verdict written only
+        # to verdict.json is undiscoverable exactly where it gets looked for.
+        state["verdict"] = result
+        atomic_write_json(path, state)
     print(json.dumps(result, indent=2))
     # Non-zero on anything but a clean bill: this is what makes the verdict
     # usable from a script rather than only readable by a human.
