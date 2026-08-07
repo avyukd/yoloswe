@@ -1,0 +1,18 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "framelog",
+    srcs = ["framelog.go"],
+    importpath = "github.com/bazelment/yoloswe/agent-cli-wrapper/framelog",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "framelog_test",
+    srcs = ["framelog_test.go"],
+    embed = [":framelog"],
+    deps = [
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+    ],
+)

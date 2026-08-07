@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/framelog"
 )
 
 // Client manages the Codex app-server subprocess and provides
@@ -575,7 +577,7 @@ func (c *Client) handleMessage(line []byte) {
 	if err := json.Unmarshal(line, &base); err != nil {
 		if method, ok := recoverMethod(line); ok && !isTerminalNotification(method) {
 			slog.Debug("codex: skipping unparseable non-terminal frame",
-				"method", method, "error", err, "line", truncateForLog(line))
+				"method", method, "error", err, "line", framelogLine(line))
 			return
 		}
 		c.emitError("", "", &ProtocolError{Message: "failed to parse message", Line: string(line), Cause: err}, "parse_message")
@@ -632,7 +634,7 @@ func (c *Client) handleNotification(line []byte, method string) {
 	if err := json.Unmarshal(line, &notif); err != nil {
 		if !isTerminalNotification(method) {
 			slog.Debug("codex: skipping unparseable notification",
-				"method", method, "error", err, "line", truncateForLog(line))
+				"method", method, "error", err, "line", framelogLine(line))
 			return
 		}
 		c.emitError("", "", &ProtocolError{Message: "failed to parse notification", Line: string(line), Cause: err}, "parse_notification")
@@ -681,50 +683,97 @@ func (c *Client) handleNotification(line []byte, method string) {
 	}
 }
 
-// maxLoggedFrame bounds a raw frame written to the debug log. A line may reach
-// the 10MB NDJSON cap and can carry reviewed file contents, so the log keeps
-// only a head — the method and the shape that broke the decode both sit near
-// the start. Mirrors the reviewer's maxLoggedProtocolLine.
-const maxLoggedFrame = 2048
-
-// truncateForLog bounds a raw frame and makes the truncation visible, so a cut
-// record is never misread as a short frame.
-func truncateForLog(line []byte) string {
-	if len(line) <= maxLoggedFrame {
-		return string(line)
-	}
-	return fmt.Sprintf("%s...[truncated, %d bytes total]", line[:maxLoggedFrame], len(line))
+// framelogLine renders a raw frame for the debug log: bounded and redacted by
+// the shared framelog rule, so a drifted frame can be diagnosed without writing
+// reviewed file contents to the log.
+func framelogLine(line []byte) string {
+	rendered, _ := framelog.RenderBytes(line)
+	return rendered
 }
 
 // recoverMethod extracts the JSON-RPC method from a line too corrupt for
-// encoding/json, scanning for `"method"` followed by a string literal.
+// encoding/json, so handleMessage can tell droppable progress traffic from a
+// frame whose loss would strand the caller.
 //
-// It deliberately does NOT accept a method inside an escaped string (a
-// `\"method\"` occurrence in some payload): the scan requires a bare quote, so
-// nested/escaped text cannot forge a method and turn a terminal frame into a
-// skipped one. Recovery failing is safe — the caller then treats the frame as
-// fatal.
+// The method must sit at the TOP LEVEL, and the line must carry no top-level
+// "id". Both restrictions exist because this decides whether to DROP a frame:
+//
+//   - A nested "method" (inside params, or inside a truncated response body) is
+//     not this frame's method. Trusting it would silently skip a frame that
+//     should have been fatal. This mirrors hasResultTypeDiscriminator in the
+//     cursor package, which is depth-aware for the same reason — one rule, not
+//     two byte scanners with different trust rules.
+//   - A top-level "id" marks a response or a request, not a notification.
+//     isTerminalNotification is a notification-only allowlist, so applying it to
+//     a response would drop it and leave sendRequestAndWait blocked on its
+//     channel until context cancellation.
+//
+// Depth is tracked outside string literals (with escape handling), so an
+// escaped or embedded occurrence cannot forge a method. Recovery failing is
+// safe: the caller then treats the frame as fatal.
 func recoverMethod(line []byte) (string, bool) {
-	const key = `"method"`
-	idx := bytes.Index(line, []byte(key))
-	if idx < 0 {
+	method := ""
+	depth := 0
+
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case '{', '[':
+			depth++
+			continue
+		case '}', ']':
+			depth--
+			continue
+		case '"':
+			// handled below
+		default:
+			continue
+		}
+
+		// Find the end of this string token, honoring escapes.
+		j := i + 1
+		terminated := false
+		for ; j < len(line); j++ {
+			if line[j] == '\\' {
+				j++
+				continue
+			}
+			if line[j] == '"' {
+				terminated = true
+				break
+			}
+		}
+		if !terminated {
+			break
+		}
+
+		if depth == 1 {
+			key := string(line[i+1 : j])
+			if key == "id" {
+				// A response/request, never droppable notification traffic.
+				return "", false
+			}
+			if key == "method" && method == "" {
+				rest := bytes.TrimLeft(line[j+1:], " \t\r\n")
+				if len(rest) > 0 && rest[0] == ':' {
+					rest = bytes.TrimLeft(rest[1:], " \t\r\n")
+					if len(rest) > 0 && rest[0] == '"' {
+						rest = rest[1:]
+						if end := bytes.IndexByte(rest, '"'); end >= 0 {
+							method = string(rest[:end])
+						}
+					}
+				}
+			}
+		}
+
+		// Skip past the string literal.
+		i = j
+	}
+
+	if method == "" {
 		return "", false
 	}
-	rest := bytes.TrimLeft(line[idx+len(key):], " \t\r\n")
-	if len(rest) == 0 || rest[0] != ':' {
-		return "", false
-	}
-	rest = bytes.TrimLeft(rest[1:], " \t\r\n")
-	if len(rest) == 0 || rest[0] != '"' {
-		return "", false
-	}
-	rest = rest[1:]
-	end := bytes.IndexByte(rest, '"')
-	if end < 0 {
-		// The method value itself was cut off — nothing trustworthy to act on.
-		return "", false
-	}
-	return string(rest[:end]), true
+	return method, true
 }
 
 // isTerminalNotification reports whether losing this notification would strand

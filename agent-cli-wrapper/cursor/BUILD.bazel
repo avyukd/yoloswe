@@ -16,6 +16,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//agent-cli-wrapper/agentstream",
+        "//agent-cli-wrapper/framelog",
         "//agent-cli-wrapper/internal/ndjson",
         "//agent-cli-wrapper/internal/procattr",
         "//agent-cli-wrapper/llmendpoint",

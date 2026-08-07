@@ -10,6 +10,7 @@ import (
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude"
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/codex"
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/cursor"
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/framelog"
 )
 
 func TestSummarizeToolInput_RedactsSensitiveValues(t *testing.T) {
@@ -124,7 +125,7 @@ func TestProtocolErrorLine_ExtractsAndBounds(t *testing.T) {
 	})
 
 	t.Run("truncates an oversized frame but reports true length", func(t *testing.T) {
-		full := strings.Repeat("x", maxLoggedProtocolLine*3)
+		full := strings.Repeat("x", framelog.MaxLen*3)
 		line, n, ok := protocolErrorLine(&codex.ProtocolError{Message: "boom", Line: full})
 		if !ok {
 			t.Fatal("expected ok")
@@ -178,6 +179,11 @@ func TestProtocolErrorLine_ExtractsAndBounds(t *testing.T) {
 		}
 		if !strings.Contains(line, "[") {
 			t.Errorf("array shape lost — that shape IS the bug being diagnosed: %s", line)
+		}
+		// The frame-kind discriminator is the single most diagnostic value in
+		// the frame; redacting it to "<str:9>" would defeat the logging.
+		if !strings.Contains(line, `"type":"tool_call"`) {
+			t.Errorf("frame-kind discriminator was redacted away: %s", line)
 		}
 	})
 

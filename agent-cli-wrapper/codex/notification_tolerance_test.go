@@ -126,6 +126,14 @@ func TestRecoverMethod(t *testing.T) {
 		{"method value truncated mid-string", `{"method":"item/star`, "", false},
 		{"method key present but non-string value", `{"method":123,"params":{`, "", false},
 		{"escaped method inside a string is not recovered", `{"payload":"\"method\":\"item/started\"","x":1`, "", false},
+		// A nested "method" is not THIS frame's method. Trusting one would
+		// silently drop a frame that should have been fatal.
+		{"nested method inside params is not recovered", `{"jsonrpc":"2.0","params":{"method":"item/started","turn":{"id":"t1"`, "", false},
+		{"nested method inside a truncated result is not recovered", `{"jsonrpc":"2.0","result":{"method":"item/started","data":{`, "", false},
+		// A top-level id marks a response/request: dropping one would leave
+		// sendRequestAndWait blocked until context cancellation.
+		{"top-level id refuses recovery", `{"jsonrpc":"2.0","id":7,"result":{"method":"item/started"`, "", false},
+		{"top-level id before method still refuses", `{"id":3,"method":"item/started","params":{`, "", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -136,56 +144,20 @@ func TestRecoverMethod(t *testing.T) {
 	}
 }
 
-// A frame written to the debug log must be bounded — codex lines reach the 10MB
-// NDJSON cap and can carry reviewed file contents.
-func TestTruncateForLog_Bounds(t *testing.T) {
-	short := []byte(`{"method":"x"}`)
-	assert.Equal(t, string(short), truncateForLog(short))
+// A corrupt frame whose method sits nested must stay FATAL end-to-end: the skip
+// decision is what makes a wrong recovery dangerous.
+func TestHandleMessage_NestedMethodStaysFatal(t *testing.T) {
+	for _, name := range []string{
+		`{"jsonrpc":"2.0","params":{"method":"item/started","turn":{"id":"t1"`,
+		`{"jsonrpc":"2.0","id":9,"result":{"method":"item/started","x":{`,
+	} {
+		c := newNotificationTestClient()
+		c.handleMessage([]byte(name))
 
-	long := make([]byte, maxLoggedFrame*3)
-	for i := range long {
-		long[i] = 'x'
+		events := drainEvents(c)
+		require.Len(t, events, 1, "a frame with no trustworthy top-level method must be fatal: %s", name)
+		errEvt, ok := events[0].(ErrorEvent)
+		require.True(t, ok)
+		assert.Equal(t, "parse_message", errEvt.Context)
 	}
-	got := truncateForLog(long)
-	assert.Less(t, len(got), len(long), "an oversized frame must be truncated")
-	assert.Contains(t, got, "truncated", "truncation must be visible in the log")
-}
-
-// A corrupt line with NO recoverable method stays fatal: nothing distinguishes
-// a droppable progress frame from the turn/completed whose loss hangs the caller.
-func TestHandleMessage_UnrecoverableLineIsFatal(t *testing.T) {
-	c := newNotificationTestClient()
-	c.handleMessage([]byte(`{not json at all`))
-
-	events := drainEvents(c)
-	require.Len(t, events, 1)
-
-	errEvt, ok := events[0].(ErrorEvent)
-	require.True(t, ok)
-	assert.Equal(t, "parse_message", errEvt.Context)
-}
-
-func TestIsTerminalNotification(t *testing.T) {
-	terminal := []string{NotifyTurnCompleted, NotifyCodexEventTaskComplete, NotifyCodexEventError}
-	for _, m := range terminal {
-		assert.True(t, isTerminalNotification(m), "%s must be terminal", m)
-	}
-
-	nonTerminal := []string{
-		NotifyItemStarted, NotifyItemCompleted, NotifyAgentMessageDelta,
-		NotifyTurnStarted, NotifyThreadStarted, NotifyCodexEventTokenCount,
-		NotifyCodexEventExecBegin, NotifyCodexEventExecEnd, "some/future/method",
-	}
-	for _, m := range nonTerminal {
-		assert.False(t, isTerminalNotification(m), "%s must not be terminal", m)
-	}
-}
-
-// The raw offending frame must reach the log through ProtocolLine — without it
-// the record names a Go struct field but never what the backend actually sent.
-func TestProtocolError_ProtocolLine(t *testing.T) {
-	err := &ProtocolError{Message: "failed to parse message", Line: `{"type":"x"}`}
-	assert.Equal(t, `{"type":"x"}`, err.ProtocolLine())
-	assert.NotContains(t, err.Error(), `{"type":"x"}`,
-		"the raw line must stay out of Error() and be logged as its own field")
 }

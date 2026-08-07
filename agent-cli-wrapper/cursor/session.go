@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/framelog"
 )
 
 // SessionInfo contains session metadata from the system init message.
@@ -198,7 +200,7 @@ func (s *Session) handleLine(line []byte, textBuilder *strings.Builder) {
 			})
 			return
 		}
-		slog.Debug("cursor: skipping unparseable frame", "error", err, "line", string(line))
+		slog.Debug("cursor: skipping unparseable frame", "error", err, "line", framelogLine(line))
 		return
 	}
 	if msg == nil {
@@ -216,6 +218,14 @@ func (s *Session) handleLine(line []byte, textBuilder *strings.Builder) {
 	case *ResultMessage:
 		s.handleResult(m)
 	}
+}
+
+// framelogLine renders a raw frame for the debug log: bounded and redacted by
+// the shared framelog rule. cursor is the backend with observed protocol drift,
+// so this is the site most likely to actually fire.
+func framelogLine(line []byte) string {
+	rendered, _ := framelog.RenderBytes(line)
+	return rendered
 }
 
 // isTerminalFrame reports whether the raw line is a "result" frame — the one
