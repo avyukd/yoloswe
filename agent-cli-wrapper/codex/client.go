@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -552,12 +553,19 @@ func (c *Client) readLoop(ctx context.Context) {
 
 // handleMessage processes a single JSON-RPC message.
 //
-// A frame that fails HERE is fatal, unlike the per-kind decodes below. This
-// outer decode reads only `id` and `method`, so reaching its error arm means the
-// line is not recoverable JSON at all and no method can be identified — there is
-// no way to tell a droppable progress notification from the turn/completed whose
-// loss would hang the caller until EOF. Failing loud is the safe direction; see
-// handleNotification for the frames that ARE safe to skip.
+// This is where a truncated or structurally broken line lands: encoding/json
+// validates the WHOLE input, so a frame cut mid-write fails here and never
+// reaches the per-method decode below. The tolerance therefore has to live here
+// too — an earlier revision put it in handleNotification, where it could only
+// fire for a non-string `jsonrpc` field and left every truncated line fatal,
+// exactly the case it was written for.
+//
+// A truncated frame still carries its method: "method" sits near the head of a
+// JSON-RPC frame, before the params payload that makes a line long enough to be
+// cut. So recover it by byte scan (the mirror of cursor's
+// hasResultTypeDiscriminator) and skip when it names non-terminal traffic. When
+// no method can be recovered the frame stays fatal — losing a completion signal
+// hangs the caller until EOF, which is worse than a spurious error.
 func (c *Client) handleMessage(line []byte) {
 	// Try to determine if this is a response or notification
 	var base struct {
@@ -565,6 +573,11 @@ func (c *Client) handleMessage(line []byte) {
 		Method string `json:"method,omitempty"`
 	}
 	if err := json.Unmarshal(line, &base); err != nil {
+		if method, ok := recoverMethod(line); ok && !isTerminalNotification(method) {
+			slog.Debug("codex: skipping unparseable non-terminal frame",
+				"method", method, "error", err, "line", truncateForLog(line))
+			return
+		}
 		c.emitError("", "", &ProtocolError{Message: "failed to parse message", Line: string(line), Cause: err}, "parse_message")
 		return
 	}
@@ -619,7 +632,7 @@ func (c *Client) handleNotification(line []byte, method string) {
 	if err := json.Unmarshal(line, &notif); err != nil {
 		if !isTerminalNotification(method) {
 			slog.Debug("codex: skipping unparseable notification",
-				"method", method, "error", err, "line", string(line))
+				"method", method, "error", err, "line", truncateForLog(line))
 			return
 		}
 		c.emitError("", "", &ProtocolError{Message: "failed to parse notification", Line: string(line), Cause: err}, "parse_notification")
@@ -666,6 +679,52 @@ func (c *Client) handleNotification(line []byte, method string) {
 	case NotifyCodexEventReasoningDelta:
 		c.handleReasoningDelta(notif.Params)
 	}
+}
+
+// maxLoggedFrame bounds a raw frame written to the debug log. A line may reach
+// the 10MB NDJSON cap and can carry reviewed file contents, so the log keeps
+// only a head — the method and the shape that broke the decode both sit near
+// the start. Mirrors the reviewer's maxLoggedProtocolLine.
+const maxLoggedFrame = 2048
+
+// truncateForLog bounds a raw frame and makes the truncation visible, so a cut
+// record is never misread as a short frame.
+func truncateForLog(line []byte) string {
+	if len(line) <= maxLoggedFrame {
+		return string(line)
+	}
+	return fmt.Sprintf("%s...[truncated, %d bytes total]", line[:maxLoggedFrame], len(line))
+}
+
+// recoverMethod extracts the JSON-RPC method from a line too corrupt for
+// encoding/json, scanning for `"method"` followed by a string literal.
+//
+// It deliberately does NOT accept a method inside an escaped string (a
+// `\"method\"` occurrence in some payload): the scan requires a bare quote, so
+// nested/escaped text cannot forge a method and turn a terminal frame into a
+// skipped one. Recovery failing is safe — the caller then treats the frame as
+// fatal.
+func recoverMethod(line []byte) (string, bool) {
+	const key = `"method"`
+	idx := bytes.Index(line, []byte(key))
+	if idx < 0 {
+		return "", false
+	}
+	rest := bytes.TrimLeft(line[idx+len(key):], " \t\r\n")
+	if len(rest) == 0 || rest[0] != ':' {
+		return "", false
+	}
+	rest = bytes.TrimLeft(rest[1:], " \t\r\n")
+	if len(rest) == 0 || rest[0] != '"' {
+		return "", false
+	}
+	rest = rest[1:]
+	end := bytes.IndexByte(rest, '"')
+	if end < 0 {
+		// The method value itself was cut off — nothing trustworthy to act on.
+		return "", false
+	}
+	return string(rest[:end]), true
 }
 
 // isTerminalNotification reports whether losing this notification would strand

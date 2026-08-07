@@ -28,12 +28,11 @@ func newNotificationTestClient() *Client {
 // malformedNotification builds a frame that fails the JSONRPCNotification
 // decode for the given method.
 //
-// Note Params is json.RawMessage, so ANY valid JSON shape under "params"
-// decodes fine — the tolerance branch is reachable only for structurally broken
-// JSON. A truncated line is the production-realistic case (it is what a killed
-// or mid-flush writer emits), and it still carries an intact method. That is
-// what makes the method a trustworthy discriminator here: it comes from the
-// outer id/method decode in handleMessage, not from this failed one.
+// A truncated line is the production-realistic corruption (what a killed or
+// mid-flush writer emits). It fails the OUTER decode in handleMessage — Go's
+// json validates the whole input — which is why every test here drives
+// handleMessage rather than handleNotification. The method survives the cut and
+// is recovered by byte scan.
 func malformedNotification(method string) []byte {
 	return []byte(`{"jsonrpc":"2.0","method":"` + method + `","params":{"threadId":"t1"`)
 }
@@ -55,7 +54,11 @@ func TestHandleNotification_MalformedNonTerminalIsSkipped(t *testing.T) {
 	} {
 		t.Run(method, func(t *testing.T) {
 			c := newNotificationTestClient()
-			c.handleNotification(malformedNotification(method), method)
+			// Through handleMessage — the REAL entry point. Driving
+			// handleNotification directly would bypass the outer decode that
+			// actually rejects a truncated frame, and pass against code that
+			// aborts in production.
+			c.handleMessage(malformedNotification(method))
 
 			assert.Empty(t, drainEvents(c),
 				"a malformed non-terminal notification must not emit an ErrorEvent")
@@ -73,35 +76,83 @@ func TestHandleNotification_MalformedTerminalIsFatal(t *testing.T) {
 	} {
 		t.Run(method, func(t *testing.T) {
 			c := newNotificationTestClient()
-			c.handleNotification(malformedNotification(method), method)
+			c.handleMessage(malformedNotification(method))
 
 			events := drainEvents(c)
 			require.Len(t, events, 1, "a malformed terminal notification must be fatal")
 
 			errEvt, ok := events[0].(ErrorEvent)
 			require.True(t, ok)
-			assert.Equal(t, "parse_notification", errEvt.Context)
+			assert.Equal(t, "parse_message", errEvt.Context)
 		})
 	}
 }
 
-// A well-formed notification is unaffected by the tolerance change.
+// A well-formed notification still DISPATCHES. Asserting only "no ErrorEvent"
+// would pass even if the whole dispatch switch were deleted, so this asserts the
+// observable effect: the turn/started event reaches the channel.
 func TestHandleNotification_WellFormedStillDispatches(t *testing.T) {
 	c := newNotificationTestClient()
-	c.handleNotification(
-		[]byte(`{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"t1","turn":{"id":"turn-1"}}}`),
-		NotifyTurnStarted)
+	c.handleMessage(
+		[]byte(`{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"t1","turn":{"id":"turn-1"}}}`))
 
-	// No error event: the frame parsed and dispatched normally.
-	for _, ev := range drainEvents(c) {
-		_, isErr := ev.(ErrorEvent)
-		assert.False(t, isErr, "a well-formed notification must not produce an ErrorEvent")
+	events := drainEvents(c)
+	var sawTurnStarted bool
+	for _, ev := range events {
+		if _, isErr := ev.(ErrorEvent); isErr {
+			t.Fatalf("a well-formed notification must not produce an ErrorEvent: %#v", ev)
+		}
+		if _, ok := ev.(TurnStartedEvent); ok {
+			sawTurnStarted = true
+		}
+	}
+	require.True(t, sawTurnStarted,
+		"turn/started must dispatch a TurnStartedEvent, not merely avoid an error")
+}
+
+// recoverMethod is what makes the skip decision possible on a line Go's json
+// rejects. It must recover a real method and refuse anything it cannot trust —
+// a forged/escaped occurrence must not be able to downgrade a terminal frame.
+func TestRecoverMethod(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		want string
+		ok   bool
+	}{
+		{"truncated frame", `{"jsonrpc":"2.0","method":"item/started","params":{"a"`, "item/started", true},
+		{"whitespace around colon", `{"method" : "turn/completed","params":{`, "turn/completed", true},
+		{"no method key", `{"jsonrpc":"2.0","params":{"a":1`, "", false},
+		{"method value truncated mid-string", `{"method":"item/star`, "", false},
+		{"method key present but non-string value", `{"method":123,"params":{`, "", false},
+		{"escaped method inside a string is not recovered", `{"payload":"\"method\":\"item/started\"","x":1`, "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := recoverMethod([]byte(tt.line))
+			assert.Equal(t, tt.ok, ok)
+			assert.Equal(t, tt.want, got)
+		})
 	}
 }
 
-// handleMessage is the one parse site that stays fatal unconditionally: it
-// decodes only id/method, so its error arm means no method is recoverable and a
-// terminal frame cannot be distinguished from droppable traffic.
+// A frame written to the debug log must be bounded — codex lines reach the 10MB
+// NDJSON cap and can carry reviewed file contents.
+func TestTruncateForLog_Bounds(t *testing.T) {
+	short := []byte(`{"method":"x"}`)
+	assert.Equal(t, string(short), truncateForLog(short))
+
+	long := make([]byte, maxLoggedFrame*3)
+	for i := range long {
+		long[i] = 'x'
+	}
+	got := truncateForLog(long)
+	assert.Less(t, len(got), len(long), "an oversized frame must be truncated")
+	assert.Contains(t, got, "truncated", "truncation must be visible in the log")
+}
+
+// A corrupt line with NO recoverable method stays fatal: nothing distinguishes
+// a droppable progress frame from the turn/completed whose loss hangs the caller.
 func TestHandleMessage_UnrecoverableLineIsFatal(t *testing.T) {
 	c := newNotificationTestClient()
 	c.handleMessage([]byte(`{not json at all`))

@@ -238,38 +238,68 @@ func isTerminalFrame(line []byte) bool {
 // tolerating insignificant whitespace around the colon, so a truncated or
 // otherwise invalid result frame is still recognized as terminal.
 //
-// EVERY `"type"` occurrence is checked, not just the first. A result frame that
-// carries an earlier nested `"type"` — e.g.
-// `{"meta":{"type":"x"},"type":"result",...}` — is exactly the case the
+// Every `"type"` key at the TOP LEVEL is checked, not just the first. A result
+// frame that carries an earlier nested `"type"` — e.g.
+// `{"meta":{"type":"x"},"type":"result",...}` — is the case the
 // first-match-only version got wrong: it read as non-terminal and the frame was
 // silently skipped, dropping the only completion signal. Since this runs only
 // after a failed decode, the line is already truncated or corrupt, so the
 // nested key may well be the only one intact.
 //
-// Scanning every occurrence cannot introduce a false positive that the previous
-// version avoided: a non-result frame is matched only if it contains the literal
-// bytes `"type":"result"` somewhere, and an escaped occurrence inside a JSON
-// string (`"{\"type\":\"result\"}"`) does not match — the backslashes break the
-// prefix. Erring toward terminal is also the safe direction: a spurious fatal
-// error is visible, while a missed terminal frame hangs the caller until EOF.
+// Depth matters in BOTH directions, which is why this tracks braces rather than
+// scanning every occurrence. A nested `"type":"result"` inside a non-result
+// frame — `{"type":"tool_call","tool_call":{"x":{"type":"result"}},…` — must NOT
+// promote it: in the reviewer a spurious terminal frame becomes an ErrorEvent,
+// and bridgeStreamEvents treats any error as a terminal failure that discards
+// the whole review. That is the same outcome this change exists to prevent, so
+// there is no "safe direction" here — both mistakes cost a review.
+//
+// Depth is tracked outside string literals only (with escape handling), so
+// braces appearing inside a string value cannot shift it. Truncation is
+// tolerated: an unclosed object just leaves depth high, and the top-level keys
+// that precede the cut have already been scanned.
 func hasResultTypeDiscriminator(line []byte) bool {
 	const key = `"type"`
-	for offset := 0; ; {
-		idx := bytes.Index(line[offset:], []byte(key))
-		if idx < 0 {
-			return false
-		}
-		offset += idx + len(key)
-
-		rest := bytes.TrimLeft(line[offset:], " \t\r\n")
-		if len(rest) == 0 || rest[0] != ':' {
+	depth := 0
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case '{', '[':
+			depth++
+			continue
+		case '}', ']':
+			depth--
+			continue
+		case '"':
+			// fall through to string handling below
+		default:
 			continue
 		}
-		rest = bytes.TrimLeft(rest[1:], " \t\r\n")
-		if bytes.HasPrefix(rest, []byte(`"result"`)) {
-			return true
+
+		// At a quote: decide whether this is the `"type"` key at depth 1 (the
+		// frame's own object) before skipping over the string literal.
+		if depth == 1 && bytes.HasPrefix(line[i:], []byte(key)) {
+			rest := bytes.TrimLeft(line[i+len(key):], " \t\r\n")
+			if len(rest) > 0 && rest[0] == ':' {
+				rest = bytes.TrimLeft(rest[1:], " \t\r\n")
+				if bytes.HasPrefix(rest, []byte(`"result"`)) {
+					return true
+				}
+			}
+		}
+
+		// Skip the string literal, honoring backslash escapes so an embedded
+		// `\"` cannot end it early and desynchronize the depth counter.
+		for i++; i < len(line); i++ {
+			if line[i] == '\\' {
+				i++
+				continue
+			}
+			if line[i] == '"' {
+				break
+			}
 		}
 	}
+	return false
 }
 
 func (s *Session) handleSystemInit(msg *SystemInitMessage) {

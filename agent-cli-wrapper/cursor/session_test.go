@@ -213,6 +213,26 @@ func TestHasResultTypeDiscriminator(t *testing.T) {
 			want: false,
 		},
 		{
+			// The direction the every-occurrence scan got wrong. An UNESCAPED
+			// nested "type":"result" must not promote a progress frame: in the
+			// reviewer a spurious terminal frame becomes an ErrorEvent, which
+			// discards the whole review — the outcome this change prevents.
+			name: "unescaped nested type:result in a tool_call frame is not terminal",
+			line: `{"type":"tool_call","tool_call":{"x":{"type":"result"}},"call_`,
+			want: false,
+		},
+		{
+			name: "unescaped nested type:result in an assistant content block is not terminal",
+			line: `{"type":"assistant","message":{"content":[{"type":"result"}]},"ses`,
+			want: false,
+		},
+		{
+			// Depth tracking must not be fooled by braces inside string values.
+			name: "braces inside a string value do not shift depth",
+			line: `{"note":"{{{","type":"result","duration_ms":`,
+			want: true,
+		},
+		{
 			name: "non-result frame",
 			line: `{"type":"assistant","message":{"role":"assistant"}`,
 			want: false,

@@ -525,15 +525,25 @@ type protocolLiner interface {
 }
 
 // maxLoggedProtocolLine bounds the captured frame. A frame may be up to the
-// 10MB NDJSON cap and may carry file contents pulled in by the review, so the
-// log stores only a head — enough to identify the shape that broke the parser,
-// which is always near the start (the type discriminator and the offending
-// field). line_len is reported separately so truncation is never mistaken for a
-// short frame.
+// 10MB NDJSON cap, so the log stores only a head — the shape that broke the
+// parser sits near the start (the type discriminator and the offending field).
+// line_len is reported separately so truncation is never mistaken for a short
+// frame.
 const maxLoggedProtocolLine = 2048
 
 // protocolErrorLine extracts the raw offending frame from err or anything it
-// wraps, returning the truncated head and the untruncated length.
+// wraps, returning a redacted, bounded head and the untruncated length.
+//
+// The frames that fail to parse are overwhelmingly tool_call frames, which
+// carry exactly the values sensitiveToolInputKeys exists to keep out of the log
+// — command, file_path, content. Logging the frame verbatim would contradict
+// that policy in the same file, and OnError logs at ERROR, which SetupRunLog
+// tees to the user's terminal.
+//
+// What makes a frame diagnostic is its SHAPE, not its values: the array-vs-object
+// mismatch behind the 102-failure investigation is visible entirely in the keys
+// and JSON types. So string values are replaced with a type+length marker and
+// only structure survives. Keys are kept — they name the drifted field.
 func protocolErrorLine(err error) (string, int, bool) {
 	var pl protocolLiner
 	if !errors.As(err, &pl) {
@@ -543,10 +553,61 @@ func protocolErrorLine(err error) (string, int, bool) {
 	if line == "" {
 		return "", 0, false
 	}
-	if len(line) > maxLoggedProtocolLine {
-		return line[:maxLoggedProtocolLine] + "...[truncated]", len(line), true
+	redacted := redactFrameValues(line)
+	if len(redacted) > maxLoggedProtocolLine {
+		return redacted[:maxLoggedProtocolLine] + "...[truncated]", len(line), true
 	}
-	return line, len(line), true
+	return redacted, len(line), true
+}
+
+// redactFrameValues replaces every JSON string VALUE in a frame with a
+// `"<str:N>"` marker, preserving keys, punctuation, and non-string literals so
+// the frame's structure stays readable.
+//
+// It scans bytes rather than decoding, because by construction this frame did
+// NOT decode — it may be truncated or malformed. A token is treated as a key
+// when the next non-space byte after its closing quote is ':'; anything else is
+// a value. A trailing unterminated string (the truncation case) is redacted
+// too, so a cut-off payload cannot leak.
+func redactFrameValues(line string) string {
+	var b strings.Builder
+	b.Grow(len(line))
+	for i := 0; i < len(line); i++ {
+		if line[i] != '"' {
+			b.WriteByte(line[i])
+			continue
+		}
+		// Find the end of this string token, honoring escapes.
+		j := i + 1
+		terminated := false
+		for ; j < len(line); j++ {
+			if line[j] == '\\' {
+				j++
+				continue
+			}
+			if line[j] == '"' {
+				terminated = true
+				break
+			}
+		}
+		if !terminated {
+			// Truncated mid-string: redact the remainder rather than emit it.
+			fmt.Fprintf(&b, "\"<str:%d,truncated>", len(line)-(i+1))
+			return b.String()
+		}
+		// Peek past the closing quote: ':' means this token was a key.
+		k := j + 1
+		for k < len(line) && (line[k] == ' ' || line[k] == '\t' || line[k] == '\r' || line[k] == '\n') {
+			k++
+		}
+		if k < len(line) && line[k] == ':' {
+			b.WriteString(line[i : j+1]) // key — keep verbatim
+		} else {
+			fmt.Fprintf(&b, "\"<str:%d>\"", j-(i+1))
+		}
+		i = j
+	}
+	return b.String()
 }
 
 // sensitiveToolInputKeys names keys whose values may contain shell commands,

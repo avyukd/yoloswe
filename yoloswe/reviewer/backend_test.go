@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/acp"
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude"
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/codex"
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/cursor"
 )
@@ -136,6 +137,58 @@ func TestProtocolErrorLine_ExtractsAndBounds(t *testing.T) {
 		}
 		if n != len(full) {
 			t.Errorf("line_len = %d, want the untruncated %d", n, len(full))
+		}
+	})
+
+	t.Run("covers all four backends", func(t *testing.T) {
+		// The contract is only useful if every backend that carries a Line
+		// implements it. claude was missed on the first pass and its parse
+		// errors reach the same sink, so pin all four.
+		for name, err := range map[string]error{
+			"cursor": &cursor.ProtocolError{Message: "m", Line: `{"k":1}`},
+			"codex":  &codex.ProtocolError{Message: "m", Line: `{"k":1}`},
+			"acp":    &acp.ProtocolError{Message: "m", Line: `{"k":1}`},
+			"claude": &claude.ProtocolError{Message: "m", Line: `{"k":1}`},
+		} {
+			if _, _, ok := protocolErrorLine(err); !ok {
+				t.Errorf("%s: ProtocolLine not reachable — that backend's frames are still lost", name)
+			}
+		}
+	})
+
+	t.Run("redacts string values but keeps structure", func(t *testing.T) {
+		// tool_call frames are the ones that fail to parse, and they carry
+		// command/file_path/content — the values sensitiveToolInputKeys exists
+		// to keep out of the log. Shape is what makes a frame diagnostic.
+		err := &cursor.ProtocolError{
+			Message: "failed to parse message",
+			Line:    `{"type":"tool_call","tool_call":[{"readToolCall":{"args":{"path":"/home/alice/.ssh/id_rsa"}}}]}`,
+		}
+		line, _, ok := protocolErrorLine(err)
+		if !ok {
+			t.Fatal("expected a line")
+		}
+		if strings.Contains(line, "/home/alice/.ssh/id_rsa") {
+			t.Errorf("secret value leaked into the log: %s", line)
+		}
+		for _, key := range []string{"tool_call", "readToolCall", "args", "path"} {
+			if !strings.Contains(line, key) {
+				t.Errorf("key %q was redacted away — the frame is no longer diagnostic: %s", key, line)
+			}
+		}
+		if !strings.Contains(line, "[") {
+			t.Errorf("array shape lost — that shape IS the bug being diagnosed: %s", line)
+		}
+	})
+
+	t.Run("redacts a truncated trailing string", func(t *testing.T) {
+		err := &cursor.ProtocolError{Message: "m", Line: `{"content":"SECRET_TOKEN=abcdef`}
+		line, _, ok := protocolErrorLine(err)
+		if !ok {
+			t.Fatal("expected a line")
+		}
+		if strings.Contains(line, "SECRET_TOKEN") {
+			t.Errorf("truncated string value leaked: %s", line)
 		}
 	})
 
