@@ -52,6 +52,7 @@ Key fields: `rounds[n].comment_actions` (audit trail), `low_only_streak` (conver
 - `source`: `claude`/`codex`/`cursor`/`gemini`/`lint`/`github-inline`/`github-issue`/`ci`/`sweep`.
 - `path` + `line` (code mode) or `section`/`dimension` (design-doc mode); `notes`/`reason`, `comment_id` (for inline replies).
 - Optional v2: `spiral_refix`, `invariant` — and any other key passes through untouched.
+- Optional v3 (Step 3.d/3.e evidence): `sites_found`/`sites_fixed`, `negative_check`.
 
 ## Step 0: Bootstrap
 
@@ -344,9 +345,21 @@ Empty plan (`.action_plan.must_fix` and `.action_plan.consider_fix` both empty, 
 
 Fix the invariant, not the citation: name rule → scan sibling sites → fix at shallowest layer (line, helper, producer). Group cross-backend findings by underlying problem. Update docs/tests in same commit when contract changes. Log extra sites as `source: "sweep"`. Record every finding in `comment_actions`; don't silently drop stale items. GitHub inline replies happen in `state-finalize-round`.
 
+**A finding is a hypothesis about a class, not a work order.** The reviewer names the one instance they saw, so their suggested fix is scoped to it — apply it verbatim and the next round finds the next instance.
+
+**Research the class before editing.** When a finding names a mechanism, helper, contract, or an `invariant` seen in a prior round, dispatch one subagent per class (group cross-backend findings first) to enumerate every site and judge, against `$PR_SUMMARY` and the round-1 file set, which are this PR's job. Skip it for typos and single-line local fixes. It researches and recommends; **you decide and edit** — its scope call is input, the Step 3.c Scope contract still binds. Record `sites_found`/`sites_fixed`; `M < N` needs a reason in `notes`. An agent that always answers "1 of 1" is rubber-stamping — say so rather than keep paying for it.
+
+**Don't claim what you haven't checked.** "always", "only", "every", "both" belong in a comment only when a named test enforces them; a claim about code you didn't open is one grep away from being verified. An overclaiming comment is worse than the bug — it tells the next reader not to look.
+
+**A partially-adopted abstraction is worse than none.** Extract a helper to be "the one rule" and every call site converts in the same edit, or it reads as if the rule holds when it doesn't.
+
 ### e) Quality gates + commit
 
 Skip if no file changes. Run project gates, then commit locally (`pr-polish round {ROUND}: …`). **No push.** Check sibling sites/tests/docs before commit; record intentional gaps as `ack`.
+
+**A green test proves nothing until you have seen it red.** Revert the fix, watch the new test fail, restore. Record `negative_check: true`. A test that passes either way is worse than none — it is counted as coverage.
+
+**State the ordering on any concurrency edit.** A select/channel/goroutine change says in a comment what happens when the other side hasn't run yet; otherwise a fix that never fires reads as done.
 
 ### f) Finalize
 
