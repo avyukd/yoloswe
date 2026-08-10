@@ -38,7 +38,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from _common import atomic_write_json, severity_rank  # noqa: E402
+from _common import action_reason, atomic_write_json, severity_rank  # noqa: E402
 
 # Producer-side backend roster; ``reviewer_stream_health`` derives its
 # state keys from it so a new backend cannot go unreported.
@@ -142,7 +142,7 @@ def open_high_deferrals(state: dict) -> list[dict]:
         verb = a.get("action")
         if verb == "ack":
             out.append(a)
-        elif verb == "wont_fix" and not reason_is_substantive(a.get("reason")):
+        elif verb == "wont_fix" and not reason_is_substantive(action_reason(a)):
             out.append(a)
     return out
 

@@ -51,6 +51,7 @@ from _common import (  # noqa: E402 — sys.path tweak above
     SOURCE_ISSUE,
     SOURCE_REVIEW,
     CommandError,
+    action_reason,
     atomic_write_json,
     changed_files,
     current_branch,
@@ -1202,13 +1203,14 @@ _DEFERRAL_VERBS = {"ack", "wont_fix"}
 def _action_is_open_deferral(action: dict[str, Any]) -> bool:
     """True if this action leaves its finding open: a bare ``ack`` (any reason)
     or a ``wont_fix`` with no non-empty reason. A ``wont_fix`` with a real
-    rationale is a resolution.
+    rationale is a resolution. The rationale is read from ``reason`` or
+    ``notes`` — the actions-file spec treats them as interchangeable.
     """
     verb = action.get("action")
     if verb not in _DEFERRAL_VERBS:
         return False
     if verb == "wont_fix":
-        return not (action.get("reason") or "").strip()
+        return not action_reason(action)
     return True  # bare ack
 
 
@@ -1438,7 +1440,7 @@ def _reply_body(action: dict[str, Any], head_after: str) -> str:
     """
     short_sha = (head_after or "")[:7]
     verb = action.get("action")
-    reason = (action.get("reason") or "").strip()
+    reason = action_reason(action)
     if verb == "fixed":
         return f"Fixed in {short_sha}." if short_sha else "Fixed."
     if verb == "stale":
