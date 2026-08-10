@@ -2100,6 +2100,28 @@ class TestAutoReplyInFinalize(unittest.TestCase):
             {"action": "wont_fix", "reason": "design tradeoff"}, "abc123fdeadbeef"
         )
         self.assertIn("Won't fix: design tradeoff", body_wf)
+        # `notes` is the other documented spelling of the same field, so a
+        # rationale filed there reaches the PR thread too.
+        body_notes = pr_ops._reply_body(
+            {"action": "wont_fix", "notes": "design tradeoff"}, "abc123fdeadbeef"
+        )
+        self.assertIn("Won't fix: design tradeoff", body_notes)
+
+    def test_open_deferral_reads_either_reason_field(self) -> None:
+        # SKILL.md documents `notes`/`reason` as interchangeable; reading only
+        # `reason` left a reasoned wont_fix looking like a bare deferral, which
+        # suppresses the convergence hint for the rest of the run.
+        self.assertFalse(
+            pr_ops._action_is_open_deferral(
+                {"action": "wont_fix", "notes": "validated upstream"}
+            )
+        )
+        self.assertTrue(
+            pr_ops._action_is_open_deferral({"action": "wont_fix", "notes": "  "})
+        )
+        self.assertTrue(
+            pr_ops._action_is_open_deferral({"action": "ack", "notes": "seen"})
+        )
 
 
 class TestPreflight(unittest.TestCase):

@@ -268,6 +268,23 @@ class TestGoalForRound(unittest.TestCase):
         self.assertNotIn("deferred, not fixed", goal)
         self.assertEqual(goal.count("a.go:5"), 1)
 
+    def test_decline_rationale_under_notes_freezes(self) -> None:
+        # `notes`/`reason` are interchangeable per the actions-file spec, so a
+        # decline that argued its case under `notes` is settled and belongs in
+        # the "do not re-raise these" block — not re-offered as open work.
+        state = {
+            "rounds": [
+                {"n": 1, "comment_actions": [
+                    {"action": "wont_fix", "path": "a.go", "line": 5,
+                     "notes": "belongs to net/"},
+                ]},
+            ]
+        }
+        goal = bramble_ops.goal_for_round(2, "PR_SUMMARY", state)
+        self.assertIn("a.go:5 wont_fix: belongs to net/", goal)
+        self.assertNotIn("treat as open", goal)
+        self.assertNotIn("deferred, not fixed", goal)
+
     def test_later_fix_still_un_settles_after_reasonless_redecline(self) -> None:
         # Only `fixed` un-settles. Once it does, the address is open again
         # and the frozen block must stop claiming it.

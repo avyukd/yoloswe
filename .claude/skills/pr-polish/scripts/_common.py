@@ -267,3 +267,22 @@ KNOWN_ACTIONS = FIXED_ACTIONS | SKIPPED_ACTIONS
 KNOWN_SEVERITIES = {"high", "medium", "low", "nit"}
 
 
+def action_reason(action: dict) -> str:
+    """The rationale an action recorded, from either spelling of the field.
+
+    SKILL.md documents the actions-file row as carrying ``notes``/``reason``
+    interchangeably, and both spellings appear in real runs — but every
+    consumer used to read ``reason`` alone, so a rationale written under
+    ``notes`` was invisible to the checks that gate on one. Read here, once,
+    so the spec and the code cannot disagree again.
+
+    ``reason`` wins when both are set: it is the field named by the decline
+    protocol, so it is the more deliberate of the two.
+    """
+    for key in ("reason", "notes"):
+        text = (action.get(key) or "").strip()
+        if text:
+            return text
+    return ""
+
+

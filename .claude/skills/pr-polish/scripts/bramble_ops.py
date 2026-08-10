@@ -37,6 +37,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from _common import (  # noqa: E402
     SKIPPED_ACTIONS,
+    action_reason,
     print_json,
     read_json,
     severity_rank,
@@ -379,13 +380,14 @@ _GOAL_SKIP_VERBS = SKIPPED_ACTIONS - {"stale"}
 def _decline_rationale(action: dict[str, Any]) -> str:
     """The reason recorded for a decline, or "" when none was.
 
-    Deliberately reads ``reason`` only, never falling back to ``topic`` the
-    way ``_skipped_label`` does: the topic is the *finding's* description,
+    Reads ``reason``/``notes`` — the two spellings the actions-file spec
+    treats as interchangeable — but never falls back to ``topic`` the way
+    ``_skipped_label`` does: the topic is the *finding's* description,
     restated from the reviewer, while the reason is the orchestrator's
     decision. Freezing on a topic would tell the next reviewer not to
     re-raise "unused param" without ever saying why it was declined.
     """
-    return (action.get("reason") or "").strip()
+    return action_reason(action)
 
 
 def _is_frozen_decline(action: dict[str, Any]) -> bool:
@@ -447,7 +449,7 @@ def _skipped_label(action: dict[str, Any], verb: str, *, settled: bool = False) 
         label_verb = f"{verb} (deferred, not fixed)"
     else:
         label_verb = verb
-    description = (action.get("reason") or action.get("topic") or "").strip()
+    description = action_reason(action) or (action.get("topic") or "").strip()
     if description:
         cap = _DECLINE_REASON_CHAR_CAP if settled else _TOPIC_CHAR_CAP
         return f"{base} {label_verb}: {_truncate(description, cap)}"

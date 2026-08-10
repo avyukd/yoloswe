@@ -50,7 +50,7 @@ Key fields: `rounds[n].comment_actions` (audit trail), `low_only_streak` (conver
 - `action`: one of `fixed`, `false_positive`, `wont_fix`, `ack`, `stale`, `pre_existing`/`flake` (CI only) — validated; an unknown verb is a loud error naming the entry index.
 - `severity`: `high`/`medium`/`low`/`nit` or null (lint advisory) — validated.
 - `source`: `claude`/`codex`/`cursor`/`gemini`/`lint`/`github-inline`/`github-issue`/`ci`/`sweep`.
-- `path` + `line` (code mode) or `section`/`dimension` (design-doc mode); `notes`/`reason`, `comment_id` (for inline replies).
+- `path` + `line` (code mode) or `section`/`dimension` (design-doc mode); `notes`/`reason` — interchangeable, every consumer reads `reason` then falls back to `notes` — and `comment_id` (for inline replies).
 - Optional v2: `spiral_refix`, `invariant` — and any other key passes through untouched.
 - Optional v3 (Step 3.d/3.e evidence): `sites_found`/`sites_fixed` (only with the enumerating command in `notes` — see Step 3.d), `negative_check`.
 - Optional v4 (Step 3.c rule 6): `consumers` — `{"grep": "<command run>", "found": [{"path": …, "in_round_1_set": true|false, "disposition": "fixed"|"wont_fix", "note": …}]}` on any fix that widens a contract.
@@ -340,7 +340,7 @@ Naming the rule is not the same as covering it. Measured on #314 (`reviewer/back
 - **Outside the round-1 files** → `wont_fix`, naming where it belongs ("not in this PR's diff — worth a ticket against `<owner>`").
 - **A flaw in a fix an earlier round of this run made** → genuinely yours, fix it, and say so in `notes`. Self-correction is chronically under-labelled: across 641 runs only 18 fix notes admit it, while the longest runs are full of it ("my round-4 fix was the wrong trade", "defect in my own round-7 fix"). If this is the **second** round correcting the same mechanism, stop patching and re-derive per rule 1 — don't add another case, don't escalate.
 
-A scope decline is a real outcome, not a gap: record it as `wont_fix` with the reason.
+A scope decline is a real outcome, not a gap: record it as `wont_fix` with the reason (in `reason` or `notes` — both are read).
 
 **5. Take the cheapest fix that makes the finding untrue.** A finding always admits more than one fix, and triage picks which — not the fixer. The reviewer proposes the fix it can see from the one site it saw; that proposal is evidence, not the decision. Name the cheapest fix and the proposed one, with the file count each implies, and take the smaller unless the larger is what the PR is *for* — a fix chosen without weighing its footprint is a scope decision made by omission. The asymmetry is severe: a claim deleted is one file, a claim implemented is a contract with consumers. It recurs hardest when the finding is "X is documented/claimed but does not exist", where correcting the claim and building the thing are both valid readings of the same sentence. New machinery (a cache, a latch, a reaper) is always the larger fix — it draws new findings, which is how a two-file fix becomes a thirteen-file one.
 

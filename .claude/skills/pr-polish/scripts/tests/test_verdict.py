@@ -81,6 +81,39 @@ class OpenHighDeferralTests(unittest.TestCase):
         ]}])
         self.assertEqual(v.open_high_deferrals(st), [])
 
+    def test_wont_fix_rationale_under_notes_resolves(self):
+        # SKILL.md documents `notes`/`reason` as interchangeable on an action
+        # row, but this check read `reason` alone — so a real rationale filed
+        # under `notes` was invisible and the high stayed "open" forever. Seen
+        # in the wild: five substantive deferrals had to be hand-backfilled
+        # into `reason` before the checker would see them.
+        st = _state(rounds=[{"n": 1, "comment_actions": [
+            {"action": "wont_fix", "severity": "high", "path": "a.py",
+             "line": 1,
+             "notes": "The value is validated upstream in the dispatcher, "
+                      "so this branch cannot be reached at runtime."},
+        ]}])
+        self.assertEqual(v.open_high_deferrals(st), [])
+
+    def test_placeholder_notes_still_block(self):
+        # The fallback widens which field is read, not what counts as an
+        # argument: a placeholder under `notes` is no better than under
+        # `reason`.
+        st = _state(rounds=[{"n": 1, "comment_actions": [
+            {"action": "wont_fix", "severity": "high", "path": "a.py",
+             "line": 1, "notes": "by design"},
+        ]}])
+        self.assertEqual(len(v.open_high_deferrals(st)), 1)
+
+    def test_bare_ack_with_notes_still_blocks(self):
+        # `ack` is a deferral whatever it says: acknowledged is not resolved.
+        st = _state(rounds=[{"n": 1, "comment_actions": [
+            {"action": "ack", "severity": "high", "path": "a.py", "line": 1,
+             "notes": "Acknowledged; the caller validates this upstream so "
+                      "the branch is unreachable in practice today."},
+        ]}])
+        self.assertEqual(len(v.open_high_deferrals(st)), 1)
+
     def test_wont_fix_with_placeholder_reason_blocks(self):
         st = _state(rounds=[{"n": 1, "comment_actions": [
             {"action": "wont_fix", "severity": "high", "path": "a.py",
