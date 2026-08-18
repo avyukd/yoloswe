@@ -117,8 +117,27 @@ type RunMeta struct {
 	Error              string `json:"error,omitempty"`
 }
 
-// Target returns the best human label for this run.
+// Target returns the best human label for this run — the name a reader can
+// correlate back to whatever dispatched it.
+//
+// A --description run's identifier is NOT that name. Its IssueIdentifier is a
+// local-tracker key ("LOCAL-1"), invented after the run started by a counter
+// scoped to this run's own directory: it collides across hosts, appears in no
+// dispatcher's task list, and is not what the run is filed under, because
+// NewRunLog names the directory from this method BEFORE createLocalIssue
+// back-fills the field. Preferring it made the listing disagree with the
+// directory and print the one label that correlates nothing. So Description —
+// which exec sets only for that run shape, and which is mutually exclusive with
+// --issue — routes to TaskID instead, matching both the run directory and the
+// precedence leaseTarget already derives lock names by.
+//
+// An --issue run is unaffected and still reports its identifier, even when the
+// dispatcher also named a task: there the identifier came from the caller,
+// names the same issue on every host, and is what an operator went looking for.
 func (m RunMeta) Target() string {
+	if m.Description != "" && m.TaskID != "" {
+		return m.TaskID
+	}
 	if m.IssueIdentifier != "" {
 		return m.IssueIdentifier
 	}

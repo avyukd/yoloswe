@@ -245,6 +245,45 @@ func TestRunMetaTargetFallsBackToTaskIDThenRunID(t *testing.T) {
 	require.Equal(t, "r", RunMeta{RunID: "r"}.Target())
 }
 
+// The label a human reads has to be the one that finds the run again.
+//
+// A --description run acquires a LOCAL-N identifier partway through, so the
+// same RunMeta reports different Targets before and after createLocalIssue.
+// Only the pre-back-fill answer names the run directory, so that is the answer
+// both must give — otherwise `jiradozer runs` prints a name that appears in no
+// task list, matches no directory, and is unique to neither host.
+func TestTargetSurvivesTheLocalIssueBackfill(t *testing.T) {
+	// Exactly the two records exec writes for one --description run: the second
+	// is the first after createLocalIssue back-fills IssueIdentifier.
+	atStart := RunMeta{
+		RunID: "r1", TaskID: "t-1", Description: "tidy the chart",
+		LeaseTarget: "adhoc-abc",
+	}
+	afterBackfill := atStart
+	afterBackfill.IssueIdentifier = "LOCAL-1"
+
+	require.Equal(t, "t-1", atStart.Target())
+	require.Equal(t, "t-1", afterBackfill.Target(),
+		"the local identifier is invented per run directory; it correlates nothing")
+
+	// The listing and the run directory must not disagree — this is the bug.
+	require.Equal(t,
+		RunDirFor(atStart.Target(), atStart.RunID),
+		RunDirFor(afterBackfill.Target(), afterBackfill.RunID),
+		"TARGET must still name the directory the run was filed under")
+
+	// An --issue run keeps its identifier even when the dispatcher named a task:
+	// it came from the caller and means the same thing on every host. This is
+	// what stops the fix from being a blanket "task id always wins".
+	withBoth := RunMeta{RunID: "r2", IssueIdentifier: "INF-3029", TaskID: "t-2"}
+	require.Equal(t, "INF-3029", withBoth.Target())
+
+	// A --description run dispatched without --task-id has nothing better than
+	// the local identifier, so it may still use it rather than degrade to RunID.
+	noTask := RunMeta{RunID: "r3", Description: "tidy the chart", IssueIdentifier: "LOCAL-1"}
+	require.Equal(t, "LOCAL-1", noTask.Target())
+}
+
 // A record with no wt_root still knows where its checkout is. Reading the root
 // back off that path is what keeps pre-WTRoot runs reclaimable after WT_ROOT
 // moves — the ambient root would send gc looking in the new tree, where those
