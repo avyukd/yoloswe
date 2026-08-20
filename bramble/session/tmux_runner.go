@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude"
+	"github.com/bazelment/yoloswe/multiagent/agent"
 )
 
 // ControlSockEnvVar is the environment variable carrying the control socket
@@ -176,17 +177,23 @@ func (r *tmuxRunner) Stop() error {
 
 // buildCommand returns the binary name and argument list for the agent CLI.
 func (r *tmuxRunner) buildCommand() (binary string, args []string) {
-	binary = r.provider
-	if binary == "" {
-		binary = ProviderClaude
+	provider := r.provider
+	if provider == "" {
+		provider = ProviderClaude
+	}
+	// The binary is not always the provider name — cursor's agent CLI is
+	// "agent". Go through the canonical mapping so a new provider whose binary
+	// differs cannot silently exec the wrong thing.
+	binary = agent.BinaryForProvider(provider)
+
+	// Add the model flag. Some of bramble's IDs are placeholders for "the CLI's
+	// own default" rather than model names, so let the registry decide whether
+	// there is anything to pass.
+	if model := agent.CLIModelArg(r.model); model != "" {
+		args = append(args, "--model", model)
 	}
 
-	// Add model flag
-	if r.model != "" {
-		args = append(args, "--model", r.model)
-	}
-
-	switch binary {
+	switch provider {
 	case ProviderCodex:
 		// Codex-specific flags
 		if r.yoloMode {
@@ -206,6 +213,25 @@ func (r *tmuxRunner) buildCommand() (binary string, args []string) {
 		}
 		if r.permissionMode == "plan" {
 			args = append(args, "--approval-mode", "plan")
+		}
+	case ProviderCursor:
+		// Cursor-specific flags. Note: do NOT use -p/--print in tmux mode.
+		// --print is for scripted one-shot calls; a tmux window is an
+		// interactive session a human attaches to.
+		//
+		// Cursor refuses to run in an untrusted directory, and bramble always
+		// starts a session in a freshly created worktree — without --trust the
+		// window opens on a blocking trust prompt. The in-process ACP path
+		// trusts unconditionally for the same reason.
+		args = append(args, "--trust")
+		if r.yoloMode {
+			args = append(args, "--yolo")
+		}
+		if r.permissionMode == "plan" {
+			args = append(args, "--mode", "plan")
+		}
+		if r.resumeSessionID != "" {
+			args = append(args, "--resume", r.resumeSessionID)
 		}
 	case ProviderAgy:
 		if r.yoloMode {

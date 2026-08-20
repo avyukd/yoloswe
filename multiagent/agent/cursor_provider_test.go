@@ -29,3 +29,22 @@ func TestCursorProvider_Close(t *testing.T) {
 	_, ok := <-p.Events()
 	assert.False(t, ok, "events channel should be closed")
 }
+
+func TestCursorModelArg(t *testing.T) {
+	tests := []struct {
+		name  string
+		model string
+		want  string
+	}{
+		{name: "unset", model: "", want: ""},
+		{name: "claude default is not a cursor model", model: "sonnet", want: ""},
+		{name: "bramble placeholder is not a cursor model", model: "cursor-default", want: ""},
+		{name: "real cursor model passes through", model: "composer-2.5", want: "composer-2.5"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, cursorModelArg(tt.model))
+		})
+	}
+}

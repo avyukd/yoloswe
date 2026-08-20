@@ -141,6 +141,82 @@ func TestTmuxRunnerBuildCommand(t *testing.T) {
 			wantArgs: []string{"--model", "sonnet", "--allow-dangerously-skip-permissions", "--dangerously-skip-permissions", "build it"},
 		},
 		{
+			// "cursor" on PATH is the IDE launcher, not the agent CLI: exec'ing
+			// it headlessly is what made every cursor tmux session die within
+			// seconds. The binary must be "agent".
+			name: "cursor builder uses the agent binary and drops the placeholder model",
+			runner: tmuxRunner{
+				model:    "cursor-default",
+				provider: ProviderCursor,
+				prompt:   "build it",
+			},
+			wantBin:  "agent",
+			wantArgs: []string{"--trust", "build it"},
+		},
+		{
+			name: "cursor with a real model passes it through",
+			runner: tmuxRunner{
+				model:    "composer-2.5",
+				provider: ProviderCursor,
+				prompt:   "build it",
+			},
+			wantBin:  "agent",
+			wantArgs: []string{"--model", "composer-2.5", "--trust", "build it"},
+		},
+		{
+			name: "cursor with yolo",
+			runner: tmuxRunner{
+				model:    "cursor-default",
+				provider: ProviderCursor,
+				prompt:   "build it",
+				yoloMode: true,
+			},
+			wantBin:  "agent",
+			wantArgs: []string{"--trust", "--yolo", "build it"},
+		},
+		{
+			name: "cursor planner resuming a chat",
+			runner: tmuxRunner{
+				model:           "cursor-default",
+				provider:        ProviderCursor,
+				permissionMode:  "plan",
+				resumeSessionID: "chat-abc123",
+				prompt:          "plan this",
+			},
+			wantBin:  "agent",
+			wantArgs: []string{"--trust", "--mode", "plan", "--resume", "chat-abc123", "plan this"},
+		},
+		{
+			// Claude's flags are meaningless to cursor-agent — the Stop hook in
+			// particular. A session ID must not leak --settings into the cursor
+			// command line.
+			name: "cursor with session ID gets no claude flags",
+			runner: tmuxRunner{
+				model:       "cursor-default",
+				provider:    ProviderCursor,
+				prompt:      "do it",
+				sessionID:   "sess-1",
+				brambleBin:  "/usr/bin/bramble",
+				brambleSock: "/tmp/bramble-123.sock",
+				yoloMode:    true,
+			},
+			wantBin:  "agent",
+			wantArgs: []string{"--trust", "--yolo", "do it"},
+		},
+		{
+			// agy has the same placeholder ID and rejects it just as cursor
+			// does ("model agy-default is not recognized").
+			name: "agy drops the placeholder model too",
+			runner: tmuxRunner{
+				model:    "agy-default",
+				provider: ProviderAgy,
+				prompt:   "build it",
+				yoloMode: true,
+			},
+			wantBin:  "agy",
+			wantArgs: []string{"--dangerously-skip-permissions", "--prompt-interactive", "build it"},
+		},
+		{
 			name: "empty provider defaults to claude",
 			runner: tmuxRunner{
 				model:  "haiku",

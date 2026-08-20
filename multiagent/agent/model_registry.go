@@ -10,6 +10,24 @@ type AgentModel struct {
 	ID       string // Model identifier passed to --model flag (e.g. "opus", "gpt-5.5")
 	Provider string // Binary/provider name: "claude", "codex", "gemini", etc.
 	Label    string // Display label for the UI (e.g. "opus (claude)")
+	// Placeholder marks an ID that names no real model — it is bramble's own
+	// label for "let this provider's CLI pick its default". Such an ID must
+	// never reach a --model flag: the CLIs reject it outright rather than
+	// falling back ("Cannot use this model: cursor-default", "model
+	// agy-default is not recognized"). Use CLIModelArg to strip it.
+	Placeholder bool
+}
+
+// CLIModelArg returns the value to pass to a provider CLI's --model flag for a
+// model ID, or "" when the CLI must be left to pick for itself. Every caller
+// that builds a provider command line has to go through this — forwarding a
+// placeholder ID verbatim is what stops the session before it starts. IDs not
+// in the registry (prefix-resolved ones like "composer-2.5") pass through.
+func CLIModelArg(model string) string {
+	if m, ok := ModelByID(model); ok && m.Placeholder {
+		return ""
+	}
+	return model
 }
 
 // AllModels is the ordered list of all known models across providers.
@@ -31,8 +49,8 @@ var AllModels = []AgentModel{
 	{ID: "gemini-2.5-pro", Provider: ProviderGemini, Label: "gemini-2.5-pro"},
 	{ID: "gemini-2.5-flash", Provider: ProviderGemini, Label: "gemini-2.5-flash"},
 	{ID: "gemini-2.5-flash-lite", Provider: ProviderGemini, Label: "gemini-2.5-flash-lite"},
-	{ID: "cursor-default", Provider: ProviderCursor, Label: "cursor-default"},
-	{ID: "agy-default", Provider: ProviderAgy, Label: "agy-default"},
+	{ID: "cursor-default", Provider: ProviderCursor, Label: "cursor-default", Placeholder: true},
+	{ID: "agy-default", Provider: ProviderAgy, Label: "agy-default", Placeholder: true},
 }
 
 // AllModelIDs returns the IDs of every curated model, in AllModels order.

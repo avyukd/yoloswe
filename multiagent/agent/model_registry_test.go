@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -309,5 +310,31 @@ func TestResolveModel(t *testing.T) {
 				assert.Equal(t, tc.id, m.Label)
 			}
 		})
+	}
+}
+
+func TestCLIModelArg(t *testing.T) {
+	// Placeholder IDs name no model; every CLI checked rejects them outright
+	// rather than falling back, so they must not reach a --model flag.
+	assert.Equal(t, "", CLIModelArg("cursor-default"))
+	assert.Equal(t, "", CLIModelArg("agy-default"))
+	assert.Equal(t, "", CLIModelArg(""))
+	// Curated real models pass through.
+	assert.Equal(t, "opus", CLIModelArg("opus"))
+	assert.Equal(t, "gpt-5.5", CLIModelArg("gpt-5.5"))
+	// So do IDs the registry does not curate, e.g. prefix-resolved cursor models.
+	assert.Equal(t, "composer-2.5", CLIModelArg("composer-2.5"))
+}
+
+// Every ID whose Label says "default" is bramble's own placeholder, not a
+// model name. Pin the flag so a new provider's placeholder cannot be added to
+// the registry without it — that omission is invisible until a session dies.
+func TestAllModels_PlaceholderIDsAreMarked(t *testing.T) {
+	for _, m := range AllModels {
+		if strings.HasSuffix(m.ID, "-default") {
+			assert.True(t, m.Placeholder, "%q looks like a placeholder ID but is not marked", m.ID)
+		} else {
+			assert.False(t, m.Placeholder, "%q is marked placeholder but names a real model", m.ID)
+		}
 	}
 }

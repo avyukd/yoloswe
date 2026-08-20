@@ -44,12 +44,9 @@ func (p *CursorProvider) Execute(ctx context.Context, prompt string, wtCtx *wt.W
 	}
 
 	// Build cursor session options.
-	// Only pass an explicit model if the caller overrode the default;
-	// the "sonnet" default from applyOptions is Claude-specific and
-	// should not be forwarded to cursor.
 	var sessionOpts []cursor.SessionOption
-	if cfg.Model != "" && cfg.Model != "sonnet" {
-		sessionOpts = append(sessionOpts, cursor.WithModel(cfg.Model))
+	if model := cursorModelArg(cfg.Model); model != "" {
+		sessionOpts = append(sessionOpts, cursor.WithModel(model))
 	}
 	if cfg.WorkDir != "" {
 		sessionOpts = append(sessionOpts, cursor.WithWorkDir(cfg.WorkDir))
@@ -120,4 +117,17 @@ func (p *CursorProvider) Events() <-chan AgentEvent { return p.events }
 func (p *CursorProvider) Close() error {
 	close(p.events)
 	return nil
+}
+
+// cursorModelArg returns the value to pass to cursor-agent's --model, or ""
+// when the CLI should pick its own. On top of the placeholder IDs CLIModelArg
+// already strips, this provider sees one more non-model: "sonnet", the
+// Claude-specific default applyOptions fills in when the caller names nothing.
+// cursor-agent rejects both with "Cannot use this model" rather than falling
+// back, so neither may be forwarded.
+func cursorModelArg(model string) string {
+	if model == "sonnet" {
+		return ""
+	}
+	return CLIModelArg(model)
 }
