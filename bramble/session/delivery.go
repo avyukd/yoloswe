@@ -120,34 +120,33 @@ type Courier struct { //nolint:govet // fieldalignment: grouping by role reads b
 	seq        uint64
 }
 
-// NewCourier creates a courier that persists its queue under dir. If dir is
-// empty it defaults to ~/.bramble/deliveries. resultDir is where subagent
-// result files are written; if empty it defaults to ~/.bramble/research. Any
-// queue already on disk is loaded, so a message queued before a bramble
-// restart is not silently lost.
-func NewCourier(target DeliveryTarget, panes PaneWriter, dir, resultDir string) (*Courier, error) {
-	if dir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get home directory: %w", err)
-		}
-		dir = filepath.Join(home, ".bramble", "deliveries")
-	}
-	if resultDir == "" {
-		var err error
-		resultDir, err = DefaultResultDir()
-		if err != nil {
-			return nil, err
-		}
+// CourierConfig holds the filesystem locations used by a Courier.
+type CourierConfig struct {
+	// DeliveryDir persists queued deliveries. Empty defaults to
+	// ~/.bramble/deliveries.
+	DeliveryDir string
+	// ResultDir holds subagent result files. Empty defaults to
+	// ~/.bramble/research.
+	ResultDir string
+}
+
+// NewCourier creates a courier and loads any existing queue from disk.
+func NewCourier(target DeliveryTarget, panes PaneWriter, config CourierConfig) (*Courier, error) {
+	deliveryDir, resultDir, err := resolveCourierDirs(config)
+	if err != nil {
+		return nil, err
 	}
 	// 0700: queue files hold message text meant for one session's operator.
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("failed to create delivery dir %s: %w", dir, err)
+	if err := os.MkdirAll(deliveryDir, 0o700); err != nil {
+		return nil, fmt.Errorf("failed to create delivery dir %s: %w", deliveryDir, err)
+	}
+	if err := os.MkdirAll(resultDir, 0o700); err != nil {
+		return nil, fmt.Errorf("failed to create result dir %s: %w", resultDir, err)
 	}
 	c := &Courier{
 		target:    target,
 		panes:     panes,
-		dir:       dir,
+		dir:       deliveryDir,
 		resultDir: resultDir,
 		pending:   make(map[SessionID][]Delivery),
 		reported:  make(map[SessionID]map[SessionStatus]bool),
@@ -157,6 +156,26 @@ func NewCourier(target DeliveryTarget, panes PaneWriter, dir, resultDir string) 
 		return nil, err
 	}
 	return c, nil
+}
+
+func resolveCourierDirs(config CourierConfig) (string, string, error) {
+	deliveryDir := config.DeliveryDir
+	resultDir := config.ResultDir
+	if deliveryDir != "" && resultDir != "" {
+		return deliveryDir, resultDir, nil
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get home directory: %w", err)
+	}
+	if deliveryDir == "" {
+		deliveryDir = filepath.Join(home, ".bramble", "deliveries")
+	}
+	if resultDir == "" {
+		resultDir = filepath.Join(home, ".bramble", resultDirName)
+	}
+	return deliveryDir, resultDir, nil
 }
 
 // Send delivers text to a session, writing it now if the recipient is idle and
@@ -718,8 +737,6 @@ func DefaultResultDir() (string, error) {
 
 // ResultFilePath returns the path a session's result file is written to under
 // dir, creating the directory. If dir is empty, defaults to ~/.bramble/research.
-// Shared by the TUI transcript writer and the tmux pane capture so a parent is
-// handed the same shape of path either way.
 func ResultFilePath(dir string, id SessionID) (string, error) {
 	if dir == "" {
 		var err error
@@ -731,5 +748,9 @@ func ResultFilePath(dir string, id SessionID) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("create result dir: %w", err)
 	}
+	return resultFilePathInDir(dir, id)
+}
+
+func resultFilePathInDir(dir string, id SessionID) (string, error) {
 	return containedPath(dir, sanitizeFileName(string(id))+".md")
 }
