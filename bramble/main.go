@@ -245,7 +245,7 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	// its parent and there is no courier here to hear it. That is also why a
 	// repo whose window already died is returned — its manager still owes the
 	// transition.
-	resumeRepos := session.ReposNeedingTmuxReconcile(store, repoName)
+	resumeRepos := session.ReposNeedingTmuxReconcile(store, repoName, sharedManagerConfig.SessionMode)
 
 	// The scan above only finds repos with a session still to reconcile, so
 	// without the handoff a repo the user had opened but left idle would
