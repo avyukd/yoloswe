@@ -688,6 +688,7 @@ func (m *Manager) ReconcileTmuxSessions() error {
 			// re-adoption path that restores a stored session.
 			select {
 			case m.events <- SessionStateChangeEvent{
+				Info:      session.ToInfo(),
 				SessionID: session.ID,
 				OldStatus: stored.Status,
 				NewStatus: stored.Status,
@@ -1993,10 +1994,12 @@ func (m *Manager) runSession(session *Session, prompt string) {
 		}
 		if len(childNotifs) > 0 {
 			var parts []string
-			for _, notif := range childNotifs {
+			// Indexed, not ranged by value: the event carries a session
+			// snapshot, so copying each one costs half a kilobyte per notif.
+			for i := range childNotifs {
 				parts = append(parts, fmt.Sprintf(
 					"Child session %s status changed to %s.",
-					notif.SessionID, notif.NewStatus))
+					childNotifs[i].SessionID, childNotifs[i].NewStatus))
 			}
 			currentPrompt = strings.Join(parts, "\n") + "\nUse get_session_progress to check details and decide next steps."
 			m.updateSessionStatus(session, StatusRunning)
@@ -2074,6 +2077,7 @@ func (m *Manager) updateSessionStatus(session *Session, newStatus SessionStatus)
 	session.mu.Unlock()
 
 	m.emitSessionStateChange(SessionStateChangeEvent{
+		Info:      session.ToInfo(),
 		SessionID: session.ID,
 		OldStatus: oldStatus,
 		NewStatus: newStatus,
@@ -2088,6 +2092,7 @@ func (m *Manager) failSession(session *Session, err error) {
 	session.mu.Unlock()
 
 	m.emitSessionStateChange(SessionStateChangeEvent{
+		Info:      session.ToInfo(),
 		SessionID: session.ID,
 		OldStatus: oldStatus,
 		NewStatus: StatusFailed,
@@ -2105,6 +2110,7 @@ func (m *Manager) tryUpdateSessionStatus(session *Session, fromStatus, toStatus 
 	session.mu.Unlock()
 
 	m.emitSessionStateChange(SessionStateChangeEvent{
+		Info:      session.ToInfo(),
 		SessionID: session.ID,
 		OldStatus: oldStatus,
 		NewStatus: toStatus,
@@ -2483,16 +2489,19 @@ func (m *Manager) writeResearchFile(session *Session) (string, error) {
 	}
 	lines := m.GetSessionOutput(session.ID)
 
-	f, err := os.Create(researchPath)
-	if err != nil {
-		return "", fmt.Errorf("create research file: %w", err)
-	}
-	defer f.Close()
-
+	var body strings.Builder
 	for i := range lines {
 		if lines[i].Type == OutputTypeText && !lines[i].IsUserPrompt {
-			fmt.Fprintln(f, lines[i].Content)
+			body.WriteString(lines[i].Content)
+			body.WriteByte('\n')
 		}
+	}
+
+	// Same treatment as the pane capture in subagent_report.go: a transcript in
+	// a world-traversable temp dir is 0600, and create-and-rename replaces a
+	// symlink at this predictable path rather than writing through it.
+	if err := writeFileAtomic(researchPath, []byte(body.String()), 0o600); err != nil {
+		return "", fmt.Errorf("write research file: %w", err)
 	}
 
 	return researchPath, nil
