@@ -442,10 +442,10 @@ type Manager struct { //nolint:govet // fieldalignment: readability over packing
 	mu              sync.RWMutex
 	outputsMu       sync.RWMutex
 	followUpChansMu sync.RWMutex
-	// stateSubscribers receive copies of SessionStateChangeEvent. Used by
-	// delegator sessions to watch child state changes without consuming the
-	// primary events channel.
-	stateSubscribers   []chan<- SessionStateChangeEvent
+	// stateSubscribers receive copies of SessionStateChangeEvent, without
+	// consuming the primary events channel. The delegator's child watcher and
+	// the subagent courier are both built on it.
+	stateSubscribers   []*stateSink
 	stateSubscribersMu sync.Mutex
 	worktreeDirtyMu    sync.RWMutex
 	onWorktreeDirty    func(repoName, worktreePath string)
@@ -566,18 +566,36 @@ func (m *Manager) DisableTmuxExitOnQuit() {
 	m.config.TmuxExitOnQuit = false
 }
 
-// SubscribeStateChanges registers a channel to receive copies of all
-// SessionStateChangeEvent emissions. Returns an unsubscribe function.
-func (m *Manager) SubscribeStateChanges(ch chan<- SessionStateChangeEvent) func() {
+// stateSink is one registered listener. A struct rather than the bare function
+// so unsubscribing can find it again: functions are not comparable.
+type stateSink struct {
+	fn func(SessionStateChangeEvent)
+}
+
+// SubscribeStateChanges registers a sink for every SessionStateChangeEvent and
+// returns an unsubscribe function.
+//
+// A function called on the emitting goroutine, not a channel. A channel here
+// has to be bounded, and a bounded channel leaves only two behaviours, both
+// wrong: drop, which loses the completion a subagent's report rides and which
+// the emitter cannot even detect — a tight burst fills the buffer before the
+// reading goroutine is scheduled once — or block, which stalls the status
+// transition that produced the event, behind arbitrary listener work.
+//
+// So the sink must not block. One that has slow work to do queues internally,
+// where the queue can grow; watchStateChanges is that, and every listener in
+// this package goes through it.
+func (m *Manager) SubscribeStateChanges(fn func(SessionStateChangeEvent)) func() {
+	sink := &stateSink{fn: fn}
 	m.stateSubscribersMu.Lock()
-	m.stateSubscribers = append(m.stateSubscribers, ch)
+	m.stateSubscribers = append(m.stateSubscribers, sink)
 	m.stateSubscribersMu.Unlock()
 
 	return func() {
 		m.stateSubscribersMu.Lock()
 		defer m.stateSubscribersMu.Unlock()
 		for i, sub := range m.stateSubscribers {
-			if sub == ch {
+			if sub == sink {
 				m.stateSubscribers = slices.Delete(m.stateSubscribers, i, i+1)
 				break
 			}
@@ -2212,16 +2230,15 @@ func (m *Manager) emitSessionStateChange(evt SessionStateChangeEvent) {
 		log.Printf("WARNING: events channel full, dropping state change event for session %s (%s -> %s)", evt.SessionID, evt.OldStatus, evt.NewStatus)
 	}
 
-	// Notify state subscribers (used by delegator child watchers)
+	// Notify state subscribers. Called outside the lock so a sink is never
+	// running while subscribe/unsubscribe waits on it, and never dropped: see
+	// SubscribeStateChanges for why a bounded channel here is not an option.
 	m.stateSubscribersMu.Lock()
-	for _, ch := range m.stateSubscribers {
-		select {
-		case ch <- evt:
-		default:
-			log.Printf("WARNING: state subscriber channel full, dropping state change event for session %s (%s -> %s)", evt.SessionID, evt.OldStatus, evt.NewStatus)
-		}
-	}
+	sinks := slices.Clone(m.stateSubscribers)
 	m.stateSubscribersMu.Unlock()
+	for _, sink := range sinks {
+		sink.fn(evt)
+	}
 }
 
 // addOutput adds an output line and emits event.

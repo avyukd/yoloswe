@@ -1298,14 +1298,6 @@ func TestReposNeedingTmuxReconcile_NoopOutsideTmux(t *testing.T) {
 	assert.Nil(t, stale.CompletedAt)
 }
 
-// TestReposNeedingTmuxReconcileIncludesDeadWindows is the case that used to
-// fall through the floor. The probe leaves a dead session alone on purpose —
-// completing it here would spend the transition its parent's report rides,
-// with no courier listening — so the repo must be named for opening, or
-// nothing ever completes it and the parent waits forever.
-//
-// The store scan is tested directly: the exported entry point refuses outside
-// tmux, which is where tests run.
 // TestResolveSessionModeIsWhatBothCallersAgreeOn pins the one answer the
 // startup probe and the manager have to share. The probe names repos to open;
 // ReconcileTmuxSessions declines to touch anything unless the mode is tmux. If
@@ -1328,6 +1320,14 @@ func TestResolveSessionModeIsWhatBothCallersAgreeOn(t *testing.T) {
 		"an unset mode means auto, in both places")
 }
 
+// TestReposNeedingTmuxReconcileIncludesDeadWindows is the case that used to
+// fall through the floor. The probe leaves a dead session alone on purpose —
+// completing it here would spend the transition its parent's report rides,
+// with no courier listening — so the repo must be named for opening, or
+// nothing ever completes it and the parent waits forever.
+//
+// The store scan is tested directly: the exported entry point refuses outside
+// tmux, which is where tests run.
 func TestReposNeedingTmuxReconcileIncludesDeadWindows(t *testing.T) {
 	t.Parallel()
 	store, err := NewStore(t.TempDir())

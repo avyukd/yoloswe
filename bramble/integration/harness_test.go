@@ -61,10 +61,14 @@ type harness struct {
 	controlSock  string
 	home         string
 	stubLog      string
-	// launchCmd and runtimeDir are kept so the bramble under test can be
-	// restarted in place — see restart.
+	// launchCmd, runtimeDir and brambleWindow are kept so the bramble under test
+	// can be restarted in place — see restart.
 	launchCmd  string
 	runtimeDir string
+	// brambleWindow is the tmux window id bramble is running in. Tracked rather
+	// than assumed: a restart brings the replacement up in a new window, so the
+	// launch window is only "@0" until the first restart.
+	brambleWindow string
 	// answeredDialogs remembers which dialogs have been answered, so one
 	// appearance collects one answer.
 	answeredDialogs map[dialogKey]bool
@@ -141,8 +145,11 @@ func newHarness(t *testing.T, stubAgent bool) *harness {
 	h.runtimeDir = runtimeDir
 
 	out, err := exec.Command("tmux", "-S", h.tmuxSocket, "new-session", "-d",
-		"-x", "200", "-y", "50", "-c", h.worktreePath, h.launchCmd).CombinedOutput()
+		"-x", "200", "-y", "50", "-P", "-F", "#{window_id}",
+		"-c", h.worktreePath, h.launchCmd).CombinedOutput()
 	require.NoError(t, err, "start bramble under tmux: %s", out)
+	h.brambleWindow = strings.TrimSpace(string(out))
+	require.NotEmpty(t, h.brambleWindow, "tmux did not report the window it started bramble in")
 
 	// A window bramble opens inherits PATH from bramble itself (its tmux
 	// client), which is how the stand-in gets found — but not arbitrary
@@ -156,7 +163,7 @@ func newHarness(t *testing.T, stubAgent bool) *harness {
 		// (unknown repo, no provider) says so there and nowhere else.
 		if t.Failed() {
 			if pane, err := exec.Command("tmux", "-S", h.tmuxSocket,
-				"capture-pane", "-p", "-t", "@0").Output(); err == nil {
+				"capture-pane", "-p", "-t", h.brambleWindow).Output(); err == nil {
 				t.Logf("bramble TUI pane:\n%s", strings.TrimRight(string(pane), "\n \t"))
 			}
 			if log, err := os.ReadFile(h.stubLog); err == nil && len(log) > 0 {
@@ -186,7 +193,7 @@ func (h *harness) restart() {
 	// cancels the program, which is the same shutdown a user quitting gets.
 	//
 	// The launch command execs bramble, so the pane's process is bramble itself.
-	pid, err := h.tmux("display-message", "-p", "-t", "@0", "#{pane_pid}")
+	pid, err := h.tmux("display-message", "-p", "-t", h.brambleWindow, "#{pane_pid}")
 	require.NoError(h.t, err, "find the bramble process")
 	require.NotEmpty(h.t, pid)
 	out0, err := exec.Command("kill", "-TERM", pid).CombinedOutput()
@@ -197,7 +204,7 @@ func (h *harness) restart() {
 	// writes into this runtime dir.
 	require.Eventually(h.t, func() bool {
 		return ipc.NewClient(h.ipcSock).Ping() != nil
-	}, settleTimeout, pollInterval, "the old bramble kept answering after its window was killed")
+	}, settleTimeout, pollInterval, "the old bramble kept answering after it was signalled")
 	socks, _ := filepath.Glob(filepath.Join(h.runtimeDir, "bramble-*.sock"))
 	for _, s := range socks {
 		require.NoError(h.t, os.Remove(s))
@@ -205,8 +212,10 @@ func (h *harness) restart() {
 	h.ipcSock, h.controlSock = "", ""
 
 	out, err := exec.Command("tmux", "-S", h.tmuxSocket, "new-window", "-d",
-		"-c", h.worktreePath, h.launchCmd).CombinedOutput()
+		"-P", "-F", "#{window_id}", "-c", h.worktreePath, h.launchCmd).CombinedOutput()
 	require.NoError(h.t, err, "restart bramble under tmux: %s", out)
+	h.brambleWindow = strings.TrimSpace(string(out))
+	require.NotEmpty(h.t, h.brambleWindow, "tmux did not report the window it restarted bramble in")
 
 	h.awaitSockets(h.runtimeDir)
 }
