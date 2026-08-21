@@ -21,13 +21,40 @@ const (
 // AllProviders is the ordered list of known provider names.
 var AllProviders = []string{ProviderClaude, ProviderCodex, ProviderGemini, ProviderCursor, ProviderAgy}
 
-// providerBinaries maps provider names to their CLI binary names.
+// providerBinaries maps provider names to their CLI binary names. Most
+// providers name their binary after themselves; cursor is the exception —
+// its agent CLI is "agent" (aka "cursor-agent"), while "cursor" on PATH is
+// the IDE launcher, which exits immediately when run headlessly.
 var providerBinaries = map[string]string{
 	ProviderClaude: "claude",
 	ProviderCodex:  "codex",
 	ProviderGemini: "gemini",
 	ProviderCursor: "agent",
 	ProviderAgy:    "agy",
+}
+
+// BinaryForProvider returns the CLI binary name to exec for a provider.
+// Unknown providers fall back to their own name, matching the convention the
+// known ones follow. Callers that spawn a provider CLI by provider name must
+// go through this rather than exec'ing the name directly, or cursor sessions
+// launch the IDE launcher instead of the agent. (The agent-cli-wrapper
+// packages address their CLIs directly and do not consult this map.)
+func BinaryForProvider(provider string) string {
+	if binary, ok := providerBinaries[provider]; ok {
+		return binary
+	}
+	return provider
+}
+
+// ProviderInstallLabel names a provider in a "not installed" message, adding
+// the binary to install whenever it differs from the provider name. Telling a
+// user only that "cursor" is missing sends them to install the Cursor IDE,
+// whose launcher on PATH is precisely the wrong binary — bramble execs `agent`.
+func ProviderInstallLabel(provider string) string {
+	if binary := BinaryForProvider(provider); binary != provider {
+		return provider + " (install " + binary + ")"
+	}
+	return provider
 }
 
 // ProviderStatus describes the availability of a single provider CLI.

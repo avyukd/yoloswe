@@ -604,7 +604,11 @@ func (d *RepoSettingsDialog) View(styles *Styles) string {
 			}
 			status = styles.Completed.Render(ver)
 		}
-		line := fmt.Sprintf("  %s %-8s %s", checkbox, ps.Provider, status)
+		name := ps.Provider
+		if !ps.Installed {
+			name = agent.ProviderInstallLabel(ps.Provider)
+		}
+		line := fmt.Sprintf("  %s %-22s %s", checkbox, name, status)
 		if d.focus == RepoSettingsFocusProviders && i == d.providerCursor {
 			line = styles.Selected.Render(line)
 		} else if !ps.Installed {

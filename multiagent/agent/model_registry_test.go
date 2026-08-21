@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -309,5 +310,48 @@ func TestResolveModel(t *testing.T) {
 				assert.Equal(t, tc.id, m.Label)
 			}
 		})
+	}
+}
+
+func TestCLIModelArg(t *testing.T) {
+	// Placeholder IDs name no model; every CLI checked rejects them outright
+	// rather than falling back, so they must not reach a --model flag.
+	assert.Equal(t, "", CLIModelArg("cursor-default", ProviderCursor))
+	assert.Equal(t, "", CLIModelArg("agy-default", ProviderAgy))
+	assert.Equal(t, "", CLIModelArg("", ProviderClaude))
+	// Neither may another provider's model — backend and model are independent
+	// choices in several entry points, so they do reach each other.
+	assert.Equal(t, "", CLIModelArg("opus", ProviderCursor))
+	assert.Equal(t, "", CLIModelArg("gpt-5.5", ProviderCursor))
+	assert.Equal(t, "", CLIModelArg("claude-fable-5", ProviderCodex))
+	// A model matched to its own provider passes through.
+	assert.Equal(t, "opus", CLIModelArg("opus", ProviderClaude))
+	assert.Equal(t, "gpt-5.5", CLIModelArg("gpt-5.5", ProviderCodex))
+	// Anything the curated list does not name passes through untouched. This is
+	// load-bearing, not laziness: cursor is a gateway that sells other vendors'
+	// models under their own names, so a prefix rule would read these as
+	// "belongs to claude/codex/gemini" and silently discard a model the user
+	// named. `agent --list-models` returns all four of these.
+	assert.Equal(t, "composer-2.5", CLIModelArg("composer-2.5", ProviderCursor))
+	assert.Equal(t, "claude-opus-5-thinking-high", CLIModelArg("claude-opus-5-thinking-high", ProviderCursor))
+	assert.Equal(t, "gpt-5.3-codex", CLIModelArg("gpt-5.3-codex", ProviderCursor))
+	assert.Equal(t, "gemini-3.7-flash-high", CLIModelArg("gemini-3.7-flash-high", ProviderCursor))
+	assert.Equal(t, "mystery-model", CLIModelArg("mystery-model", ProviderCursor))
+	// An unknown provider means "no attribution known": placeholders still go,
+	// everything else passes through rather than being stripped wholesale.
+	assert.Equal(t, "opus", CLIModelArg("opus", ""))
+	assert.Equal(t, "", CLIModelArg("cursor-default", ""))
+}
+
+// Every ID whose Label says "default" is bramble's own placeholder, not a
+// model name. Pin the flag so a new provider's placeholder cannot be added to
+// the registry without it — that omission is invisible until a session dies.
+func TestAllModels_PlaceholderIDsAreMarked(t *testing.T) {
+	for _, m := range AllModels {
+		if strings.HasSuffix(m.ID, "-default") {
+			assert.True(t, m.Placeholder, "%q looks like a placeholder ID but is not marked", m.ID)
+		} else {
+			assert.False(t, m.Placeholder, "%q is marked placeholder but names a real model", m.ID)
+		}
 	}
 }

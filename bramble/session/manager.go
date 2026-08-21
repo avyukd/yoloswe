@@ -1414,7 +1414,12 @@ func (m *Manager) runSession(session *Session, prompt string) {
 		m.addOutput(session.ID, OutputLine{
 			Timestamp: time.Now(),
 			Type:      OutputTypeError,
-			Content:   fmt.Sprintf("Provider %q is not available. Install the CLI or enable it in settings.", agentModel.Provider),
+			// Name the binary in the advice, not in the %q slot: HasProvider is
+			// installed AND enabled, so this also fires for a CLI the user has
+			// but switched off — telling them to install `cursor` would be
+			// wrong, while naming `agent` is right either way.
+			Content: fmt.Sprintf("Provider %q is not available. Install %s or enable it in settings.",
+				agentModel.Provider, agent.BinaryForProvider(agentModel.Provider)),
 		})
 		m.persistSession(session)
 		return

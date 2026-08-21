@@ -10,6 +10,44 @@ type AgentModel struct {
 	ID       string // Model identifier passed to --model flag (e.g. "opus", "gpt-5.5")
 	Provider string // Binary/provider name: "claude", "codex", "gemini", etc.
 	Label    string // Display label for the UI (e.g. "opus (claude)")
+	// Placeholder marks an ID that names no real model — it is bramble's own
+	// label for "let this provider's CLI pick its default". Such an ID must
+	// never reach a --model flag: the CLIs reject it outright rather than
+	// falling back ("Cannot use this model: cursor-default", "model
+	// agy-default is not recognized"). Use CLIModelArg to strip it.
+	Placeholder bool
+}
+
+// CLIModelArg returns the value to pass to provider's CLI on --model for a
+// model ID, or "" when the CLI must be left to pick for itself. Two kinds of
+// curated ID name nothing that CLI can run: placeholders, and IDs curated
+// against a *different* provider — backend and model are separate choices in
+// several entry points (`yoloswe codetalk --backend cursor --model opus`), so
+// they do reach each other. Neither is a soft fallback at the CLI; both are a
+// hard "cannot use this model" that stops the session before it starts.
+//
+// Attribution is by exact curated ID only — deliberately ModelByID, not
+// ResolveModel. The prefix rules answer a different question: "which CLI does
+// bramble route this ID to by default", not "which CLI can run it". Cursor is
+// a gateway that serves other vendors' models under their own names — 181 of
+// the 204 IDs `agent --list-models` returns start with claude-, gpt- or
+// gemini- — so attributing by prefix would silently discard a model the user
+// asked for by name. None of the curated IDs collide with that catalog, which
+// is what makes the exact check safe. Anything the curated list does not name
+// passes through: there the CLI is the authority, not this list. An empty
+// provider means "no attribution known", so only the placeholder rule applies.
+func CLIModelArg(model, provider string) string {
+	m, ok := ModelByID(model)
+	if !ok {
+		return model
+	}
+	if m.Placeholder {
+		return ""
+	}
+	if provider != "" && m.Provider != provider {
+		return ""
+	}
+	return model
 }
 
 // AllModels is the ordered list of all known models across providers.
@@ -31,8 +69,8 @@ var AllModels = []AgentModel{
 	{ID: "gemini-2.5-pro", Provider: ProviderGemini, Label: "gemini-2.5-pro"},
 	{ID: "gemini-2.5-flash", Provider: ProviderGemini, Label: "gemini-2.5-flash"},
 	{ID: "gemini-2.5-flash-lite", Provider: ProviderGemini, Label: "gemini-2.5-flash-lite"},
-	{ID: "cursor-default", Provider: ProviderCursor, Label: "cursor-default"},
-	{ID: "agy-default", Provider: ProviderAgy, Label: "agy-default"},
+	{ID: "cursor-default", Provider: ProviderCursor, Label: "cursor-default", Placeholder: true},
+	{ID: "agy-default", Provider: ProviderAgy, Label: "agy-default", Placeholder: true},
 }
 
 // AllModelIDs returns the IDs of every curated model, in AllModels order.

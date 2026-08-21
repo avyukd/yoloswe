@@ -323,7 +323,7 @@ func renderProviderStatus(availability *agent.ProviderAvailability, enabledProvi
 		} else if status.Installed && !enabled {
 			parts = append(parts, s.Dim.Render(name+" (disabled)"))
 		} else {
-			parts = append(parts, s.Dim.Render(name+" (not found)"))
+			parts = append(parts, s.Dim.Render(agent.ProviderInstallLabel(name)+" (not found)"))
 		}
 	}
 

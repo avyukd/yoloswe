@@ -56,3 +56,24 @@ func TestProviderAvailability_Accessors(t *testing.T) {
 func TestAllProviders(t *testing.T) {
 	assert.Equal(t, []string{ProviderClaude, ProviderCodex, ProviderGemini, ProviderCursor, ProviderAgy}, AllProviders)
 }
+
+func TestBinaryForProvider(t *testing.T) {
+	// "cursor" on PATH is the IDE launcher; the agent CLI is "agent".
+	assert.Equal(t, "agent", BinaryForProvider(ProviderCursor))
+	assert.Equal(t, "claude", BinaryForProvider(ProviderClaude))
+	assert.Equal(t, "codex", BinaryForProvider(ProviderCodex))
+	assert.Equal(t, "gemini", BinaryForProvider(ProviderGemini))
+	assert.Equal(t, "agy", BinaryForProvider(ProviderAgy))
+	// Unknown providers fall back to their own name.
+	assert.Equal(t, "future-cli", BinaryForProvider("future-cli"))
+}
+
+func TestProviderInstallLabel(t *testing.T) {
+	// Naming only the provider sends a user to the Cursor IDE, whose launcher
+	// on PATH is the binary that made every cursor session die.
+	assert.Equal(t, "cursor (install agent)", ProviderInstallLabel(ProviderCursor))
+	// Providers whose binary is their own name stay unadorned.
+	for _, p := range []string{ProviderClaude, ProviderCodex, ProviderGemini, ProviderAgy} {
+		assert.Equal(t, p, ProviderInstallLabel(p))
+	}
+}

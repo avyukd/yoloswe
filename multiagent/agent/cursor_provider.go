@@ -43,25 +43,8 @@ func (p *CursorProvider) Execute(ctx context.Context, prompt string, wtCtx *wt.W
 		fullPrompt = wtCtx.FormatForPrompt() + "\n\n" + prompt
 	}
 
-	// Build cursor session options.
-	// Only pass an explicit model if the caller overrode the default;
-	// the "sonnet" default from applyOptions is Claude-specific and
-	// should not be forwarded to cursor.
-	var sessionOpts []cursor.SessionOption
-	if cfg.Model != "" && cfg.Model != "sonnet" {
-		sessionOpts = append(sessionOpts, cursor.WithModel(cfg.Model))
-	}
-	if cfg.WorkDir != "" {
-		sessionOpts = append(sessionOpts, cursor.WithWorkDir(cfg.WorkDir))
-	}
-	// Cursor requires --trust for non-interactive use
-	sessionOpts = append(sessionOpts, cursor.WithTrust())
-	if !cfg.LLMEndpoint.IsZero() {
-		sessionOpts = append(sessionOpts, cursor.WithLLMEndpoint(cfg.LLMEndpoint))
-	}
-
 	// Create session
-	session := cursor.NewSession(fullPrompt, sessionOpts...)
+	session := cursor.NewSession(fullPrompt, cursorSessionOpts(cfg)...)
 	if err := session.Start(ctx); err != nil {
 		return nil, err
 	}
@@ -120,4 +103,27 @@ func (p *CursorProvider) Events() <-chan AgentEvent { return p.events }
 func (p *CursorProvider) Close() error {
 	close(p.events)
 	return nil
+}
+
+// cursorSessionOpts builds the cursor session options for one Execute call.
+// It is split out of Execute so a test can assert what actually reaches the
+// CLI: pinning the model rule on its own leaves Execute free to stop calling
+// it, which is the regression that broke cursor sessions in the first place.
+func cursorSessionOpts(cfg ExecuteConfig) []cursor.SessionOption {
+	var opts []cursor.SessionOption
+	// applyOptions defaults Model to "sonnet" when the caller named nothing;
+	// CLIModelArg strips it as a Claude ID, along with placeholders and any
+	// other provider's models.
+	if model := CLIModelArg(cfg.Model, ProviderCursor); model != "" {
+		opts = append(opts, cursor.WithModel(model))
+	}
+	if cfg.WorkDir != "" {
+		opts = append(opts, cursor.WithWorkDir(cfg.WorkDir))
+	}
+	// Cursor requires --trust for non-interactive use
+	opts = append(opts, cursor.WithTrust())
+	if !cfg.LLMEndpoint.IsZero() {
+		opts = append(opts, cursor.WithLLMEndpoint(cfg.LLMEndpoint))
+	}
+	return opts
 }
