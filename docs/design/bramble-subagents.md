@@ -34,7 +34,17 @@ service. The delegator (`bramble/session/delegator_tools.go`) is untouched.
 spawn through `SpawnOpts` and persisted, so a subagent's return address survives
 a restart. `new-session --parent` defaults to `$BRAMBLE_SESSION_ID`;
 `--no-parent` opts out. With no `--branch` and no `--worktree`, a subagent
-inherits its parent's worktree.
+inherits its parent's worktree — and must then be filed under its parent's
+repo, so an explicit `--repo` naming a different one is refused rather than
+registering a session under a repo whose tree it is not in.
+
+The two ways of naming a parent are not the same claim. An id passed to
+`--parent` must resolve, and does not silently become a top-level spawn. One
+inherited from `$BRAMBLE_SESSION_ID` is a default: the registry only sees
+sessions adopted into an open manager, so an agent whose own repo is closed
+would otherwise lose the ability to spawn anything at all. That case warns and
+spawns top-level (`ipc.NewSessionParams.ParentInherited` carries the
+distinction).
 
 The delegator deliberately does *not* set a parent: it runs its own child
 watcher and would otherwise be told about every transition twice.
@@ -60,6 +70,14 @@ refused rather than queued, and a queue whose session dies is reclaimed.
 **One delivery per idle transition.** Writing a message starts the recipient's
 next turn, so a second write in the same drain would land mid-turn — the very
 thing the queue prevents. The rest ride the transition after.
+
+**A failed write queues instead of failing.** Both write paths — the direct one
+for an idle recipient and the drain — hand a failure to the queue and arm a
+timed retry, because the recipient of a failed write is a session that was idle
+and stays idle: there is no later transition for the message to ride. Only a
+queue that cannot be written is reported as an error, and that is the one case
+where a subagent report releases its dedup reservation and tries again on the
+child's next transition.
 
 The unqueued `send-input` path is unchanged, and stays the right tool for a
 deliberate interrupt and for raw pane targets.
@@ -159,6 +177,13 @@ than guessing when it cannot find the composer line, and a provider is only
 listed once its chrome has been checked against the real CLI. Claude and codex
 are deliberately absent: they report their own turn ends, and a second, weaker
 signal could only contradict them.
+
+Both tmux monitor loops poll it — the one `runSession` starts, and the one a
+session re-adopted after a restart gets — through
+`Manager.newPaneIdleTrackerForModel`. A loop that skipped it would leave a
+cursor subagent that outlived a bramble restart running forever: nothing would
+drain its queued mail and its parent would never be told it finished, which is
+the whole failure this section exists to fix.
 
 ## Known limitations
 
