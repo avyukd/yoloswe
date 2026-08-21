@@ -486,18 +486,29 @@ func NewManager() *Manager {
 	return NewManagerWithConfig(ManagerConfig{})
 }
 
+// ResolveSessionMode turns a configured mode into the one a manager will
+// actually run in: auto (and unset) means tmux exactly when there is a tmux to
+// be inside, and an explicit mode is taken at its word.
+//
+// Exported because callers outside a manager have to make the same call — the
+// startup probe decides which repos to open on it, and deciding differently
+// from the manager that then has to reconcile them is how repos get opened for
+// sessions nothing will ever touch.
+func ResolveSessionMode(mode SessionMode) SessionMode {
+	if mode != SessionModeAuto && mode != "" {
+		return mode
+	}
+	if IsInsideTmux() && IsTmuxAvailable() {
+		return SessionModeTmux
+	}
+	return SessionModeTUI
+}
+
 // NewManagerWithConfig creates a new session manager with the given config.
 func NewManagerWithConfig(config ManagerConfig) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Resolve auto mode
-	if config.SessionMode == SessionModeAuto || config.SessionMode == "" {
-		if IsInsideTmux() && IsTmuxAvailable() {
-			config.SessionMode = SessionModeTmux
-		} else {
-			config.SessionMode = SessionModeTUI
-		}
-	}
+	config.SessionMode = ResolveSessionMode(config.SessionMode)
 
 	return &Manager{
 		config:        config,
@@ -740,12 +751,19 @@ func (m *Manager) ReconcileTmuxSessions() error {
 // gets opened. So a repo whose only subagent died while bramble was down has to
 // be returned too, or the parent is never told, which is the whole point of
 // leaving the session alone.
-func ReposNeedingTmuxReconcile(store *Store, activeRepo string) []string {
+func ReposNeedingTmuxReconcile(store *Store, activeRepo string, mode SessionMode) []string {
 	if store == nil {
 		return nil
 	}
-	// Outside tmux there is nothing to reconcile into: ReconcileTmuxSessions is
-	// itself a no-op there, so opening these repos would achieve nothing.
+	// Both of ReconcileTmuxSessions' environmental guards, because naming a repo
+	// it will decline to reconcile is worse than saying nothing: the repo is
+	// opened — a manager and its goroutines, and a sidebar entry — on every
+	// startup, and since nothing there will ever mark those sessions terminal,
+	// it happens again forever. In TUI mode a tmux session record is simply not
+	// this process's to settle.
+	if ResolveSessionMode(mode) != SessionModeTmux {
+		return nil
+	}
 	if !IsInsideTmux() || !IsTmuxAvailable() {
 		return nil
 	}

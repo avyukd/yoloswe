@@ -1282,7 +1282,7 @@ func TestReposNeedingTmuxReconcile_NoopOutsideTmux(t *testing.T) {
 	require.NoError(t, store.SaveSession(staleRepoSession))
 
 	// Not inside tmux → no-op; neither repo is returned and no sessions are mutated.
-	liveRepos := ReposNeedingTmuxReconcile(store, "active-repo")
+	liveRepos := ReposNeedingTmuxReconcile(store, "active-repo", SessionModeTmux)
 	assert.Empty(t, liveRepos)
 
 	// Active repo session should be untouched (skipped by activeRepo filter)
@@ -1306,6 +1306,28 @@ func TestReposNeedingTmuxReconcile_NoopOutsideTmux(t *testing.T) {
 //
 // The store scan is tested directly: the exported entry point refuses outside
 // tmux, which is where tests run.
+// TestResolveSessionModeIsWhatBothCallersAgreeOn pins the one answer the
+// startup probe and the manager have to share. The probe names repos to open;
+// ReconcileTmuxSessions declines to touch anything unless the mode is tmux. If
+// they disagreed, a TUI-mode bramble would open those repos on every startup —
+// forever, since nothing in that mode ever settles a tmux session record.
+func TestResolveSessionModeIsWhatBothCallersAgreeOn(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, SessionModeTUI, ResolveSessionMode(SessionModeTUI),
+		"an explicit mode is taken at its word, tmux or no tmux")
+	assert.Equal(t, SessionModeTmux, ResolveSessionMode(SessionModeTmux))
+
+	// Auto is decided by the environment, which is the same call
+	// NewManagerWithConfig makes — assert they agree rather than assert which,
+	// since the test may run either inside tmux or outside it.
+	m := NewManagerWithConfig(ManagerConfig{SessionMode: SessionModeAuto})
+	defer m.Close()
+	assert.Equal(t, m.config.SessionMode, ResolveSessionMode(SessionModeAuto))
+	assert.Equal(t, m.config.SessionMode, ResolveSessionMode(""),
+		"an unset mode means auto, in both places")
+}
+
 func TestReposNeedingTmuxReconcileIncludesDeadWindows(t *testing.T) {
 	t.Parallel()
 	store, err := NewStore(t.TempDir())
@@ -1362,7 +1384,7 @@ func TestReposNeedingTmuxReconcile_SkipsNonTmuxSessions(t *testing.T) {
 	}
 	require.NoError(t, store.SaveSession(stored))
 
-	liveRepos := ReposNeedingTmuxReconcile(store, "active-repo")
+	liveRepos := ReposNeedingTmuxReconcile(store, "active-repo", SessionModeTmux)
 	assert.Empty(t, liveRepos)
 
 	reloaded, err := store.LoadSession("other-repo", "main", "non-tmux-session")
@@ -1566,6 +1588,6 @@ func assertNoStateChangeEvent(t *testing.T, m *Manager) {
 }
 
 func TestReposNeedingTmuxReconcile_NilStore(t *testing.T) {
-	liveRepos := ReposNeedingTmuxReconcile(nil, "active-repo")
+	liveRepos := ReposNeedingTmuxReconcile(nil, "active-repo", SessionModeTmux)
 	assert.Nil(t, liveRepos)
 }

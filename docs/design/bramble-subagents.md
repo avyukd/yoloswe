@@ -188,7 +188,10 @@ signal could only contradict them.
 
 Both tmux monitor loops poll it — the one `runSession` starts, and the one a
 session re-adopted after a restart gets — through
-`Manager.newPaneIdleTrackerForModel`. A loop that skipped it would leave a
+`Manager.newPaneIdleTrackerForModel`, and
+`TestReadoptedCursorSubagentIsStillSeenToFinish` drives the second of those for
+real: it restarts bramble under tmux and asserts the re-adopted cursor session
+is still seen to finish a turn. A loop that skipped it would leave a
 cursor subagent that outlived a bramble restart running forever: nothing would
 drain its queued mail and its parent would never be told it finished, which is
 the whole failure this section exists to fix.
@@ -244,10 +247,17 @@ agent CLIs — and is run with:
 
 Two layers:
 
-- **Stubbed.** A scripted stand-in for an agent CLI, installed on PATH as
-  `codex`, exercises bramble's own logic deterministically and with no
-  credentials: lineage, the notify hook, queued delivery, delivery into a pane
-  left in copy mode, and a full two-round conversation.
+- **Stubbed.** Scripted stand-ins for the agent CLIs, installed on PATH as
+  `codex` and as `agent` (cursor's binary), exercise bramble's own logic
+  deterministically and with no credentials: lineage, the notify hook, queued
+  delivery, delivery into a pane left in copy mode, and a full two-round
+  conversation. The cursor stand-in is faithful about one thing only — the
+  composer footer, which is the entire idle signal for a backend with no hook.
+  - `TestReadoptedCursorSubagentIsStillSeenToFinish` restarts bramble (by
+    signal, so its sessions are written to the store the way a real quit writes
+    them) and takes another turn on the re-adopted cursor child. It is the only
+    test that runs `monitorTrackedTmuxWindow`, the loop a session gets after a
+    restart, and neither loop can be driven without a tmux server.
 - **Live.** Two tests drive the real claude, codex and cursor CLIs, one subtest
   each, with a Claude parent. They run by default and skip only when a backend
   is missing or logged out, because every bug this feature shipped with was
