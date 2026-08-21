@@ -19,20 +19,25 @@ type AgentModel struct {
 }
 
 // CLIModelArg returns the value to pass to provider's CLI on --model for a
-// model ID, or "" when the CLI must be left to pick for itself. Two kinds of ID
-// name nothing that CLI can run: placeholders, and IDs the registry attributes
-// to a *different* provider — backend and model are separate choices in several
-// entry points (`yoloswe codetalk --backend cursor --model opus`), so they do
-// reach each other. Neither is a soft fallback at the CLI; both are a hard
-// "cannot use this model" that stops the session before it starts.
+// model ID, or "" when the CLI must be left to pick for itself. Two kinds of
+// curated ID name nothing that CLI can run: placeholders, and IDs curated
+// against a *different* provider — backend and model are separate choices in
+// several entry points (`yoloswe codetalk --backend cursor --model opus`), so
+// they do reach each other. Neither is a soft fallback at the CLI; both are a
+// hard "cannot use this model" that stops the session before it starts.
 //
-// Attribution goes through ResolveModel, not ModelByID: the registry decides a
-// provider by exact ID *and* by prefix, so checking only the curated list lets
-// "gpt-future-9000" through to cursor. An ID the registry cannot attribute at
-// all passes through — there the CLI is the authority, not this list. An empty
+// Attribution is by exact curated ID only — deliberately ModelByID, not
+// ResolveModel. The prefix rules answer a different question: "which CLI does
+// bramble route this ID to by default", not "which CLI can run it". Cursor is
+// a gateway that serves other vendors' models under their own names — 181 of
+// the 204 IDs `agent --list-models` returns start with claude-, gpt- or
+// gemini- — so attributing by prefix would silently discard a model the user
+// asked for by name. None of the curated IDs collide with that catalog, which
+// is what makes the exact check safe. Anything the curated list does not name
+// passes through: there the CLI is the authority, not this list. An empty
 // provider means "no attribution known", so only the placeholder rule applies.
 func CLIModelArg(model, provider string) string {
-	m, ok := ResolveModel(model)
+	m, ok := ModelByID(model)
 	if !ok {
 		return model
 	}
