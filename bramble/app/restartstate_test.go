@@ -54,7 +54,11 @@ func TestLoadRestartStateRejectsForeignVersion(t *testing.T) {
 }
 
 func TestLoadRestartStateFromEnvConsumesTheHandoff(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
+	// Not parallel: pins $HOME, which is what makes the handoff path an owned
+	// one. Production only ever points the env var at RestartStatePath().
+	t.Setenv("HOME", t.TempDir())
+	path, err := RestartStatePath()
+	require.NoError(t, err)
 	require.NoError(t, WriteRestartState(path, RestartState{ActiveRepo: "yoloswe"}))
 	t.Setenv(RestartStateEnvVar, path)
 
@@ -66,12 +70,18 @@ func TestLoadRestartStateFromEnvConsumesTheHandoff(t *testing.T) {
 	// child we spawn, and a later restart in this same process would otherwise
 	// re-apply this stale snapshot over wherever the user had navigated to.
 	assert.Empty(t, os.Getenv(RestartStateEnvVar))
-	_, err := os.Stat(path)
+	_, err = os.Stat(path)
 	assert.True(t, os.IsNotExist(err), "state file should be removed after being consumed")
 }
 
 func TestLoadRestartStateFromEnvDegradesToColdStart(t *testing.T) {
-	corrupt := filepath.Join(t.TempDir(), "corrupt.json")
+	// Not parallel: pins $HOME so the owned-path check has a restart dir.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	restartDir := filepath.Join(home, ".bramble", "restart")
+	require.NoError(t, os.MkdirAll(restartDir, 0o700))
+
+	corrupt := filepath.Join(restartDir, "424242.json")
 	require.NoError(t, os.WriteFile(corrupt, []byte("{not json"), 0o600))
 
 	tests := []struct {
@@ -79,7 +89,7 @@ func TestLoadRestartStateFromEnvDegradesToColdStart(t *testing.T) {
 		path string
 	}{
 		{"unset", ""},
-		{"missing file", filepath.Join(t.TempDir(), "absent.json")},
+		{"missing file", filepath.Join(restartDir, "999999.json")},
 		{"corrupt file", corrupt},
 	}
 	for _, tt := range tests {
@@ -96,6 +106,69 @@ func TestLoadRestartStateFromEnvDegradesToColdStart(t *testing.T) {
 	// A file we could not parse is a file nobody should retry.
 	_, err := os.Stat(corrupt)
 	assert.True(t, os.IsNotExist(err), "unusable state file should still be removed")
+}
+
+func TestLoadRestartStateFromEnvIgnoresUnownedPaths(t *testing.T) {
+	// $BRAMBLE_RESTART_STATE is an inherited environment variable, so a value
+	// bramble did not write can reach this code — from a shell profile, a stale
+	// export, or a caller pointing it somewhere on purpose. The deletion below
+	// is unconditional and silent, so anything that is not recognisably our own
+	// handoff must be left completely alone rather than read and unlinked.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	restartDir := filepath.Join(home, ".bramble", "restart")
+	require.NoError(t, os.MkdirAll(restartDir, 0o700))
+
+	outside := filepath.Join(t.TempDir(), "precious.json")
+	nested := filepath.Join(restartDir, "sub")
+	require.NoError(t, os.MkdirAll(nested, 0o700))
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{"outside the restart dir", outside},
+		{"right dir, foreign name", filepath.Join(restartDir, "settings.json")},
+		{"right dir, not a json handoff", filepath.Join(restartDir, "12345.txt")},
+		{"below the restart dir", filepath.Join(nested, "12345.json")},
+		{"traversal back out", filepath.Join(restartDir, "..", "settings.json")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.NoError(t, os.WriteFile(tt.path, []byte(`{"version":1}`), 0o600))
+			t.Setenv(RestartStateEnvVar, tt.path)
+
+			assert.Nil(t, LoadRestartStateFromEnv(), "an unowned path is not a handoff")
+			assert.FileExists(t, tt.path, "an unowned path must never be unlinked")
+		})
+	}
+}
+
+func TestPruneStaleRestartStatesLeavesForeignFiles(t *testing.T) {
+	t.Parallel()
+
+	// The sweep walks a whole directory, so it needs the same ownership test:
+	// an old file that bramble did not write is not an abandoned handoff.
+	dir := t.TempDir()
+	old := time.Now().Add(-2 * staleRestartStateAge)
+
+	foreign := []string{"settings.json", "notes.txt", "abc.json", "12345.json.bak"}
+	for _, name := range foreign {
+		p := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(p, []byte("keep me"), 0o600))
+		require.NoError(t, os.Chtimes(p, old, old))
+	}
+	ours := filepath.Join(dir, "999999.json")
+	require.NoError(t, os.WriteFile(ours, []byte(`{"version":1}`), 0o600))
+	require.NoError(t, os.Chtimes(ours, old, old))
+
+	pruneStaleRestartStates(dir)
+
+	for _, name := range foreign {
+		assert.FileExists(t, filepath.Join(dir, name), "%s is not ours to delete", name)
+	}
+	_, err := os.Stat(ours)
+	assert.True(t, os.IsNotExist(err), "an abandoned handoff should still be swept")
 }
 
 func TestRestartStatePathIsPidScoped(t *testing.T) {

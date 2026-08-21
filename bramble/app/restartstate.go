@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 )
 
@@ -71,6 +72,41 @@ func RestartStatePath() (string, error) {
 	return filepath.Join(dir, fmt.Sprintf("%d.json", os.Getpid())), nil
 }
 
+// ownedRestartStateName matches exactly what this package writes into the
+// restart directory: the pid-keyed handoff itself, and the "<name>.<random>.tmp"
+// scratch file WriteRestartState renames into place. Anything else in there was
+// put there by something other than bramble.
+var ownedRestartStateName = regexp.MustCompile(`^\d+\.json(\.[^/]*\.tmp)?$`)
+
+// isOwnedRestartStatePath reports whether path is a file this package created:
+// it must sit directly in the restart directory and carry a name only
+// WriteRestartState produces.
+//
+// Both deletion sites below are gated on this rather than on any list of paths
+// to avoid. The removals are unconditional and silent, so the safe condition
+// has to be stated positively — "this is ours" — or the next unowned shape
+// anyone can name gets deleted. $BRAMBLE_RESTART_STATE in particular is an
+// inherited environment variable: a stale or hand-set value must be ignored,
+// never unlinked.
+func isOwnedRestartStatePath(path string) bool {
+	dir, err := restartStateDir()
+	if err != nil {
+		return false
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	if filepath.Dir(abs) != absDir {
+		return false
+	}
+	return ownedRestartStateName.MatchString(filepath.Base(abs))
+}
+
 // WriteRestartState writes state to path via temp file + rename, so a reader
 // (the next process image) never observes a partial file.
 func WriteRestartState(path string, state RestartState) error {
@@ -118,6 +154,9 @@ func pruneStaleRestartStates(dir string) {
 		if err != nil || entry.IsDir() || info.ModTime().After(cutoff) {
 			continue
 		}
+		if !ownedRestartStateName.MatchString(entry.Name()) {
+			continue
+		}
 		os.Remove(filepath.Join(dir, entry.Name()))
 	}
 }
@@ -153,6 +192,11 @@ func LoadRestartStateFromEnv() *RestartState {
 		return nil
 	}
 	os.Unsetenv(RestartStateEnvVar)
+	if !isOwnedRestartStatePath(path) {
+		// Not a handoff we wrote, so it is not ours to read or unlink. Degrade
+		// to a cold start.
+		return nil
+	}
 	// Remove regardless of whether the parse succeeds: a file we cannot use is
 	// a file nobody should retry.
 	defer os.Remove(path)

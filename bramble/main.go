@@ -882,22 +882,43 @@ var notifyCmd = &cobra.Command{
 // since the notify handler is the only caller of SetSessionIdle the session
 // never shows as idle at all. The stop hook runs with --silent, so nothing
 // would ever say so.
+//
+// The budget is a wall-clock span rather than an attempt count because what has
+// to be covered is a duration: the gap above is however long the replacement
+// image takes to reach its IPC bind, and a count only expresses that
+// second-hand. Delays grow geometrically so a socket that comes back quickly is
+// noticed quickly, and cap out so the tail stays a poll rather than one long
+// sleep that overshoots the budget.
+//
+// The ceiling is what a stop hook pays when bramble is gone for good rather
+// than restarting, since that case is indistinguishable from here — which is
+// why it is seconds and not the minute a truly generous budget would want.
 const (
-	notifyRetries         = 4
+	notifyRetryBudget     = 5 * time.Second
 	notifyRetryBaseDelay  = 100 * time.Millisecond
+	notifyRetryMaxDelay   = time.Second
 	notifyRetryMultiplier = 3
 )
 
 // sendNotifyWithRetry sends a notify request, backing off over a transport
-// failure. Only transport errors are retried: a response from the server, even
-// an error one, is a real answer and is returned as-is.
+// failure until notifyRetryBudget is spent. Only transport errors are retried:
+// a response from the server, even an error one, is a real answer and is
+// returned as-is.
 func sendNotifyWithRetry(client *ipc.Client, sessionID string) (*ipc.Response, error) {
 	var lastErr error
+	deadline := time.Now().Add(notifyRetryBudget)
 	delay := notifyRetryBaseDelay
-	for attempt := range notifyRetries {
+	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
-			time.Sleep(delay)
-			delay *= notifyRetryMultiplier
+			// Sleeping past the deadline would spend more than the budget
+			// allows, and waking to a dial we have already decided not to make
+			// is pure latency.
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				break
+			}
+			time.Sleep(min(delay, remaining))
+			delay = min(delay*notifyRetryMultiplier, notifyRetryMaxDelay)
 		}
 		resp, err := client.Send(&ipc.Request{
 			Type:   ipc.RequestNotify,

@@ -5,6 +5,7 @@ import (
 	"net"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -136,4 +137,78 @@ func TestNotifyCmdSilentSwallowsMissingSessionID(t *testing.T) {
 	})
 
 	assert.NoError(t, notifyCmd.RunE(notifyCmd, nil))
+}
+
+// serveIPCAt answers notify requests on an already-created listener, mirroring
+// startFakeIPCServer's handler. It exists so a test can control *when* the
+// socket appears.
+func serveIPCAt(t *testing.T, ln net.Listener) {
+	t.Helper()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return // listener closed by cleanup
+			}
+			go func() {
+				defer conn.Close()
+				var req ipc.Request
+				if err := json.NewDecoder(conn).Decode(&req); err != nil {
+					return
+				}
+				_ = json.NewEncoder(conn).Encode(ipc.Response{ID: req.ID, OK: true})
+			}()
+		}
+	}()
+}
+
+// The retry loop is the only thing keeping a session from being stuck Running
+// forever: notify is the sole caller of SetSessionIdle, and the stop hook runs
+// with --silent, so a notify that lands while the replacement image has not yet
+// re-bound the IPC socket fails invisibly. Bind deliberately later than the
+// pre-budget backoff (100+300+900ms) ever waited, so shrinking the budget back
+// to a handful of fixed attempts fails here rather than in production.
+func TestSendNotifyWithRetrySpansTheRestartGap(t *testing.T) {
+	// Unix socket paths are length-limited; keep the name short.
+	sockPath := filepath.Join(t.TempDir(), "b.sock")
+
+	const bindAfter = 1500 * time.Millisecond
+	bound := make(chan struct{})
+	go func() {
+		time.Sleep(bindAfter)
+		ln, err := net.Listen("unix", sockPath)
+		if err != nil {
+			close(bound)
+			return
+		}
+		t.Cleanup(func() { _ = ln.Close() })
+		serveIPCAt(t, ln)
+		close(bound)
+	}()
+	t.Cleanup(func() { <-bound })
+
+	start := time.Now()
+	resp, err := sendNotifyWithRetry(ipc.NewClient(sockPath), "sess-1")
+	require.NoError(t, err, "notify should survive the socket being absent at first")
+	assert.True(t, resp.OK)
+	assert.GreaterOrEqual(t, time.Since(start), bindAfter,
+		"a success before the socket existed would mean the test proved nothing")
+}
+
+// The budget is also a ceiling: when bramble is gone for good rather than
+// restarting, the stop hook must not block indefinitely waiting for a socket
+// that is never coming back.
+func TestSendNotifyWithRetryGivesUpWithinBudget(t *testing.T) {
+	// Nothing ever listens here.
+	sockPath := filepath.Join(t.TempDir(), "b.sock")
+
+	start := time.Now()
+	_, err := sendNotifyWithRetry(ipc.NewClient(sockPath), "sess-1")
+	elapsed := time.Since(start)
+
+	require.Error(t, err, "an unreachable socket is still a failure once the budget is spent")
+	assert.GreaterOrEqual(t, elapsed, notifyRetryBudget, "gave up before spending the budget")
+	// Generous headroom: the bound that matters is that it terminates near the
+	// budget rather than retrying forever, not the exact overshoot.
+	assert.Less(t, elapsed, notifyRetryBudget+2*time.Second, "overshot the budget")
 }
