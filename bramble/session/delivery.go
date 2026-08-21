@@ -158,6 +158,11 @@ func NewCourier(target DeliveryTarget, panes PaneWriter, config CourierConfig) (
 	return c, nil
 }
 
+// ResultDir returns the directory where subagent result files are written.
+func (c *Courier) ResultDir() string {
+	return c.resultDir
+}
+
 func resolveCourierDirs(config CourierConfig) (string, string, error) {
 	deliveryDir := config.DeliveryDir
 	resultDir := config.ResultDir
