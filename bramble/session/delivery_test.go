@@ -194,11 +194,14 @@ func echoPanes(target *fakeTarget) *fakePanes {
 	return p
 }
 
+// testCourierResultDir names a result dir inside this test's temp dir without
+// creating it. Deliberately not pre-created: the courier's own MkdirAll must be
+// what brings it into existence, or TestResultArtifactsAreNotWorldReadable
+// would be asserting on the mode this helper chose rather than the one the
+// production code does.
 func testCourierResultDir(t *testing.T) string {
 	t.Helper()
-	dir := filepath.Join(t.TempDir(), "results")
-	require.NoError(t, os.Mkdir(dir, 0o700))
-	return dir
+	return filepath.Join(t.TempDir(), "results")
 }
 
 func testCourierConfig(t *testing.T) CourierConfig {
