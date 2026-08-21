@@ -165,15 +165,19 @@ func resolveCourierDirs(config CourierConfig) (string, string, error) {
 		return deliveryDir, resultDir, nil
 	}
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", "", fmt.Errorf("failed to get home directory: %w", err)
-	}
 	if deliveryDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", "", fmt.Errorf("failed to get home directory: %w", err)
+		}
 		deliveryDir = filepath.Join(home, ".bramble", "deliveries")
 	}
 	if resultDir == "" {
-		resultDir = filepath.Join(home, ".bramble", resultDirName)
+		var err error
+		resultDir, err = DefaultResultDir()
+		if err != nil {
+			return "", "", err
+		}
 	}
 	return deliveryDir, resultDir, nil
 }
