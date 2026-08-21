@@ -1414,7 +1414,7 @@ func (m *Manager) runSession(session *Session, prompt string) {
 		m.addOutput(session.ID, OutputLine{
 			Timestamp: time.Now(),
 			Type:      OutputTypeError,
-			Content:   fmt.Sprintf("Provider %q is not available. Install the CLI or enable it in settings.", agentModel.Provider),
+			Content:   fmt.Sprintf("Provider %q is not available. Install the CLI or enable it in settings.", agent.ProviderInstallLabel(agentModel.Provider)),
 		})
 		m.persistSession(session)
 		return

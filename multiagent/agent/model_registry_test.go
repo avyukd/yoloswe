@@ -327,9 +327,16 @@ func TestCLIModelArg(t *testing.T) {
 	// A model matched to its own provider passes through.
 	assert.Equal(t, "opus", CLIModelArg("opus", ProviderClaude))
 	assert.Equal(t, "gpt-5.5", CLIModelArg("gpt-5.5", ProviderCodex))
-	// So do IDs the registry does not curate, e.g. prefix-resolved cursor
-	// models — there the CLI is the authority, not this list.
+	// Attribution is by prefix as well as by exact ID, so a not-yet-curated
+	// model still reaches the right CLI and only the right CLI.
 	assert.Equal(t, "composer-2.5", CLIModelArg("composer-2.5", ProviderCursor))
+	assert.Equal(t, "", CLIModelArg("composer-2.5", ProviderCodex))
+	assert.Equal(t, "gpt-future-9000", CLIModelArg("gpt-future-9000", ProviderCodex))
+	assert.Equal(t, "", CLIModelArg("gpt-future-9000", ProviderCursor))
+	assert.Equal(t, "", CLIModelArg("gemini-future", ProviderCursor))
+	// An ID the registry cannot attribute at all passes through — there the CLI
+	// is the authority, not this list.
+	assert.Equal(t, "mystery-model", CLIModelArg("mystery-model", ProviderCursor))
 	// An unknown provider means "no attribution known": placeholders still go,
 	// everything else passes through rather than being stripped wholesale.
 	assert.Equal(t, "opus", CLIModelArg("opus", ""))

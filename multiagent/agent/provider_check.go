@@ -46,6 +46,17 @@ func BinaryForProvider(provider string) string {
 	return provider
 }
 
+// ProviderInstallLabel names a provider in a "not installed" message, adding
+// the binary to install whenever it differs from the provider name. Telling a
+// user only that "cursor" is missing sends them to install the Cursor IDE,
+// whose launcher on PATH is precisely the wrong binary — bramble execs `agent`.
+func ProviderInstallLabel(provider string) string {
+	if binary := BinaryForProvider(provider); binary != provider {
+		return provider + " (install " + binary + ")"
+	}
+	return provider
+}
+
 // ProviderStatus describes the availability of a single provider CLI.
 type ProviderStatus struct {
 	Provider  string

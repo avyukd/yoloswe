@@ -323,13 +323,7 @@ func renderProviderStatus(availability *agent.ProviderAvailability, enabledProvi
 		} else if status.Installed && !enabled {
 			parts = append(parts, s.Dim.Render(name+" (disabled)"))
 		} else {
-			// Name the binary to install when it differs from the provider —
-			// "cursor" on PATH is the IDE launcher, not the agent CLI.
-			missing := name
-			if bin := agent.BinaryForProvider(name); bin != name {
-				missing = fmt.Sprintf("%s (install %s)", name, bin)
-			}
-			parts = append(parts, s.Dim.Render(missing+" (not found)"))
+			parts = append(parts, s.Dim.Render(agent.ProviderInstallLabel(name)+" (not found)"))
 		}
 	}
 

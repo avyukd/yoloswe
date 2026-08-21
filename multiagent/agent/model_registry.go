@@ -26,11 +26,13 @@ type AgentModel struct {
 // reach each other. Neither is a soft fallback at the CLI; both are a hard
 // "cannot use this model" that stops the session before it starts.
 //
-// IDs the registry does not curate pass through — for those (prefix-resolved
-// ones like "composer-2.5") the CLI is the authority, not this list. An empty
+// Attribution goes through ResolveModel, not ModelByID: the registry decides a
+// provider by exact ID *and* by prefix, so checking only the curated list lets
+// "gpt-future-9000" through to cursor. An ID the registry cannot attribute at
+// all passes through — there the CLI is the authority, not this list. An empty
 // provider means "no attribution known", so only the placeholder rule applies.
 func CLIModelArg(model, provider string) string {
-	m, ok := ModelByID(model)
+	m, ok := ResolveModel(model)
 	if !ok {
 		return model
 	}

@@ -67,3 +67,13 @@ func TestBinaryForProvider(t *testing.T) {
 	// Unknown providers fall back to their own name.
 	assert.Equal(t, "future-cli", BinaryForProvider("future-cli"))
 }
+
+func TestProviderInstallLabel(t *testing.T) {
+	// Naming only the provider sends a user to the Cursor IDE, whose launcher
+	// on PATH is the binary that made every cursor session die.
+	assert.Equal(t, "cursor (install agent)", ProviderInstallLabel(ProviderCursor))
+	// Providers whose binary is their own name stay unadorned.
+	for _, p := range []string{ProviderClaude, ProviderCodex, ProviderGemini, ProviderAgy} {
+		assert.Equal(t, p, ProviderInstallLabel(p))
+	}
+}
