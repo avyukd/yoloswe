@@ -409,6 +409,10 @@ type ManagerConfig struct { //nolint:govet // fieldalignment: readability over p
 	// RecordingDir enables JSONL session recording for all sessions.
 	// If empty, recording is disabled.
 	RecordingDir string
+	// ResearchDir is where subagent result files are written. If empty it
+	// defaults to ~/.bramble/research. Injectable so a test can point it at
+	// its own directory rather than writing into the real one.
+	ResearchDir string
 	// IPCSockPath is the path to the bramble IPC Unix domain socket.
 	// Used to propagate BRAMBLE_SOCK to tmux windows so hook commands
 	// can call back to the TUI. Set by main after startIPCServer.
@@ -449,9 +453,6 @@ type Manager struct { //nolint:govet // fieldalignment: readability over packing
 	stateSubscribersMu sync.Mutex
 	worktreeDirtyMu    sync.RWMutex
 	onWorktreeDirty    func(repoName, worktreePath string)
-	researchDir        string
-	researchDirOnce    sync.Once
-	researchDirErr     error
 }
 
 // RepoName returns the repo name this manager is configured for.
@@ -501,11 +502,8 @@ func NewManagerWithConfig(config ManagerConfig) *Manager {
 			config.SessionMode = SessionModeTUI
 		}
 	}
-	researchDir, _ := DefaultResultDir()
-
 	return &Manager{
 		config:        config,
-		researchDir:   researchDir,
 		sessions:      make(map[SessionID]*Session),
 		events:        make(chan interface{}, 10000),
 		outputs:       make(map[SessionID][]OutputLine),
@@ -2502,9 +2500,10 @@ func (m *Manager) RecentOutputLines(id SessionID, n int) []string {
 	return sessionmodel.RecentAssistantTextFromSlice(lines, n)
 }
 
-// writeResearchFile writes a codetalk session's text output to a markdown file.
+// writeResearchFile writes a codetalk session's text output to a markdown file
+// under the manager's result dir (~/.bramble/research by default).
 func (m *Manager) writeResearchFile(session *Session) (string, error) {
-	researchPath, err := m.resultFilePath(session.ID)
+	researchPath, err := ResultFilePath(m.config.ResearchDir, session.ID)
 	if err != nil {
 		return "", err
 	}
@@ -2526,20 +2525,6 @@ func (m *Manager) writeResearchFile(session *Session) (string, error) {
 	}
 
 	return researchPath, nil
-}
-
-func (m *Manager) resultFilePath(id SessionID) (string, error) {
-	dir := m.researchDir
-	if dir == "" {
-		return ResultFilePath("", id)
-	}
-	m.researchDirOnce.Do(func() {
-		m.researchDirErr = os.MkdirAll(dir, 0o700)
-	})
-	if m.researchDirErr != nil {
-		return "", fmt.Errorf("create result dir: %w", m.researchDirErr)
-	}
-	return resultFilePathInDir(dir, id)
 }
 
 // CapturePaneText captures the last n lines of text from a tmux session's pane.

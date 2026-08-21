@@ -737,6 +737,12 @@ func DefaultResultDir() (string, error) {
 
 // ResultFilePath returns the path a session's result file is written to under
 // dir, creating the directory. If dir is empty, defaults to ~/.bramble/research.
+//
+// Shared by the TUI transcript writer and the tmux pane capture so a parent is
+// handed the same shape of path either way. It re-creates the directory on
+// every call rather than once at startup: the create is idempotent and cheap,
+// and a result dir removed while bramble runs then heals itself instead of
+// failing every write for the rest of the process lifetime.
 func ResultFilePath(dir string, id SessionID) (string, error) {
 	if dir == "" {
 		var err error
@@ -748,9 +754,5 @@ func ResultFilePath(dir string, id SessionID) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("create result dir: %w", err)
 	}
-	return resultFilePathInDir(dir, id)
-}
-
-func resultFilePathInDir(dir string, id SessionID) (string, error) {
 	return containedPath(dir, sanitizeFileName(string(id))+".md")
 }
