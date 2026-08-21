@@ -79,6 +79,15 @@ refused rather than queued, and a queue whose session dies is reclaimed.
 next turn, so a second write in the same drain would land mid-turn — the very
 thing the queue prevents. The rest ride the transition after.
 
+**No state change reaches the courier through a buffer.** Reporting rides
+transitions, and a lost completion is the one event that never comes again — so
+`SubscribeStateChanges` takes a function called on the goroutine that made the
+transition, and `watchStateChanges` puts a growable queue behind it. A bounded
+channel would have to drop or block: drop loses exactly the fan-out case this
+feature is for (and a tight burst fills any buffer before the reader is
+scheduled once, so a bigger one is not the fix), and block would stall a status
+transition behind a pane capture and a file write.
+
 **A failed write queues instead of failing.** Both write paths — the direct one
 for an idle recipient and the drain — hand a failure to the queue and arm a
 timed retry, because the recipient of a failed write is a session that was idle

@@ -19,13 +19,17 @@ import (
 // fakeTarget is a DeliveryTarget backed by a map, so courier behaviour can be
 // driven through every status and runner type without live managers or tmux.
 type fakeTarget struct { //nolint:govet // fieldalignment: readability over packing
-	mu            sync.Mutex
-	sessions      map[SessionID]SessionInfo
-	followUps     []string
-	tmuxTarget    string
-	followErr     error
-	captured      map[SessionID][]string
-	captureErr    error
+	mu         sync.Mutex
+	sessions   map[SessionID]SessionInfo
+	followUps  []string
+	tmuxTarget string
+	followErr  error
+	captured   map[SessionID][]string
+	captureErr error
+	// captureDelay stands in for how long a real pane capture takes. It is what
+	// makes the courier's event handling slow enough to test what happens to the
+	// events arriving behind it.
+	captureDelay  time.Duration
 	markedRunning []SessionID
 }
 
@@ -95,11 +99,19 @@ func (f *fakeTarget) ResolveTmuxTarget(id SessionID) (string, error) {
 
 func (f *fakeTarget) CapturePaneText(id SessionID, _ int) ([]string, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.captureErr != nil {
-		return nil, f.captureErr
+	delay := f.captureDelay
+	err := f.captureErr
+	lines := f.captured[id]
+	f.mu.Unlock()
+	if delay > 0 {
+		// Outside the lock: this stands in for a real pane capture, which
+		// shells out to tmux and holds nothing of the courier's.
+		time.Sleep(delay)
 	}
-	return f.captured[id], nil
+	if err != nil {
+		return nil, err
+	}
+	return lines, nil
 }
 
 // appendPane mirrors text into every session's pane buffer. The courier only
@@ -1006,6 +1018,55 @@ func TestFailedDirectWriteIsQueuedAndRetried(t *testing.T) {
 	armed := c.retryArmed
 	c.mu.Unlock()
 	assert.True(t, armed, "no retry was scheduled for a recipient that never leaves idle")
+}
+
+// TestNoReportIsLostWhenManySubagentsFinishAtOnce pins the courier against the
+// manager's own back pressure. Subscriber events go through a 100-slot channel
+// that *drops* when full, and the courier's handling of one is slow — a report
+// captures a pane and writes a file. Fan-out is the case this feature exists
+// for, and a dropped completion is the one event that never comes again: the
+// parent would wait forever for a subagent that already finished.
+func TestNoReportIsLostWhenManySubagentsFinishAtOnce(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	c, err := NewCourier(target, echoPanes(target), t.TempDir())
+	require.NoError(t, err)
+
+	mgr := NewManagerWithConfig(ManagerConfig{RepoName: "repo"})
+	defer mgr.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer c.Watch(ctx, mgr)()
+
+	// Busy, so every report queues rather than racing a write.
+	parentID, _ := ids(t)
+	target.set(parentID, StatusRunning, RunnerTypeTmux)
+
+	// Slow enough that the emitter below runs far ahead of the handler: with
+	// the work on the channel's own goroutine, the 101st event is dropped.
+	target.mu.Lock()
+	target.captureDelay = 2 * time.Millisecond
+	target.mu.Unlock()
+
+	const children = 150
+	for i := range children {
+		childID := SessionID(fmt.Sprintf("%s-child-%03d", parentID, i))
+		target.setChild(childID, parentID, StatusIdle, RunnerTypeTmux)
+		target.mu.Lock()
+		target.captured[childID] = []string{"answer from " + string(childID)}
+		target.mu.Unlock()
+		mgr.emitSessionStateChange(SessionStateChangeEvent{
+			Info:      target.mustInfo(childID),
+			SessionID: childID,
+			OldStatus: StatusRunning,
+			NewStatus: StatusIdle,
+		})
+	}
+
+	require.Eventually(t, func() bool { return len(c.Pending(parentID)) == children },
+		30*time.Second, 20*time.Millisecond,
+		"only %d of %d subagents were reported: events were dropped on the way to the courier",
+		len(c.Pending(parentID)), children)
 }
 
 // TestStaleQueueIsReclaimedOnLoad bounds the cost of never discarding on an

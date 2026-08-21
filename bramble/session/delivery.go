@@ -556,6 +556,11 @@ func (c *Courier) DrainIdle(ctx context.Context) {
 // Watch drains a session's queue whenever it becomes idle. It returns an
 // unsubscribe function and runs until ctx is canceled.
 func (c *Courier) Watch(ctx context.Context, mgr *Manager) func() {
+	// Everything below is slow — a report captures two thousand lines of pane and
+	// writes a file, a drain pastes into a pane and reads it back — and the
+	// transition a parent's report rides is the one event that never comes again.
+	// watchStateChanges is what makes that safe: it queues events for this
+	// handler rather than letting a full buffer drop them.
 	return watchStateChanges(ctx, mgr, func(evt SessionStateChangeEvent) {
 		// A session is both a recipient of queued mail and, when it has a
 		// parent, a subagent whose progress that parent is waiting on. One
