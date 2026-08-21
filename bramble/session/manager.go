@@ -1251,6 +1251,15 @@ func (m *Manager) monitorTrackedTmuxWindow(session *Session) {
 		}
 	}
 
+	// A re-adopted session reaches this loop instead of runSession's, so its
+	// hookless backend needs the same pane-idle polling here or a restart
+	// permanently strands it. The provider comes from the stored model: there is
+	// no live agentModel on the re-adopt path.
+	session.mu.RLock()
+	storedModel := session.Model
+	session.mu.RUnlock()
+	idleTracker := m.newPaneIdleTrackerForModel(storedModel)
+
 	// Do an initial capture so the command center has data immediately.
 	captureRecentOutput()
 
@@ -1310,6 +1319,9 @@ func (m *Manager) monitorTrackedTmuxWindow(session *Session) {
 				session.mu.RLock()
 				status := session.Status
 				session.mu.RUnlock()
+
+				m.pollPaneIdle(idleTracker, sessionID, status, windowTarget)
+
 				if status == StatusIdle {
 					if IsSessionWindowActive(windowID, windowName) {
 						// Use windowID as target when available; for re-adopted
@@ -1397,6 +1409,27 @@ func resolveAgentModel(modelID string, registry *agent.ModelRegistry) (agent.Age
 		return m, nil
 	}
 	return agent.AgentModel{}, fmt.Errorf("unknown model %q: no curated entry and no recognized prefix (%s)", modelID, agent.KnownModelPrefixes())
+}
+
+// newPaneIdleTrackerForModel returns the pane-idle tracker a session needs,
+// resolving its provider from the model it was created with.
+//
+// Both tmux monitor loops go through this — the one runSession runs for a
+// session it started, and monitorTrackedTmuxWindow for one re-adopted after a
+// restart. That is the point: a backend with no completion hook (cursor) is
+// only ever seen to finish because one of these loops reads its pane, and a
+// loop that skips it leaves such a session running forever, with its queued
+// mail undelivered and its parent never told it is done.
+//
+// nil for a provider that reports its own turn ends, and nil for a model that
+// no longer resolves — an unrecognized model is not grounds for guessing at a
+// pane's chrome.
+func (m *Manager) newPaneIdleTrackerForModel(model string) *paneIdleTracker {
+	agentModel, err := resolveAgentModel(model, m.config.ModelRegistry)
+	if err != nil {
+		return nil
+	}
+	return newPaneIdleTracker(agentModel.Provider)
 }
 
 // newTmuxRunner builds the runner for a tmux-mode session, copying the
@@ -1772,7 +1805,7 @@ func (m *Manager) runSession(session *Session, prompt string) {
 		// Backends with no turn-completion hook (cursor) have their idleness
 		// read off the pane instead. nil for claude and codex, which report it
 		// themselves; see pane_idle.go for why this is a last resort.
-		idleTracker := newPaneIdleTracker(agentModel.Provider)
+		idleTracker := m.newPaneIdleTrackerForModel(session.Model)
 
 		// Periodically check if tmux window still exists
 		ticker := time.NewTicker(2 * time.Second)
@@ -2514,9 +2547,10 @@ func (m *Manager) writeResearchFile(session *Session) (string, error) {
 		}
 	}
 
-	// Same treatment as the pane capture in subagent_report.go: a transcript in
-	// a world-traversable temp dir is 0600, and create-and-rename replaces a
-	// symlink at this predictable path rather than writing through it.
+	// Same treatment as the pane capture in subagent_report.go: a transcript is
+	// the session's whole output and so is 0600 even inside a private ~/.bramble,
+	// and create-and-rename replaces a symlink at this predictable path rather
+	// than writing through it.
 	if err := writeFileAtomic(researchPath, []byte(body.String()), 0o600); err != nil {
 		return "", fmt.Errorf("write research file: %w", err)
 	}

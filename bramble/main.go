@@ -565,9 +565,9 @@ func startIPCServer(registry *session.SessionRegistry, sockPath, wtRoot, repoNam
 		// A parent pins the repo more precisely than the process-wide default:
 		// a subagent belongs with its parent, which may live under a different
 		// manager than the repo bramble was launched on.
-		parent, hasParent := resolveParentSession(registry, params.ParentSessionID)
-		if params.ParentSessionID != "" && !hasParent {
-			return nil, fmt.Errorf("parent session %q not found", params.ParentSessionID)
+		parent, hasParent, err := parentForSpawn(registry, params)
+		if err != nil {
+			return nil, err
 		}
 
 		targetRepo := params.RepoName
@@ -747,6 +747,30 @@ func resolveParentSession(registry *session.SessionRegistry, id string) (session
 	return info, true
 }
 
+// parentForSpawn resolves the parent a new session should be filed under, and
+// clears params.ParentSessionID when there is none — so the rest of the spawn
+// sees one answer rather than an ID nothing can be looked up by.
+//
+// An explicitly named parent that does not resolve is an error: the caller
+// asked for that session and got something else. An inherited one is only a
+// default, and a default that cannot be honored must not cost the caller a
+// spawn that would have worked without it — the registry sees only sessions
+// adopted into an open manager, so an agent whose own repo is not open in this
+// bramble would otherwise lose the ability to start any session at all.
+func parentForSpawn(registry *session.SessionRegistry, params *ipc.NewSessionParams) (session.SessionInfo, bool, error) {
+	parent, ok := resolveParentSession(registry, params.ParentSessionID)
+	if ok || params.ParentSessionID == "" {
+		return parent, ok, nil
+	}
+	if !params.ParentInherited {
+		return session.SessionInfo{}, false, fmt.Errorf("parent session %q not found", params.ParentSessionID)
+	}
+	slog.Warn("spawning a top-level session: inherited parent is not adopted in this bramble; pass --no-parent to silence this",
+		"parent_session_id", params.ParentSessionID)
+	params.ParentSessionID = ""
+	return session.SessionInfo{}, false, nil
+}
+
 func handleNewSession(ctx context.Context, mgr *session.Manager, wtRoot, repoName string, params *ipc.NewSessionParams, parent session.SessionInfo) (*ipc.NewSessionResult, error) {
 	worktreePath := params.WorktreePath
 
@@ -765,6 +789,15 @@ func handleNewSession(ctx context.Context, mgr *session.Manager, wtRoot, repoNam
 	// still explicit (--create-worktree -b), so this never surprises a caller
 	// who wanted isolation.
 	if worktreePath == "" && parent.WorktreePath != "" {
+		// A child living in its parent's tree must be filed under its parent's
+		// repo. repoName picked mgr, and an explicit --repo naming a different
+		// one would register the session — and persist its history — under a repo
+		// whose worktree it is not in.
+		if parent.RepoName != "" && parent.RepoName != repoName {
+			return nil, fmt.Errorf("cannot spawn into repo %q while inheriting parent %s's worktree in repo %q: "+
+				"give the subagent a tree of its own with --worktree, or --create-worktree --branch",
+				repoName, parent.ID, parent.RepoName)
+		}
 		worktreePath = parent.WorktreePath
 	}
 
@@ -885,7 +918,7 @@ var newSessionCmd = &cobra.Command{
 		repo, _ := cmd.Flags().GetString("repo")
 		parentFlag, _ := cmd.Flags().GetString("parent")
 		noParent, _ := cmd.Flags().GetBool("no-parent")
-		parent := resolveParentSessionID(parentFlag, os.Getenv(session.SessionIDEnvVar), noParent)
+		parent, parentInherited := resolveParentSessionID(parentFlag, os.Getenv(session.SessionIDEnvVar), noParent)
 
 		// Auto-detect repo from cwd if not explicitly specified.
 		if repo == "" {
@@ -909,6 +942,7 @@ var newSessionCmd = &cobra.Command{
 				Goal:            goal,
 				RepoName:        repo,
 				ParentSessionID: parent,
+				ParentInherited: parentInherited,
 			},
 		})
 		if err != nil {
@@ -944,14 +978,18 @@ func resolveOwnSessionID(flagID, envID string) (string, error) {
 // terminal is simply top-level — so this returns "" rather than an error.
 // --no-parent is the escape hatch for spawning a top-level session from inside
 // a bramble session, which would otherwise always inherit a parent.
-func resolveParentSessionID(flagID, envID string, noParent bool) string {
+//
+// inherited says the ID came from the environment rather than the flag. The
+// server needs that distinction to decide whether an unresolvable parent is an
+// error or just a default it should drop — see ipc.NewSessionParams.
+func resolveParentSessionID(flagID, envID string, noParent bool) (id string, inherited bool) {
 	if noParent {
-		return ""
+		return "", false
 	}
 	if flagID != "" {
-		return flagID
+		return flagID, false
 	}
-	return envID
+	return envID, envID != ""
 }
 
 var notifyCmd = &cobra.Command{
@@ -1128,7 +1166,7 @@ var listSessionsCmd = &cobra.Command{
 			parentFlag, _ := cmd.Flags().GetString("parent")
 			// --parent= (empty) means "my own children", so a caller inside a
 			// bramble session need not echo its own ID back.
-			parent := resolveParentSessionID(parentFlag, os.Getenv(session.SessionIDEnvVar), false)
+			parent, _ := resolveParentSessionID(parentFlag, os.Getenv(session.SessionIDEnvVar), false)
 			if parent == "" {
 				return fmt.Errorf("--parent needs an ID, or $%s must be set", session.SessionIDEnvVar)
 			}
@@ -1226,7 +1264,7 @@ the recipient should read as part of its own work.`,
 			return err
 		}
 		if result.Queued {
-			fmt.Printf("queued for %s; it will be delivered when that session goes idle\n", sessionID)
+			fmt.Printf("queued for %s; it will be delivered when that session can take it\n", sessionID)
 		}
 		return nil
 	},

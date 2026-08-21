@@ -157,3 +157,22 @@ func TestCursorPlanModeIdleIsIdle(t *testing.T) {
 	require.True(t, known)
 	assert.True(t, idle)
 }
+
+// TestPaneIdleTrackerComesFromTheStoredModel pins the input the re-adopt path
+// has to work from. monitorTrackedTmuxWindow never sees a resolved agent model
+// — only the model string the session was persisted with — so if that string
+// does not yield a provider, a cursor session that survives a bramble restart
+// gets no idle signal at all and its parent is never told it finished.
+func TestPaneIdleTrackerComesFromTheStoredModel(t *testing.T) {
+	t.Parallel()
+
+	m := NewManagerWithConfig(ManagerConfig{RepoName: "repo"})
+	defer m.Close()
+
+	assert.NotNil(t, m.newPaneIdleTrackerForModel("composer-3"),
+		"a stored cursor model must still produce a pane-idle tracker")
+	assert.Nil(t, m.newPaneIdleTrackerForModel("sonnet"),
+		"claude reports its own turn ends; a second signal could only contradict it")
+	assert.Nil(t, m.newPaneIdleTrackerForModel("not-a-model"),
+		"an unresolvable model is not grounds for guessing at a pane's chrome")
+}

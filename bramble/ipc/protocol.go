@@ -56,7 +56,15 @@ type NewSessionParams struct {
 	// finishes, bramble delivers a completion report back there. When set with
 	// no Branch and no WorktreePath, the child inherits the parent's worktree.
 	ParentSessionID string `json:"parent_session_id,omitempty"`
-	CreateWorktree  bool   `json:"create_worktree,omitempty"` // if true, create a new worktree for Branch
+	// ParentInherited says ParentSessionID came from $BRAMBLE_SESSION_ID rather
+	// than an explicit --parent. The two must be told apart on the server: an
+	// explicitly named parent that does not resolve is a mistake worth failing
+	// on, while an inherited one is only a default — and a default that cannot
+	// be honored must not cost the caller a spawn that would have worked without
+	// it. The registry sees only sessions adopted into an open manager, so any
+	// agent whose own repo is not open in this bramble hits that case.
+	ParentInherited bool `json:"parent_inherited,omitempty"`
+	CreateWorktree  bool `json:"create_worktree,omitempty"` // if true, create a new worktree for Branch
 }
 
 // NewSessionResult is the result of a successful new-session request.
