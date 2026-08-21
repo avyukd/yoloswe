@@ -349,8 +349,8 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	p := tea.NewProgram(model)
 
 	// Let out-of-band restart requests (SIGUSR2, IPC) reach the event loop, but
-	// only while there is a loop to reach. Cleared before the deferred teardown
-	// so a late request is refused rather than delivered into a dying program.
+	// only while there is a loop to reach. The defers are the safety net for an
+	// early return; the ordinary path disarms below, the instant Run returns.
 	restartRequests.set(func(msg app.RestartRequestedMsg) { p.Send(msg) })
 	defer restartRequests.set(nil)
 	stopRestartSignal := watchRestartSignal(func() {
@@ -359,6 +359,17 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	defer stopRestartSignal()
 
 	finalModel, err := p.Run()
+
+	// Disarm here rather than leaving it to the defers. The program is gone the
+	// moment Run returns, but the defers do not run until the cleanup below has
+	// finished writing the handoff and closing every manager — and the IPC
+	// server is still accepting throughout. A restart request arriving in that
+	// window would reach a p.Send that silently discards it, and the caller
+	// would be told it succeeded. Refusing is the honest answer, and it is what
+	// restartRequester exists to be able to do.
+	restartRequests.set(nil)
+	stopRestartSignal()
+
 	if err != nil {
 		return fmt.Errorf("TUI error: %w", err)
 	}
@@ -893,21 +904,42 @@ var notifyCmd = &cobra.Command{
 // The ceiling is what a stop hook pays when bramble is gone for good rather
 // than restarting, since that case is indistinguishable from here — which is
 // why it is seconds and not the minute a truly generous budget would want.
-const (
-	notifyRetryBudget     = 5 * time.Second
-	notifyRetryBaseDelay  = 100 * time.Millisecond
-	notifyRetryMaxDelay   = time.Second
-	notifyRetryMultiplier = 3
-)
+// notifyRetryPolicy is the shape of that backoff, separated from the constants
+// so a test can drive the loop on a millisecond budget instead of waiting out
+// the real one.
+type notifyRetryPolicy struct {
+	budget     time.Duration
+	baseDelay  time.Duration
+	maxDelay   time.Duration
+	multiplier int
+}
+
+var defaultNotifyRetryPolicy = notifyRetryPolicy{
+	budget:     5 * time.Second,
+	baseDelay:  100 * time.Millisecond,
+	maxDelay:   time.Second,
+	multiplier: 3,
+}
 
 // sendNotifyWithRetry sends a notify request, backing off over a transport
-// failure until notifyRetryBudget is spent. Only transport errors are retried:
-// a response from the server, even an error one, is a real answer and is
-// returned as-is.
+// failure until the budget is spent.
 func sendNotifyWithRetry(client *ipc.Client, sessionID string) (*ipc.Response, error) {
+	return retryNotify(defaultNotifyRetryPolicy, func() (*ipc.Response, error) {
+		return client.Send(&ipc.Request{
+			Type:   ipc.RequestNotify,
+			ID:     "cli-notify",
+			Params: &ipc.NotifyParams{SessionID: sessionID},
+		})
+	})
+}
+
+// retryNotify calls send until it stops returning a transport error or the
+// policy's budget runs out. Only transport errors are retried: a response from
+// the server, even an error one, is a real answer and is returned as-is.
+func retryNotify(p notifyRetryPolicy, send func() (*ipc.Response, error)) (*ipc.Response, error) {
 	var lastErr error
-	deadline := time.Now().Add(notifyRetryBudget)
-	delay := notifyRetryBaseDelay
+	deadline := time.Now().Add(p.budget)
+	delay := p.baseDelay
 	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
 			// Sleeping past the deadline would spend more than the budget
@@ -918,13 +950,9 @@ func sendNotifyWithRetry(client *ipc.Client, sessionID string) (*ipc.Response, e
 				break
 			}
 			time.Sleep(min(delay, remaining))
-			delay = min(delay*notifyRetryMultiplier, notifyRetryMaxDelay)
+			delay = min(delay*time.Duration(p.multiplier), p.maxDelay)
 		}
-		resp, err := client.Send(&ipc.Request{
-			Type:   ipc.RequestNotify,
-			ID:     "cli-notify",
-			Params: &ipc.NotifyParams{SessionID: sessionID},
-		})
+		resp, err := send()
 		if err == nil {
 			return resp, nil
 		}

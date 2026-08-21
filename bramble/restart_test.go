@@ -132,3 +132,17 @@ func TestSocketPathsSurviveAnExecRestart(t *testing.T) {
 	assert.Equal(t, ipcSocketPath(), ipcSocketPath())
 	assert.Equal(t, controlSocketPath(), controlSocketPath())
 }
+
+// runTUI stops the signal watcher the moment tea's Run returns and also defers
+// it, so the ordinary path calls stop twice. That belt-and-braces pair is what
+// keeps a restart request from being accepted during post-run cleanup and
+// silently discarded, so stop has to tolerate it — a second close(done) would
+// panic and take the process down on every clean exit.
+func TestWatchRestartSignalStopIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	stop := watchRestartSignal(func() {})
+	stop()
+	assert.NotPanics(t, stop, "runTUI calls stop twice on every clean exit")
+	assert.NotPanics(t, stop)
+}

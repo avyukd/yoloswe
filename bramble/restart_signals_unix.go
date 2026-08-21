@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 )
 
@@ -14,7 +15,9 @@ import (
 // the binary now on disk, for callers that cannot reach the IPC socket.
 //
 // stop blocks until the watcher has finished, so no handle call is still in
-// flight once it returns.
+// flight once it returns. It is safe to call more than once: the caller stops
+// the watcher at the end of the program run and also defers it, so the ordinary
+// path runs it twice.
 func watchRestartSignal(handle func()) func() {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGUSR2)
@@ -32,9 +35,12 @@ func watchRestartSignal(handle func()) func() {
 			}
 		}
 	}()
+	var once sync.Once
 	return func() {
-		signal.Stop(ch)
-		close(done)
+		once.Do(func() {
+			signal.Stop(ch)
+			close(done)
+		})
 		<-stopped
 	}
 }
