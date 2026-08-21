@@ -158,11 +158,6 @@ func NewCourier(target DeliveryTarget, panes PaneWriter, config CourierConfig) (
 	return c, nil
 }
 
-// ResultDir returns the directory where subagent result files are written.
-func (c *Courier) ResultDir() string {
-	return c.resultDir
-}
-
 func resolveCourierDirs(config CourierConfig) (string, string, error) {
 	deliveryDir := config.DeliveryDir
 	resultDir := config.ResultDir
@@ -170,15 +165,19 @@ func resolveCourierDirs(config CourierConfig) (string, string, error) {
 		return deliveryDir, resultDir, nil
 	}
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", "", fmt.Errorf("failed to get home directory: %w", err)
-	}
 	if deliveryDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", "", fmt.Errorf("failed to get home directory: %w", err)
+		}
 		deliveryDir = filepath.Join(home, ".bramble", "deliveries")
 	}
 	if resultDir == "" {
-		resultDir = filepath.Join(home, ".bramble", resultDirName)
+		var err error
+		resultDir, err = DefaultResultDir()
+		if err != nil {
+			return "", "", err
+		}
 	}
 	return deliveryDir, resultDir, nil
 }

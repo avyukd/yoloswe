@@ -199,16 +199,16 @@ func echoPanes(target *fakeTarget) *fakePanes {
 // what brings it into existence, or TestResultArtifactsAreNotWorldReadable
 // would be asserting on the mode this helper chose rather than the one the
 // production code does.
-func testCourierResultDir(t *testing.T) string {
-	t.Helper()
-	return filepath.Join(t.TempDir(), "results")
+func testCourierResultDir(root string) string {
+	return filepath.Join(root, "results")
 }
 
 func testCourierConfig(t *testing.T) CourierConfig {
 	t.Helper()
+	root := t.TempDir()
 	return CourierConfig{
-		DeliveryDir: t.TempDir(),
-		ResultDir:   testCourierResultDir(t),
+		DeliveryDir: filepath.Join(root, "deliveries"),
+		ResultDir:   testCourierResultDir(root),
 	}
 }
 
@@ -216,7 +216,7 @@ func testCourierConfigDeliveryDir(t *testing.T, deliveryDir string) CourierConfi
 	t.Helper()
 	return CourierConfig{
 		DeliveryDir: deliveryDir,
-		ResultDir:   testCourierResultDir(t),
+		ResultDir:   testCourierResultDir(t.TempDir()),
 	}
 }
 
@@ -247,6 +247,18 @@ func reportFixture(t *testing.T, childStatus SessionStatus) (*Courier, *fakeTarg
 func reportNow(c *Courier, target *fakeTarget, childID SessionID) {
 	child, _ := target.SessionInfo(childID)
 	c.reportToParent(context.Background(), child)
+}
+
+func reportResultPath(t *testing.T, report string) string {
+	t.Helper()
+	for _, line := range strings.Split(report, "\n") {
+		path, ok := strings.CutPrefix(line, "result: ")
+		if ok {
+			return path
+		}
+	}
+	require.FailNow(t, "report did not include a result path", report)
+	return ""
 }
 
 // ids returns session IDs unique to this test so parallel runs get readable,
@@ -459,7 +471,8 @@ func TestQueueSurvivesReload(t *testing.T) {
 	target := newFakeTarget()
 	target.set("s1", StatusRunning, RunnerTypeTmux)
 
-	c1, err := NewCourier(target, echoPanes(target), testCourierConfigDeliveryDir(t, dir))
+	cfg := testCourierConfigDeliveryDir(t, dir)
+	c1, err := NewCourier(target, echoPanes(target), cfg)
 	require.NoError(t, err)
 	for _, msg := range []string{"first", "second"} {
 		_, err := c1.Send(context.Background(), "", "s1", msg, true)
@@ -467,7 +480,7 @@ func TestQueueSurvivesReload(t *testing.T) {
 	}
 
 	panes := echoPanes(target)
-	c2, err := NewCourier(target, panes, testCourierConfigDeliveryDir(t, dir))
+	c2, err := NewCourier(target, panes, cfg)
 	require.NoError(t, err)
 
 	pending := c2.Pending("s1")
@@ -1003,14 +1016,15 @@ func TestUnknownRecipientKeepsItsQueue(t *testing.T) {
 	target := newFakeTarget()
 	target.set("s1", StatusRunning, RunnerTypeTmux)
 
-	c, err := NewCourier(target, echoPanes(target), testCourierConfigDeliveryDir(t, dir))
+	cfg := testCourierConfigDeliveryDir(t, dir)
+	c, err := NewCourier(target, echoPanes(target), cfg)
 	require.NoError(t, err)
 	_, err = c.Send(context.Background(), "", "s1", "held for a repo that is not open yet", true)
 	require.NoError(t, err)
 
 	// A courier that cannot see the recipient at all — a not-yet-registered
 	// manager, or a sweep that beat reconciliation to it.
-	blind, err := NewCourier(newFakeTarget(), &fakePanes{}, testCourierConfigDeliveryDir(t, dir))
+	blind, err := NewCourier(newFakeTarget(), &fakePanes{}, cfg)
 	require.NoError(t, err)
 	require.Len(t, blind.Pending("s1"), 1)
 
@@ -1073,14 +1087,15 @@ func TestDrainIdleDeliversAfterAReload(t *testing.T) {
 	target := newFakeTarget()
 	target.set("s1", StatusRunning, RunnerTypeTmux)
 
-	first, err := NewCourier(target, echoPanes(target), testCourierConfigDeliveryDir(t, dir))
+	cfg := testCourierConfigDeliveryDir(t, dir)
+	first, err := NewCourier(target, echoPanes(target), cfg)
 	require.NoError(t, err)
 	queued, err := first.Send(context.Background(), "", "s1", "held over a restart", true)
 	require.NoError(t, err)
 	require.True(t, queued)
 
 	// A fresh courier over the same directory is what a restart looks like.
-	reloaded, err := NewCourier(target, echoPanes(target), testCourierConfigDeliveryDir(t, dir))
+	reloaded, err := NewCourier(target, echoPanes(target), cfg)
 	require.NoError(t, err)
 	require.Len(t, reloaded.Pending("s1"), 1, "the queue should have been reloaded")
 
@@ -1199,9 +1214,7 @@ func TestTmuxChildResultComesFromPaneCapture(t *testing.T) {
 	pending := c.Pending(parentID)
 	require.Len(t, pending, 1)
 
-	path, err := ResultFilePath(c.ResultDir(), childID)
-	require.NoError(t, err)
-	assert.Contains(t, pending[0].Text, "result: "+path)
+	path := reportResultPath(t, pending[0].Text)
 
 	body, err := os.ReadFile(path)
 	require.NoError(t, err)
@@ -1451,7 +1464,8 @@ func TestConcurrentSendsToOneRecipientAllPersist(t *testing.T) {
 	target := newFakeTarget()
 	target.set("parent", StatusRunning, RunnerTypeTmux)
 
-	c, err := NewCourier(target, echoPanes(target), testCourierConfigDeliveryDir(t, dir))
+	cfg := testCourierConfigDeliveryDir(t, dir)
+	c, err := NewCourier(target, echoPanes(target), cfg)
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
@@ -1468,7 +1482,7 @@ func TestConcurrentSendsToOneRecipientAllPersist(t *testing.T) {
 	require.Len(t, c.Pending("parent"), senders, "in-memory queue lost a report")
 
 	// Reload from disk: this is what a restarted bramble would see.
-	reloaded, err := NewCourier(target, echoPanes(target), testCourierConfigDeliveryDir(t, dir))
+	reloaded, err := NewCourier(target, echoPanes(target), cfg)
 	require.NoError(t, err)
 	assert.Lenf(t, reloaded.Pending("parent"), senders,
 		"the persisted queue lost reports; a restart would drop them")
@@ -1485,7 +1499,8 @@ func TestConcurrentDrainAndSendKeepsQueueConsistent(t *testing.T) {
 	target := newFakeTarget()
 	target.set("parent", StatusIdle, RunnerTypeTmux)
 
-	c, err := NewCourier(target, echoPanes(target), testCourierConfigDeliveryDir(t, dir))
+	cfg := testCourierConfigDeliveryDir(t, dir)
+	c, err := NewCourier(target, echoPanes(target), cfg)
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
@@ -1510,7 +1525,7 @@ func TestConcurrentDrainAndSendKeepsQueueConsistent(t *testing.T) {
 	// Whatever is still queued in memory must match what is on disk: a stale
 	// write would leave a restart with a different queue than this process has.
 	inMemory := c.Pending("parent")
-	reloaded, err := NewCourier(target, echoPanes(target), testCourierConfigDeliveryDir(t, dir))
+	reloaded, err := NewCourier(target, echoPanes(target), cfg)
 	require.NoError(t, err)
 	assert.Lenf(t, reloaded.Pending("parent"), len(inMemory),
 		"the persisted queue disagrees with the live one")
