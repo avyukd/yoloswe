@@ -685,6 +685,7 @@ func startCourier(ctx context.Context, registry *session.SessionRegistry) *sessi
 		session.NewRegistryDeliveryTarget(registry),
 		tmuxctl.NewPaneWriter(tmuxctl.New()),
 		"",
+		"",
 	)
 	if err != nil {
 		slog.Warn("courier failed to start; queued delivery and subagent reports are unavailable", "err", err)

@@ -409,6 +409,9 @@ type ManagerConfig struct { //nolint:govet // fieldalignment: readability over p
 	// RecordingDir enables JSONL session recording for all sessions.
 	// If empty, recording is disabled.
 	RecordingDir string
+	// ResearchDir is where subagent result files are written.
+	// If empty, defaults to ~/.bramble/research.
+	ResearchDir string
 	// IPCSockPath is the path to the bramble IPC Unix domain socket.
 	// Used to propagate BRAMBLE_SOCK to tmux windows so hook commands
 	// can call back to the TUI. Set by main after startIPCServer.
@@ -2500,7 +2503,7 @@ func (m *Manager) RecentOutputLines(id SessionID, n int) []string {
 // writeResearchFile writes a codetalk session's text output to a markdown file
 // under ~/.bramble/research/. Returns the file path on success.
 func (m *Manager) writeResearchFile(session *Session) (string, error) {
-	researchPath, err := ResultFilePath(session.ID)
+	researchPath, err := ResultFilePath(m.config.ResearchDir, session.ID)
 	if err != nil {
 		return "", err
 	}
@@ -2514,9 +2517,9 @@ func (m *Manager) writeResearchFile(session *Session) (string, error) {
 		}
 	}
 
-	// Same treatment as the pane capture in subagent_report.go: a transcript in
-	// a world-traversable temp dir is 0600, and create-and-rename replaces a
-	// symlink at this predictable path rather than writing through it.
+	// Same treatment as the pane capture in subagent_report.go: 0600, and
+	// create-and-rename replaces a symlink at this predictable path rather than
+	// writing through it.
 	if err := writeFileAtomic(researchPath, []byte(body.String()), 0o600); err != nil {
 		return "", fmt.Errorf("write research file: %w", err)
 	}

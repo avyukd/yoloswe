@@ -96,11 +96,12 @@ func (t *registryTarget) MarkRunning(id SessionID) { t.reg.SetSessionRunning(id)
 // A queued delivery is durable, ordered per recipient, and written exactly once,
 // when the recipient is genuinely ready for it.
 type Courier struct { //nolint:govet // fieldalignment: grouping by role reads better
-	target  DeliveryTarget
-	panes   PaneWriter
-	dir     string
-	mu      sync.Mutex
-	pending map[SessionID][]Delivery
+	target    DeliveryTarget
+	panes     PaneWriter
+	dir       string
+	resultDir string
+	mu        sync.Mutex
+	pending   map[SessionID][]Delivery
 	// reported remembers which (child, status) pairs have already been
 	// reported to a parent, so a child is not announced twice.
 	reported map[SessionID]map[SessionStatus]bool
@@ -120,9 +121,11 @@ type Courier struct { //nolint:govet // fieldalignment: grouping by role reads b
 }
 
 // NewCourier creates a courier that persists its queue under dir. If dir is
-// empty it defaults to ~/.bramble/deliveries. Any queue already on disk is
-// loaded, so a message queued before a bramble restart is not silently lost.
-func NewCourier(target DeliveryTarget, panes PaneWriter, dir string) (*Courier, error) {
+// empty it defaults to ~/.bramble/deliveries. resultDir is where subagent
+// result files are written; if empty it defaults to ~/.bramble/research. Any
+// queue already on disk is loaded, so a message queued before a bramble
+// restart is not silently lost.
+func NewCourier(target DeliveryTarget, panes PaneWriter, dir, resultDir string) (*Courier, error) {
 	if dir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -130,17 +133,25 @@ func NewCourier(target DeliveryTarget, panes PaneWriter, dir string) (*Courier, 
 		}
 		dir = filepath.Join(home, ".bramble", "deliveries")
 	}
+	if resultDir == "" {
+		var err error
+		resultDir, err = DefaultResultDir()
+		if err != nil {
+			return nil, err
+		}
+	}
 	// 0700: queue files hold message text meant for one session's operator.
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("failed to create delivery dir %s: %w", dir, err)
 	}
 	c := &Courier{
-		target:   target,
-		panes:    panes,
-		dir:      dir,
-		pending:  make(map[SessionID][]Delivery),
-		reported: make(map[SessionID]map[SessionStatus]bool),
-		writing:  make(map[SessionID]bool),
+		target:    target,
+		panes:     panes,
+		dir:       dir,
+		resultDir: resultDir,
+		pending:   make(map[SessionID][]Delivery),
+		reported:  make(map[SessionID]map[SessionStatus]bool),
+		writing:   make(map[SessionID]bool),
 	}
 	if err := c.load(); err != nil {
 		return nil, err
@@ -684,8 +695,9 @@ func (s *Session) parentSessionID() SessionID {
 	return s.ParentSessionID
 }
 
-// resultDirName holds the files a subagent's parent is pointed at: the
-// transcript of a TUI session, or the captured pane of a tmux one.
+// resultDirName is the ~/.bramble/ subdirectory that holds the files a
+// subagent's parent is pointed at: the transcript of a TUI session, or the
+// captured pane of a tmux one.
 //
 // Under the user's home rather than os.TempDir(). A world-writable temp dir
 // cannot be secured from inside this process: another local user can
@@ -695,11 +707,27 @@ func (s *Session) parentSessionID() SessionID {
 // anyone else, so the question does not arise.
 const resultDirName = "research"
 
-// ResultFilePath returns the path a session's result file is written to,
-// creating the directory. Shared by the TUI transcript writer and the tmux
-// pane capture so a parent is handed the same shape of path either way.
-func ResultFilePath(id SessionID) (string, error) {
-	dir := filepath.Join(os.TempDir(), resultDirName)
+// DefaultResultDir returns ~/.bramble/research.
+func DefaultResultDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get home directory: %w", err)
+	}
+	return filepath.Join(home, ".bramble", resultDirName), nil
+}
+
+// ResultFilePath returns the path a session's result file is written to under
+// dir, creating the directory. If dir is empty, defaults to ~/.bramble/research.
+// Shared by the TUI transcript writer and the tmux pane capture so a parent is
+// handed the same shape of path either way.
+func ResultFilePath(dir string, id SessionID) (string, error) {
+	if dir == "" {
+		var err error
+		dir, err = DefaultResultDir()
+		if err != nil {
+			return "", err
+		}
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("create result dir: %w", err)
 	}
