@@ -35,16 +35,24 @@ spawn through `SpawnOpts` and persisted, so a subagent's return address survives
 a restart. `new-session --parent` defaults to `$BRAMBLE_SESSION_ID`;
 `--no-parent` opts out. With no `--branch` and no `--worktree`, a subagent
 inherits its parent's worktree — and must then be filed under its parent's
-repo, so an explicit `--repo` naming a different one is refused rather than
-registering a session under a repo whose tree it is not in.
+repo, so a `--repo` naming a different one is refused rather than registering a
+session under a repo whose tree it is not in.
 
-The two ways of naming a parent are not the same claim. An id passed to
-`--parent` must resolve, and does not silently become a top-level spawn. One
-inherited from `$BRAMBLE_SESSION_ID` is a default: the registry only sees
-sessions adopted into an open manager, so an agent whose own repo is closed
-would otherwise lose the ability to spawn anything at all. That case warns and
-spawns top-level (`ipc.NewSessionParams.ParentInherited` carries the
-distinction).
+**A value the client inferred is not a claim the caller made.** `new-session`
+fills in two fields on its own — the parent from `$BRAMBLE_SESSION_ID`, and the
+repo from the cwd when `--repo` is omitted — and both carry that provenance to
+the server (`ipc.NewSessionParams.ParentInherited`, `RepoInferred`), because
+each is weighed differently from a typed one:
+
+- An id passed to `--parent` must resolve and never silently becomes a
+  top-level spawn. An inherited one is a default, and the registry only sees
+  sessions adopted into an open manager — so an agent whose own repo is closed
+  would otherwise lose the ability to spawn anything at all. That case warns and
+  spawns top-level.
+- A `--repo` the caller typed picks the manager, and `handleNewSession` refuses
+  if that then contradicts an inherited worktree. An inferred one loses to a
+  resolved parent's repo, which is exact where a cwd is merely wherever the
+  agent's worktree happens to be.
 
 The delegator deliberately does *not* set a parent: it runs its own child
 watcher and would otherwise be told about every transition twice.

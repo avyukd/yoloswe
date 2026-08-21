@@ -728,76 +728,73 @@ func (m *Manager) ReconcileTmuxSessions() error {
 	return nil
 }
 
-// ReposWithLiveTmuxSessions returns repo names (other than activeRepo) that
-// have at least one tmux session whose window is still alive. Repos that only
-// have dead tmux sessions are cleaned up in place (marked completed).
-// The caller can use the returned list to auto-open those repos so their
-// sessions are fully re-adopted by a Manager.
-func ReposWithLiveTmuxSessions(store *Store, activeRepo string) []string {
+// ReposNeedingTmuxReconcile returns repo names (other than activeRepo) holding
+// a tmux session that has not reached a terminal state. The caller auto-opens
+// them so a Manager re-adopts their sessions.
+//
+// Deliberately not "repos with a *live* window". This probe has no manager and
+// so no courier, which is why it mutates nothing: marking a dead session
+// completed here would consume the one transition its parent's report depends
+// on with nothing listening. That leaves ReconcileTmuxSessions to make the
+// transition and emit it — and ReconcileTmuxSessions only runs for a repo that
+// gets opened. So a repo whose only subagent died while bramble was down has to
+// be returned too, or the parent is never told, which is the whole point of
+// leaving the session alone.
+func ReposNeedingTmuxReconcile(store *Store, activeRepo string) []string {
 	if store == nil {
 		return nil
 	}
-	// Only scan for live sessions when inside tmux; outside tmux all window-alive
-	// checks return false, which would incorrectly mark live sessions as completed.
+	// Outside tmux there is nothing to reconcile into: ReconcileTmuxSessions is
+	// itself a no-op there, so opening these repos would achieve nothing.
 	if !IsInsideTmux() || !IsTmuxAvailable() {
 		return nil
 	}
+	return reposWithUnreconciledTmuxSessions(store, activeRepo)
+}
 
+// reposWithUnreconciledTmuxSessions is the store scan behind
+// ReposNeedingTmuxReconcile, split out so it can be tested without a tmux
+// server: the caller's guard is the only part that needs one.
+func reposWithUnreconciledTmuxSessions(store *Store, activeRepo string) []string {
 	repos, err := store.ListRepos()
 	if err != nil {
 		return nil
 	}
 
-	var liveRepos []string
+	var needing []string
 	for _, repo := range repos {
 		if repo == activeRepo {
 			continue // handled by the active manager's ReconcileTmuxSessions
 		}
-
-		hasLive := false
-
-		worktrees, err := store.ListWorktrees(repo)
-		if err != nil {
-			continue
-		}
-
-		for _, wtName := range worktrees {
-			sessions, err := store.ListSessions(repo, wtName)
-			if err != nil {
-				continue
-			}
-
-			for _, meta := range sessions {
-				if !isTmuxRunner(meta.RunnerType) {
-					continue
-				}
-				if meta.Status.IsTerminal() {
-					continue
-				}
-
-				stored, err := store.LoadSession(repo, wtName, meta.ID)
-				if err != nil {
-					continue
-				}
-
-				if tmuxWindowAlive(stored.TmuxWindowID, stored.TmuxWindowName) {
-					hasLive = true
-				}
-				// Deliberately does not mark a dead session completed. This is
-				// a read-only probe over repos that have no manager and so no
-				// courier: completing a session here would consume the one
-				// transition its parent's report depends on, and nothing would
-				// be listening. The owning manager's ReconcileTmuxSessions does
-				// it — and emits — when the repo is opened.
-			}
-		}
-
-		if hasLive {
-			liveRepos = append(liveRepos, repo)
+		if repoHasUnreconciledTmuxSession(store, repo) {
+			needing = append(needing, repo)
 		}
 	}
 
-	return liveRepos
+	return needing
+}
+
+// repoHasUnreconciledTmuxSession reports whether a repo holds a tmux session
+// still owed a terminal transition. Decided from the session metadata alone —
+// a dead window and a live one both need the repo opened, so there is nothing
+// left for a window-alive check to decide.
+func repoHasUnreconciledTmuxSession(store *Store, repo string) bool {
+	worktrees, err := store.ListWorktrees(repo)
+	if err != nil {
+		return false
+	}
+	for _, wtName := range worktrees {
+		sessions, err := store.ListSessions(repo, wtName)
+		if err != nil {
+			continue
+		}
+		for _, meta := range sessions {
+			if isTmuxRunner(meta.RunnerType) && !meta.Status.IsTerminal() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Close shuts down the manager and all sessions.
@@ -1318,9 +1315,10 @@ func (m *Manager) monitorTrackedTmuxWindow(session *Session) {
 				// tmux-mode sessions receive the Notification hook.
 				session.mu.RLock()
 				status := session.Status
+				turnEpoch := session.turnEpoch
 				session.mu.RUnlock()
 
-				m.pollPaneIdle(idleTracker, sessionID, status, windowTarget)
+				m.pollPaneIdle(idleTracker, sessionID, status, turnEpoch, windowTarget)
 
 				if status == StatusIdle {
 					if IsSessionWindowActive(windowID, windowName) {
@@ -1824,6 +1822,7 @@ func (m *Manager) runSession(session *Session, prompt string) {
 				tmuxID := session.TmuxWindowID
 				sessionID := session.ID
 				status := session.Status
+				turnEpoch := session.turnEpoch
 				session.mu.RUnlock()
 
 				if tmuxName == "" && tmuxID == "" {
@@ -1837,7 +1836,7 @@ func (m *Manager) runSession(session *Session, prompt string) {
 					windowTarget = tmuxID
 				}
 
-				m.pollPaneIdle(idleTracker, sessionID, status, windowTarget)
+				m.pollPaneIdle(idleTracker, sessionID, status, turnEpoch, windowTarget)
 
 				windowExists := tmuxWindowAlive(tmuxID, tmuxName)
 				paneDead := windowExists && TmuxWindowPaneDead(windowTarget)
@@ -2173,6 +2172,10 @@ func applySessionStatusLocked(session *Session, oldStatus, newStatus SessionStat
 	now := time.Now()
 	switch newStatus {
 	case StatusRunning:
+		// A new turn. Bumped here rather than at each caller because this is the
+		// only place a session's status is written, so nothing can start a turn
+		// without the pane-idle probe noticing — see paneIdleTracker.forTurn.
+		session.turnEpoch++
 		// Set StartedAt only when first starting (Pending→Running) or when missing;
 		// preserve the original start time when resuming from Idle.
 		if oldStatus == StatusPending || session.StartedAt == nil {
@@ -2426,9 +2429,10 @@ func (m *Manager) SetSessionRunning(id SessionID) {
 // ends, in which case this does nothing.
 //
 // Only a running session is a candidate: once idle it stays idle until
-// something delivers work and marks it running again, which is also what
-// re-arms the tracker.
-func (m *Manager) pollPaneIdle(tracker *paneIdleTracker, id SessionID, status SessionStatus, windowTarget string) {
+// something delivers work and marks it running again. turnEpoch is what makes
+// that re-arming reliable — the delivery and the transition it causes both
+// happen between two polls, so the status alone cannot show the boundary.
+func (m *Manager) pollPaneIdle(tracker *paneIdleTracker, id SessionID, status SessionStatus, turnEpoch uint64, windowTarget string) {
 	if tracker == nil {
 		return
 	}
@@ -2436,6 +2440,7 @@ func (m *Manager) pollPaneIdle(tracker *paneIdleTracker, id SessionID, status Se
 		tracker.reset()
 		return
 	}
+	tracker.forTurn(turnEpoch)
 	// CaptureTmuxPane rather than CapturePaneText: the caller resolved this
 	// same target from the same session a few lines ago, and going back through
 	// the session map would retake two locks per tick to rederive it.
