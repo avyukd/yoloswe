@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"slices"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -13,8 +14,6 @@ import (
 // is exported because the request can arrive from outside the Bubble Tea event
 // loop — a SIGUSR2 handler or an IPC request — via Program.Send.
 type RestartRequestedMsg struct {
-	// Source names who asked, for the log line and the toast.
-	Source string
 	// Force skips the "these sessions will be lost" confirmation. Only the
 	// `bramble restart --force` path sets it; a keypress never does, because a
 	// user at the keyboard can answer the prompt.
@@ -26,13 +25,13 @@ type RestartRequestedMsg struct {
 func (m Model) RestartRequested() bool { return m.restartRequested }
 
 // RestartSnapshot captures the view state that an exec restart cannot otherwise
-// recover. Everything else — sessions, their tmux windows, their history — comes
-// back through the session store and tmux reconciliation.
+// recover. Everything else — sessions, their tmux windows, their history —
+// comes back through the session store and tmux reconciliation.
 func (m Model) RestartSnapshot() RestartState {
 	state := RestartState{
 		ActiveRepo:       m.repoName,
 		ViewingSessionID: string(m.viewingSessionID),
-		OpenedRepos:      append([]string(nil), m.openedRepos...),
+		OpenedRepos:      slices.Clone(m.openedRepos),
 	}
 	if item := m.worktreeDropdown.SelectedItem(); item != nil {
 		state.SelectedWorktree = item.ID
@@ -52,46 +51,29 @@ func (m Model) DisableTmuxExitOnQuitAll() {
 	}
 }
 
-// lostOnRestartCount counts sessions that an exec cannot preserve.
-//
-// Tmux-mode sessions are children of the tmux server, so they outlive us. TUI-mode
-// sessions are our own children, spawned with Pdeathsig, and die with the process
-// image — those are the ones worth warning about.
-func (m Model) lostOnRestartCount() int {
-	lost := 0
-	for _, rc := range m.repos {
-		if rc.sessionManager == nil || rc.sessionManager.IsInTmuxMode() {
-			continue
-		}
-		counts := rc.sessionManager.CountByStatus()
-		lost += counts[session.StatusRunning] + counts[session.StatusIdle] + counts[session.StatusPending]
-	}
-	return lost
-}
-
 // requestRestart runs the pre-flight for an in-place restart: refuse outright if
 // the binary on disk could not be exec'd, ask first if live work would be lost,
 // and otherwise quit with restartRequested set so main() execs instead of
 // returning.
 //
-// Verifying before tea.Quit is deliberate. A restart that fails after the TUI
-// has torn itself down leaves the user staring at a shell, so the failure has to
-// surface while there is still a UI to surface it in.
-func (m Model) requestRestart(msg RestartRequestedMsg) (Model, tea.Cmd) {
+// Verifying before tea.Quit is deliberate: a restart that fails after the TUI
+// has torn itself down leaves the user staring at a shell.
+func (m Model) requestRestart(force bool) (Model, tea.Cmd) {
 	if err := selfexec.Verify(); err != nil {
 		cmd := m.addToast(fmt.Sprintf("Cannot restart: %v", err), ToastError)
 		return m, cmd
 	}
 
-	if !msg.Force {
-		if lost := m.lostOnRestartCount(); lost > 0 {
-			m.confirmRestart = true
-			cmd := m.addToast(
-				fmt.Sprintf("%d in-process session(s) will be lost. Press ctrl+r or 'y' to confirm restart, any other key to cancel", lost),
-				ToastInfo,
-			)
-			return m, cmd
-		}
+	// Tmux-mode sessions are children of the tmux server and outlive the exec.
+	// TUI-mode sessions are our own children, spawned with Pdeathsig, and die
+	// with the process image — those are the ones worth warning about.
+	if lost := m.countActiveSessions(true); !force && lost > 0 {
+		model, cmd := m.showConfirm(
+			fmt.Sprintf("%d in-process session(s) will be lost by restarting. Restart anyway?", lost),
+			[]ConfirmOption{{Key: "y", Label: "restart"}},
+			func(string) tea.Cmd { return func() tea.Msg { return RestartRequestedMsg{Force: true} } },
+		)
+		return model.(Model), cmd
 	}
 
 	m.restartRequested = true
@@ -103,18 +85,18 @@ func (m Model) requestRestart(msg RestartRequestedMsg) (Model, tea.Cmd) {
 //
 // The worktree selection has to cope with both startup paths. main() usually
 // pre-loads worktrees before building the model, and Init() then skips the
-// async refresh entirely — so there is no worktreesMsg to piggyback on and the
-// selection must be applied right here. When the dropdown is still empty (no
-// pre-loaded worktrees, so Init() will call refreshWorktrees), we fall back to
-// pendingWorktreeSelect, which the worktreesMsg handler drains.
+// async refresh entirely — so the selection must be applied right here.
+// Deferring to pendingWorktreeSelect is only correct when worktrees have yet to
+// load, because that field is drained solely by the worktreesMsg handler.
 func (m *Model) ApplyRestartState(state *RestartState) {
 	if state == nil {
 		return
 	}
 	if state.SelectedWorktree != "" {
-		if m.worktreeDropdown.SelectByID(state.SelectedWorktree) {
+		switch {
+		case m.worktreeDropdown.SelectByID(state.SelectedWorktree):
 			m.updateSessionDropdown()
-		} else {
+		case !m.worktreesLoaded:
 			m.pendingWorktreeSelect = state.SelectedWorktree
 		}
 	}

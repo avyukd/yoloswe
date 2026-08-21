@@ -58,12 +58,14 @@ var (
 	voiceSaveDir       string
 )
 
-// Restart plumbing. pendingRestart is set after the TUI exits asking to be
+// Restart plumbing. restart is filled in after the TUI exits asking to be
 // replaced; main() acts on it once runTUI's deferred cleanup has finished.
 var (
-	pendingRestart      bool
-	pendingRestartState string
-	restartRequests     restartRequester
+	restart struct {
+		statePath string
+		pending   bool
+	}
+	restartRequests restartRequester
 )
 
 var rootCmd = &cobra.Command{
@@ -112,18 +114,12 @@ func main() {
 		os.Exit(1)
 	}
 	// The exec happens here, not in runTUI, because syscall.Exec never runs
-	// deferred functions: by the time Execute returns, runTUI's defers have
-	// unbound both Unix sockets, persisted every live session, and stopped the
-	// task router and hub client. Only then is it safe to discard the process
-	// image.
-	//
-	// The PID survives the exec, so the replacement recomputes the same two
-	// socket paths and re-binds them — which is what lets already-running tmux
-	// sessions keep talking to bramble across the swap.
-	if pendingRestart {
+	// deferred functions: only once Execute returns have runTUI's defers
+	// unbound both sockets and persisted every live session.
+	if restart.pending {
 		env := os.Environ()
-		if pendingRestartState != "" {
-			env = append(env, restartStateEnv+"="+pendingRestartState)
+		if restart.statePath != "" {
+			env = append(env, app.RestartStateEnvVar+"="+restart.statePath)
 		}
 		if err := selfexec.Exec(os.Args, env); err != nil {
 			fmt.Fprintf(os.Stderr, "bramble restart failed: %v\n", err)
@@ -158,10 +154,10 @@ func runTUI(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Consume any handoff left by the process image we replaced. This must come
-	// before repo resolution: a restart restores the repo the user was actually
-	// looking at, which outranks both --repo and cwd detection (the user may
-	// have switched repos in-app long after launch).
+	// Consume any handoff left by the process image we replaced. A restart
+	// restores the repo the user was actually looking at, which outranks both
+	// --repo and cwd detection — they may have switched repos in-app long
+	// after launch.
 	restored := app.LoadRestartStateFromEnv()
 
 	// Determine repo to use (priority: restart handoff > --repo flag > auto-detect from cwd > picker)
@@ -252,10 +248,9 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	// by the TUI so their sessions are fully re-adopted.
 	resumeRepos := session.ReposWithLiveTmuxSessions(store, repoName)
 
-	// Fold in the repos the previous image had open. The scan above only finds
-	// repos with a live tmux window, so without this a repo the user had opened
-	// but left idle would silently disappear across a restart.
-	resumeRepos = mergeResumeRepos(resumeRepos, restoredOpenedRepos(restored), repoName)
+	// The scan above only finds repos with a live tmux window, so without the
+	// handoff a repo the user had opened but left idle would disappear.
+	resumeRepos = mergeResumeRepos(resumeRepos, restored, repoName)
 
 	// Start the AI task router using the best available provider.
 	// Priority: codex (original default) → claude → gemini.
@@ -359,7 +354,7 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	restartRequests.set(func(msg app.RestartRequestedMsg) { p.Send(msg) })
 	defer restartRequests.set(nil)
 	stopRestartSignal := watchRestartSignal(func() {
-		_ = restartRequests.request(app.RestartRequestedMsg{Source: "signal"})
+		_ = restartRequests.request(app.RestartRequestedMsg{})
 	})
 	defer stopRestartSignal()
 
@@ -373,12 +368,9 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	// opened repos are cleaned up properly.
 	if m, ok := finalModel.(app.Model); ok {
 		if m.RestartRequested() {
-			// A restart is not a quit: every tmux window must outlive us, because
-			// re-adopting them is the entire point. Clearing the flag on each
-			// manager before Close() is what keeps --tmux-exit-on-quit from
-			// killing the sessions we are trying to preserve.
+			// A restart is not a quit: the tmux windows are exactly what the
+			// replacement re-adopts, so --tmux-exit-on-quit must not fire.
 			m.DisableTmuxExitOnQuitAll()
-			sessionManager.DisableTmuxExitOnQuit()
 			armRestart(m.RestartSnapshot())
 		}
 		m.CloseSecondaryManagers(repoName)
@@ -392,18 +384,17 @@ func runTUI(cmd *cobra.Command, args []string) error {
 // write costs the user their selection, which is not worth cancelling a restart
 // over, so the restart is still armed.
 func armRestart(state app.RestartState) {
+	restart.pending = true
 	statePath, err := app.RestartStatePath()
 	if err != nil {
 		slog.Warn("cannot determine restart state path; restarting without restoring view state", "err", err)
-		pendingRestart = true
 		return
 	}
 	if err := app.WriteRestartState(statePath, state); err != nil {
 		slog.Warn("failed to write restart state; restarting without restoring view state", "err", err)
-	} else {
-		pendingRestartState = statePath
+		return
 	}
-	pendingRestart = true
+	restart.statePath = statePath
 }
 
 // runRepoPicker shows the repo selection screen and returns the selected repo.
@@ -599,11 +590,11 @@ func startIPCServer(registry *session.SessionRegistry, sockPath, wtRoot, repoNam
 	})
 
 	srv.Handle(ipc.RequestRestart, func(_ context.Context, req *ipc.Request) (any, error) {
-		force := false
-		if params, ok := req.Params.(*ipc.RestartParams); ok {
-			force = params.Force
+		params, ok := req.Params.(*ipc.RestartParams)
+		if !ok {
+			return nil, fmt.Errorf("invalid params")
 		}
-		if err := restartRequests.request(app.RestartRequestedMsg{Source: "ipc", Force: force}); err != nil {
+		if err := restartRequests.request(app.RestartRequestedMsg{Force: params.Force}); err != nil {
 			return nil, err
 		}
 		return "ok", nil
@@ -883,26 +874,30 @@ var notifyCmd = &cobra.Command{
 	},
 }
 
-// notifyRetries and notifyRetryDelay bound how long a notify waits for a socket
-// to come back. An in-place restart unbinds the IPC socket and re-binds the
-// same path in the replacement image a moment later; without a retry, a session
-// that finishes its turn inside that window notifies nobody. Since the notify
-// handler is the only caller of SetSessionIdle, that lost notification means
-// the session never shows as idle at all — and the stop hook runs with
-// --silent, so nothing would ever say so.
+// Backoff for a notify whose socket is missing. An in-place restart unbinds the
+// IPC socket and re-binds the same path in the replacement image, but only
+// after the new process has re-listed worktrees, probed providers, and
+// reconciled tmux — routinely more than a second. Without a retry spanning
+// that, a session finishing its turn inside the window notifies nobody, and
+// since the notify handler is the only caller of SetSessionIdle the session
+// never shows as idle at all. The stop hook runs with --silent, so nothing
+// would ever say so.
 const (
-	notifyRetries    = 3
-	notifyRetryDelay = 500 * time.Millisecond
+	notifyRetries         = 4
+	notifyRetryBaseDelay  = 100 * time.Millisecond
+	notifyRetryMultiplier = 3
 )
 
-// sendNotifyWithRetry sends a notify request, retrying a dial failure a few
-// times. Only transport errors are retried: a response from the server, even an
-// error one, is a real answer and is returned as-is.
+// sendNotifyWithRetry sends a notify request, backing off over a transport
+// failure. Only transport errors are retried: a response from the server, even
+// an error one, is a real answer and is returned as-is.
 func sendNotifyWithRetry(client *ipc.Client, sessionID string) (*ipc.Response, error) {
 	var lastErr error
+	delay := notifyRetryBaseDelay
 	for attempt := range notifyRetries {
 		if attempt > 0 {
-			time.Sleep(notifyRetryDelay)
+			time.Sleep(delay)
+			delay *= notifyRetryMultiplier
 		}
 		resp, err := client.Send(&ipc.Request{
 			Type:   ipc.RequestNotify,

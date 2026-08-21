@@ -7,18 +7,14 @@ import (
 	"github.com/bazelment/yoloswe/bramble/app"
 )
 
-// restartStateEnv names the handoff file passed to the process image that
-// replaces this one. Defined by the app package, which owns both ends of it.
-const restartStateEnv = app.RestartStateEnvVar
-
 // restartRequester routes an out-of-band restart request (SIGUSR2, IPC) into
 // the Bubble Tea event loop.
 //
-// It exists because of an ordering problem: the IPC server binds and starts
-// serving well before tea.NewProgram exists, so the handler cannot close over
-// the program directly. It closes over this holder instead, which is filled in
-// once the program is created and emptied again when it exits. A request that
-// lands outside that window is refused honestly rather than dropped.
+// It exists because the IPC server binds and starts serving well before
+// tea.NewProgram exists, so the handler cannot close over the program directly.
+// It closes over this holder instead, which is filled in once the program is
+// created and emptied again when it exits. A request that lands outside that
+// window is refused honestly rather than dropped.
 type restartRequester struct {
 	send func(app.RestartRequestedMsg)
 	mu   sync.Mutex
@@ -44,21 +40,14 @@ func (r *restartRequester) request(msg app.RestartRequestedMsg) error {
 	return nil
 }
 
-// restoredOpenedRepos returns the opened-repo list from a restart handoff, or
-// nil when there was no handoff.
-func restoredOpenedRepos(state *app.RestartState) []string {
-	if state == nil {
-		return nil
-	}
-	return state.OpenedRepos
-}
-
-// mergeResumeRepos appends extra onto live, dropping duplicates and activeRepo.
+// mergeResumeRepos appends the repos a restart handoff had open onto the ones
+// found by the live tmux scan, dropping duplicates and activeRepo.
 //
 // activeRepo is excluded because its manager is constructed directly and
 // reconciles itself; re-listing it here would have the TUI open it a second
 // time. Order is preserved so repos with live tmux windows are re-adopted first.
-func mergeResumeRepos(live, extra []string, activeRepo string) []string {
+func mergeResumeRepos(live []string, restored *app.RestartState, activeRepo string) []string {
+	extra := restored.Repos()
 	seen := make(map[string]bool, len(live)+len(extra))
 	seen[activeRepo] = true
 	merged := make([]string, 0, len(live)+len(extra))

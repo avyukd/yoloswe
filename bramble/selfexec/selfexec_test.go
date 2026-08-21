@@ -72,12 +72,8 @@ func TestVerifyRejectsUnusableTargets(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Not parallel: these swap the package-level self path.
-			restore := self
-			self = tt.path
-			t.Cleanup(func() { self = restore })
-
-			err := Verify()
+			t.Parallel()
+			err := verify(tt.path)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.errSubstr)
 		})

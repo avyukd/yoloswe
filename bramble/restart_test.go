@@ -70,16 +70,13 @@ func TestMergeResumeRepos(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			assert.Equal(t, tt.want, mergeResumeRepos(tt.live, tt.extra, tt.activeRepo))
+			var restored *app.RestartState
+			if tt.extra != nil {
+				restored = &app.RestartState{OpenedRepos: tt.extra}
+			}
+			assert.Equal(t, tt.want, mergeResumeRepos(tt.live, restored, tt.activeRepo))
 		})
 	}
-}
-
-func TestRestoredOpenedRepos(t *testing.T) {
-	t.Parallel()
-
-	assert.Nil(t, restoredOpenedRepos(nil))
-	assert.Equal(t, []string{"a"}, restoredOpenedRepos(&app.RestartState{OpenedRepos: []string{"a"}}))
 }
 
 func TestRestartRequesterRefusesWhenNoTUIIsRunning(t *testing.T) {
@@ -90,7 +87,7 @@ func TestRestartRequesterRefusesWhenNoTUIIsRunning(t *testing.T) {
 	// where anything could act on it. That must be an honest error, not a
 	// silently dropped request.
 	var r restartRequester
-	err := r.request(app.RestartRequestedMsg{Source: "ipc"})
+	err := r.request(app.RestartRequestedMsg{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no bramble TUI is running")
 }
@@ -102,17 +99,16 @@ func TestRestartRequesterDeliversAndClears(t *testing.T) {
 	got := make(chan app.RestartRequestedMsg, 1)
 	r.set(func(msg app.RestartRequestedMsg) { got <- msg })
 
-	require.NoError(t, r.request(app.RestartRequestedMsg{Source: "signal", Force: true}))
+	require.NoError(t, r.request(app.RestartRequestedMsg{Force: true}))
 	select {
 	case msg := <-got:
-		assert.Equal(t, "signal", msg.Source)
 		assert.True(t, msg.Force)
 	default:
 		t.Fatal("expected the request to be delivered")
 	}
 
 	r.set(nil)
-	assert.Error(t, r.request(app.RestartRequestedMsg{Source: "signal"}))
+	assert.Error(t, r.request(app.RestartRequestedMsg{}))
 }
 
 // TestSocketPathsSurviveAnExecRestart pins the property the whole in-place

@@ -545,15 +545,12 @@ func (m *Manager) SetControlSockPath(path string) {
 	m.config.ControlSockPath = path
 }
 
-// DisableTmuxExitOnQuit clears the kill-windows-on-close behaviour for the rest
-// of this manager's life. Close() interprets TmuxExitOnQuit as "the user is
-// done", which is wrong for an in-place restart: the windows are exactly what
-// the new process re-adopts. Callers restarting the process must call this on
-// every manager before Close().
+// DisableTmuxExitOnQuit clears the kill-windows-on-close behaviour that Close()
+// applies, which an in-place restart must not trigger: those windows are what
+// the new process image re-adopts.
 //
 // Like the socket-path setters above, this is unsynchronized because it runs on
-// the main goroutine after the TUI has exited, at which point no session
-// goroutine is still starting windows.
+// the main goroutine after the TUI has exited.
 func (m *Manager) DisableTmuxExitOnQuit() {
 	m.config.TmuxExitOnQuit = false
 }
@@ -1375,10 +1372,10 @@ func (m *Manager) newTmuxRunner(session *Session, prompt, tmuxName string, agent
 		permissionMode = "plan"
 	}
 
-	// selfexec.Path() rather than os.Executable(): this value is baked into the
+	// selfexec.Path() rather than os.Executable(): this is baked into the
 	// session's Claude Stop-hook argv for the window's whole lifetime, and a
-	// lazy os.Executable() call returns "<path> (deleted)" once someone rebuilds
-	// the binary underneath a running bramble.
+	// lazy os.Executable() returns "<path> (deleted)" once someone rebuilds the
+	// binary underneath a running bramble.
 	brambleBin := selfexec.Path()
 	if brambleBin == "" {
 		brambleBin = "bramble" // fallback to PATH lookup

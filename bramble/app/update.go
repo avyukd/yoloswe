@@ -174,7 +174,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case RestartRequestedMsg:
-		return m.requestRestart(msg)
+		return m.requestRestart(msg.Force)
 
 	case resumeReposMsg:
 		var cmds []tea.Cmd
@@ -531,20 +531,6 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// Restart confirmation, same shape as quit's. Forced here rather than
-	// routed back through requestRestart: the user has now answered the very
-	// question that pre-flight would ask again.
-	if m.confirmRestart {
-		m.confirmRestart = false
-		switch msg.String() {
-		case "ctrl+r", "y":
-			return m.requestRestart(RestartRequestedMsg{Source: "confirm", Force: true})
-		default:
-			toastCmd := m.addToast("Restart cancelled", ToastInfo)
-			return m, toastCmd
-		}
-	}
-
 	switch msg.String() {
 	case "?":
 		// Open help overlay
@@ -559,18 +545,10 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case "ctrl+r":
-		return m.requestRestart(RestartRequestedMsg{Source: "key"})
+		return m.requestRestart(false)
 
 	case "q":
-		// Check for active sessions across ALL opened repos
-		activeCount := 0
-		for _, rc := range m.repos {
-			if rc.sessionManager == nil {
-				continue
-			}
-			counts := rc.sessionManager.CountByStatus()
-			activeCount += counts[session.StatusRunning] + counts[session.StatusIdle] + counts[session.StatusPending]
-		}
+		activeCount := m.countActiveSessions(false)
 		if activeCount > 0 {
 			m.confirmQuit = true
 			toastMsg := fmt.Sprintf("%d active session(s). Press 'q' or 'y' to confirm quit, any other key to cancel", activeCount)
@@ -1259,6 +1237,26 @@ func (m Model) showConfirm(message string, options []ConfirmOption, handler func
 	m.confirmHandler = handler
 	m.focus = FocusConfirm
 	return m, nil
+}
+
+// countActiveSessions sums running, idle, and pending sessions across every
+// opened repo. skipTmux excludes tmux-mode managers, whose sessions belong to
+// the tmux server and so survive things that end this process.
+func (m Model) countActiveSessions(skipTmux bool) int {
+	total := 0
+	for _, rc := range m.repos {
+		if rc.sessionManager == nil || (skipTmux && rc.sessionManager.IsInTmuxMode()) {
+			continue
+		}
+		total += activeSessionCount(rc.sessionManager)
+	}
+	return total
+}
+
+// activeSessionCount is countActiveSessions for a single manager.
+func activeSessionCount(mgr *session.Manager) int {
+	counts := mgr.CountByStatus()
+	return counts[session.StatusRunning] + counts[session.StatusIdle] + counts[session.StatusPending]
 }
 
 // promptInput switches to input mode with an optional placeholder.
@@ -2873,9 +2871,7 @@ func (m *Model) populateRepoDropdown(allRepos []string) {
 	for _, name := range m.openedRepos {
 		badge := ""
 		if rc, ok := m.repos[name]; ok && rc.sessionManager != nil {
-			counts := rc.sessionManager.CountByStatus()
-			active := counts[session.StatusRunning] + counts[session.StatusIdle] + counts[session.StatusPending]
-			if active > 0 {
+			if active := activeSessionCount(rc.sessionManager); active > 0 {
 				badge = fmt.Sprintf("%d active", active)
 			}
 		}

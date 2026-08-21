@@ -17,6 +17,11 @@ const RestartStateEnvVar = "BRAMBLE_RESTART_STATE"
 // disposable, and starting fresh beats restoring nonsense.
 const restartStateVersion = 1
 
+// staleRestartStateAge is how long an unconsumed handoff lingers before the
+// next writer sweeps it. A handoff is normally consumed seconds after it is
+// written; anything older belongs to a process image that never came back.
+const staleRestartStateAge = time.Hour
+
 // RestartState is the slice of a running TUI that has no other way back.
 //
 // It is deliberately small. Sessions, their tmux windows, and their output all
@@ -25,9 +30,6 @@ const restartStateVersion = 1
 // cannot reconstruct is which repo the user was looking at (repos with no live
 // tmux session are invisible to that scan) and where the cursor was.
 type RestartState struct {
-	// FromBuildTime is the mtime of the binary being replaced, used only to
-	// tell the user which build they left behind.
-	FromBuildTime time.Time `json:"from_build_time,omitzero"`
 	// ActiveRepo is the repo the TUI was showing. It outranks --repo and cwd
 	// detection on the next start.
 	ActiveRepo string `json:"active_repo"`
@@ -41,21 +43,28 @@ type RestartState struct {
 	Version int `json:"version"`
 }
 
-// DefaultRestartStateDir returns ~/.bramble/restart, alongside the session
-// store.
-func DefaultRestartStateDir() (string, error) {
-	home, err := os.UserHomeDir()
+// Repos returns the opened-repo list, tolerating a nil state (a cold start).
+func (s *RestartState) Repos() []string {
+	if s == nil {
+		return nil
+	}
+	return s.OpenedRepos
+}
+
+// restartStateDir returns ~/.bramble/restart, alongside the session store.
+func restartStateDir() (string, error) {
+	dir, err := settingsDir()
 	if err != nil {
 		return "", fmt.Errorf("failed to get home directory: %w", err)
 	}
-	return filepath.Join(home, ".bramble", "restart"), nil
+	return filepath.Join(dir, "restart"), nil
 }
 
 // RestartStatePath returns the state file path for this process. It is keyed by
 // pid so that concurrent bramble processes restarting at once cannot clobber
 // each other's handoff.
 func RestartStatePath() (string, error) {
-	dir, err := DefaultRestartStateDir()
+	dir, err := restartStateDir()
 	if err != nil {
 		return "", err
 	}
@@ -70,6 +79,7 @@ func WriteRestartState(path string, state RestartState) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create restart state dir: %w", err)
 	}
+	pruneStaleRestartStates(dir)
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal restart state: %w", err)
@@ -91,6 +101,25 @@ func WriteRestartState(path string, state RestartState) error {
 		return fmt.Errorf("rename restart state: %w", err)
 	}
 	return nil
+}
+
+// pruneStaleRestartStates removes handoffs nobody will ever consume: the
+// replacement image deletes its own on startup, so anything left behind is from
+// an exec that failed or an image that died before reading it. Best-effort —
+// the directory holds at most a handful of tiny files.
+func pruneStaleRestartStates(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-staleRestartStateAge)
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil || entry.IsDir() || info.ModTime().After(cutoff) {
+			continue
+		}
+		os.Remove(filepath.Join(dir, entry.Name()))
+	}
 }
 
 // LoadRestartState reads a state file written by WriteRestartState.

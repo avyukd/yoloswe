@@ -47,7 +47,7 @@ func TestCtrlR_TmuxSessions_RestartsWithoutConfirming(t *testing.T) {
 	m2 := newModel.(Model)
 
 	assert.True(t, m2.RestartRequested())
-	assert.False(t, m2.confirmRestart)
+	assert.Nil(t, m2.confirmPrompt)
 	assert.True(t, isQuit(t, cmd))
 }
 
@@ -70,48 +70,49 @@ func TestCtrlR_InProcessSessions_ConfirmsFirst(t *testing.T) {
 	newModel, cmd := m.handleKeyPress(ctrlKey('r'))
 	m2 := newModel.(Model)
 
-	assert.True(t, m2.confirmRestart)
+	require.NotNil(t, m2.confirmPrompt)
+	assert.Equal(t, FocusConfirm, m2.focus)
+	assert.Contains(t, m2.confirmPrompt.message, "in-process session")
 	assert.False(t, m2.RestartRequested(), "must not commit to a restart before the user confirms")
-	require.True(t, m2.toasts.HasToasts())
-	assert.Contains(t, m2.toasts.toasts[0].Message, "in-process session")
 	assert.False(t, isQuit(t, cmd))
 }
 
-func TestRestartConfirm_AcceptedKeys_Restart(t *testing.T) {
-	for _, key := range []tea.KeyPressMsg{ctrlKey('r'), keyPress('y')} {
-		t.Run(key.String(), func(t *testing.T) {
-			m := setupModel(t, session.SessionModeTUI, mainWorktree(), "test-repo")
-			addRunningSession(&m, "in-process-session")
-
-			newModel, _ := m.handleKeyPress(ctrlKey('r'))
-			m2 := newModel.(Model)
-			require.True(t, m2.confirmRestart)
-
-			newModel2, cmd := m2.handleKeyPress(key)
-			m3 := newModel2.(Model)
-
-			assert.False(t, m3.confirmRestart)
-			assert.True(t, m3.RestartRequested())
-			assert.True(t, isQuit(t, cmd))
-		})
-	}
-}
-
-func TestRestartConfirm_OtherKey_Cancels(t *testing.T) {
+func TestRestartConfirm_Accepted_Restarts(t *testing.T) {
 	m := setupModel(t, session.SessionModeTUI, mainWorktree(), "test-repo")
 	addRunningSession(&m, "in-process-session")
 
 	newModel, _ := m.handleKeyPress(ctrlKey('r'))
 	m2 := newModel.(Model)
-	require.True(t, m2.confirmRestart)
+	require.NotNil(t, m2.confirmPrompt)
 
-	newModel2, cmd := m2.handleKeyPress(keyPress('x'))
+	// Answering the prompt re-enters the same pre-flight with Force set, so the
+	// question is asked exactly once.
+	newModel2, cmd := m2.Update(keyPress('y'))
+	m3 := newModel2.(Model)
+	require.Nil(t, m3.confirmPrompt)
+	require.NotNil(t, cmd)
+
+	newModel3, quitCmd := m3.Update(cmd())
+	m4 := newModel3.(Model)
+
+	assert.True(t, m4.RestartRequested())
+	assert.True(t, isQuit(t, quitCmd))
+}
+
+func TestRestartConfirm_Escape_Cancels(t *testing.T) {
+	m := setupModel(t, session.SessionModeTUI, mainWorktree(), "test-repo")
+	addRunningSession(&m, "in-process-session")
+
+	newModel, _ := m.handleKeyPress(ctrlKey('r'))
+	m2 := newModel.(Model)
+	require.NotNil(t, m2.confirmPrompt)
+
+	newModel2, cmd := m2.Update(specialKey(tea.KeyEscape))
 	m3 := newModel2.(Model)
 
-	assert.False(t, m3.confirmRestart)
+	assert.Nil(t, m3.confirmPrompt)
 	assert.False(t, m3.RestartRequested())
 	assert.False(t, isQuit(t, cmd))
-	assert.Contains(t, m3.toasts.toasts[len(m3.toasts.toasts)-1].Message, "Restart cancelled")
 }
 
 func TestRestartRequestedMsg_TakesTheSamePath(t *testing.T) {
@@ -120,10 +121,10 @@ func TestRestartRequestedMsg_TakesTheSamePath(t *testing.T) {
 	m := setupModel(t, session.SessionModeTUI, mainWorktree(), "test-repo")
 	addRunningSession(&m, "in-process-session")
 
-	newModel, _ := m.Update(RestartRequestedMsg{Source: "signal"})
+	newModel, _ := m.Update(RestartRequestedMsg{})
 	m2 := newModel.(Model)
 
-	assert.True(t, m2.confirmRestart)
+	assert.NotNil(t, m2.confirmPrompt)
 	assert.False(t, m2.RestartRequested())
 }
 
@@ -132,10 +133,10 @@ func TestRestartRequestedMsg_ForceSkipsConfirmation(t *testing.T) {
 	m := setupModel(t, session.SessionModeTUI, mainWorktree(), "test-repo")
 	addRunningSession(&m, "in-process-session")
 
-	newModel, cmd := m.Update(RestartRequestedMsg{Source: "ipc", Force: true})
+	newModel, cmd := m.Update(RestartRequestedMsg{Force: true})
 	m2 := newModel.(Model)
 
-	assert.False(t, m2.confirmRestart)
+	assert.Nil(t, m2.confirmPrompt)
 	assert.True(t, m2.RestartRequested())
 	assert.True(t, isQuit(t, cmd))
 }
@@ -210,4 +211,20 @@ func TestApplyRestartState_NilIsNoOp(t *testing.T) {
 
 	assert.Empty(t, m.pendingWorktreeSelect)
 	assert.Equal(t, session.SessionID("unchanged"), m.viewingSessionID)
+}
+
+// TestApplyRestartState_UnknownWorktreeIsDropped covers a worktree that no
+// longer exists. Deferring it to pendingWorktreeSelect once worktrees are
+// already loaded would strand it until some unrelated refresh fired and then
+// yank the user's selection out from under them.
+func TestApplyRestartState_UnknownWorktreeIsDropped(t *testing.T) {
+	m := setupModel(t, session.SessionModeTmux, mainWorktree(), "test-repo")
+
+	m.ApplyRestartState(&RestartState{
+		ActiveRepo:       "test-repo",
+		SelectedWorktree: "deleted-branch",
+	})
+
+	assert.Empty(t, m.pendingWorktreeSelect)
+	assert.Equal(t, "main", m.worktreeDropdown.SelectedItem().ID)
 }

@@ -20,7 +20,6 @@ func TestRestartStateRoundTrip(t *testing.T) {
 		SelectedWorktree: "feat/in-place-start",
 		ViewingSessionID: "sess-123",
 		OpenedRepos:      []string{"yoloswe", "other"},
-		FromBuildTime:    time.Date(2026, 8, 21, 10, 0, 0, 0, time.UTC),
 	}
 	require.NoError(t, WriteRestartState(path, want))
 
@@ -113,4 +112,27 @@ func TestRestartStatePathIsPidScoped(t *testing.T) {
 	again, err := RestartStatePath()
 	require.NoError(t, err)
 	assert.Equal(t, path, again)
+}
+
+func TestWriteRestartStateSweepsAbandonedHandoffs(t *testing.T) {
+	t.Parallel()
+
+	// A handoff whose replacement image never started would otherwise sit in
+	// ~/.bramble/restart forever; nothing else ever reads that directory.
+	dir := t.TempDir()
+	stale := filepath.Join(dir, "999999.json")
+	require.NoError(t, os.WriteFile(stale, []byte(`{"version":1}`), 0o600))
+	old := time.Now().Add(-2 * staleRestartStateAge)
+	require.NoError(t, os.Chtimes(stale, old, old))
+
+	fresh := filepath.Join(dir, "12345.json")
+	require.NoError(t, os.WriteFile(fresh, []byte(`{"version":1}`), 0o600))
+
+	path := filepath.Join(dir, "state.json")
+	require.NoError(t, WriteRestartState(path, RestartState{ActiveRepo: "r"}))
+
+	_, err := os.Stat(stale)
+	assert.True(t, os.IsNotExist(err), "abandoned handoff should be swept")
+	assert.FileExists(t, fresh, "a recent handoff belongs to a live restart")
+	assert.FileExists(t, path)
 }

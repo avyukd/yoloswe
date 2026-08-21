@@ -4,6 +4,8 @@ package selfexec
 
 import "syscall"
 
+func execSupported() error { return nil }
+
 // Exec replaces the current process image with the binary at Path(), keeping
 // the PID. It only returns on failure — on success there is no "after".
 //

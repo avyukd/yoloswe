@@ -97,7 +97,6 @@ type Model struct { //nolint:govet // fieldalignment: readability over packing
 	lastUserInputAt           time.Time
 	inputMode                 bool
 	confirmQuit               bool
-	confirmRestart            bool
 	restartRequested          bool
 	worktreesLoaded           bool
 	gitStatusTickInFlight     bool
