@@ -186,7 +186,7 @@ func (c *Courier) resultPathFor(child SessionInfo) string {
 		// child finished, just without a pointer to read.
 		return ""
 	}
-	path, err := ResultFilePath(child.ID)
+	path, err := resultFilePathInDir(c.resultDir, child.ID)
 	if err != nil {
 		return ""
 	}
