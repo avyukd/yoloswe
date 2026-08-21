@@ -173,6 +173,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		)
 		return m, tea.Batch(cmds...)
 
+	case RestartRequestedMsg:
+		return m.requestRestart(msg)
+
 	case resumeReposMsg:
 		var cmds []tea.Cmd
 		for _, repo := range msg.repos {
@@ -528,6 +531,20 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// Restart confirmation, same shape as quit's. Forced here rather than
+	// routed back through requestRestart: the user has now answered the very
+	// question that pre-flight would ask again.
+	if m.confirmRestart {
+		m.confirmRestart = false
+		switch msg.String() {
+		case "ctrl+r", "y":
+			return m.requestRestart(RestartRequestedMsg{Source: "confirm", Force: true})
+		default:
+			toastCmd := m.addToast("Restart cancelled", ToastInfo)
+			return m, toastCmd
+		}
+	}
+
 	switch msg.String() {
 	case "?":
 		// Open help overlay
@@ -540,6 +557,9 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	case "ctrl+c":
 		return m, tea.Quit
+
+	case "ctrl+r":
+		return m.requestRestart(RestartRequestedMsg{Source: "key"})
 
 	case "q":
 		// Check for active sessions across ALL opened repos

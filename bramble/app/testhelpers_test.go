@@ -11,3 +11,8 @@ func keyPress(r rune) tea.KeyPressMsg {
 func specialKey(code rune) tea.KeyPressMsg {
 	return tea.KeyPressMsg{Code: code}
 }
+
+// ctrlKey creates a KeyPressMsg for a ctrl-modified character, e.g. ctrl+r.
+func ctrlKey(r rune) tea.KeyPressMsg {
+	return tea.KeyPressMsg{Code: r, Mod: tea.ModCtrl}
+}

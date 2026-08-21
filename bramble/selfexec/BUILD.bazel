@@ -1,0 +1,22 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "selfexec",
+    srcs = [
+        "selfexec.go",
+        "selfexec_other.go",
+        "selfexec_unix.go",
+    ],
+    importpath = "github.com/bazelment/yoloswe/bramble/selfexec",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "selfexec_test",
+    srcs = ["selfexec_test.go"],
+    embed = [":selfexec"],
+    deps = [
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+    ],
+)

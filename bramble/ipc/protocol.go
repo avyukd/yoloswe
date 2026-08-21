@@ -13,6 +13,7 @@ const (
 	RequestListSessions RequestType = "list-sessions"
 	RequestNotify       RequestType = "notify"
 	RequestCapturePane  RequestType = "capture-pane"
+	RequestRestart      RequestType = "restart"
 )
 
 // Request is the envelope sent by the client to the server.
@@ -28,6 +29,17 @@ type Response struct {
 	ID     string `json:"id"`
 	Error  string `json:"error,omitempty"`
 	OK     bool   `json:"ok"`
+}
+
+// RestartParams are the parameters for a restart request.
+//
+// Restart is intentionally IPC-only and never exposed through the control
+// protocol: the control plane is reachable from the network via the hub, and
+// bouncing a user's TUI is not something a remote caller should be able to do.
+type RestartParams struct {
+	// Force skips the confirmation the TUI would otherwise show when live
+	// in-process sessions would be lost.
+	Force bool `json:"force,omitempty"`
 }
 
 // NewSessionParams are the parameters for a new-session request.
