@@ -33,6 +33,7 @@ import (
 	"github.com/bazelment/yoloswe/bramble/control"
 	"github.com/bazelment/yoloswe/bramble/ipc"
 	"github.com/bazelment/yoloswe/bramble/remote"
+	"github.com/bazelment/yoloswe/bramble/selfexec"
 	"github.com/bazelment/yoloswe/bramble/session"
 	"github.com/bazelment/yoloswe/bramble/taskrouter"
 	"github.com/bazelment/yoloswe/bramble/tmuxctl"
@@ -55,6 +56,16 @@ var (
 	ttsVoice           string
 	voiceReportMode    string
 	voiceSaveDir       string
+)
+
+// Restart plumbing. restart is filled in after the TUI exits asking to be
+// replaced; main() acts on it once runTUI's deferred cleanup has finished.
+var (
+	restart struct {
+		statePath string
+		pending   bool
+	}
+	restartRequests restartRequester
 )
 
 var rootCmd = &cobra.Command{
@@ -102,6 +113,19 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	// The exec happens here, not in runTUI, because syscall.Exec never runs
+	// deferred functions: only once Execute returns have runTUI's defers
+	// unbound both sockets and persisted every live session.
+	if restart.pending {
+		env := os.Environ()
+		if restart.statePath != "" {
+			env = append(env, app.RestartStateEnvVar+"="+restart.statePath)
+		}
+		if err := selfexec.Exec(os.Args, env); err != nil {
+			fmt.Fprintf(os.Stderr, "bramble restart failed: %v\n", err)
+			os.Exit(1)
+		}
+	}
 }
 
 func runTUI(cmd *cobra.Command, args []string) error {
@@ -130,8 +154,17 @@ func runTUI(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Determine repo to use (priority: --repo flag > auto-detect from cwd > picker)
+	// Consume any handoff left by the process image we replaced. A restart
+	// restores the repo the user was actually looking at, which outranks both
+	// --repo and cwd detection — they may have switched repos in-app long
+	// after launch.
+	restored := app.LoadRestartStateFromEnv()
+
+	// Determine repo to use (priority: restart handoff > --repo flag > auto-detect from cwd > picker)
 	repoName := repoFlag
+	if restored != nil && restored.ActiveRepo != "" {
+		repoName = restored.ActiveRepo
+	}
 	if repoName == "" {
 		// Try to detect current repo from cwd
 		if cwd, err := os.Getwd(); err == nil {
@@ -214,6 +247,10 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	// Dead sessions from those repos are cleaned up; live ones will be auto-opened
 	// by the TUI so their sessions are fully re-adopted.
 	resumeRepos := session.ReposWithLiveTmuxSessions(store, repoName)
+
+	// The scan above only finds repos with a live tmux window, so without the
+	// handoff a repo the user had opened but left idle would disappear.
+	resumeRepos = mergeResumeRepos(resumeRepos, restored, repoName)
 
 	// Start the AI task router using the best available provider.
 	// Priority: codex (original default) → claude → gemini.
@@ -307,9 +344,32 @@ func runTUI(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	model.ApplyRestartState(restored)
+
 	p := tea.NewProgram(model)
 
+	// Let out-of-band restart requests (SIGUSR2, IPC) reach the event loop, but
+	// only while there is a loop to reach. The defers are the safety net for an
+	// early return; the ordinary path disarms below, the instant Run returns.
+	restartRequests.set(func(msg app.RestartRequestedMsg) { p.Send(msg) })
+	defer restartRequests.set(nil)
+	stopRestartSignal := watchRestartSignal(func() {
+		_ = restartRequests.request(app.RestartRequestedMsg{})
+	})
+	defer stopRestartSignal()
+
 	finalModel, err := p.Run()
+
+	// Disarm here rather than leaving it to the defers. The program is gone the
+	// moment Run returns, but the defers do not run until the cleanup below has
+	// finished writing the handoff and closing every manager — and the IPC
+	// server is still accepting throughout. A restart request arriving in that
+	// window would reach a p.Send that silently discards it, and the caller
+	// would be told it succeeded. Refusing is the honest answer, and it is what
+	// restartRequester exists to be able to do.
+	restartRequests.set(nil)
+	stopRestartSignal()
+
 	if err != nil {
 		return fmt.Errorf("TUI error: %w", err)
 	}
@@ -318,10 +378,34 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	// closed by the defer above. This ensures tmux windows from any additionally
 	// opened repos are cleaned up properly.
 	if m, ok := finalModel.(app.Model); ok {
+		if m.RestartRequested() {
+			// A restart is not a quit: the tmux windows are exactly what the
+			// replacement re-adopts, so --tmux-exit-on-quit must not fire.
+			m.DisableTmuxExitOnQuitAll()
+			armRestart(m.RestartSnapshot())
+		}
 		m.CloseSecondaryManagers(repoName)
 	}
 
 	return nil
+}
+
+// armRestart records the handoff for the exec that main() performs once every
+// deferred cleanup in runTUI has run. It is best-effort: a state file we cannot
+// write costs the user their selection, which is not worth cancelling a restart
+// over, so the restart is still armed.
+func armRestart(state app.RestartState) {
+	restart.pending = true
+	statePath, err := app.RestartStatePath()
+	if err != nil {
+		slog.Warn("cannot determine restart state path; restarting without restoring view state", "err", err)
+		return
+	}
+	if err := app.WriteRestartState(statePath, state); err != nil {
+		slog.Warn("failed to write restart state; restarting without restoring view state", "err", err)
+		return
+	}
+	restart.statePath = statePath
 }
 
 // runRepoPicker shows the repo selection screen and returns the selected repo.
@@ -516,6 +600,17 @@ func startIPCServer(registry *session.SessionRegistry, sockPath, wtRoot, repoNam
 		return "ok", nil
 	})
 
+	srv.Handle(ipc.RequestRestart, func(_ context.Context, req *ipc.Request) (any, error) {
+		params, ok := req.Params.(*ipc.RestartParams)
+		if !ok {
+			return nil, fmt.Errorf("invalid params")
+		}
+		if err := restartRequests.request(app.RestartRequestedMsg{Force: params.Force}); err != nil {
+			return nil, err
+		}
+		return "ok", nil
+	})
+
 	if err := srv.Start(); err != nil {
 		slog.Warn("IPC server failed to start", "err", err)
 		return nil
@@ -646,6 +741,39 @@ var pingCmd = &cobra.Command{
 	},
 }
 
+var restartCmd = &cobra.Command{
+	Use:   "restart",
+	Short: "Ask the running bramble TUI to restart into the binary on disk",
+	Long: `Replaces the running bramble TUI with the binary currently at its own
+path, keeping the process ID so that already-running sessions keep their IPC and
+control sockets.
+
+Rebuild or reinstall bramble first; this only performs the swap.
+
+Without --force the TUI asks for confirmation if any in-process (non-tmux)
+session would be lost, so this command returning successfully means the restart
+was requested, not necessarily that it happened.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		force, _ := cmd.Flags().GetBool("force")
+		client, err := ipc.NewClientFromEnv()
+		if err != nil {
+			return err
+		}
+		resp, err := client.Send(&ipc.Request{
+			Type:   ipc.RequestRestart,
+			Params: &ipc.RestartParams{Force: force},
+		})
+		if err != nil {
+			return err
+		}
+		if !resp.OK {
+			return fmt.Errorf("restart request failed: %s", resp.Error)
+		}
+		fmt.Println("restart requested")
+		return nil
+	},
+}
+
 var newSessionCmd = &cobra.Command{
 	Use:   "new-session",
 	Short: "Request the running bramble TUI to create a new session",
@@ -740,11 +868,7 @@ var notifyCmd = &cobra.Command{
 			}
 			return err
 		}
-		resp, err := client.Send(&ipc.Request{
-			Type:   ipc.RequestNotify,
-			ID:     "cli-notify",
-			Params: &ipc.NotifyParams{SessionID: sessionID},
-		})
+		resp, err := sendNotifyWithRetry(client, sessionID)
 		if err != nil {
 			if silent {
 				return nil
@@ -759,6 +883,82 @@ var notifyCmd = &cobra.Command{
 		}
 		return nil
 	},
+}
+
+// Backoff for a notify whose socket is missing. An in-place restart unbinds the
+// IPC socket and re-binds the same path in the replacement image, but only
+// after the new process has re-listed worktrees, probed providers, and
+// reconciled tmux — routinely more than a second. Without a retry spanning
+// that, a session finishing its turn inside the window notifies nobody, and
+// since the notify handler is the only caller of SetSessionIdle the session
+// never shows as idle at all. The stop hook runs with --silent, so nothing
+// would ever say so.
+//
+// The budget is a wall-clock span rather than an attempt count because what has
+// to be covered is a duration: the gap above is however long the replacement
+// image takes to reach its IPC bind, and a count only expresses that
+// second-hand. Delays grow geometrically so a socket that comes back quickly is
+// noticed quickly, and cap out so the tail stays a poll rather than one long
+// sleep that overshoots the budget.
+//
+// The ceiling is what a stop hook pays when bramble is gone for good rather
+// than restarting, since that case is indistinguishable from here — which is
+// why it is seconds and not the minute a truly generous budget would want.
+// notifyRetryPolicy is the shape of that backoff, separated from the constants
+// so a test can drive the loop on a millisecond budget instead of waiting out
+// the real one.
+type notifyRetryPolicy struct {
+	budget     time.Duration
+	baseDelay  time.Duration
+	maxDelay   time.Duration
+	multiplier int
+}
+
+var defaultNotifyRetryPolicy = notifyRetryPolicy{
+	budget:     5 * time.Second,
+	baseDelay:  100 * time.Millisecond,
+	maxDelay:   time.Second,
+	multiplier: 3,
+}
+
+// sendNotifyWithRetry sends a notify request, backing off over a transport
+// failure until the budget is spent.
+func sendNotifyWithRetry(client *ipc.Client, sessionID string) (*ipc.Response, error) {
+	return retryNotify(defaultNotifyRetryPolicy, func() (*ipc.Response, error) {
+		return client.Send(&ipc.Request{
+			Type:   ipc.RequestNotify,
+			ID:     "cli-notify",
+			Params: &ipc.NotifyParams{SessionID: sessionID},
+		})
+	})
+}
+
+// retryNotify calls send until it stops returning a transport error or the
+// policy's budget runs out. Only transport errors are retried: a response from
+// the server, even an error one, is a real answer and is returned as-is.
+func retryNotify(p notifyRetryPolicy, send func() (*ipc.Response, error)) (*ipc.Response, error) {
+	var lastErr error
+	deadline := time.Now().Add(p.budget)
+	delay := p.baseDelay
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 {
+			// Sleeping past the deadline would spend more than the budget
+			// allows, and waking to a dial we have already decided not to make
+			// is pure latency.
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				break
+			}
+			time.Sleep(min(delay, remaining))
+			delay = min(delay*time.Duration(p.multiplier), p.maxDelay)
+		}
+		resp, err := send()
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
 }
 
 var capturePaneCmd = &cobra.Command{
@@ -1014,7 +1214,10 @@ func init() {
 	codetalkCmd.Flags().String("system", "", "Custom system prompt")
 	codetalkCmd.Flags().BoolP("verbose", "v", false, "Show detailed tool results")
 
+	restartCmd.Flags().Bool("force", false, "Restart without confirming, even if in-process sessions would be lost")
+
 	rootCmd.AddCommand(pingCmd)
+	rootCmd.AddCommand(restartCmd)
 	rootCmd.AddCommand(newSessionCmd)
 	rootCmd.AddCommand(listSessionsCmd)
 	rootCmd.AddCommand(notifyCmd)

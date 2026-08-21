@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -136,4 +138,94 @@ func TestNotifyCmdSilentSwallowsMissingSessionID(t *testing.T) {
 	})
 
 	assert.NoError(t, notifyCmd.RunE(notifyCmd, nil))
+}
+
+// A fake policy: same shape as the real one, fast enough that the retry tests
+// are bounded by call counts rather than by wall-clock backoff.
+var testNotifyRetryPolicy = notifyRetryPolicy{
+	budget:     100 * time.Millisecond,
+	baseDelay:  time.Millisecond,
+	maxDelay:   2 * time.Millisecond,
+	multiplier: 3,
+}
+
+// The retry loop is the only thing keeping a session from being stuck Running
+// forever: notify is the sole caller of SetSessionIdle, and the stop hook runs
+// with --silent, so a notify that lands while the replacement image has not yet
+// re-bound the IPC socket fails invisibly.
+func TestRetryNotifyOutlastsATransportOutage(t *testing.T) {
+	t.Parallel()
+
+	// Fail the dial the first few times, exactly as an unbound socket does,
+	// then answer. Synchronizing on the call count rather than on elapsed time
+	// keeps this deterministic under load.
+	const failures = 4
+	calls := 0
+	resp, err := retryNotify(testNotifyRetryPolicy, func() (*ipc.Response, error) {
+		calls++
+		if calls <= failures {
+			return nil, errors.New("dial unix: connect: no such file or directory")
+		}
+		return &ipc.Response{ID: "cli-notify", OK: true}, nil
+	})
+
+	require.NoError(t, err, "notify should survive the socket being absent at first")
+	assert.True(t, resp.OK)
+	assert.Equal(t, failures+1, calls, "should have retried until the socket answered")
+}
+
+// A response from the server is a real answer even when it is an error one.
+// Retrying it would notify the same session repeatedly.
+func TestRetryNotifyDoesNotRetryAServerError(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	resp, err := retryNotify(testNotifyRetryPolicy, func() (*ipc.Response, error) {
+		calls++
+		return &ipc.Response{ID: "cli-notify", OK: false, Error: "no such session"}, nil
+	})
+
+	require.NoError(t, err)
+	assert.False(t, resp.OK)
+	assert.Equal(t, 1, calls, "a served error is an answer, not a transport failure")
+}
+
+// The budget is also a ceiling: when bramble is gone for good rather than
+// restarting, the stop hook must not block waiting for a socket that is never
+// coming back.
+func TestRetryNotifyGivesUpWhenTheBudgetIsSpent(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("dial unix: connect: no such file or directory")
+	calls := 0
+	start := time.Now()
+	_, err := retryNotify(testNotifyRetryPolicy, func() (*ipc.Response, error) {
+		calls++
+		return nil, wantErr
+	})
+	elapsed := time.Since(start)
+
+	require.ErrorIs(t, err, wantErr, "the last transport error is what the caller gets")
+	assert.Greater(t, calls, 1, "should have retried before giving up")
+	assert.GreaterOrEqual(t, elapsed, testNotifyRetryPolicy.budget, "gave up before spending the budget")
+	// Generous headroom: what matters is that it terminates near the budget
+	// rather than retrying forever, not the exact overshoot.
+	assert.Less(t, elapsed, testNotifyRetryPolicy.budget+2*time.Second, "overshot the budget")
+}
+
+// The behaviour tests above run on a fake policy, so they would still pass if
+// the real budget were shrunk back to the fixed 100/300/900ms backoff that
+// preceded it — which did not span the gap it was written for. This pins the
+// shipped number: the comment on defaultNotifyRetryPolicy's gap says the
+// replacement image routinely takes more than a second to re-bind, so a budget
+// in the low hundreds of milliseconds is a regression, not a tuning choice.
+func TestDefaultNotifyRetryPolicyCoversTheRestartGap(t *testing.T) {
+	t.Parallel()
+
+	assert.GreaterOrEqual(t, defaultNotifyRetryPolicy.budget, 5*time.Second,
+		"the notify budget must outlast a replacement image's time to IPC bind")
+	assert.Positive(t, defaultNotifyRetryPolicy.baseDelay, "a zero base delay busy-loops the budget")
+	assert.LessOrEqual(t, defaultNotifyRetryPolicy.maxDelay, defaultNotifyRetryPolicy.budget,
+		"a delay cap above the budget makes the tail one long sleep")
+	assert.Greater(t, defaultNotifyRetryPolicy.multiplier, 1, "a multiplier of 1 is a fixed-interval poll")
 }

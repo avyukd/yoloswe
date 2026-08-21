@@ -2,7 +2,12 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 
 go_library(
     name = "bramble_lib",
-    srcs = ["main.go"],
+    srcs = [
+        "main.go",
+        "restart.go",
+        "restart_signals_other.go",
+        "restart_signals_unix.go",
+    ],
     importpath = "github.com/bazelment/yoloswe/bramble",
     visibility = ["//visibility:private"],
     deps = [
@@ -14,6 +19,7 @@ go_library(
         "//bramble/control",
         "//bramble/ipc",
         "//bramble/remote",
+        "//bramble/selfexec",
         "//bramble/session",
         "//bramble/taskrouter",
         "//bramble/tmuxctl",
@@ -39,10 +45,12 @@ go_test(
         "main_test.go",
         "notify_cmd_test.go",
         "notify_session_id_test.go",
+        "restart_test.go",
         "socket_path_test.go",
     ],
     embed = [":bramble_lib"],
     deps = [
+        "//bramble/app",
         "//bramble/ipc",
         "//bramble/session",
         "@com_github_stretchr_testify//assert",

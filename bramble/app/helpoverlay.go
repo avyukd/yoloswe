@@ -166,6 +166,7 @@ func buildHelpSections(m *Model) []HelpSection {
 		HelpBinding{"?", "Toggle this help"},
 		HelpBinding{"F2", "Toggle file tree split"},
 		HelpBinding{"Tab", "Switch pane focus (when split)"},
+		HelpBinding{"Ctrl-R", "Restart into the binary on disk"},
 	)
 	if !inTmux {
 		nav.Bindings = append(nav.Bindings,

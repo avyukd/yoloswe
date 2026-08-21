@@ -18,6 +18,7 @@ import (
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/acp"
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude"
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/codex"
+	"github.com/bazelment/yoloswe/bramble/selfexec"
 	"github.com/bazelment/yoloswe/bramble/sessionmodel"
 	"github.com/bazelment/yoloswe/multiagent/agent"
 	"github.com/bazelment/yoloswe/yoloswe"
@@ -542,6 +543,16 @@ func (m *Manager) ControlSockPath() string {
 // is created before the control server.
 func (m *Manager) SetControlSockPath(path string) {
 	m.config.ControlSockPath = path
+}
+
+// DisableTmuxExitOnQuit clears the kill-windows-on-close behaviour that Close()
+// applies, which an in-place restart must not trigger: those windows are what
+// the new process image re-adopts.
+//
+// Like the socket-path setters above, this is unsynchronized because it runs on
+// the main goroutine after the TUI has exited.
+func (m *Manager) DisableTmuxExitOnQuit() {
+	m.config.TmuxExitOnQuit = false
 }
 
 // SubscribeStateChanges registers a channel to receive copies of all
@@ -1361,7 +1372,11 @@ func (m *Manager) newTmuxRunner(session *Session, prompt, tmuxName string, agent
 		permissionMode = "plan"
 	}
 
-	brambleBin, _ := os.Executable()
+	// selfexec.Path() rather than os.Executable(): this is baked into the
+	// session's Claude Stop-hook argv for the window's whole lifetime, and a
+	// lazy os.Executable() returns "<path> (deleted)" once someone rebuilds the
+	// binary underneath a running bramble.
+	brambleBin := selfexec.Path()
 	if brambleBin == "" {
 		brambleBin = "bramble" // fallback to PATH lookup
 	}
