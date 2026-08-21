@@ -1020,12 +1020,13 @@ func TestFailedDirectWriteIsQueuedAndRetried(t *testing.T) {
 	assert.True(t, armed, "no retry was scheduled for a recipient that never leaves idle")
 }
 
-// TestNoReportIsLostWhenManySubagentsFinishAtOnce pins the courier against the
-// manager's own back pressure. Subscriber events go through a 100-slot channel
-// that *drops* when full, and the courier's handling of one is slow — a report
-// captures a pane and writes a file. Fan-out is the case this feature exists
-// for, and a dropped completion is the one event that never comes again: the
-// parent would wait forever for a subagent that already finished.
+// TestNoReportIsLostWhenManySubagentsFinishAtOnce pins the path a completion
+// takes from the manager to the courier. The courier's handling of one event is
+// slow — a report captures a pane and writes a file — so the emitter runs far
+// ahead of it, which is what a bounded buffer between them would drop. Fan-out
+// is the case this feature exists for, and a dropped completion is the one event
+// that never comes again: the parent would wait forever for a subagent that
+// already finished. See SubscribeStateChanges for why there is no such buffer.
 func TestNoReportIsLostWhenManySubagentsFinishAtOnce(t *testing.T) {
 	t.Parallel()
 	target := newFakeTarget()
@@ -1042,8 +1043,9 @@ func TestNoReportIsLostWhenManySubagentsFinishAtOnce(t *testing.T) {
 	parentID, _ := ids(t)
 	target.set(parentID, StatusRunning, RunnerTypeTmux)
 
-	// Slow enough that the emitter below runs far ahead of the handler: with
-	// the work on the channel's own goroutine, the 101st event is dropped.
+	// Slow enough that the emitter below runs far ahead of the handler. Against
+	// the bounded channel this replaced, that is what lost events — measured, 8
+	// of the 150 below.
 	target.mu.Lock()
 	target.captureDelay = 2 * time.Millisecond
 	target.mu.Unlock()
@@ -1067,6 +1069,75 @@ func TestNoReportIsLostWhenManySubagentsFinishAtOnce(t *testing.T) {
 		30*time.Second, 20*time.Millisecond,
 		"only %d of %d subagents were reported: events were dropped on the way to the courier",
 		len(c.Pending(parentID)), children)
+}
+
+// TestEventPumpKeepsEventsQueuedBeforeItsWorkerStarts covers the ordering the
+// pump promises. push runs on the goroutine making the status transition and
+// may well run before the worker is scheduled at all, so the queue — not a
+// wakeup — is what carries those events, and it must carry them in order.
+func TestEventPumpKeepsEventsQueuedBeforeItsWorkerStarts(t *testing.T) {
+	t.Parallel()
+	p := newEventPump()
+
+	const events = 5
+	for i := range events {
+		p.push(SessionStateChangeEvent{SessionID: SessionID(fmt.Sprintf("s%d", i))})
+	}
+
+	seen := make(chan SessionID, events)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go p.run(ctx, func(evt SessionStateChangeEvent) { seen <- evt.SessionID })
+	t.Cleanup(p.close)
+
+	for i := range events {
+		select {
+		case got := <-seen:
+			require.Equal(t, SessionID(fmt.Sprintf("s%d", i)), got,
+				"events queued before the worker started must arrive in order")
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d of %d events queued before the worker started arrived", i, events)
+		}
+	}
+}
+
+// TestEventPumpDrainsWhatItHoldsOnClose is the contract with teeth. An event
+// dropped at close is a completion that never became a queued Delivery, so
+// unlike a delivery it is not recoverable from anything on disk — the parent
+// simply never hears.
+func TestEventPumpDrainsWhatItHoldsOnClose(t *testing.T) {
+	t.Parallel()
+	p := newEventPump()
+
+	// Block the worker on its first event so the rest are still queued when the
+	// pump is closed underneath it.
+	release := make(chan struct{})
+	var handled sync.WaitGroup
+	handled.Add(4)
+	first := true
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go p.run(ctx, func(SessionStateChangeEvent) {
+		if first {
+			first = false
+			<-release
+		}
+		handled.Done()
+	})
+
+	for i := range 4 {
+		p.push(SessionStateChangeEvent{SessionID: SessionID(fmt.Sprintf("s%d", i))})
+	}
+	p.close()
+	close(release)
+
+	done := make(chan struct{})
+	go func() { handled.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("closing the pump discarded events it had already accepted")
+	}
 }
 
 // TestStaleQueueIsReclaimedOnLoad bounds the cost of never discarding on an
