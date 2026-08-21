@@ -1240,10 +1240,10 @@ func TestClose_PersistsTmuxSessions(t *testing.T) {
 	assert.Equal(t, RunnerTypeTmuxTracked, loaded.RunnerType)
 }
 
-func TestReposWithLiveTmuxSessions_NoopOutsideTmux(t *testing.T) {
-	// ReposWithLiveTmuxSessions must be a no-op when not inside tmux.
-	// Outside tmux, tmuxWindowAlive always returns false, which would
-	// incorrectly mark still-live sessions as completed.
+func TestReposNeedingTmuxReconcile_NoopOutsideTmux(t *testing.T) {
+	// ReposNeedingTmuxReconcile must be a no-op when not inside tmux: nothing
+	// there can re-adopt a session, so naming repos to open would achieve
+	// nothing.
 	store, err := NewStore(t.TempDir())
 	require.NoError(t, err)
 
@@ -1282,7 +1282,7 @@ func TestReposWithLiveTmuxSessions_NoopOutsideTmux(t *testing.T) {
 	require.NoError(t, store.SaveSession(staleRepoSession))
 
 	// Not inside tmux → no-op; neither repo is returned and no sessions are mutated.
-	liveRepos := ReposWithLiveTmuxSessions(store, "active-repo")
+	liveRepos := ReposNeedingTmuxReconcile(store, "active-repo")
 	assert.Empty(t, liveRepos)
 
 	// Active repo session should be untouched (skipped by activeRepo filter)
@@ -1298,7 +1298,53 @@ func TestReposWithLiveTmuxSessions_NoopOutsideTmux(t *testing.T) {
 	assert.Nil(t, stale.CompletedAt)
 }
 
-func TestReposWithLiveTmuxSessions_SkipsNonTmuxSessions(t *testing.T) {
+// TestReposNeedingTmuxReconcileIncludesDeadWindows is the case that used to
+// fall through the floor. The probe leaves a dead session alone on purpose —
+// completing it here would spend the transition its parent's report rides,
+// with no courier listening — so the repo must be named for opening, or
+// nothing ever completes it and the parent waits forever.
+//
+// The store scan is tested directly: the exported entry point refuses outside
+// tmux, which is where tests run.
+func TestReposNeedingTmuxReconcileIncludesDeadWindows(t *testing.T) {
+	t.Parallel()
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	// A window ID that cannot be alive: nothing about this session is live, and
+	// its repo is still owed the completion that reports it to its parent.
+	require.NoError(t, store.SaveSession(&StoredSession{
+		ID:              "dead-child",
+		Type:            SessionTypeCodeTalk,
+		Status:          StatusRunning,
+		RepoName:        "child-repo",
+		WorktreePath:    "/path/to/child",
+		WorktreeName:    "feature",
+		TmuxWindowName:  "child-repo/feature:0",
+		TmuxWindowID:    "@999999",
+		RunnerType:      RunnerTypeTmux,
+		ParentSessionID: "parent-1",
+		CreatedAt:       time.Now(),
+	}))
+	// An already-reported one must not drag its repo open on every startup.
+	require.NoError(t, store.SaveSession(&StoredSession{
+		ID:             "settled-child",
+		Type:           SessionTypeCodeTalk,
+		Status:         StatusCompleted,
+		RepoName:       "settled-repo",
+		WorktreePath:   "/path/to/settled",
+		WorktreeName:   "feature",
+		TmuxWindowName: "settled-repo/feature:0",
+		RunnerType:     RunnerTypeTmux,
+		CreatedAt:      time.Now(),
+	}))
+
+	assert.Equal(t, []string{"child-repo"},
+		reposWithUnreconciledTmuxSessions(store, "active-repo"),
+		"a repo whose subagent died while bramble was down still owes its parent a report")
+}
+
+func TestReposNeedingTmuxReconcile_SkipsNonTmuxSessions(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	require.NoError(t, err)
 
@@ -1316,7 +1362,7 @@ func TestReposWithLiveTmuxSessions_SkipsNonTmuxSessions(t *testing.T) {
 	}
 	require.NoError(t, store.SaveSession(stored))
 
-	liveRepos := ReposWithLiveTmuxSessions(store, "active-repo")
+	liveRepos := ReposNeedingTmuxReconcile(store, "active-repo")
 	assert.Empty(t, liveRepos)
 
 	reloaded, err := store.LoadSession("other-repo", "main", "non-tmux-session")
@@ -1519,7 +1565,7 @@ func assertNoStateChangeEvent(t *testing.T, m *Manager) {
 	}
 }
 
-func TestReposWithLiveTmuxSessions_NilStore(t *testing.T) {
-	liveRepos := ReposWithLiveTmuxSessions(nil, "active-repo")
+func TestReposNeedingTmuxReconcile_NilStore(t *testing.T) {
+	liveRepos := ReposNeedingTmuxReconcile(nil, "active-repo")
 	assert.Nil(t, liveRepos)
 }

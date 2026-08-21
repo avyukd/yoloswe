@@ -90,3 +90,34 @@ func TestNewSessionRefusesToInheritAWorktreeFromAnotherRepo(t *testing.T) {
 	assert.Contains(t, err.Error(), "repo-a")
 	assert.Contains(t, err.Error(), "repo-b")
 }
+
+// TestRepoForSpawnPrefersTheParentOverAnInferredRepo applies to the repo the
+// rule round 6 established for the parent: a value the client guessed is not a
+// claim the caller made. `bramble new-session` auto-detects the repo from cwd
+// whenever --repo is omitted, so without this the guess is indistinguishable
+// from a flag — the parent's repo would effectively never win, and the
+// cross-repo refusal below would fire on a spawn nobody asked to redirect.
+func TestRepoForSpawnPrefersTheParentOverAnInferredRepo(t *testing.T) {
+	t.Parallel()
+	parent := session.SessionInfo{ID: "parent-1", RepoName: "repo-a"}
+
+	assert.Equal(t, "repo-a", repoForSpawn(
+		&ipc.NewSessionParams{RepoName: "repo-b", RepoInferred: true}, parent, true, "initial"),
+		"a cwd guess must lose to the parent that knows its own repo")
+
+	assert.Equal(t, "repo-b", repoForSpawn(
+		&ipc.NewSessionParams{RepoName: "repo-b"}, parent, true, "initial"),
+		"a --repo the caller typed still wins; handleNewSession decides if that conflicts")
+
+	assert.Equal(t, "repo-a", repoForSpawn(
+		&ipc.NewSessionParams{}, parent, true, "initial"),
+		"with no repo at all the parent still pins it")
+
+	assert.Equal(t, "repo-b", repoForSpawn(
+		&ipc.NewSessionParams{RepoName: "repo-b", RepoInferred: true}, session.SessionInfo{}, false, "initial"),
+		"with no parent the inferred repo is the best information there is")
+
+	assert.Equal(t, "initial", repoForSpawn(
+		&ipc.NewSessionParams{}, session.SessionInfo{}, false, "initial"),
+		"nothing to go on falls back to the repo bramble was launched on")
+}
