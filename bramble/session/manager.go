@@ -619,7 +619,7 @@ func (m *Manager) ReconcileTmuxSessions() error {
 		}
 
 		for _, meta := range sessions {
-			if meta.RunnerType != RunnerTypeTmux && meta.RunnerType != RunnerTypeTmuxTracked {
+			if !isTmuxRunner(meta.RunnerType) {
 				continue
 			}
 			if meta.Status.IsTerminal() {
@@ -642,35 +642,55 @@ func (m *Manager) ReconcileTmuxSessions() error {
 
 			// Check if the tmux window is still alive
 			if !tmuxWindowAlive(stored.TmuxWindowID, stored.TmuxWindowName) {
-				// Window is gone — mark as completed
+				// Window is gone — mark as completed.
+				//
+				// Only when it is not terminal already: this runs on every
+				// start, and re-announcing a session that was completed three
+				// restarts ago would report it to its parent each time.
+				if stored.Status.IsTerminal() {
+					continue
+				}
+				previous := stored.Status
 				now := time.Now()
 				stored.Status = StatusCompleted
 				stored.CompletedAt = &now
 				_ = m.config.Store.SaveSession(stored)
+
+				// Announce it. A subagent that finished while bramble was down
+				// still owes its parent a report, and this is the only place
+				// that transition happens — nothing else will emit it, because
+				// the session is never adopted into m.sessions.
+				m.emitSessionStateChange(SessionStateChangeEvent{
+					Info:      StoredToSessionInfo(stored),
+					SessionID: stored.ID,
+					OldStatus: previous,
+					NewStatus: StatusCompleted,
+				})
 				continue
 			}
 
 			// Re-adopt: create in-memory session and start monitoring
 			ctx, cancel := context.WithCancel(m.ctx)
 			session := &Session{
-				ID:             stored.ID,
-				Type:           stored.Type,
-				Status:         stored.Status,
-				WorktreePath:   stored.WorktreePath,
-				WorktreeName:   stored.WorktreeName,
-				Prompt:         stored.Prompt,
-				Title:          stored.Title,
-				Model:          stored.Model,
-				TmuxWindowName: stored.TmuxWindowName,
-				TmuxWindowID:   stored.TmuxWindowID,
-				RunnerType:     stored.RunnerType,
-				RepoName:       m.config.RepoName,
-				CLISessionID:   stored.CLISessionID,
-				Progress:       &SessionProgress{LastActivity: time.Now()},
-				CreatedAt:      stored.CreatedAt,
-				StartedAt:      stored.StartedAt,
-				ctx:            ctx,
-				cancel:         cancel,
+				ID:              stored.ID,
+				Type:            stored.Type,
+				Status:          stored.Status,
+				WorktreePath:    stored.WorktreePath,
+				WorktreeName:    stored.WorktreeName,
+				Prompt:          stored.Prompt,
+				Title:           stored.Title,
+				Model:           stored.Model,
+				TmuxWindowName:  stored.TmuxWindowName,
+				TmuxWindowID:    stored.TmuxWindowID,
+				RunnerType:      stored.RunnerType,
+				RepoName:        m.config.RepoName,
+				CLISessionID:    stored.CLISessionID,
+				ParentSessionID: stored.ParentSessionID,
+				Progress:        &SessionProgress{LastActivity: time.Now()},
+				CreatedAt:       stored.CreatedAt,
+				StartedAt:       stored.StartedAt,
+				ctx:             ctx,
+				cancel:          cancel,
 			}
 
 			m.mu.Lock()
@@ -682,18 +702,20 @@ func (m *Manager) ReconcileTmuxSessions() error {
 			m.outputs[session.ID] = make([]OutputLine, 0, 16)
 			m.outputsMu.Unlock()
 
-			// Emit the state-change event directly rather than calling updateSessionStatus,
-			// so we avoid any side-effects on StartedAt or other fields for this
-			// re-adoption path that restores a stored session.
-			select {
-			case m.events <- SessionStateChangeEvent{
+			// Emit rather than calling updateSessionStatus, so this re-adoption
+			// path has no side-effects on StartedAt or the other fields that
+			// a real transition would touch.
+			//
+			// Through emitSessionStateChange, so state subscribers see it too:
+			// a re-adopted session that is already idle makes no further
+			// transition, and the courier would otherwise never learn it is
+			// reachable and could take the mail waiting for it.
+			m.emitSessionStateChange(SessionStateChangeEvent{
+				Info:      session.ToInfo(),
 				SessionID: session.ID,
 				OldStatus: stored.Status,
 				NewStatus: stored.Status,
-			}:
-			default:
-				log.Printf("WARNING: events channel full, dropping state change event for re-adopted session %s", session.ID)
-			}
+			})
 
 			// Monitor the window lifecycle
 			if IsInsideTmux() && IsTmuxAvailable() {
@@ -746,7 +768,7 @@ func ReposWithLiveTmuxSessions(store *Store, activeRepo string) []string {
 			}
 
 			for _, meta := range sessions {
-				if meta.RunnerType != RunnerTypeTmux && meta.RunnerType != RunnerTypeTmuxTracked {
+				if !isTmuxRunner(meta.RunnerType) {
 					continue
 				}
 				if meta.Status.IsTerminal() {
@@ -760,16 +782,13 @@ func ReposWithLiveTmuxSessions(store *Store, activeRepo string) []string {
 
 				if tmuxWindowAlive(stored.TmuxWindowID, stored.TmuxWindowName) {
 					hasLive = true
-					continue
 				}
-
-				// Window is gone — mark as completed
-				now := time.Now()
-				stored.Status = StatusCompleted
-				stored.CompletedAt = &now
-				if err := store.SaveSession(stored); err != nil {
-					log.Printf("Warning: failed to mark stale session %s as completed: %v", stored.ID, err)
-				}
+				// Deliberately does not mark a dead session completed. This is
+				// a read-only probe over repos that have no manager and so no
+				// courier: completing a session here would consume the one
+				// transition its parent's report depends on, and nothing would
+				// be listening. The owning manager's ReconcileTmuxSessions does
+				// it — and emits — when the repo is opened.
 			}
 		}
 
@@ -868,16 +887,34 @@ func generateTitle(prompt string, maxLen int) string {
 // model is the AgentModel ID (e.g. "opus", "gpt-5.5"). If empty,
 // defaults to "opus" for planners and "sonnet" for builders.
 func (m *Manager) StartSession(sessionType SessionType, worktreePath, prompt, model string) (SessionID, error) {
+	return m.StartSessionWithOpts(sessionType, worktreePath, prompt, model, SpawnOpts{})
+}
+
+// SpawnOpts carries the optional attributes of a new session that only some
+// callers set. The zero value means a plain, top-level session, so callers with
+// nothing to say can keep using StartSession.
+type SpawnOpts struct {
+	// ParentSessionID makes the new session a subagent of that parent: its
+	// completion is reported back there. Leave empty for a top-level session.
+	//
+	// The delegator deliberately does NOT set this. It runs its own child
+	// watcher (watchChildSessionChanges) and would otherwise be told about
+	// every child transition twice.
+	ParentSessionID SessionID
+}
+
+// StartSessionWithOpts is StartSession with the optional attributes in SpawnOpts.
+func (m *Manager) StartSessionWithOpts(sessionType SessionType, worktreePath, prompt, model string, opts SpawnOpts) (SessionID, error) {
 	worktreeName := filepath.Base(worktreePath)
 	sessionID := generateSessionID(worktreeName, sessionType)
-	return m.startSessionWithID(sessionID, sessionType, worktreePath, worktreeName, prompt, model)
+	return m.startSessionWithID(sessionID, sessionType, worktreePath, worktreeName, prompt, model, opts)
 }
 
 // startSessionWithID starts a session using a caller-supplied session ID.
 // This allows callers (e.g. DelegatorToolHandler) to pre-register the ID
 // before spawning the child goroutine, closing the window where a very fast
 // state transition could be missed by watchChildSessionChanges.
-func (m *Manager) startSessionWithID(sessionID SessionID, sessionType SessionType, worktreePath, worktreeName, prompt, model string) (SessionID, error) {
+func (m *Manager) startSessionWithID(sessionID SessionID, sessionType SessionType, worktreePath, worktreeName, prompt, model string, opts SpawnOpts) (SessionID, error) {
 	ctx, cancel := context.WithCancel(m.ctx)
 
 	if model == "" {
@@ -890,19 +927,20 @@ func (m *Manager) startSessionWithID(sessionID SessionID, sessionType SessionTyp
 	}
 
 	session := &Session{
-		ID:           sessionID,
-		Type:         sessionType,
-		Status:       StatusPending,
-		WorktreePath: worktreePath,
-		WorktreeName: worktreeName,
-		Prompt:       prompt,
-		Title:        generateTitle(prompt, 20),
-		Model:        model,
-		RepoName:     m.config.RepoName,
-		Progress:     &SessionProgress{LastActivity: time.Now()},
-		CreatedAt:    time.Now(),
-		ctx:          ctx,
-		cancel:       cancel,
+		ID:              sessionID,
+		Type:            sessionType,
+		Status:          StatusPending,
+		WorktreePath:    worktreePath,
+		WorktreeName:    worktreeName,
+		Prompt:          prompt,
+		Title:           generateTitle(prompt, 20),
+		Model:           model,
+		RepoName:        m.config.RepoName,
+		ParentSessionID: opts.ParentSessionID,
+		Progress:        &SessionProgress{LastActivity: time.Now()},
+		CreatedAt:       time.Now(),
+		ctx:             ctx,
+		cancel:          cancel,
 	}
 
 	m.mu.Lock()
@@ -1027,20 +1065,21 @@ func (m *Manager) rehydrateSession(id SessionID) (*Session, bool) {
 		// (completed/failed/stopped) and ResumeSession will set ctx/cancel
 		// before running. Allocating one here would leak it immediately.
 		session := &Session{
-			ID:           stored.ID,
-			Type:         stored.Type,
-			Status:       stored.Status,
-			WorktreePath: stored.WorktreePath,
-			WorktreeName: stored.WorktreeName,
-			Prompt:       stored.Prompt,
-			Title:        stored.Title,
-			Model:        stored.Model,
-			RepoName:     stored.RepoName,
-			CLISessionID: stored.CLISessionID,
-			CreatedAt:    stored.CreatedAt,
-			StartedAt:    stored.StartedAt,
-			CompletedAt:  stored.CompletedAt,
-			Progress:     &SessionProgress{LastActivity: time.Now()},
+			ID:              stored.ID,
+			Type:            stored.Type,
+			Status:          stored.Status,
+			WorktreePath:    stored.WorktreePath,
+			WorktreeName:    stored.WorktreeName,
+			Prompt:          stored.Prompt,
+			Title:           stored.Title,
+			Model:           stored.Model,
+			RepoName:        stored.RepoName,
+			CLISessionID:    stored.CLISessionID,
+			ParentSessionID: stored.ParentSessionID,
+			CreatedAt:       stored.CreatedAt,
+			StartedAt:       stored.StartedAt,
+			CompletedAt:     stored.CompletedAt,
+			Progress:        &SessionProgress{LastActivity: time.Now()},
 		}
 
 		m.mu.Lock()
@@ -1717,8 +1756,23 @@ func (m *Manager) runSession(session *Session, prompt string) {
 	// Tmux mode: just wait for the window to be stopped manually
 	// The tmux window handles all interaction, so we don't run turns
 	if m.config.SessionMode == SessionModeTmux {
-		m.updateSessionStatus(session, StatusRunning)
+		// Compare-and-set, not a plain write. The window has been up since
+		// runner.Start(), which lingers ~100ms before returning, and the agent
+		// inside can finish a turn and fire its notify hook in that gap. An
+		// unconditional write here would overwrite that idle with Running and
+		// leave the session stuck: SetSessionIdle only advances a Running
+		// session, so the *next* notify — which never comes, because the agent
+		// is waiting for input — is the only thing that could fix it.
+		//
+		// Status is already Running from the top of runSession, so this is a
+		// no-op in the normal case and simply declines to move backwards.
+		m.tryUpdateSessionStatus(session, StatusPending, StatusRunning)
 		startTime := time.Now()
+
+		// Backends with no turn-completion hook (cursor) have their idleness
+		// read off the pane instead. nil for claude and codex, which report it
+		// themselves; see pane_idle.go for why this is a last resort.
+		idleTracker := newPaneIdleTracker(agentModel.Provider)
 
 		// Periodically check if tmux window still exists
 		ticker := time.NewTicker(2 * time.Second)
@@ -1736,6 +1790,7 @@ func (m *Manager) runSession(session *Session, prompt string) {
 				tmuxName := session.TmuxWindowName
 				tmuxID := session.TmuxWindowID
 				sessionID := session.ID
+				status := session.Status
 				session.mu.RUnlock()
 
 				if tmuxName == "" && tmuxID == "" {
@@ -1748,6 +1803,8 @@ func (m *Manager) runSession(session *Session, prompt string) {
 				if tmuxID != "" {
 					windowTarget = tmuxID
 				}
+
+				m.pollPaneIdle(idleTracker, sessionID, status, windowTarget)
 
 				windowExists := tmuxWindowAlive(tmuxID, tmuxName)
 				paneDead := windowExists && TmuxWindowPaneDead(windowTarget)
@@ -1920,8 +1977,12 @@ func (m *Manager) runSession(session *Session, prompt string) {
 			}
 		}
 
-		// After codetalk turn: write research output to a file for delegator consumption.
-		if session.Type == SessionTypeCodeTalk {
+		// After a codetalk turn: write research output to a file for delegator
+		// consumption. Subagents get the same treatment whatever their type —
+		// their parent is told they finished and handed this path, and a
+		// backend like codex cannot be asked to produce a result file itself.
+		// Without this a parent would have to scrape the child's pane.
+		if session.Type == SessionTypeCodeTalk || session.parentSessionID() != "" {
 			if researchPath, err := m.writeResearchFile(session); err == nil {
 				session.mu.Lock()
 				session.ResearchFilePath = researchPath
@@ -1950,10 +2011,12 @@ func (m *Manager) runSession(session *Session, prompt string) {
 		}
 		if len(childNotifs) > 0 {
 			var parts []string
-			for _, notif := range childNotifs {
+			// Indexed, not ranged by value: the event carries a session
+			// snapshot, so copying each one costs half a kilobyte per notif.
+			for i := range childNotifs {
 				parts = append(parts, fmt.Sprintf(
 					"Child session %s status changed to %s.",
-					notif.SessionID, notif.NewStatus))
+					childNotifs[i].SessionID, childNotifs[i].NewStatus))
 			}
 			currentPrompt = strings.Join(parts, "\n") + "\nUse get_session_progress to check details and decide next steps."
 			m.updateSessionStatus(session, StatusRunning)
@@ -2031,6 +2094,7 @@ func (m *Manager) updateSessionStatus(session *Session, newStatus SessionStatus)
 	session.mu.Unlock()
 
 	m.emitSessionStateChange(SessionStateChangeEvent{
+		Info:      session.ToInfo(),
 		SessionID: session.ID,
 		OldStatus: oldStatus,
 		NewStatus: newStatus,
@@ -2045,6 +2109,7 @@ func (m *Manager) failSession(session *Session, err error) {
 	session.mu.Unlock()
 
 	m.emitSessionStateChange(SessionStateChangeEvent{
+		Info:      session.ToInfo(),
 		SessionID: session.ID,
 		OldStatus: oldStatus,
 		NewStatus: StatusFailed,
@@ -2062,6 +2127,7 @@ func (m *Manager) tryUpdateSessionStatus(session *Session, fromStatus, toStatus 
 	session.mu.Unlock()
 
 	m.emitSessionStateChange(SessionStateChangeEvent{
+		Info:      session.ToInfo(),
 		SessionID: session.ID,
 		OldStatus: oldStatus,
 		NewStatus: toStatus,
@@ -2301,23 +2367,71 @@ func (m *Manager) ActiveWorktreePaths() map[string]struct{} {
 	return paths
 }
 
+// SetSessionRunning moves an idle session back to running.
+//
+// Needed because a tmux session's status is driven entirely from outside: the
+// agent's notify hook reports idleness, and nothing reports the opposite. When
+// bramble itself types a prompt into such a session it is the only party that
+// knows a turn just started. Without this the session stays "idle" through the
+// whole turn, and the next notify hits the StatusRunning guard in
+// SetSessionIdle and is dropped — so a second turn never produces a state
+// change, and anything waiting on one (queued delivery, subagent reports)
+// goes quiet after the first exchange.
+//
+// TUI sessions do not need this: their turn loop sets StatusRunning itself.
+//
+// The transition is compare-and-set rather than check-then-set because this is
+// racing the agent's notify hook by construction: bramble submits a prompt at
+// the same moment the previous turn's notify may be landing, and a separate
+// read and write would let the two interleave into a lost update.
+func (m *Manager) SetSessionRunning(id SessionID) {
+	m.trySetStatus(id, StatusIdle, StatusRunning)
+}
+
+// pollPaneIdle reads idleness off a hookless backend's pane, for one tick of
+// the monitor loop. tracker is nil for a provider that reports its own turn
+// ends, in which case this does nothing.
+//
+// Only a running session is a candidate: once idle it stays idle until
+// something delivers work and marks it running again, which is also what
+// re-arms the tracker.
+func (m *Manager) pollPaneIdle(tracker *paneIdleTracker, id SessionID, status SessionStatus, windowTarget string) {
+	if tracker == nil {
+		return
+	}
+	if status != StatusRunning {
+		tracker.reset()
+		return
+	}
+	// CaptureTmuxPane rather than CapturePaneText: the caller resolved this
+	// same target from the same session a few lines ago, and going back through
+	// the session map would retake two locks per tick to rederive it.
+	lines, err := CaptureTmuxPane(windowTarget, paneIdleCaptureLines)
+	if err != nil {
+		return
+	}
+	if tracker.observe(lines) {
+		m.SetSessionIdle(id)
+	}
+}
+
 // SetSessionIdle transitions a session to StatusIdle (waiting for user input).
 // It only transitions from StatusRunning to avoid reverting terminal states
 // (completed, failed, stopped) that may have been set by the monitor loop.
 func (m *Manager) SetSessionIdle(id SessionID) {
+	m.trySetStatus(id, StatusRunning, StatusIdle)
+}
+
+// trySetStatus looks a session up and moves it from one status to another,
+// doing nothing if it is not there or has since moved on.
+func (m *Manager) trySetStatus(id SessionID, from, to SessionStatus) {
 	m.mu.RLock()
 	s, ok := m.sessions[id]
 	m.mu.RUnlock()
 	if !ok {
 		return
 	}
-	s.mu.RLock()
-	status := s.Status
-	s.mu.RUnlock()
-	if status != StatusRunning {
-		return
-	}
-	m.updateSessionStatus(s, StatusIdle)
+	m.tryUpdateSessionStatus(s, from, to)
 }
 
 // GetAllSessions returns all sessions sorted by creation time (newest first).
@@ -2333,7 +2447,7 @@ func (m *Manager) GetAllSessions() []SessionInfo {
 		// so the command center shows the latest agent text, not a stale snapshot.
 		// For tmux sessions, RecentOutput is already set by captureRecentOutput()
 		// in the session's Progress struct, so we keep it from ToInfo().
-		if info.RunnerType != RunnerTypeTmux && info.RunnerType != RunnerTypeTmuxTracked {
+		if !isTmuxRunner(info.RunnerType) {
 			info.Progress.RecentOutput = m.RecentOutputLines(s.ID, sessionmodel.RecentOutputDisplayLines)
 		}
 		result = append(result, info)
@@ -2384,26 +2498,27 @@ func (m *Manager) RecentOutputLines(id SessionID, n int) []string {
 }
 
 // writeResearchFile writes a codetalk session's text output to a markdown file
-// in /tmp/bramble-research/. Returns the file path on success.
+// under ~/.bramble/research/. Returns the file path on success.
 func (m *Manager) writeResearchFile(session *Session) (string, error) {
-	researchDir := filepath.Join(os.TempDir(), "bramble-research")
-	if err := os.MkdirAll(researchDir, 0o755); err != nil {
-		return "", fmt.Errorf("create research dir: %w", err)
+	researchPath, err := ResultFilePath(session.ID)
+	if err != nil {
+		return "", err
 	}
-
-	researchPath := filepath.Join(researchDir, string(session.ID)+".md")
 	lines := m.GetSessionOutput(session.ID)
 
-	f, err := os.Create(researchPath)
-	if err != nil {
-		return "", fmt.Errorf("create research file: %w", err)
-	}
-	defer f.Close()
-
+	var body strings.Builder
 	for i := range lines {
 		if lines[i].Type == OutputTypeText && !lines[i].IsUserPrompt {
-			fmt.Fprintln(f, lines[i].Content)
+			body.WriteString(lines[i].Content)
+			body.WriteByte('\n')
 		}
+	}
+
+	// Same treatment as the pane capture in subagent_report.go: a transcript in
+	// a world-traversable temp dir is 0600, and create-and-rename replaces a
+	// symlink at this predictable path rather than writing through it.
+	if err := writeFileAtomic(researchPath, []byte(body.String()), 0o600); err != nil {
+		return "", fmt.Errorf("write research file: %w", err)
 	}
 
 	return researchPath, nil
@@ -2425,7 +2540,7 @@ func (m *Manager) CapturePaneText(id SessionID, n int) ([]string, error) {
 	runnerType := session.RunnerType
 	session.mu.RUnlock()
 
-	if runnerType != RunnerTypeTmux && runnerType != RunnerTypeTmuxTracked {
+	if !isTmuxRunner(runnerType) {
 		return nil, fmt.Errorf("session %q is not a tmux session (runner type: %s)", id, runnerType)
 	}
 
@@ -2462,7 +2577,7 @@ func (m *Manager) ResolveTmuxTarget(id SessionID) (string, error) {
 	runnerType := session.RunnerType
 	session.mu.RUnlock()
 
-	if runnerType != RunnerTypeTmux && runnerType != RunnerTypeTmuxTracked {
+	if !isTmuxRunner(runnerType) {
 		return "", fmt.Errorf("session %q is not a tmux session (runner type: %s)", id, runnerType)
 	}
 

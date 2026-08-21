@@ -104,6 +104,21 @@ const (
 	RunnerTypeTmuxTracked = "tmux-tracked"
 )
 
+// tmuxTarget is the session's tmux window, preferring the stable window ID over
+// the name, which a rename can change. Empty when the session has neither.
+func (s SessionInfo) tmuxTarget() string {
+	if s.TmuxWindowID != "" {
+		return s.TmuxWindowID
+	}
+	return s.TmuxWindowName
+}
+
+// isTmuxRunner reports whether a session runs in a tmux window, and so is
+// reachable by typing into a pane rather than through the TUI turn loop.
+func isTmuxRunner(runnerType string) bool {
+	return runnerType == RunnerTypeTmux || runnerType == RunnerTypeTmuxTracked
+}
+
 // Session represents a single plan or builder session.
 type Session struct {
 	CreatedAt        time.Time
@@ -124,11 +139,15 @@ type Session struct {
 	RepoName         string // Repository this session belongs to
 	CLISessionID     string // CLI session ID (from system{init}), used for --resume
 	ResearchFilePath string // Path to research output file (codetalk sessions only)
-	ID               SessionID
-	WorktreePath     string
-	Status           SessionStatus
-	Type             SessionType
-	mu               sync.RWMutex
+	// ParentSessionID names the session that spawned this one, making the
+	// session a subagent of that parent. Empty for a top-level session. It is
+	// the address the completion report is delivered to; see delivery.go.
+	ParentSessionID SessionID
+	ID              SessionID
+	WorktreePath    string
+	Status          SessionStatus
+	Type            SessionType
+	mu              sync.RWMutex
 }
 
 // SessionProgress tracks real-time progress.
@@ -210,12 +229,13 @@ type SessionInfo struct {
 	Title            string
 	Model            string
 	PlanFilePath     string
-	TmuxWindowName   string // tmux window name (empty for TUI mode)
-	TmuxWindowID     string // tmux window ID like @1, @2 (empty for TUI mode)
-	RunnerType       string // "tui", "tmux", or "tmux-tracked"
-	RepoName         string // Repository this session belongs to
-	CLISessionID     string // CLI session ID, used for --resume
-	ResearchFilePath string // Path to research output file (codetalk sessions only)
+	TmuxWindowName   string    // tmux window name (empty for TUI mode)
+	TmuxWindowID     string    // tmux window ID like @1, @2 (empty for TUI mode)
+	RunnerType       string    // "tui", "tmux", or "tmux-tracked"
+	RepoName         string    // Repository this session belongs to
+	CLISessionID     string    // CLI session ID, used for --resume
+	ResearchFilePath string    // Path to research output file (codetalk sessions only)
+	ParentSessionID  SessionID // session that spawned this one; empty for top-level
 	ID               SessionID
 	Status           SessionStatus
 	Type             SessionType
@@ -244,6 +264,7 @@ func (s *Session) ToInfo() SessionInfo {
 		RepoName:         s.RepoName,
 		CLISessionID:     s.CLISessionID,
 		ResearchFilePath: s.ResearchFilePath,
+		ParentSessionID:  s.ParentSessionID,
 		CreatedAt:        s.CreatedAt,
 		StartedAt:        s.StartedAt,
 		CompletedAt:      s.CompletedAt,
@@ -318,7 +339,16 @@ type SessionOutputEvent struct {
 }
 
 // SessionStateChangeEvent is sent when session state changes.
-type SessionStateChangeEvent struct {
+type SessionStateChangeEvent struct { //nolint:govet // fieldalignment: readability over packing
+	// Info is the session as it stood when the change was emitted.
+	//
+	// Carried on the event rather than looked up by the subscriber because a
+	// subscriber often runs after the session is gone: the tmux monitor emits
+	// StatusCompleted and then deletes the session from the manager, so a
+	// lookup keyed on SessionID races the delete and usually loses. That race
+	// silently dropped the completion report a subagent's parent was waiting
+	// for — see Courier.Watch.
+	Info      SessionInfo
 	SessionID SessionID
 	OldStatus SessionStatus
 	NewStatus SessionStatus

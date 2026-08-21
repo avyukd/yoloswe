@@ -20,25 +20,29 @@ type Store struct {
 
 // StoredSession is the serializable representation of a session.
 type StoredSession struct {
-	ID             SessionID       `json:"id"`
-	Type           SessionType     `json:"type"`
-	Status         SessionStatus   `json:"status"`
-	RepoName       string          `json:"repo_name"`
-	WorktreePath   string          `json:"worktree_path"`
-	WorktreeName   string          `json:"worktree_name"`
-	Prompt         string          `json:"prompt"`
-	Title          string          `json:"title,omitempty"`
-	Model          string          `json:"model,omitempty"`
-	CreatedAt      time.Time       `json:"created_at"`
-	StartedAt      *time.Time      `json:"started_at,omitempty"`
-	CompletedAt    *time.Time      `json:"completed_at,omitempty"`
-	ErrorMsg       string          `json:"error_msg,omitempty"`
-	CLISessionID   string          `json:"cli_session_id,omitempty"`
-	TmuxWindowName string          `json:"tmux_window_name,omitempty"`
-	TmuxWindowID   string          `json:"tmux_window_id,omitempty"`
-	RunnerType     string          `json:"runner_type,omitempty"`
-	Progress       *StoredProgress `json:"progress,omitempty"`
-	Output         []OutputLine    `json:"output,omitempty"`
+	ID             SessionID     `json:"id"`
+	Type           SessionType   `json:"type"`
+	Status         SessionStatus `json:"status"`
+	RepoName       string        `json:"repo_name"`
+	WorktreePath   string        `json:"worktree_path"`
+	WorktreeName   string        `json:"worktree_name"`
+	Prompt         string        `json:"prompt"`
+	Title          string        `json:"title,omitempty"`
+	Model          string        `json:"model,omitempty"`
+	CreatedAt      time.Time     `json:"created_at"`
+	StartedAt      *time.Time    `json:"started_at,omitempty"`
+	CompletedAt    *time.Time    `json:"completed_at,omitempty"`
+	ErrorMsg       string        `json:"error_msg,omitempty"`
+	CLISessionID   string        `json:"cli_session_id,omitempty"`
+	TmuxWindowName string        `json:"tmux_window_name,omitempty"`
+	TmuxWindowID   string        `json:"tmux_window_id,omitempty"`
+	RunnerType     string        `json:"runner_type,omitempty"`
+	// ParentSessionID names the session that spawned this one. Persisted so a
+	// subagent's lineage survives a TUI restart and its completion report still
+	// has somewhere to go.
+	ParentSessionID SessionID       `json:"parent_session_id,omitempty"`
+	Progress        *StoredProgress `json:"progress,omitempty"`
+	Output          []OutputLine    `json:"output,omitempty"`
 }
 
 // StoredProgress is the serializable representation of session progress.
@@ -65,6 +69,9 @@ type SessionMeta struct {
 	TmuxWindowName string        `json:"tmux_window_name,omitempty"`
 	TmuxWindowID   string        `json:"tmux_window_id,omitempty"`
 	RunnerType     string        `json:"runner_type,omitempty"`
+	// ParentSessionID names the session that spawned this one, so lineage
+	// survives into the history listing and not only the live session list.
+	ParentSessionID SessionID `json:"parent_session_id,omitempty"`
 }
 
 // DefaultStoreDir returns the default store directory (~/.bramble/sessions).
@@ -97,20 +104,70 @@ func NewStore(baseDir string) (*Store, error) {
 	}, nil
 }
 
+// containedPath joins parts under base and refuses a result that escapes it.
+//
+// A containment check rather than stricter character rewriting, because the
+// store's directory names are load-bearing: tightening sanitizeName would move
+// every existing user's history to a new path and make it look empty. Refusing
+// an escape leaves well-formed names exactly where they are and rejects only
+// what could never have been a real session.
+//
+// It is a real hole, not a theoretical one. A worktree name reaches here as
+// filepath.Base of the worktree path an IPC caller supplied, and
+// filepath.Base("/a/b/..") is "..", which walks straight out of the store.
+func containedPath(base string, parts ...string) (string, error) {
+	// Every part is meant to be one directory or file name, so anything that
+	// is not — a separator, or a dot segment — is refused outright. Checking
+	// only the joined result is not enough: base/repo/../x.json stays inside
+	// base while still landing somewhere its caller never meant, which is how
+	// one session's record would overwrite another's.
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." ||
+			strings.ContainsRune(part, '/') || strings.ContainsRune(part, filepath.Separator) {
+			return "", fmt.Errorf("refusing %q as a path component under the session store", part)
+		}
+	}
+
+	base = filepath.Clean(base)
+
+	// Build the tail rooted at the separator and then re-join it under base.
+	// Rooting is what makes confinement structural rather than a matter of
+	// having checked: Clean("/../../x") is "/x", so no dot segment can survive
+	// into the result even if the rules above are ever loosened. It is also the
+	// shape a static analyzer can follow, which the rules above are not.
+	rooted := filepath.Clean(string(filepath.Separator) + filepath.Join(parts...))
+	joined := filepath.Join(base, rooted)
+
+	// Independent backstop, so a gap in either step still cannot escape.
+	rel, err := filepath.Rel(base, joined)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("refusing path outside the session store: %q", filepath.Join(parts...))
+	}
+	return joined, nil
+}
+
 // sessionDir returns the directory for a session's repo/worktree.
-func (s *Store) sessionDir(repoName, worktreeName string) string {
+func (s *Store) sessionDir(repoName, worktreeName string) (string, error) {
 	// Sanitize names for filesystem
 	repoName = sanitizeName(repoName)
 	worktreeName = sanitizeName(worktreeName)
-	return filepath.Join(s.baseDir, repoName, worktreeName)
+	return containedPath(s.baseDir, repoName, worktreeName)
 }
 
 // sessionPath returns the file path for a session.
-func (s *Store) sessionPath(repoName, worktreeName string, id SessionID) string {
-	return filepath.Join(s.sessionDir(repoName, worktreeName), string(id)+".json")
+//
+// The ID is not rewritten for the same reason the names are not: it is part of
+// existing filenames. It is contained instead.
+func (s *Store) sessionPath(repoName, worktreeName string, id SessionID) (string, error) {
+	return containedPath(s.baseDir, sanitizeName(repoName), sanitizeName(worktreeName), string(id)+".json")
 }
 
-// sanitizeName sanitizes a name for use as a directory name.
+// sanitizeName sanitizes a repo or worktree name for use as a directory name.
+//
+// Deliberately NOT the stricter sanitizeFileName: this one decides where a
+// user's saved sessions live, so tightening it would move existing stores to
+// new paths and make their history look empty. The inputs are local repo and
+// worktree names rather than anything off a socket.
 func sanitizeName(name string) string {
 	// Replace problematic characters
 	name = strings.ReplaceAll(name, "/", "_")
@@ -118,6 +175,56 @@ func sanitizeName(name string) string {
 	name = strings.ReplaceAll(name, ":", "_")
 	name = strings.ReplaceAll(name, " ", "_")
 	return name
+}
+
+// sanitizeFileName makes an untrusted name safe as a single path component.
+//
+// An allowlist, not a list of characters to strip: session IDs reach the
+// delivery queue and the result file straight off a socket, and a denylist that
+// forgets "." lets "../.." walk out of the directory the result is joined to.
+func sanitizeFileName(name string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			return r
+		case r == '-', r == '_':
+			return r
+		default:
+			return '_'
+		}
+	}, name)
+}
+
+// writeFileAtomic writes data to path via a temp file in the same directory and
+// a rename, so a concurrent reader sees either the old contents or the new ones
+// and never a half-written file.
+//
+// The temp file gets a random name rather than a fixed "<path>.tmp": two writers
+// racing on one path would otherwise share the scratch file and interleave.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 // SaveSession saves a session to disk.
@@ -144,22 +251,21 @@ func (s *Store) SaveSession(session *StoredSession) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	dir := s.sessionDir(session.RepoName, session.WorktreeName)
+	dir, err := s.sessionDir(session.RepoName, session.WorktreeName)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create session directory: %w", err)
 	}
 
-	path := s.sessionPath(session.RepoName, session.WorktreeName, session.ID)
-
-	// Write atomically using temp file + rename
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write session file: %w", err)
+	path, err := s.sessionPath(session.RepoName, session.WorktreeName, session.ID)
+	if err != nil {
+		return err
 	}
 
-	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath) // Clean up temp file
-		return fmt.Errorf("failed to rename session file: %w", err)
+	if err := writeFileAtomic(path, data, 0644); err != nil {
+		return fmt.Errorf("failed to write session file: %w", err)
 	}
 
 	return nil
@@ -170,7 +276,10 @@ func (s *Store) LoadSession(repoName, worktreeName string, id SessionID) (*Store
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	path := s.sessionPath(repoName, worktreeName, id)
+	path, err := s.sessionPath(repoName, worktreeName, id)
+	if err != nil {
+		return nil, err
+	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -193,7 +302,10 @@ func (s *Store) DeleteSession(repoName, worktreeName string, id SessionID) error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	path := s.sessionPath(repoName, worktreeName, id)
+	path, err := s.sessionPath(repoName, worktreeName, id)
+	if err != nil {
+		return err
+	}
 
 	if err := os.Remove(path); err != nil {
 		if os.IsNotExist(err) {
@@ -210,7 +322,11 @@ func (s *Store) DeleteSession(repoName, worktreeName string, id SessionID) error
 func (s *Store) ListSessions(repoName, worktreeName string) ([]*SessionMeta, error) {
 	// Read directory entries under lock, then release for file I/O.
 	s.mu.RLock()
-	dir := s.sessionDir(repoName, worktreeName)
+	dir, err := s.sessionDir(repoName, worktreeName)
+	if err != nil {
+		s.mu.RUnlock()
+		return nil, err
+	}
 	entries, err := os.ReadDir(dir)
 	s.mu.RUnlock()
 
@@ -349,20 +465,21 @@ func (s *Store) ListWorktrees(repoName string) ([]string, error) {
 // storedToMeta converts a StoredSession to a SessionMeta for listing.
 func storedToMeta(stored *StoredSession) *SessionMeta {
 	return &SessionMeta{
-		ID:             stored.ID,
-		Type:           stored.Type,
-		Status:         stored.Status,
-		RepoName:       stored.RepoName,
-		WorktreeName:   stored.WorktreeName,
-		Prompt:         stored.Prompt,
-		Title:          stored.Title,
-		Model:          stored.Model,
-		CLISessionID:   stored.CLISessionID,
-		TmuxWindowName: stored.TmuxWindowName,
-		TmuxWindowID:   stored.TmuxWindowID,
-		RunnerType:     stored.RunnerType,
-		CreatedAt:      stored.CreatedAt,
-		CompletedAt:    stored.CompletedAt,
+		ID:              stored.ID,
+		Type:            stored.Type,
+		Status:          stored.Status,
+		RepoName:        stored.RepoName,
+		WorktreeName:    stored.WorktreeName,
+		Prompt:          stored.Prompt,
+		Title:           stored.Title,
+		Model:           stored.Model,
+		CLISessionID:    stored.CLISessionID,
+		TmuxWindowName:  stored.TmuxWindowName,
+		TmuxWindowID:    stored.TmuxWindowID,
+		RunnerType:      stored.RunnerType,
+		ParentSessionID: stored.ParentSessionID,
+		CreatedAt:       stored.CreatedAt,
+		CompletedAt:     stored.CompletedAt,
 	}
 }
 
@@ -376,23 +493,24 @@ func SessionToStored(session *Session, repoName string, output []OutputLine) *St
 	defer session.mu.RUnlock()
 
 	stored := &StoredSession{
-		ID:             session.ID,
-		Type:           session.Type,
-		Status:         session.Status,
-		RepoName:       repoName,
-		WorktreePath:   session.WorktreePath,
-		WorktreeName:   session.WorktreeName,
-		Prompt:         session.Prompt,
-		Title:          session.Title,
-		Model:          session.Model,
-		CLISessionID:   session.CLISessionID,
-		TmuxWindowName: session.TmuxWindowName,
-		TmuxWindowID:   session.TmuxWindowID,
-		RunnerType:     session.RunnerType,
-		CreatedAt:      session.CreatedAt,
-		StartedAt:      session.StartedAt,
-		CompletedAt:    session.CompletedAt,
-		Output:         output,
+		ID:              session.ID,
+		Type:            session.Type,
+		Status:          session.Status,
+		RepoName:        repoName,
+		WorktreePath:    session.WorktreePath,
+		WorktreeName:    session.WorktreeName,
+		Prompt:          session.Prompt,
+		Title:           session.Title,
+		Model:           session.Model,
+		CLISessionID:    session.CLISessionID,
+		TmuxWindowName:  session.TmuxWindowName,
+		TmuxWindowID:    session.TmuxWindowID,
+		RunnerType:      session.RunnerType,
+		ParentSessionID: session.ParentSessionID,
+		CreatedAt:       session.CreatedAt,
+		StartedAt:       session.StartedAt,
+		CompletedAt:     session.CompletedAt,
+		Output:          output,
 	}
 
 	if session.Error != nil {
@@ -419,22 +537,23 @@ func StoredToSessionInfo(stored *StoredSession) SessionInfo {
 	}
 
 	info := SessionInfo{
-		ID:             stored.ID,
-		Type:           stored.Type,
-		Status:         stored.Status,
-		WorktreePath:   stored.WorktreePath,
-		WorktreeName:   stored.WorktreeName,
-		Prompt:         stored.Prompt,
-		Title:          stored.Title,
-		Model:          stored.Model,
-		CLISessionID:   stored.CLISessionID,
-		TmuxWindowName: stored.TmuxWindowName,
-		TmuxWindowID:   stored.TmuxWindowID,
-		RunnerType:     stored.RunnerType,
-		CreatedAt:      stored.CreatedAt,
-		StartedAt:      stored.StartedAt,
-		CompletedAt:    stored.CompletedAt,
-		ErrorMsg:       stored.ErrorMsg,
+		ID:              stored.ID,
+		Type:            stored.Type,
+		Status:          stored.Status,
+		WorktreePath:    stored.WorktreePath,
+		WorktreeName:    stored.WorktreeName,
+		Prompt:          stored.Prompt,
+		Title:           stored.Title,
+		Model:           stored.Model,
+		CLISessionID:    stored.CLISessionID,
+		TmuxWindowName:  stored.TmuxWindowName,
+		TmuxWindowID:    stored.TmuxWindowID,
+		RunnerType:      stored.RunnerType,
+		ParentSessionID: stored.ParentSessionID,
+		CreatedAt:       stored.CreatedAt,
+		StartedAt:       stored.StartedAt,
+		CompletedAt:     stored.CompletedAt,
+		ErrorMsg:        stored.ErrorMsg,
 	}
 
 	if stored.Progress != nil {
