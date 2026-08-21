@@ -604,7 +604,14 @@ func (d *RepoSettingsDialog) View(styles *Styles) string {
 			}
 			status = styles.Completed.Render(ver)
 		}
-		line := fmt.Sprintf("  %s %-8s %s", checkbox, ps.Provider, status)
+		// Name the binary when it differs from the provider: "cursor not found"
+		// sends a user to install the Cursor IDE, whose launcher is exactly the
+		// wrong thing to put on PATH — the agent CLI is `agent`.
+		name := ps.Provider
+		if bin := agent.BinaryForProvider(ps.Provider); bin != ps.Provider {
+			name = fmt.Sprintf("%s (%s)", ps.Provider, bin)
+		}
+		line := fmt.Sprintf("  %s %-16s %s", checkbox, name, status)
 		if d.focus == RepoSettingsFocusProviders && i == d.providerCursor {
 			line = styles.Selected.Render(line)
 		} else if !ps.Installed {

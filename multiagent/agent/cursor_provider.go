@@ -43,22 +43,8 @@ func (p *CursorProvider) Execute(ctx context.Context, prompt string, wtCtx *wt.W
 		fullPrompt = wtCtx.FormatForPrompt() + "\n\n" + prompt
 	}
 
-	// Build cursor session options.
-	var sessionOpts []cursor.SessionOption
-	if model := cursorModelArg(cfg.Model); model != "" {
-		sessionOpts = append(sessionOpts, cursor.WithModel(model))
-	}
-	if cfg.WorkDir != "" {
-		sessionOpts = append(sessionOpts, cursor.WithWorkDir(cfg.WorkDir))
-	}
-	// Cursor requires --trust for non-interactive use
-	sessionOpts = append(sessionOpts, cursor.WithTrust())
-	if !cfg.LLMEndpoint.IsZero() {
-		sessionOpts = append(sessionOpts, cursor.WithLLMEndpoint(cfg.LLMEndpoint))
-	}
-
 	// Create session
-	session := cursor.NewSession(fullPrompt, sessionOpts...)
+	session := cursor.NewSession(fullPrompt, cursorSessionOpts(cfg)...)
 	if err := session.Start(ctx); err != nil {
 		return nil, err
 	}
@@ -119,15 +105,25 @@ func (p *CursorProvider) Close() error {
 	return nil
 }
 
-// cursorModelArg returns the value to pass to cursor-agent's --model, or ""
-// when the CLI should pick its own. On top of the placeholder IDs CLIModelArg
-// already strips, this provider sees one more non-model: "sonnet", the
-// Claude-specific default applyOptions fills in when the caller names nothing.
-// cursor-agent rejects both with "Cannot use this model" rather than falling
-// back, so neither may be forwarded.
-func cursorModelArg(model string) string {
-	if model == "sonnet" {
-		return ""
+// cursorSessionOpts builds the cursor session options for one Execute call.
+// It is split out of Execute so a test can assert what actually reaches the
+// CLI: pinning the model rule on its own leaves Execute free to stop calling
+// it, which is the regression that broke cursor sessions in the first place.
+func cursorSessionOpts(cfg ExecuteConfig) []cursor.SessionOption {
+	var opts []cursor.SessionOption
+	// applyOptions defaults Model to "sonnet" when the caller named nothing;
+	// CLIModelArg strips it as a Claude ID, along with placeholders and any
+	// other provider's models.
+	if model := CLIModelArg(cfg.Model, ProviderCursor); model != "" {
+		opts = append(opts, cursor.WithModel(model))
 	}
-	return CLIModelArg(model)
+	if cfg.WorkDir != "" {
+		opts = append(opts, cursor.WithWorkDir(cfg.WorkDir))
+	}
+	// Cursor requires --trust for non-interactive use
+	opts = append(opts, cursor.WithTrust())
+	if !cfg.LLMEndpoint.IsZero() {
+		opts = append(opts, cursor.WithLLMEndpoint(cfg.LLMEndpoint))
+	}
+	return opts
 }

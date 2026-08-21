@@ -187,9 +187,9 @@ func (r *tmuxRunner) buildCommand() (binary string, args []string) {
 	binary = agent.BinaryForProvider(provider)
 
 	// Add the model flag. Some of bramble's IDs are placeholders for "the CLI's
-	// own default" rather than model names, so let the registry decide whether
-	// there is anything to pass.
-	if model := agent.CLIModelArg(r.model); model != "" {
+	// own default", and some name another provider's model, so let the registry
+	// decide whether this CLI can be given anything at all.
+	if model := agent.CLIModelArg(r.model, provider); model != "" {
 		args = append(args, "--model", model)
 	}
 

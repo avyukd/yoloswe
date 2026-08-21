@@ -316,14 +316,24 @@ func TestResolveModel(t *testing.T) {
 func TestCLIModelArg(t *testing.T) {
 	// Placeholder IDs name no model; every CLI checked rejects them outright
 	// rather than falling back, so they must not reach a --model flag.
-	assert.Equal(t, "", CLIModelArg("cursor-default"))
-	assert.Equal(t, "", CLIModelArg("agy-default"))
-	assert.Equal(t, "", CLIModelArg(""))
-	// Curated real models pass through.
-	assert.Equal(t, "opus", CLIModelArg("opus"))
-	assert.Equal(t, "gpt-5.5", CLIModelArg("gpt-5.5"))
-	// So do IDs the registry does not curate, e.g. prefix-resolved cursor models.
-	assert.Equal(t, "composer-2.5", CLIModelArg("composer-2.5"))
+	assert.Equal(t, "", CLIModelArg("cursor-default", ProviderCursor))
+	assert.Equal(t, "", CLIModelArg("agy-default", ProviderAgy))
+	assert.Equal(t, "", CLIModelArg("", ProviderClaude))
+	// Neither may another provider's model — backend and model are independent
+	// choices in several entry points, so they do reach each other.
+	assert.Equal(t, "", CLIModelArg("opus", ProviderCursor))
+	assert.Equal(t, "", CLIModelArg("gpt-5.5", ProviderCursor))
+	assert.Equal(t, "", CLIModelArg("claude-fable-5", ProviderCodex))
+	// A model matched to its own provider passes through.
+	assert.Equal(t, "opus", CLIModelArg("opus", ProviderClaude))
+	assert.Equal(t, "gpt-5.5", CLIModelArg("gpt-5.5", ProviderCodex))
+	// So do IDs the registry does not curate, e.g. prefix-resolved cursor
+	// models — there the CLI is the authority, not this list.
+	assert.Equal(t, "composer-2.5", CLIModelArg("composer-2.5", ProviderCursor))
+	// An unknown provider means "no attribution known": placeholders still go,
+	// everything else passes through rather than being stripped wholesale.
+	assert.Equal(t, "opus", CLIModelArg("opus", ""))
+	assert.Equal(t, "", CLIModelArg("cursor-default", ""))
 }
 
 // Every ID whose Label says "default" is bramble's own placeholder, not a

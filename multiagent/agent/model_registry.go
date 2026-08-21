@@ -18,13 +18,26 @@ type AgentModel struct {
 	Placeholder bool
 }
 
-// CLIModelArg returns the value to pass to a provider CLI's --model flag for a
-// model ID, or "" when the CLI must be left to pick for itself. Every caller
-// that builds a provider command line has to go through this — forwarding a
-// placeholder ID verbatim is what stops the session before it starts. IDs not
-// in the registry (prefix-resolved ones like "composer-2.5") pass through.
-func CLIModelArg(model string) string {
-	if m, ok := ModelByID(model); ok && m.Placeholder {
+// CLIModelArg returns the value to pass to provider's CLI on --model for a
+// model ID, or "" when the CLI must be left to pick for itself. Two kinds of ID
+// name nothing that CLI can run: placeholders, and IDs the registry attributes
+// to a *different* provider — backend and model are separate choices in several
+// entry points (`yoloswe codetalk --backend cursor --model opus`), so they do
+// reach each other. Neither is a soft fallback at the CLI; both are a hard
+// "cannot use this model" that stops the session before it starts.
+//
+// IDs the registry does not curate pass through — for those (prefix-resolved
+// ones like "composer-2.5") the CLI is the authority, not this list. An empty
+// provider means "no attribution known", so only the placeholder rule applies.
+func CLIModelArg(model, provider string) string {
+	m, ok := ModelByID(model)
+	if !ok {
+		return model
+	}
+	if m.Placeholder {
+		return ""
+	}
+	if provider != "" && m.Provider != provider {
 		return ""
 	}
 	return model
