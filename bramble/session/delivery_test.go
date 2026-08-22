@@ -1331,8 +1331,8 @@ func TestSyntheticSameStatusDoesNotRearmReporting(t *testing.T) {
 	mgr.emitSessionStateChange(SessionStateChangeEvent{
 		SessionID: childID, OldStatus: StatusIdle, NewStatus: StatusIdle,
 	})
-	require.Eventually(t, func() bool { return len(c.Pending(parentID)) == 1 },
-		5*time.Second, 10*time.Millisecond,
+	require.Never(t, func() bool { return len(c.Pending(parentID)) > 1 },
+		500*time.Millisecond, 10*time.Millisecond,
 		"synthetic idle must not re-report")
 
 	// Synthetic same-status running: must not re-arm (child stays idle after).
@@ -1343,8 +1343,8 @@ func TestSyntheticSameStatusDoesNotRearmReporting(t *testing.T) {
 	mgr.emitSessionStateChange(SessionStateChangeEvent{
 		SessionID: childID, OldStatus: StatusRunning, NewStatus: StatusIdle,
 	})
-	require.Eventually(t, func() bool { return len(c.Pending(parentID)) == 1 },
-		5*time.Second, 10*time.Millisecond,
+	require.Never(t, func() bool { return len(c.Pending(parentID)) > 1 },
+		500*time.Millisecond, 10*time.Millisecond,
 		"synthetic running must not re-arm reporting")
 }
 
