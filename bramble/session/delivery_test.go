@@ -1254,6 +1254,100 @@ func TestTUIChildDoesNotCapturePane(t *testing.T) {
 	assert.Contains(t, c.Pending(parentID)[0].Text, "result: /tmp/transcript.md")
 }
 
+// TestRunningTransitionRearmsIdleReporting is the path a prematurely-reported
+// codex subagent takes: it announces idle, is reported, keeps working without
+// the courier writing to it, then goes idle again — and the parent must hear
+// about that second idle.
+func TestRunningTransitionRearmsIdleReporting(t *testing.T) {
+	t.Parallel()
+	parentID, childID := ids(t)
+	target := newFakeTarget()
+	c, err := NewCourier(target, echoPanes(target), testCourierConfig(t))
+	require.NoError(t, err)
+
+	mgr := NewManagerWithConfig(ManagerConfig{RepoName: "repo"})
+	defer mgr.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	unsub := c.Watch(ctx, mgr)
+	defer unsub()
+
+	target.set(parentID, StatusRunning, RunnerTypeTmux)
+	target.setChild(childID, parentID, StatusRunning, RunnerTypeTmux)
+
+	// Round 1: premature idle is reported.
+	target.setChild(childID, parentID, StatusIdle, RunnerTypeTmux)
+	mgr.emitSessionStateChange(SessionStateChangeEvent{
+		SessionID: childID, OldStatus: StatusRunning, NewStatus: StatusIdle,
+	})
+	require.Eventually(t, func() bool { return len(c.Pending(parentID)) == 1 },
+		5*time.Second, 10*time.Millisecond,
+		"first idle was never reported")
+
+	// The child keeps working — no courier write, just a status transition.
+	target.setChild(childID, parentID, StatusRunning, RunnerTypeTmux)
+	mgr.emitSessionStateChange(SessionStateChangeEvent{
+		SessionID: childID, OldStatus: StatusIdle, NewStatus: StatusRunning,
+	})
+
+	// Round 2: genuine completion must be reported too.
+	target.setChild(childID, parentID, StatusIdle, RunnerTypeTmux)
+	mgr.emitSessionStateChange(SessionStateChangeEvent{
+		SessionID: childID, OldStatus: StatusRunning, NewStatus: StatusIdle,
+	})
+	require.Eventually(t, func() bool { return len(c.Pending(parentID)) == 2 },
+		5*time.Second, 10*time.Millisecond,
+		"second idle after running without courier write was never reported")
+}
+
+// TestSyntheticSameStatusDoesNotRearmReporting pins that re-adoption's
+// same-status events neither re-report nor re-arm idle dedup.
+func TestSyntheticSameStatusDoesNotRearmReporting(t *testing.T) {
+	t.Parallel()
+	parentID, childID := ids(t)
+	target := newFakeTarget()
+	c, err := NewCourier(target, echoPanes(target), testCourierConfig(t))
+	require.NoError(t, err)
+
+	mgr := NewManagerWithConfig(ManagerConfig{RepoName: "repo"})
+	defer mgr.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	unsub := c.Watch(ctx, mgr)
+	defer unsub()
+
+	target.set(parentID, StatusRunning, RunnerTypeTmux)
+	target.setChild(childID, parentID, StatusIdle, RunnerTypeTmux)
+
+	mgr.emitSessionStateChange(SessionStateChangeEvent{
+		SessionID: childID, OldStatus: StatusRunning, NewStatus: StatusIdle,
+	})
+	require.Eventually(t, func() bool { return len(c.Pending(parentID)) == 1 },
+		5*time.Second, 10*time.Millisecond)
+
+	// Synthetic same-status idle (re-adoption): must not report again.
+	mgr.emitSessionStateChange(SessionStateChangeEvent{
+		SessionID: childID, OldStatus: StatusIdle, NewStatus: StatusIdle,
+	})
+	require.Eventually(t, func() bool { return len(c.Pending(parentID)) == 1 },
+		5*time.Second, 10*time.Millisecond,
+		"synthetic idle must not re-report")
+
+	// Synthetic same-status running: must not re-arm (child stays idle after).
+	mgr.emitSessionStateChange(SessionStateChangeEvent{
+		SessionID: childID, OldStatus: StatusRunning, NewStatus: StatusRunning,
+	})
+	target.setChild(childID, parentID, StatusIdle, RunnerTypeTmux)
+	mgr.emitSessionStateChange(SessionStateChangeEvent{
+		SessionID: childID, OldStatus: StatusRunning, NewStatus: StatusIdle,
+	})
+	require.Eventually(t, func() bool { return len(c.Pending(parentID)) == 1 },
+		5*time.Second, 10*time.Millisecond,
+		"synthetic running must not re-arm reporting")
+}
+
 // TestFollowUpToChildRearmsReporting is what makes a conversation possible
 // rather than a single exchange. The child's first idle is reported; then the
 // parent replies, and the answer to *that* must be reported too, or the parent
