@@ -1772,9 +1772,9 @@ func (m *Manager) runSession(session *Session, prompt string) {
 		m.tryUpdateSessionStatus(session, StatusPending, StatusRunning)
 		startTime := time.Now()
 
-		// Backends with no turn-completion hook (cursor) have their idleness
-		// read off the pane instead. nil for claude and codex, which report it
-		// themselves; see pane_idle.go for why this is a last resort.
+		// Pane probes cover hookless backends (cursor) and premature-idle
+		// correction for codex, whose notify hook can fire before the pane
+		// shows idle. nil for claude, which reports turn ends reliably.
 		idleTracker := newPaneIdleTracker(agentModel.Provider)
 
 		// Periodically check if tmux window still exists
@@ -2391,30 +2391,27 @@ func (m *Manager) SetSessionRunning(id SessionID) {
 	m.trySetStatus(id, StatusIdle, StatusRunning)
 }
 
-// pollPaneIdle reads idleness off a hookless backend's pane, for one tick of
-// the monitor loop. tracker is nil for a provider that reports its own turn
-// ends, in which case this does nothing.
+// pollPaneIdle reads idleness off a backend's pane, for one tick of the
+// monitor loop. tracker is nil for a provider with no probe, in which case
+// this does nothing.
 //
-// Only a running session is a candidate: once idle it stays idle until
-// something delivers work and marks it running again, which is also what
-// re-arms the tracker.
+// For running sessions it may mark idle after consecutive idle observations.
+// For idle sessions it may mark running again when the pane clearly shows a
+// turn in flight — correcting a premature notify-hook idle without relaxing
+// SetSessionIdle's compare-and-set. Terminal sessions are never resurrected.
 func (m *Manager) pollPaneIdle(tracker *paneIdleTracker, id SessionID, status SessionStatus, windowTarget string) {
 	if tracker == nil {
 		return
 	}
-	if status != StatusRunning {
-		tracker.reset()
-		return
-	}
-	// CaptureTmuxPane rather than CapturePaneText: the caller resolved this
-	// same target from the same session a few lines ago, and going back through
-	// the session map would retake two locks per tick to rederive it.
 	lines, err := CaptureTmuxPane(windowTarget, paneIdleCaptureLines)
 	if err != nil {
 		return
 	}
-	if tracker.observe(lines) {
+	switch decidePaneIdlePoll(tracker, status, lines) {
+	case paneIdleActionMarkIdle:
 		m.SetSessionIdle(id)
+	case paneIdleActionMarkRunning:
+		m.SetSessionRunning(id)
 	}
 }
 
