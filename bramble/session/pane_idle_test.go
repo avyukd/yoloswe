@@ -198,9 +198,10 @@ func TestCodexFooterWorkingMarkerNotOnComposer(t *testing.T) {
 	require.True(t, known)
 	assert.True(t, working)
 
-	prompt, ok := findPromptLine(codexPane(true), []string{"Ask Codex to do anything"})
+	probe := paneIdleProbes[ProviderCodex]
+	prompt, ok := findPromptLine(codexPane(true), probe.promptMarkers)
 	require.True(t, ok)
-	assert.False(t, containsAny(prompt, []string{"esc to interrupt"}))
+	assert.False(t, containsAny(prompt, probe.workingInFooter))
 }
 
 // TestCodexTranscriptDoesNotReadAsWorking keeps scrollback that quotes the

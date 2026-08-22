@@ -2403,6 +2403,16 @@ func (m *Manager) pollPaneIdle(tracker *paneIdleTracker, id SessionID, status Se
 	if tracker == nil {
 		return
 	}
+	// Only Codex needs a pane read after it is marked idle: its notify hook can
+	// fire while the pane still shows an active turn. Hookless providers are
+	// probed while running, when the pane can establish the idle transition.
+	if status != StatusRunning && !(status == StatusIdle && tracker.provider == ProviderCodex) {
+		tracker.reset()
+		return
+	}
+	// CaptureTmuxPane rather than CapturePaneText: the caller resolved this
+	// same target from the same session a few lines ago, and going back through
+	// the session map would retake two locks per tick to rederive it.
 	lines, err := CaptureTmuxPane(windowTarget, paneIdleCaptureLines)
 	if err != nil {
 		return

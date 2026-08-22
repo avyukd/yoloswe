@@ -5,13 +5,13 @@ import "strings"
 // paneIdleProbe tells, from a tmux pane's text, whether an agent CLI is waiting
 // for input.
 //
-// It exists for backends with no turn-completion hook. Claude gets a Stop hook
-// through --settings and codex a notify program through -c notify=[...], so
-// both tell bramble when a turn ends. Cursor has neither: no --notify flag, and
-// its plugin `stop` hook does not fire from the CLI in either interactive or
-// --print mode (checked against cursor-agent 2026.08.11). Without some signal,
-// bramble only ever learns such a session finished when its window dies — so
-// nothing drains its queued mail and its parent is never told it is done.
+// It exists for backends with no turn-completion hook and for hook-correction
+// cases. Claude gets a Stop hook through --settings and Codex a notify program
+// through -c notify=[...]. Cursor has neither: no --notify flag, and its plugin
+// `stop` hook does not fire from the CLI in either interactive or --print mode
+// (checked against cursor-agent 2026.08.11). Without some signal, bramble only
+// ever learns such a session finished when its window dies — so nothing drains
+// its queued mail and its parent is never told it is done.
 //
 // Codex also uses a pane probe, but only to correct premature notify-hook
 // idles — its hook can fire before the pane shows idle.
@@ -36,7 +36,8 @@ type paneIdleProbe struct {
 	workingInFooter []string
 }
 
-// paneIdleProbes holds a probe per provider that lacks a completion hook.
+// paneIdleProbes holds a probe per provider that lacks a completion hook or
+// needs pane evidence to correct a premature hook result.
 //
 // Deliberately not a fallback for every provider: a wrong "idle" is worse than
 // no signal, because it releases queued messages into a live turn. A provider
@@ -111,35 +112,46 @@ func paneShowsIdle(provider string, lines []string) (idle, known bool) {
 // footerShowsWorking reports whether a working marker appears on a non-composer
 // line within the tail window.
 func footerShowsWorking(lines []string, promptMarkers, workingMarkers []string) bool {
-	seen := 0
-	for i := len(lines) - 1; i >= 0 && seen < paneIdleTailLines; i-- {
-		line := lines[i]
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		seen++
+	working := false
+	forEachPaneTailLine(lines, func(line string) bool {
 		if containsAny(line, promptMarkers) {
-			continue
+			return false
 		}
 		if containsAny(line, workingMarkers) {
+			working = true
 			return true
 		}
-	}
-	return false
+		return false
+	})
+	return working
 }
 
-// findPromptLine returns the composer line, searched upwards from the bottom of
-// the pane so the most recent one wins.
-func findPromptLine(lines, markers []string) (string, bool) {
+func forEachPaneTailLine(lines []string, visit func(string) bool) {
 	seen := 0
 	for i := len(lines) - 1; i >= 0 && seen < paneIdleTailLines; i-- {
 		if strings.TrimSpace(lines[i]) == "" {
 			continue
 		}
 		seen++
-		if containsAny(lines[i], markers) {
-			return lines[i], true
+		if visit(lines[i]) {
+			return
 		}
+	}
+}
+
+// findPromptLine returns the composer line, searched upwards from the bottom of
+// the pane so the most recent one wins.
+func findPromptLine(lines, markers []string) (string, bool) {
+	var prompt string
+	forEachPaneTailLine(lines, func(line string) bool {
+		if containsAny(line, markers) {
+			prompt = line
+			return true
+		}
+		return false
+	})
+	if prompt != "" {
+		return prompt, true
 	}
 	return "", false
 }
@@ -159,8 +171,8 @@ type paneIdleTracker struct {
 	streak   int
 }
 
-// newPaneIdleTracker returns a tracker for a provider, or nil when that
-// provider reports its own idleness through a hook.
+// newPaneIdleTracker returns a tracker for a provider that needs pane evidence,
+// or nil when its hook is sufficient on its own.
 func newPaneIdleTracker(provider string) *paneIdleTracker {
 	if !providerHasIdleProbe(provider) {
 		return nil
@@ -231,5 +243,5 @@ func decidePaneIdlePoll(tracker *paneIdleTracker, status SessionStatus, lines []
 
 // paneIdleCaptureLines is how much scrollback the monitor pulls per poll. Small
 // on purpose: only the footer is read, and this runs every couple of seconds
-// for every hookless session.
+// for every session with a hookless or hook-correcting probe.
 const paneIdleCaptureLines = 12
