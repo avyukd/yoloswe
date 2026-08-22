@@ -243,3 +243,19 @@ func TestTerminalSessionNeverResurrectedByProbe(t *testing.T) {
 		assert.Equal(t, paneIdleActionNone, action, "status %s", status)
 	}
 }
+
+// TestOnlyHookCorrectingProvidersArePolledWhileIdle pins which providers the
+// monitor reads a pane for after a session is already idle. That poll exists
+// solely to undo a hook that fired early, so a provider without one buys tmux
+// I/O for every idle session on the host and learns nothing. Cursor has no hook
+// at all — an idle cursor session has nothing to correct.
+func TestOnlyHookCorrectingProvidersArePolledWhileIdle(t *testing.T) {
+	t.Parallel()
+
+	assert.True(t, newPaneIdleTracker(ProviderCodex).correctsPrematureIdle(),
+		"codex's notify hook fires early; its pane must still be read when idle")
+	assert.False(t, newPaneIdleTracker(ProviderCursor).correctsPrematureIdle(),
+		"cursor has no hook to correct; polling it while idle is pure cost")
+	assert.False(t, newPaneIdleTracker(ProviderClaude).correctsPrematureIdle(),
+		"a provider with no probe at all has no tracker to ask")
+}

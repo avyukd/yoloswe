@@ -2403,10 +2403,12 @@ func (m *Manager) pollPaneIdle(tracker *paneIdleTracker, id SessionID, status Se
 	if tracker == nil {
 		return
 	}
-	// Only Codex needs a pane read after it is marked idle: its notify hook can
-	// fire while the pane still shows an active turn. Hookless providers are
-	// probed while running, when the pane can establish the idle transition.
-	if status != StatusRunning && !(status == StatusIdle && tracker.provider == ProviderCodex) {
+	// A provider whose hook can fire early needs a pane read even once marked
+	// idle — that read is the only thing that can put it back to running.
+	// Everything else is probed only while running, when the pane can
+	// establish the idle transition. Which providers those are is the probe
+	// table's business, not this loop's.
+	if status != StatusRunning && !(status == StatusIdle && tracker.correctsPrematureIdle()) {
 		tracker.reset()
 		return
 	}

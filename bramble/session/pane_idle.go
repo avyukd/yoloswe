@@ -34,6 +34,13 @@ type paneIdleProbe struct {
 	// interrupt)" on its own line above the composer; the tail bound keeps
 	// scrollback that quotes these markers out of reach.
 	workingInFooter []string
+	// correctsPrematureIdle marks a provider whose completion hook can fire
+	// before its turn is really over, so the pane is worth reading even after
+	// the session is already idle — the only way such a session ever gets back
+	// to running. Off by default: for a hookless provider an idle session has
+	// nothing to correct, and polling it would buy tmux I/O for every idle
+	// session on the host and nothing else.
+	correctsPrematureIdle bool
 }
 
 // paneIdleProbes holds a probe per provider that lacks a completion hook or
@@ -55,8 +62,9 @@ var paneIdleProbes = map[string]paneIdleProbe{
 	// before the pane shows idle — while "Working (… • esc to interrupt)" is
 	// still on screen. The probe corrects that premature idle back to running.
 	ProviderCodex: {
-		promptMarkers:   []string{"Ask Codex to do anything"},
-		workingInFooter: []string{"esc to interrupt"},
+		promptMarkers:         []string{"Ask Codex to do anything"},
+		workingInFooter:       []string{"esc to interrupt"},
+		correctsPrematureIdle: true,
 	},
 }
 
@@ -169,6 +177,15 @@ func containsAny(haystack string, needles []string) bool {
 type paneIdleTracker struct {
 	provider string
 	streak   int
+}
+
+// correctsPrematureIdle reports whether this provider's pane is worth reading
+// while the session is already idle.
+func (p *paneIdleTracker) correctsPrematureIdle() bool {
+	if p == nil {
+		return false
+	}
+	return paneIdleProbes[p.provider].correctsPrematureIdle
 }
 
 // newPaneIdleTracker returns a tracker for a provider that needs pane evidence,
