@@ -593,9 +593,7 @@ func (c *Courier) Watch(ctx context.Context, mgr *Manager) func() {
 		// on it would hand the parent the same "is idle" report, with the same
 		// result path, after every single restart.
 		if evt.OldStatus != evt.NewStatus {
-			if child.ParentSessionID != "" {
-				c.reportToParent(ctx, child)
-			}
+			c.reportToParent(ctx, child)
 			// A child can start a new turn without the courier writing to it
 			// (e.g. a prematurely-reported codex session that keeps working).
 			// Re-arm idle reporting so the parent hears when that turn ends.

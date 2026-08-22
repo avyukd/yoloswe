@@ -1260,10 +1260,7 @@ func TestTUIChildDoesNotCapturePane(t *testing.T) {
 // about that second idle.
 func TestRunningTransitionRearmsIdleReporting(t *testing.T) {
 	t.Parallel()
-	parentID, childID := ids(t)
-	target := newFakeTarget()
-	c, err := NewCourier(target, echoPanes(target), testCourierConfig(t))
-	require.NoError(t, err)
+	c, target, parentID, childID := reportFixture(t, StatusRunning)
 
 	mgr := NewManagerWithConfig(ManagerConfig{RepoName: "repo"})
 	defer mgr.Close()
@@ -1272,9 +1269,6 @@ func TestRunningTransitionRearmsIdleReporting(t *testing.T) {
 	defer cancel()
 	unsub := c.Watch(ctx, mgr)
 	defer unsub()
-
-	target.set(parentID, StatusRunning, RunnerTypeTmux)
-	target.setChild(childID, parentID, StatusRunning, RunnerTypeTmux)
 
 	// Round 1: premature idle is reported.
 	target.setChild(childID, parentID, StatusIdle, RunnerTypeTmux)
@@ -1305,10 +1299,7 @@ func TestRunningTransitionRearmsIdleReporting(t *testing.T) {
 // same-status events neither re-report nor re-arm idle dedup.
 func TestSyntheticSameStatusDoesNotRearmReporting(t *testing.T) {
 	t.Parallel()
-	parentID, childID := ids(t)
-	target := newFakeTarget()
-	c, err := NewCourier(target, echoPanes(target), testCourierConfig(t))
-	require.NoError(t, err)
+	c, target, parentID, childID := reportFixture(t, StatusIdle)
 
 	mgr := NewManagerWithConfig(ManagerConfig{RepoName: "repo"})
 	defer mgr.Close()
@@ -1317,9 +1308,6 @@ func TestSyntheticSameStatusDoesNotRearmReporting(t *testing.T) {
 	defer cancel()
 	unsub := c.Watch(ctx, mgr)
 	defer unsub()
-
-	target.set(parentID, StatusRunning, RunnerTypeTmux)
-	target.setChild(childID, parentID, StatusIdle, RunnerTypeTmux)
 
 	mgr.emitSessionStateChange(SessionStateChangeEvent{
 		SessionID: childID, OldStatus: StatusRunning, NewStatus: StatusIdle,
