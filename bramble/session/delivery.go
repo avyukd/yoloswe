@@ -592,8 +592,14 @@ func (c *Courier) Watch(ctx context.Context, mgr *Manager) func() {
 		// that is not news: the dedup map lives only in memory, so reporting
 		// on it would hand the parent the same "is idle" report, with the same
 		// result path, after every single restart.
-		if child.ParentSessionID != "" && evt.OldStatus != evt.NewStatus {
+		if evt.OldStatus != evt.NewStatus {
 			c.reportToParent(ctx, child)
+			// A child can start a new turn without the courier writing to it
+			// (e.g. a prematurely-reported codex session that keeps working).
+			// Re-arm idle reporting so the parent hears when that turn ends.
+			if evt.NewStatus == StatusRunning {
+				c.resetIdleReport(evt.SessionID)
+			}
 		}
 		switch {
 		case evt.NewStatus == StatusIdle:
