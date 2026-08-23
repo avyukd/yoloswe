@@ -1292,9 +1292,11 @@ func filterSessionsByParent(result any, parent string) (*ipc.ListSessionsResult,
 		return nil, err
 	}
 	children := make([]ipc.SessionSummary, 0, len(list.Sessions))
-	for _, s := range list.Sessions {
-		if s.ParentSessionID == parent {
-			children = append(children, s)
+	// Index rather than range-by-value: SessionSummary is over gocritic's
+	// 128-byte rangeValCopy threshold.
+	for i := range list.Sessions {
+		if list.Sessions[i].ParentSessionID == parent {
+			children = append(children, list.Sessions[i])
 		}
 	}
 	return &ipc.ListSessionsResult{Sessions: children}, nil
