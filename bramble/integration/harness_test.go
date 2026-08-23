@@ -472,6 +472,14 @@ var startupDialogs = []startupDialog{
 		keys:  []string{"Enter"},
 	},
 	{
+		// Claude asks before using API-key authentication when its usual
+		// account login is also available. The recommended/default option is
+		// No, so move to option 1 explicitly instead of blindly pressing Enter.
+		name:  "claude custom API key",
+		match: []string{"Detected a custom API key in your environment", "Do you want to use this API key", "No (recommended)"},
+		keys:  []string{"Up", "Enter"},
+	},
+	{
 		// Codex, on a directory it has not seen before. Option 1, the default,
 		// is "Yes, continue".
 		name:  "codex directory trust",
@@ -580,7 +588,12 @@ func (h *harness) answerStartupDialogs(id session.SessionID, pane string) bool {
 // on rather than a fresh one taken afterwards.
 func (h *harness) awaitClearingDialogs(id session.SessionID, cond func(pane string) bool, failf string, args ...any) {
 	h.t.Helper()
-	deadline := time.Now().Add(settleTimeout)
+	h.awaitClearingDialogsFor(id, settleTimeout, cond, failf, args...)
+}
+
+func (h *harness) awaitClearingDialogsFor(id session.SessionID, timeout time.Duration, cond func(pane string) bool, failf string, args ...any) {
+	h.t.Helper()
+	deadline := time.Now().Add(timeout)
 	var pane string
 	for time.Now().Before(deadline) {
 		pane = h.pane(id)

@@ -1,6 +1,7 @@
 package session
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 )
 
 func TestNewStore(t *testing.T) {
@@ -450,6 +453,29 @@ func TestSessionToStored(t *testing.T) {
 	require.NotNil(t, stored.Progress)
 	assert.Equal(t, 3, stored.Progress.TurnCount)
 	assert.Len(t, stored.Output, 1)
+}
+
+func TestSessionToStoredRedactsLiteralLLMAPIKeyFromJSON(t *testing.T) {
+	const secret = "sk-live-must-never-reach-session-store"
+	sess := &Session{
+		ID:           "endpoint-redaction",
+		Type:         SessionTypeBuilder,
+		Status:       StatusRunning,
+		WorktreePath: "/path/to/worktree",
+		WorktreeName: "worktree",
+		LLMEndpoint: llmendpoint.Endpoint{
+			BaseURL:   "https://gateway.example/v1",
+			APIKey:    secret,
+			APIKeyEnv: "GATEWAY_API_KEY",
+		},
+	}
+
+	payload, err := json.Marshal(SessionToStored(sess, "repo", nil))
+	require.NoError(t, err)
+	serialized := string(payload)
+	assert.NotContains(t, serialized, secret)
+	assert.Contains(t, serialized, "GATEWAY_API_KEY")
+	assert.Contains(t, serialized, "https://gateway.example/v1")
 }
 
 func TestStoredToSessionInfo(t *testing.T) {

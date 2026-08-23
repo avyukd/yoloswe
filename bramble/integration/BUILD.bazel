@@ -17,6 +17,7 @@ go_test(
     timeout = "long",
     srcs = [
         "harness_test.go",
+        "openrouter_test.go",
         "subagent_test.go",
         "support_test.go",
     ],
@@ -29,6 +30,7 @@ go_test(
     # logged-out one that hangs on a login prompt.
     env_inherit = [
         "HOME",
+        "OPEN_ROUTER_KEY",
         "PATH",
         "USER",
     ],
@@ -41,6 +43,7 @@ go_test(
         "manual",
     ],
     deps = [
+        "//agent-cli-wrapper/llmendpoint",
         "//bramble/control",
         "//bramble/ipc",
         "//bramble/session",
