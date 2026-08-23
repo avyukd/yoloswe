@@ -390,7 +390,7 @@ func TestClientOption_WithLLMEndpoint_OpenRouter(t *testing.T) {
 	want := []string{
 		`model_providers.openrouter.name="openrouter"`,
 		`model_providers.openrouter.base_url="https://openrouter.ai/api/v1"`,
-		`model_providers.openrouter.wire_api="chat"`,
+		`model_providers.openrouter.wire_api="responses"`,
 		`model_providers.openrouter.env_key="CODEX_OPENROUTER_TEST_KEY"`,
 		`model_provider="openrouter"`,
 	}

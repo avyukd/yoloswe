@@ -16,11 +16,12 @@
 //   - cursor: best-effort OPENAI_BASE_URL/OPENAI_API_KEY (cursor-agent ignores
 //     these for non-Cursor models; the option exists for symmetry)
 //
-// OpenRouter serves both Anthropic Messages and OpenAI Chat Completions under
-// https://openrouter.ai/api/v1. OpenRouter returns WireAPIChat from its preset
-// because that is the wire codex uses. The claude wrapper strips the terminal
-// /v1 before setting ANTHROPIC_BASE_URL because claude-cli appends /v1/messages;
-// codex keeps the preset URL unchanged and appends /chat/completions itself.
+// OpenRouter serves both Anthropic Messages and OpenAI Responses under
+// https://openrouter.ai/api/v1. OpenRouter returns WireAPIResponses from its
+// preset because that is the wire supported by current codex releases. The
+// claude wrapper strips the terminal /v1 before setting ANTHROPIC_BASE_URL
+// because claude-cli appends /v1/messages; codex keeps the preset URL unchanged
+// and appends /responses itself.
 package llmendpoint
 
 import (
@@ -61,14 +62,14 @@ const (
 )
 
 // OpenRouter returns an endpoint configured for OpenRouter's OpenAI-compatible
-// Chat Completions API. Callers whose key uses another environment variable may
+// Responses API. Callers whose key uses another environment variable may
 // override APIKeyEnv on the returned Endpoint.
 func OpenRouter() Endpoint {
 	return Endpoint{
 		BaseURL:      OpenRouterBaseURL,
 		APIKeyEnv:    OpenRouterAPIKeyEnv,
 		ProviderName: OpenRouterProviderName,
-		Wire:         WireAPIChat,
+		Wire:         WireAPIResponses,
 	}
 }
 

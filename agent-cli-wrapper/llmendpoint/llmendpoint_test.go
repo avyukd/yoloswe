@@ -20,9 +20,9 @@ func TestOpenRouter(t *testing.T) {
 				BaseURL:      "https://openrouter.ai/api/v1",
 				APIKeyEnv:    "OPENROUTER_API_KEY",
 				ProviderName: "openrouter",
-				Wire:         WireAPIChat,
+				Wire:         WireAPIResponses,
 			},
-			wantText: "llmendpoint{base=https://openrouter.ai/api/v1 provider=openrouter wire=chat key=$OPENROUTER_API_KEY}",
+			wantText: "llmendpoint{base=https://openrouter.ai/api/v1 provider=openrouter wire=responses key=$OPENROUTER_API_KEY}",
 		},
 		{
 			name:      "overridden key environment",
@@ -31,9 +31,9 @@ func TestOpenRouter(t *testing.T) {
 				BaseURL:      "https://openrouter.ai/api/v1",
 				APIKeyEnv:    "HOST_OPENROUTER_KEY",
 				ProviderName: "openrouter",
-				Wire:         WireAPIChat,
+				Wire:         WireAPIResponses,
 			},
-			wantText: "llmendpoint{base=https://openrouter.ai/api/v1 provider=openrouter wire=chat key=$HOST_OPENROUTER_KEY}",
+			wantText: "llmendpoint{base=https://openrouter.ai/api/v1 provider=openrouter wire=responses key=$HOST_OPENROUTER_KEY}",
 		},
 	}
 
