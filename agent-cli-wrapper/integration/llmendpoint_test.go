@@ -39,8 +39,10 @@ package integration
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -131,6 +133,10 @@ type llmEndpointSmokeConfig struct {
 	sentinel   string
 	timeout    time.Duration
 	clientName string
+	// claudeMaxAttempts applies only when a successful Claude turn contains
+	// no text. Zero means one attempt; transport and terminal errors are not
+	// retried.
+	claudeMaxAttempts int
 }
 
 func runClaudeLLMEndpoint(t *testing.T, ep llmendpoint.Endpoint, smoke llmEndpointSmokeConfig) {
@@ -138,6 +144,45 @@ func runClaudeLLMEndpoint(t *testing.T, ep llmendpoint.Endpoint, smoke llmEndpoi
 
 	ctx, cancel := context.WithTimeout(context.Background(), smoke.timeout)
 	defer cancel()
+
+	maxAttempts := smoke.claudeMaxAttempts
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
+	var response string
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		var err error
+		response, err = runClaudeLLMEndpointAttempt(ctx, t, ep, smoke)
+		if err == nil {
+			break
+		}
+
+		var noText *claudeNoTextError
+		if !errors.As(err, &noText) {
+			failLLMEndpointTurn(t, "claude", smoke.label, "turn", err)
+			return
+		}
+		if attempt == maxAttempts {
+			t.Fatalf("claude→%s CLI/wrapper completed with no text after %d attempts "+
+				"(thinking_observed=%t, output_tokens=%d); sentinel %q was not verified",
+				smoke.label, attempt, noText.thinkingObserved, noText.outputTokens, smoke.sentinel)
+		}
+		t.Logf("claude→%s CLI/wrapper completed with no text on attempt %d/%d "+
+			"(thinking_observed=%t, output_tokens=%d); retrying",
+			smoke.label, attempt, maxAttempts, noText.thinkingObserved, noText.outputTokens)
+	}
+	t.Logf("claude→%s response: %s", smoke.label, truncate(response, 200))
+	assertLLMEndpointSentinel(t, "claude", smoke, response)
+}
+
+func runClaudeLLMEndpointAttempt(
+	ctx context.Context,
+	t *testing.T,
+	ep llmendpoint.Endpoint,
+	smoke llmEndpointSmokeConfig,
+) (string, error) {
+	t.Helper()
 
 	session := claude.NewSession(
 		claude.WithModel(smoke.model),
@@ -147,28 +192,29 @@ func runClaudeLLMEndpoint(t *testing.T, ep llmendpoint.Endpoint, smoke llmEndpoi
 		claude.WithLLMEndpoint(ep),
 	)
 	if err := session.Start(ctx); err != nil {
-		t.Fatalf("claude session start: %v", err)
+		return "", fmt.Errorf("session start: %w", err)
 	}
 	defer session.Stop()
 
 	if _, err := session.SendMessage(ctx, smoke.prompt); err != nil {
-		t.Fatalf("claude SendMessage: %v", err)
+		return "", fmt.Errorf("SendMessage: %w", err)
 	}
+	return drainClaudeForLLMEndpoint(ctx, session)
+}
 
-	response, err := drainClaudeForLLMEndpoint(ctx, session)
-	if err != nil {
-		t.Fatalf("claude turn drain: %v", err)
-	}
-	t.Logf("claude→%s response: %s", smoke.label, truncate(response, 200))
+type claudeNoTextError struct {
+	outputTokens     int
+	thinkingObserved bool
+}
 
-	if !containsSecret(response, smoke.sentinel) {
-		t.Fatalf("claude→%s did not echo sentinel %q; got %s",
-			smoke.label, smoke.sentinel, truncate(response, 500))
-	}
+func (e *claudeNoTextError) Error() string {
+	return fmt.Sprintf("claude CLI/wrapper turn completed without text (thinking_observed=%t, output_tokens=%d)",
+		e.thinkingObserved, e.outputTokens)
 }
 
 func drainClaudeForLLMEndpoint(ctx context.Context, session *claude.Session) (string, error) {
 	var response string
+	var thinkingObserved bool
 	for {
 		select {
 		case <-ctx.Done():
@@ -182,9 +228,38 @@ func drainClaudeForLLMEndpoint(ctx context.Context, session *claude.Session) (st
 				if e.FullText != "" {
 					response = e.FullText
 				}
+			case claude.ThinkingEvent:
+				thinkingObserved = thinkingObserved || e.Thinking != "" || e.FullThinking != ""
 			case claude.TurnCompleteEvent:
 				if !e.Success {
+					if e.Error != nil {
+						return response, fmt.Errorf("claude turn failed: %w", e.Error)
+					}
 					return response, errors.New("claude turn failed: success=false")
+				}
+				outputTokens := e.Usage.OutputTokens
+				completed, err := session.WaitForTurn(ctx)
+				if err != nil {
+					return response, fmt.Errorf("read completed Claude turn: %w", err)
+				}
+				if completed != nil {
+					if strings.TrimSpace(completed.Text) != "" {
+						response = completed.Text
+					}
+					thinkingObserved = thinkingObserved || strings.TrimSpace(completed.Thinking) != ""
+					outputTokens = completed.Usage.OutputTokens
+				}
+				// Claude's handleResult does not require a text block before it
+				// finalizes a successful turn. TurnCompleteEvent follows that CLI
+				// result and all parsed assistant content, and WaitForTurn above
+				// reads the cached canonical result. No later text can arrive for
+				// this turn, so a successful no-text result must be retried in a
+				// fresh session instead of waiting until ctx expires.
+				if strings.TrimSpace(response) == "" {
+					return response, &claudeNoTextError{
+						outputTokens:     outputTokens,
+						thinkingObserved: thinkingObserved,
+					}
 				}
 				return response, nil
 			}
@@ -240,18 +315,49 @@ func runCodexLLMEndpoint(t *testing.T, ep llmendpoint.Endpoint, smoke llmEndpoin
 
 	result, err := thread.Ask(ctx, smoke.prompt)
 	if err != nil {
-		t.Fatalf("codex Ask: %v", err)
+		failLLMEndpointTurn(t, "codex", smoke.label, "Ask", err)
+		return
 	}
 	if !result.Success {
-		t.Fatalf("codex turn failed: %v\nfull text: %s",
-			result.Error, truncate(result.FullText, 500))
+		if isOpenRouterHighDemand(smoke.label, fmt.Sprint(result.Error)) {
+			t.Fatalf("codex→%s OpenRouter throttled the request: %v",
+				smoke.label, result.Error)
+		}
+		t.Fatalf("codex→%s turn failed: %v\nfull text: %s",
+			smoke.label, result.Error, truncate(result.FullText, 500))
 	}
 	t.Logf("codex→%s response: %s", smoke.label, truncate(result.FullText, 200))
+	assertLLMEndpointSentinel(t, "codex", smoke, result.FullText)
+}
 
-	if !containsSecret(result.FullText, smoke.sentinel) {
-		t.Fatalf("codex→%s did not echo sentinel %q; got %s",
-			smoke.label, smoke.sentinel, truncate(result.FullText, 500))
+func failLLMEndpointTurn(t *testing.T, cli, label, operation string, err error) {
+	t.Helper()
+	if isOpenRouterHighDemand(label, err.Error()) {
+		t.Fatalf("%s→%s OpenRouter throttled the request during %s: %v",
+			cli, label, operation, err)
 	}
+	t.Fatalf("%s→%s %s: %v", cli, label, operation, err)
+}
+
+func assertLLMEndpointSentinel(t *testing.T, cli string, smoke llmEndpointSmokeConfig, response string) {
+	t.Helper()
+	if isOpenRouterHighDemand(smoke.label, response) {
+		t.Fatalf("%s→%s OpenRouter returned a throttle response: %s",
+			cli, smoke.label, truncate(response, 500))
+	}
+	if strings.TrimSpace(response) == "" {
+		t.Fatalf("%s→%s CLI/wrapper completed with no text; sentinel %q was not verified",
+			cli, smoke.label, smoke.sentinel)
+	}
+	if !containsSecret(response, smoke.sentinel) {
+		t.Fatalf("%s→%s returned the wrong answer; expected sentinel %q, got %s",
+			cli, smoke.label, smoke.sentinel, truncate(response, 500))
+	}
+}
+
+func isOpenRouterHighDemand(label, message string) bool {
+	return label == "openrouter" &&
+		strings.Contains(strings.ToLower(message), "currently experiencing high demand")
 }
 
 // Compile-time guards that the wrappers we're testing still expose the
