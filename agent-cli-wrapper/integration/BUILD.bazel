@@ -21,6 +21,7 @@ go_test(
     size = "large",
     srcs = [
         "llmendpoint_test.go",
+        "openrouter_test.go",
         "resume_test.go",
     ],
     # The agent CLIs need real user state to authenticate and run:
@@ -34,6 +35,9 @@ go_test(
         # cleanly when unset so the rest of the suite still runs.
         "BASETEN_API_KEY",
         "HOME",
+        # OPEN_ROUTER_KEY: gates TestLLMEndpoint_OpenRouter and deliberately
+        # exercises overriding the preset's conventional API key env var.
+        "OPEN_ROUTER_KEY",
         "PATH",
         "USER",
         "XDG_CACHE_HOME",
