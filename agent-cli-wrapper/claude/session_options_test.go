@@ -6,6 +6,12 @@ import (
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 )
 
+// Both auth schemes, because proxies differ on which they accept and
+// `claude -p` never prompts for either. Interactive launchers must narrow this:
+// bramble's tmux runner drops ANTHROPIC_API_KEY so the CLI does not park on its
+// custom-API-key approval modal (endpointEnv in bramble/session/tmux_runner.go).
+// If this test ever stops requiring both, that narrowing becomes a no-op and
+// x-api-key-only gateways lose the in-process path too.
 func TestWithLLMEndpoint_setsEnv(t *testing.T) {
 	t.Parallel()
 	cfg := defaultConfig()

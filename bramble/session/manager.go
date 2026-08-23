@@ -991,17 +991,20 @@ func (m *Manager) startSessionWithID(sessionID SessionID, sessionType SessionTyp
 		cancel()
 		return "", err
 	}
-	// Validate shape AND credential. Only the env var *name* is guaranteed to
-	// cross the IPC boundary from `bramble new-session`, and this process is
-	// the one that reads it: a TUI started before the key was exported
-	// resolves nothing. Without this check the wrappers silently omit the auth
-	// headers while still setting the base URL, so the session launches
-	// pointed at the endpoint with no credential and fails remotely with a
-	// 401 that names nothing. Restarts hit the same hole, since a persisted
-	// endpoint is stored via Redacted() and re-resolves through APIKeyEnv.
-	if !endpoint.IsZero() && endpoint.ResolvedKey() == "" {
+	// Fail here as well as in runSession so `bramble new-session` gets the
+	// error on stderr instead of a session ID followed by a background
+	// failure. runSession carries the same check for the resume path.
+	if err := validateEndpointCredential(endpoint); err != nil {
 		cancel()
-		return "", fmt.Errorf("llm endpoint api key is unset: %s holds no value in the bramble server's environment (export it before starting bramble)", endpointKeySource(endpoint))
+		return "", err
+	}
+	// An explicit backend means the model ID is that backend's own, so there is
+	// no default to fall back to and the session cannot start. Reported here
+	// rather than left to resolveAgentModel inside runSession, so the operator
+	// sees it at the command line.
+	if model == "" && backend != "" {
+		cancel()
+		return "", fmt.Errorf("model must not be empty when backend %q is selected", backend)
 	}
 
 	session := &Session{
@@ -1540,6 +1543,27 @@ func validateBackend(backend string) error {
 	return nil
 }
 
+// validateEndpointCredential rejects an endpoint whose key resolves to nothing.
+//
+// Only the env var *name* is guaranteed to cross the IPC boundary from
+// `bramble new-session`; this process is the one that reads it, so a TUI
+// started before the key was exported resolves nothing. Resume is the same
+// hole reached by a different route: SessionToStored persists the endpoint via
+// Redacted(), so a rehydrated session has APIKey=="" and re-resolves through
+// APIKeyEnv. Either way the wrappers would omit the auth headers while still
+// setting the base URL, and the window would talk to the endpoint with the
+// user's own credentials and fail on an opaque remote 401.
+//
+// Called from startSessionWithID (so the CLI gets a synchronous error) and
+// from runSession (so ResumeSession, the other caller, is covered too). One
+// function rather than two copies: this is one rule about one invariant.
+func validateEndpointCredential(endpoint llmendpoint.Endpoint) error {
+	if endpoint.IsZero() || endpoint.ResolvedKey() != "" {
+		return nil
+	}
+	return fmt.Errorf("llm endpoint api key is unset: %s holds no value in the bramble server's environment (export it before starting bramble)", endpointKeySource(endpoint))
+}
+
 // endpointKeySource names where the endpoint's credential was meant to come
 // from, so an unresolved key reports the env var the operator actually typed
 // rather than a generic "no key". An inline APIKey can never be the unresolved
@@ -1627,6 +1651,15 @@ func (m *Manager) runSession(session *Session, prompt string) {
 		return
 	}
 	if err := validateEndpointBackend(session.LLMEndpoint, agentModel.Provider); err != nil {
+		m.failSession(session, err)
+		m.addOutput(session.ID, OutputLine{Timestamp: time.Now(), Type: OutputTypeError, Content: err.Error()})
+		m.persistSession(session)
+		return
+	}
+	// Both callers of runSession pass through here; ResumeSession does not go
+	// through startSessionWithID, so this is the only place a resumed endpoint
+	// session's credential is checked.
+	if err := validateEndpointCredential(session.LLMEndpoint); err != nil {
 		m.failSession(session, err)
 		m.addOutput(session.ID, OutputLine{Timestamp: time.Now(), Type: OutputTypeError, Content: err.Error()})
 		m.persistSession(session)

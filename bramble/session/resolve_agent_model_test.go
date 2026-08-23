@@ -301,14 +301,53 @@ func TestManager_ExplicitBackendWithoutModelNamesTheMissingFlag(t *testing.T) {
 	})
 	t.Cleanup(mgr.Close)
 
-	// resolveAgentModel runs inside runSession, so the guard surfaces as a
-	// failed session rather than a StartSession error — the same route every
-	// other model-resolution failure takes.
-	sid, err := mgr.StartSessionWithOpts(
+	// Synchronously, so `bramble new-session` prints it on stderr rather than a
+	// session ID followed by a background failure the operator has to go
+	// looking for in the TUI.
+	_, err := mgr.StartSessionWithOpts(
 		SessionTypeBuilder, t.TempDir(), "test prompt", "",
 		SpawnOpts{Backend: ProviderCodex, LLMEndpoint: endpoint},
 	)
-	require.NoError(t, err)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "model must not be empty")
+	assert.NotContains(t, err.Error(), "sonnet", "the default must not have been substituted")
+}
+
+// ResumeSession does not go through startSessionWithID, so the credential
+// guard installed there left the resume path uncovered — and a persisted
+// endpoint is exactly the case that needs it: SessionToStored writes it via
+// Redacted(), so the rehydrated endpoint has no APIKey and re-resolves through
+// APIKeyEnv. A TUI whose environment lacks that variable would resume the
+// window against the endpoint with the user's own credentials.
+func TestManager_ResumeChecksEndpointCredential(t *testing.T) {
+	t.Parallel()
+
+	endpoint := llmendpoint.OpenRouter()
+	endpoint.APIKeyEnv = "BRAMBLE_TEST_ABSENT_OPENROUTER_KEY"
+	mgr := NewManagerWithConfig(ManagerConfig{
+		Provider:    &silentEphemeralProvider{},
+		SessionMode: SessionModeTUI,
+	})
+	t.Cleanup(mgr.Close)
+
+	// Register the session directly: startSessionWithID would reject the
+	// unresolvable key up front, which is the very check this path skips.
+	sid := SessionID("builder-resumed")
+	mgr.mu.Lock()
+	mgr.sessions[sid] = &Session{
+		ID:           sid,
+		Type:         SessionTypeBuilder,
+		Status:       StatusCompleted,
+		WorktreePath: t.TempDir(),
+		Model:        "stealth/ox-alpha",
+		Backend:      ProviderCodex,
+		LLMEndpoint:  endpoint,
+		CLISessionID: "cli-abc123",
+		Progress:     &SessionProgress{LastActivity: time.Now()},
+	}
+	mgr.mu.Unlock()
+
+	require.NoError(t, mgr.ResumeSession(sid, "continue"))
 	require.Eventually(t, func() bool {
 		info, ok := mgr.GetSessionInfo(sid)
 		return ok && info.Status == StatusFailed
@@ -316,6 +355,6 @@ func TestManager_ExplicitBackendWithoutModelNamesTheMissingFlag(t *testing.T) {
 
 	info, ok := mgr.GetSessionInfo(sid)
 	require.True(t, ok)
-	assert.Contains(t, info.ErrorMsg, "model must not be empty")
-	assert.Empty(t, info.Model, "the default must not have been substituted")
+	assert.Contains(t, info.ErrorMsg, "BRAMBLE_TEST_ABSENT_OPENROUTER_KEY",
+		"a resumed session must name the unresolved variable, not fail on a remote 401")
 }

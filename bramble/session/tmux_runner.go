@@ -123,6 +123,13 @@ func (r *tmuxRunner) endpointEnv() map[string]string {
 		// a good one), so drop the x-api-key half here. The cost is a
 		// hypothetical Bearer-rejecting proxy, which would need its own
 		// non-interactive path anyway.
+		//
+		// This is a deliberate divergence from the in-process path, which keeps
+		// both variables because `claude -p` never prompts. It is pinned from
+		// both sides — see TestTmuxRunnerNewWindowArgs_OpenRouterClaudeFullArgv
+		// here and TestWithLLMEndpoint_setsEnv in the wrapper — so
+		// an x-api-key-only gateway fails on a documented decision rather than
+		// an accident. Such a gateway must use the in-process path.
 		delete(cfg.Env, "ANTHROPIC_API_KEY")
 		return cfg.Env
 	default:
@@ -395,20 +402,26 @@ func (r *tmuxRunner) buildCommand() (binary string, args []string) {
 // Translating the whole stream rather than filtering for --config is the point:
 // the previous filter silently dropped every flag it did not recognize, so a
 // future addition to WithLLMEndpoint would go missing here again with no
-// symptom until a request 400s. Unknown two-token flags pass through verbatim.
+// symptom until a request 400s.
+//
+// The walk is element-wise on purpose. Reading the stream as flag/value pairs
+// would trade the silent drop for a silent desync — one single-token flag and
+// every later pair reverses into `value flag`. Rewriting each token
+// independently has no arity to get wrong: --config is the only spelling that
+// differs, and no value WithLLMEndpoint emits (a model_providers.* assignment
+// or a feature name) can collide with that literal.
 func (r *tmuxRunner) codexEndpointArgs() []string {
 	if r.llmEndpoint.IsZero() {
 		return nil
 	}
 	cfg := codex.ClientConfig{}
 	codex.WithLLMEndpoint(r.llmEndpoint)(&cfg)
-	var args []string
-	for i := 0; i+1 < len(cfg.AppServerArgs); i += 2 {
-		flag, value := cfg.AppServerArgs[i], cfg.AppServerArgs[i+1]
-		if flag == "--config" {
-			flag = "-c"
+	args := make([]string, 0, len(cfg.AppServerArgs))
+	for _, a := range cfg.AppServerArgs {
+		if a == "--config" {
+			a = "-c"
 		}
-		args = append(args, flag, value)
+		args = append(args, a)
 	}
 	return args
 }

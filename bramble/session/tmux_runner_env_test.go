@@ -271,26 +271,21 @@ func TestCodexEndpointArgs_ForwardsFeatureDenylist(t *testing.T) {
 	codex.WithLLMEndpoint(llmendpoint.OpenRouter())(&cfg)
 	got := r.codexEndpointArgs()
 
-	// The translation walks AppServerArgs two tokens at a time, so a
-	// single-token flag would silently shift every later pair. Nothing in
-	// WithLLMEndpoint emits one today; assert that rather than assume it.
-	if len(cfg.AppServerArgs)%2 != 0 {
-		t.Fatalf("WithLLMEndpoint emitted an odd number of app-server args (%d); codexEndpointArgs pairs them\ngot: %#v",
-			len(cfg.AppServerArgs), cfg.AppServerArgs)
-	}
 	if len(got) != len(cfg.AppServerArgs) {
 		t.Fatalf("codexEndpointArgs dropped %d of %d app-server args\ngot: %#v\nfrom: %#v",
 			len(cfg.AppServerArgs)-len(got), len(cfg.AppServerArgs), got, cfg.AppServerArgs)
 	}
 
-	// Every --disable pair survives verbatim; --config is respelled -c.
-	for i := 0; i < len(cfg.AppServerArgs); i += 2 {
-		wantFlag := cfg.AppServerArgs[i]
-		if wantFlag == "--config" {
-			wantFlag = "-c"
+	// Element-wise and order-preserving: --config is the only token respelled,
+	// everything else — the --disable flags and every value — survives
+	// verbatim. Asserting per token rather than per pair is the point: the
+	// translation must not depend on the stream being all two-token flags.
+	for i, want := range cfg.AppServerArgs {
+		if want == "--config" {
+			want = "-c"
 		}
-		if got[i] != wantFlag || got[i+1] != cfg.AppServerArgs[i+1] {
-			t.Errorf("arg %d: got %q %q, want %q %q", i/2, got[i], got[i+1], wantFlag, cfg.AppServerArgs[i+1])
+		if got[i] != want {
+			t.Errorf("arg %d: got %q, want %q", i, got[i], want)
 		}
 	}
 

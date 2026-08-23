@@ -931,8 +931,17 @@ var newSessionCmd = &cobra.Command{
 	Short: "Request the running bramble TUI to create a new session",
 	Long: `Request the running bramble TUI to create a new session.
 
-Use --backend to select the CLI independently from --model. Third-party
-endpoints can be supplied with --llm-* flags, or with --llm-preset=openrouter.
+Use --backend to select the CLI independently from --model. Naming a backend
+makes --model required: the model ID is then that backend's own (an OpenRouter
+slug, say), and bramble's defaults are Claude aliases that would not resolve.
+Third-party endpoints can be supplied with --llm-* flags, or with
+--llm-preset=openrouter. --llm-api-key-env is read in this process, so the key
+need not be exported in the shell that started the bramble TUI.
+
+Interactive (tmux) Claude sessions authenticate to a third-party endpoint with
+Bearer only: exporting an x-api-key would park the CLI on its custom-API-key
+approval modal, which nothing answers. A gateway that requires x-api-key must
+use the in-process path.
 
 Claude Code does not know stealth/ox-alpha's one-million-token context window.
 For long Claude sessions, pass --model 'stealth/ox-alpha[1m]' to prevent early
@@ -1511,7 +1520,7 @@ func init() {
 	newSessionCmd.Flags().StringP("worktree", "w", "", "Existing worktree path")
 	newSessionCmd.Flags().StringP("prompt", "p", "", "Prompt for the session")
 	newSessionCmd.Flags().StringP("model", "m", "", "Model ID (e.g. opus, sonnet)")
-	newSessionCmd.Flags().String("backend", "", "CLI backend, independent of model: claude or codex (empty infers from model)")
+	newSessionCmd.Flags().String("backend", "", "CLI backend, independent of model: claude or codex (empty infers from model; naming one requires --model)")
 	registerLLMEndpointFlags(newSessionCmd.Flags())
 	newSessionCmd.Flags().StringP("goal", "g", "", "Goal for new worktree")
 	newSessionCmd.Flags().Bool("create-worktree", false, "Create a new worktree for the branch")
