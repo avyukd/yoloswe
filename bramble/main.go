@@ -21,6 +21,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"golang.org/x/term"
 
 	"github.com/bazelment/yoloswe/logging/klogfmt"
@@ -867,6 +868,7 @@ func handleListSessions(registry *session.SessionRegistry) *ipc.ListSessionsResu
 			WorktreeName:    s.WorktreeName,
 			Prompt:          s.Prompt,
 			Model:           s.Model,
+			Backend:         s.Backend,
 			ParentSessionID: string(s.ParentSessionID),
 		}
 	}
@@ -1042,6 +1044,14 @@ func newSessionEndpoint(cmd *cobra.Command) (llmendpoint.Endpoint, error) {
 		return llmendpoint.Endpoint{}, err
 	}
 	return endpoint, nil
+}
+
+func registerLLMEndpointFlags(flags *pflag.FlagSet) {
+	flags.String("llm-preset", "", "Third-party LLM endpoint preset: openrouter")
+	flags.String("llm-base-url", "", "Custom LLM endpoint base URL")
+	flags.String("llm-api-key-env", "", "Env var name holding the LLM API key")
+	flags.String("llm-provider-name", "", "Provider name label (codex model_providers.<name>)")
+	flags.String("llm-wire-api", "responses", "Wire API (current Codex requires responses)")
 }
 
 // resolveOwnSessionID picks the session a self-referential command (notify)
@@ -1485,11 +1495,7 @@ func init() {
 	newSessionCmd.Flags().StringP("prompt", "p", "", "Prompt for the session")
 	newSessionCmd.Flags().StringP("model", "m", "", "Model ID (e.g. opus, sonnet)")
 	newSessionCmd.Flags().String("backend", "", "CLI backend, independent of model: claude or codex (empty infers from model)")
-	newSessionCmd.Flags().String("llm-preset", "", "Third-party LLM endpoint preset: openrouter")
-	newSessionCmd.Flags().String("llm-base-url", "", "Custom LLM endpoint base URL")
-	newSessionCmd.Flags().String("llm-api-key-env", "", "Env var name holding the LLM API key")
-	newSessionCmd.Flags().String("llm-provider-name", "", "Provider name label (codex model_providers.<name>)")
-	newSessionCmd.Flags().String("llm-wire-api", "responses", "Wire API (current Codex requires responses)")
+	registerLLMEndpointFlags(newSessionCmd.Flags())
 	newSessionCmd.Flags().StringP("goal", "g", "", "Goal for new worktree")
 	newSessionCmd.Flags().Bool("create-worktree", false, "Create a new worktree for the branch")
 	newSessionCmd.Flags().StringP("repo", "r", "", "Target repo name (auto-detected from cwd if omitted)")

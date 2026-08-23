@@ -16,11 +16,7 @@ import (
 func newEndpointFlagsTestCommand(t *testing.T, args ...string) *cobra.Command {
 	t.Helper()
 	cmd := &cobra.Command{}
-	cmd.Flags().String("llm-preset", "", "")
-	cmd.Flags().String("llm-base-url", "", "")
-	cmd.Flags().String("llm-api-key-env", "", "")
-	cmd.Flags().String("llm-provider-name", "", "")
-	cmd.Flags().String("llm-wire-api", "responses", "")
+	registerLLMEndpointFlags(cmd.Flags())
 	require.NoError(t, cmd.Flags().Parse(args))
 	return cmd
 }

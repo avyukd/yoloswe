@@ -29,6 +29,7 @@ go_library(
         "//wt",
         "//yoloswe",
         "@com_github_spf13_cobra//:cobra",
+        "@com_github_spf13_pflag//:pflag",
         "@land_charm_bubbletea_v2//:bubbletea",
         "@org_golang_x_term//:term",
     ],

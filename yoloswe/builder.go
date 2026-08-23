@@ -7,11 +7,13 @@ import (
 
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude"
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude/render"
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 )
 
 // BuilderConfig holds configuration for the builder session.
 type BuilderConfig struct {
 	Model           string
+	LLMEndpoint     llmendpoint.Endpoint
 	WorkDir         string
 	RecordingDir    string
 	SystemPrompt    string
@@ -62,6 +64,10 @@ func NewBuilderSessionWithEvents(config BuilderConfig, output io.Writer, eventHa
 
 // Start initializes and starts the claude session.
 func (b *BuilderSession) Start(ctx context.Context) error {
+	if err := b.config.LLMEndpoint.Validate(); err != nil {
+		return err
+	}
+
 	opts := []claude.SessionOption{
 		claude.WithModel(b.config.Model),
 		claude.WithPermissionPromptToolStdio(),
@@ -89,6 +95,10 @@ func (b *BuilderSession) Start(ctx context.Context) error {
 
 	if b.config.ResumeSessionID != "" {
 		opts = append(opts, claude.WithResume(b.config.ResumeSessionID))
+	}
+
+	if !b.config.LLMEndpoint.IsZero() {
+		opts = append(opts, claude.WithLLMEndpoint(b.config.LLMEndpoint))
 	}
 
 	// Use interactive tool handler for AskUserQuestion (auto-answers)

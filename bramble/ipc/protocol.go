@@ -97,6 +97,7 @@ type SessionSummary struct {
 	WorktreeName string `json:"worktree_name"`
 	Prompt       string `json:"prompt"`
 	Model        string `json:"model"`
+	Backend      string `json:"backend,omitempty"`
 	// ParentSessionID is the session that spawned this one, so a caller can
 	// pick its own subagents out of the list. Empty for a top-level session.
 	ParentSessionID string `json:"parent_session_id,omitempty"`

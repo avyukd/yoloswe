@@ -979,9 +979,9 @@ func (m *Manager) startSessionWithID(sessionID SessionID, sessionType SessionTyp
 	if backend == "" {
 		backend = m.config.Backend
 	}
-	if backend != "" && !slices.Contains(agent.AllProviders, backend) {
+	if err := validateBackend(backend); err != nil {
 		cancel()
-		return "", fmt.Errorf("unknown backend %q (expected one of %s)", backend, strings.Join(agent.AllProviders, ", "))
+		return "", err
 	}
 	endpoint := opts.LLMEndpoint
 	if endpoint.IsZero() {
@@ -1479,8 +1479,8 @@ func (m *Manager) monitorTrackedTmuxWindow(session *Session) {
 
 func resolveAgentModel(modelID, backend string, registry *agent.ModelRegistry) (agent.AgentModel, error) {
 	if backend != "" {
-		if !slices.Contains(agent.AllProviders, backend) {
-			return agent.AgentModel{}, fmt.Errorf("unknown backend %q (expected one of %s)", backend, strings.Join(agent.AllProviders, ", "))
+		if err := validateBackend(backend); err != nil {
+			return agent.AgentModel{}, err
 		}
 		if modelID == "" {
 			return agent.AgentModel{}, fmt.Errorf("model must not be empty when backend %q is selected", backend)
@@ -1523,6 +1523,13 @@ func (m *Manager) newPaneIdleTrackerForModel(model, backend string) *paneIdleTra
 		return nil
 	}
 	return newPaneIdleTracker(agentModel.Provider)
+}
+
+func validateBackend(backend string) error {
+	if backend != "" && !slices.Contains(agent.AllProviders, backend) {
+		return fmt.Errorf("unknown backend %q (expected one of %s)", backend, strings.Join(agent.AllProviders, ", "))
+	}
+	return nil
 }
 
 func validateEndpointBackend(endpoint llmendpoint.Endpoint, backend string) error {
@@ -1775,6 +1782,7 @@ func (m *Manager) runSession(session *Session, prompt string) {
 			case SessionTypePlanner:
 				pw := planner.NewPlannerWrapper(planner.Config{
 					Model:           session.Model,
+					LLMEndpoint:     session.LLMEndpoint.Clone(),
 					WorkDir:         session.WorktreePath,
 					Simple:          true,
 					BuildMode:       planner.BuildModeReturn,
@@ -1788,6 +1796,7 @@ func (m *Manager) runSession(session *Session, prompt string) {
 				builderHandler := newSessionEventHandlerNoTurnEnd(m, session.ID)
 				builder := yoloswe.NewBuilderSessionWithEvents(yoloswe.BuilderConfig{
 					Model:           session.Model,
+					LLMEndpoint:     session.LLMEndpoint.Clone(),
 					WorkDir:         session.WorktreePath,
 					ResumeSessionID: session.CLISessionID,
 					RecordingDir:    m.config.RecordingDir,
@@ -1810,6 +1819,7 @@ func (m *Manager) runSession(session *Session, prompt string) {
 				codetalkHandler := newSessionEventHandlerNoTurnEnd(m, session.ID)
 				ct := yoloswe.NewCodeTalkSessionWithEvents(yoloswe.CodeTalkConfig{
 					Model:           session.Model,
+					LLMEndpoint:     session.LLMEndpoint.Clone(),
 					WorkDir:         session.WorktreePath,
 					ResumeSessionID: session.CLISessionID,
 					RecordingDir:    m.config.RecordingDir,
