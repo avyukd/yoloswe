@@ -25,6 +25,7 @@ import (
 
 	"github.com/bazelment/yoloswe/logging/klogfmt"
 
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 	"github.com/bazelment/yoloswe/bramble/app"
 	"github.com/bazelment/yoloswe/bramble/cmd/codereview"
 	"github.com/bazelment/yoloswe/bramble/cmd/delegator"
@@ -839,7 +840,11 @@ func handleNewSession(ctx context.Context, mgr *session.Manager, wtRoot, repoNam
 	}
 
 	id, err := mgr.StartSessionWithOpts(sessionType, worktreePath, params.Prompt, params.Model,
-		session.SpawnOpts{ParentSessionID: session.SessionID(params.ParentSessionID)})
+		session.SpawnOpts{
+			ParentSessionID: session.SessionID(params.ParentSessionID),
+			Backend:         params.Backend,
+			LLMEndpoint:     params.LLMEndpoint,
+		})
 	if err != nil {
 		return nil, fmt.Errorf("failed to start session: %w", err)
 	}
@@ -922,6 +927,16 @@ was requested, not necessarily that it happened.`,
 var newSessionCmd = &cobra.Command{
 	Use:   "new-session",
 	Short: "Request the running bramble TUI to create a new session",
+	Long: `Request the running bramble TUI to create a new session.
+
+Use --backend to select the CLI independently from --model. Third-party
+endpoints can be supplied with --llm-* flags, or with --llm-preset=openrouter.
+
+Claude Code does not know stealth/ox-alpha's one-million-token context window.
+For long Claude sessions, pass --model 'stealth/ox-alpha[1m]' to prevent early
+auto-compaction. Codex does not need this suffix.`,
+	Example: `  bramble new-session --backend claude --model stealth/ox-alpha --llm-preset openrouter -w "$PWD" -p "help me"
+  bramble new-session --backend codex --model stealth/ox-alpha --llm-preset openrouter -w "$PWD" -p "help me"`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		client, err := ipc.NewClientFromEnv()
 		if err != nil {
@@ -934,12 +949,17 @@ var newSessionCmd = &cobra.Command{
 		worktreePath, _ := cmd.Flags().GetString("worktree")
 		prompt, _ := cmd.Flags().GetString("prompt")
 		model, _ := cmd.Flags().GetString("model")
+		backend, _ := cmd.Flags().GetString("backend")
 		goal, _ := cmd.Flags().GetString("goal")
 		createWT, _ := cmd.Flags().GetBool("create-worktree")
 		repo, _ := cmd.Flags().GetString("repo")
 		parentFlag, _ := cmd.Flags().GetString("parent")
 		noParent, _ := cmd.Flags().GetBool("no-parent")
 		parent, parentInherited := resolveParentSessionID(parentFlag, os.Getenv(session.SessionIDEnvVar), noParent)
+		endpoint, err := newSessionEndpoint(cmd)
+		if err != nil {
+			return err
+		}
 
 		// Auto-detect repo from cwd if not explicitly specified. Flagged as
 		// inferred: an agent's cwd is wherever its worktree is, which is not the
@@ -964,6 +984,8 @@ var newSessionCmd = &cobra.Command{
 				CreateWorktree:  createWT,
 				Prompt:          prompt,
 				Model:           model,
+				Backend:         backend,
+				LLMEndpoint:     endpoint,
 				Goal:            goal,
 				RepoName:        repo,
 				RepoInferred:    repoInferred,
@@ -982,6 +1004,44 @@ var newSessionCmd = &cobra.Command{
 		fmt.Println(string(out))
 		return nil
 	},
+}
+
+func newSessionEndpoint(cmd *cobra.Command) (llmendpoint.Endpoint, error) {
+	preset, _ := cmd.Flags().GetString("llm-preset")
+	var endpoint llmendpoint.Endpoint
+	switch preset {
+	case "":
+	case "openrouter":
+		endpoint = llmendpoint.OpenRouter()
+	default:
+		return llmendpoint.Endpoint{}, fmt.Errorf("unknown LLM preset %q (expected openrouter)", preset)
+	}
+
+	llmFlags := []string{"llm-base-url", "llm-api-key-env", "llm-provider-name", "llm-wire-api"}
+	configured := preset != ""
+	for _, name := range llmFlags {
+		configured = configured || cmd.Flags().Changed(name)
+	}
+	if !configured {
+		return llmendpoint.Endpoint{}, nil
+	}
+	if cmd.Flags().Changed("llm-base-url") {
+		endpoint.BaseURL, _ = cmd.Flags().GetString("llm-base-url")
+	}
+	if cmd.Flags().Changed("llm-api-key-env") {
+		endpoint.APIKeyEnv, _ = cmd.Flags().GetString("llm-api-key-env")
+	}
+	if cmd.Flags().Changed("llm-provider-name") {
+		endpoint.ProviderName, _ = cmd.Flags().GetString("llm-provider-name")
+	}
+	if cmd.Flags().Changed("llm-wire-api") || preset == "" {
+		wire, _ := cmd.Flags().GetString("llm-wire-api")
+		endpoint.Wire = llmendpoint.WireAPI(wire)
+	}
+	if err := endpoint.Validate(); err != nil {
+		return llmendpoint.Endpoint{}, err
+	}
+	return endpoint, nil
 }
 
 // resolveOwnSessionID picks the session a self-referential command (notify)
@@ -1424,6 +1484,12 @@ func init() {
 	newSessionCmd.Flags().StringP("worktree", "w", "", "Existing worktree path")
 	newSessionCmd.Flags().StringP("prompt", "p", "", "Prompt for the session")
 	newSessionCmd.Flags().StringP("model", "m", "", "Model ID (e.g. opus, sonnet)")
+	newSessionCmd.Flags().String("backend", "", "CLI backend, independent of model: claude or codex (empty infers from model)")
+	newSessionCmd.Flags().String("llm-preset", "", "Third-party LLM endpoint preset: openrouter")
+	newSessionCmd.Flags().String("llm-base-url", "", "Custom LLM endpoint base URL")
+	newSessionCmd.Flags().String("llm-api-key-env", "", "Env var name holding the LLM API key")
+	newSessionCmd.Flags().String("llm-provider-name", "", "Provider name label (codex model_providers.<name>)")
+	newSessionCmd.Flags().String("llm-wire-api", "responses", "Wire API (current Codex requires responses)")
 	newSessionCmd.Flags().StringP("goal", "g", "", "Goal for new worktree")
 	newSessionCmd.Flags().Bool("create-worktree", false, "Create a new worktree for the branch")
 	newSessionCmd.Flags().StringP("repo", "r", "", "Target repo name (auto-detected from cwd if omitted)")

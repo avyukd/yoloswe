@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 	"github.com/bazelment/yoloswe/multiagent/agent"
 )
 
@@ -86,4 +87,19 @@ func TestManagerNewTmuxRunnerOmitsUnstartedControlSocket(t *testing.T) {
 	for _, a := range runner.envArgs() {
 		assert.NotContains(t, a, ControlSockEnvVar, "unset control socket should be omitted, got %q", a)
 	}
+}
+
+func TestManagerNewTmuxRunnerCarriesDefaultLLMEndpoint(t *testing.T) {
+	t.Parallel()
+
+	endpoint := llmendpoint.OpenRouter()
+	m := NewManagerWithConfig(ManagerConfig{LLMEndpoint: endpoint})
+	runner := m.newTmuxRunner(
+		&Session{ID: "builder-openrouter", Model: "stealth/ox-alpha"},
+		"prompt",
+		"window",
+		agent.AgentModel{ID: "stealth/ox-alpha", Provider: ProviderCodex},
+	)
+
+	assert.Equal(t, endpoint, runner.llmEndpoint)
 }

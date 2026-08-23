@@ -4,6 +4,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 )
 
 // A session that does not receive its own ID and the control socket can read
@@ -88,6 +90,61 @@ func TestTmuxRunnerNewWindowArgs_SplicesEnvIntoInvocation(t *testing.T) {
 	}
 	if got := args[len(args)-2]; got != "/work/repo" {
 		t.Errorf("working directory not passed via -c, got %q: %v", got, args)
+	}
+}
+
+func TestTmuxRunnerNewWindowArgs_OpenRouterClaudeFullArgv(t *testing.T) {
+	t.Setenv(llmendpoint.OpenRouterAPIKeyEnv, "openrouter-test-key")
+	r := &tmuxRunner{
+		windowName:  "openrouter-claude",
+		workDir:     "/work/repo",
+		prompt:      "return sentinel",
+		model:       "stealth/ox-alpha",
+		provider:    ProviderClaude,
+		llmEndpoint: llmendpoint.OpenRouter(),
+	}
+
+	want := []string{
+		"new-window", "-P", "-F", "#{window_id}",
+		"-e", "ANTHROPIC_API_KEY=openrouter-test-key",
+		"-e", "ANTHROPIC_AUTH_TOKEN=openrouter-test-key",
+		"-e", "ANTHROPIC_BASE_URL=https://openrouter.ai/api",
+		"-e", "ANTHROPIC_DEFAULT_HAIKU_MODEL=stealth/ox-alpha",
+		"-e", "ANTHROPIC_DEFAULT_OPUS_MODEL=stealth/ox-alpha",
+		"-e", "ANTHROPIC_DEFAULT_SONNET_MODEL=stealth/ox-alpha",
+		"-e", "ANTHROPIC_MODEL=stealth/ox-alpha",
+		"-e", "ANTHROPIC_SMALL_FAST_MODEL=stealth/ox-alpha",
+		"-n", "openrouter-claude", "-c", "/work/repo",
+		"claude '--model' 'stealth/ox-alpha' 'return sentinel'",
+	}
+	if got := r.newWindowArgs(); !slices.Equal(got, want) {
+		t.Fatalf("newWindowArgs() mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestTmuxRunnerNewWindowArgs_OpenRouterCodexFullArgv(t *testing.T) {
+	t.Setenv(llmendpoint.OpenRouterAPIKeyEnv, "openrouter-test-key")
+	r := &tmuxRunner{
+		windowName:  "openrouter-codex",
+		workDir:     "/work/repo",
+		prompt:      "return sentinel",
+		model:       "stealth/ox-alpha",
+		provider:    ProviderCodex,
+		llmEndpoint: llmendpoint.OpenRouter(),
+	}
+
+	want := []string{
+		"new-window", "-P", "-F", "#{window_id}",
+		"-e", "OPENROUTER_API_KEY=openrouter-test-key",
+		"-n", "openrouter-codex", "-c", "/work/repo",
+		"codex '-c' 'model_providers.openrouter.name=\"openrouter\"' " +
+			"'-c' 'model_providers.openrouter.base_url=\"https://openrouter.ai/api/v1\"' " +
+			"'-c' 'model_providers.openrouter.wire_api=\"responses\"' " +
+			"'-c' 'model_providers.openrouter.env_key=\"OPENROUTER_API_KEY\"' " +
+			"'-c' 'model_provider=\"openrouter\"' '-m' 'stealth/ox-alpha' 'return sentinel'",
+	}
+	if got := r.newWindowArgs(); !slices.Equal(got, want) {
+		t.Fatalf("newWindowArgs() mismatch\n got: %#v\nwant: %#v", got, want)
 	}
 }
 

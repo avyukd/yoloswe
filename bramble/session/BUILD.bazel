@@ -28,6 +28,7 @@ go_library(
         "//agent-cli-wrapper/claude",
         "//agent-cli-wrapper/claude/render",
         "//agent-cli-wrapper/codex",
+        "//agent-cli-wrapper/llmendpoint",
         "//bramble/selfexec",
         "//bramble/sessionmodel",
         "//multiagent/agent",
@@ -61,6 +62,7 @@ go_test(
     embed = [":session"],
     deps = [
         "//agent-cli-wrapper/claude",
+        "//agent-cli-wrapper/llmendpoint",
         "//bramble/sessionmodel",
         "//multiagent/agent",
         "//wt",

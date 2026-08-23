@@ -11,6 +11,7 @@ go_library(
     importpath = "github.com/bazelment/yoloswe/bramble",
     visibility = ["//visibility:private"],
     deps = [
+        "//agent-cli-wrapper/llmendpoint",
         "//bramble/app",
         "//bramble/cmd/codereview",
         "//bramble/cmd/delegator",
@@ -51,9 +52,11 @@ go_test(
     ],
     embed = [":bramble_lib"],
     deps = [
+        "//agent-cli-wrapper/llmendpoint",
         "//bramble/app",
         "//bramble/ipc",
         "//bramble/session",
+        "@com_github_spf13_cobra//:cobra",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
     ],

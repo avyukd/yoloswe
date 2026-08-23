@@ -6,9 +6,50 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 )
+
+func newEndpointFlagsTestCommand(t *testing.T, args ...string) *cobra.Command {
+	t.Helper()
+	cmd := &cobra.Command{}
+	cmd.Flags().String("llm-preset", "", "")
+	cmd.Flags().String("llm-base-url", "", "")
+	cmd.Flags().String("llm-api-key-env", "", "")
+	cmd.Flags().String("llm-provider-name", "", "")
+	cmd.Flags().String("llm-wire-api", "responses", "")
+	require.NoError(t, cmd.Flags().Parse(args))
+	return cmd
+}
+
+func TestNewSessionEndpointOpenRouterPreset(t *testing.T) {
+	t.Parallel()
+
+	endpoint, err := newSessionEndpoint(newEndpointFlagsTestCommand(t, "--llm-preset", "openrouter"))
+	require.NoError(t, err)
+	assert.Equal(t, llmendpoint.OpenRouter(), endpoint)
+}
+
+func TestNewSessionEndpointCustomFlags(t *testing.T) {
+	t.Parallel()
+
+	endpoint, err := newSessionEndpoint(newEndpointFlagsTestCommand(t,
+		"--llm-base-url", "https://gateway.example/v1",
+		"--llm-api-key-env", "GATEWAY_KEY",
+		"--llm-provider-name", "gateway",
+		"--llm-wire-api", "responses",
+	))
+	require.NoError(t, err)
+	assert.Equal(t, llmendpoint.Endpoint{
+		BaseURL:      "https://gateway.example/v1",
+		APIKeyEnv:    "GATEWAY_KEY",
+		ProviderName: "gateway",
+		Wire:         llmendpoint.WireAPIResponses,
+	}, endpoint)
+}
 
 // mkBareRepo creates a fake wt-managed repo under wtRoot:
 //

@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude"
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/codex"
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 	"github.com/bazelment/yoloswe/multiagent/agent"
 )
 
@@ -31,7 +34,7 @@ const SessionIDEnvVar = "BRAMBLE_SESSION_ID"
 const IPCSockEnvVar = "BRAMBLE_SOCK"
 
 // tmuxRunner implements sessionRunner by creating a tmux window that runs the agent CLI.
-type tmuxRunner struct {
+type tmuxRunner struct { //nolint:govet // fieldalignment: keep launch configuration readable.
 	windowName      string // tmux window name (e.g., "happy-tiger")
 	workDir         string // working directory for the window
 	prompt          string // initial prompt
@@ -44,8 +47,9 @@ type tmuxRunner struct {
 	brambleBin      string // absolute path to the bramble binary for hook commands
 	brambleSock     string // IPC socket path to pass to hook commands
 	controlSock     string // control socket path, so the session can drive peers
-	yoloMode        bool   // skip all permission prompts
-	killOnStop      bool   // kill tmux window on Stop()
+	llmEndpoint     llmendpoint.Endpoint
+	yoloMode        bool // skip all permission prompts
+	killOnStop      bool // kill tmux window on Stop()
 }
 
 // envArgs returns the "-e VAR=value" pairs that give the agent inside the
@@ -68,7 +72,37 @@ func (r *tmuxRunner) envArgs() []string {
 			args = append(args, "-e", kv[0]+"="+kv[1])
 		}
 	}
+	endpointEnv := r.endpointEnv()
+	names := make([]string, 0, len(endpointEnv))
+	for name := range endpointEnv {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		args = append(args, "-e", name+"="+endpointEnv[name])
+	}
 	return args
+}
+
+// endpointEnv delegates endpoint translation to the same wrapper options used
+// by in-process sessions, then returns the subprocess environment they produce.
+func (r *tmuxRunner) endpointEnv() map[string]string {
+	if r.llmEndpoint.IsZero() {
+		return nil
+	}
+	switch r.provider {
+	case ProviderCodex:
+		cfg := codex.ClientConfig{}
+		codex.WithLLMEndpoint(r.llmEndpoint)(&cfg)
+		return cfg.Env
+	case ProviderClaude, "":
+		cfg := claude.SessionConfig{}
+		claude.WithModel(r.model)(&cfg)
+		claude.WithLLMEndpoint(r.llmEndpoint)(&cfg)
+		return cfg.Env
+	default:
+		return nil
+	}
 }
 
 // newWindowArgs builds the full argv for the `tmux new-window` that launches
@@ -189,7 +223,13 @@ func (r *tmuxRunner) buildCommand() (binary string, args []string) {
 	// Add the model flag. Some of bramble's IDs are placeholders for "the CLI's
 	// own default", and some name another provider's model, so let the registry
 	// decide whether this CLI can be given anything at all.
-	if model := agent.CLIModelArg(r.model, provider); model != "" {
+	model := agent.CLIModelArg(r.model, provider)
+	if provider == ProviderCodex {
+		args = append(args, r.codexEndpointArgs()...)
+		if model != "" {
+			args = append(args, "-m", model)
+		}
+	} else if model != "" {
 		args = append(args, "--model", model)
 	}
 
@@ -313,6 +353,25 @@ func (r *tmuxRunner) buildCommand() (binary string, args []string) {
 	// the prompt so the user's message is not silently discarded.
 	args = append(args, r.prompt)
 	return binary, args
+}
+
+// codexEndpointArgs reuses codex.WithLLMEndpoint's config translation. The
+// interactive CLI spells app-server's --config flag as -c; only that shared
+// model-provider config applies here (the app-server feature denylist does not).
+func (r *tmuxRunner) codexEndpointArgs() []string {
+	if r.llmEndpoint.IsZero() {
+		return nil
+	}
+	cfg := codex.ClientConfig{}
+	codex.WithLLMEndpoint(r.llmEndpoint)(&cfg)
+	var args []string
+	for i := 0; i+1 < len(cfg.AppServerArgs); i++ {
+		if cfg.AppServerArgs[i] == "--config" {
+			args = append(args, "-c", cfg.AppServerArgs[i+1])
+			i++
+		}
+	}
+	return args
 }
 
 // buildShellCommand constructs a shell command string with properly escaped arguments.

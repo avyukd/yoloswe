@@ -169,11 +169,11 @@ func TestPaneIdleTrackerComesFromTheStoredModel(t *testing.T) {
 	m := NewManagerWithConfig(ManagerConfig{RepoName: "repo"})
 	defer m.Close()
 
-	assert.NotNil(t, m.newPaneIdleTrackerForModel("composer-3"),
+	assert.NotNil(t, m.newPaneIdleTrackerForModel("composer-3", ""),
 		"a stored cursor model must still produce a pane-idle tracker")
-	assert.Nil(t, m.newPaneIdleTrackerForModel("sonnet"),
+	assert.Nil(t, m.newPaneIdleTrackerForModel("sonnet", ""),
 		"claude reports its own turn ends; a second signal could only contradict it")
-	assert.Nil(t, m.newPaneIdleTrackerForModel("not-a-model"),
+	assert.Nil(t, m.newPaneIdleTrackerForModel("not-a-model", ""),
 		"an unresolvable model is not grounds for guessing at a pane's chrome")
 }
 

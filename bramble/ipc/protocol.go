@@ -2,7 +2,10 @@
 // for communication between the bramble TUI server and CLI clients.
 package ipc
 
-import "github.com/bazelment/yoloswe/bramble/session"
+import (
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
+	"github.com/bazelment/yoloswe/bramble/session"
+)
 
 // RequestType identifies the kind of IPC request.
 type RequestType string
@@ -44,14 +47,16 @@ type RestartParams struct {
 
 // NewSessionParams are the parameters for a new-session request.
 type NewSessionParams struct {
-	SessionType  string `json:"session_type"`            // "planner", "builder", or "codetalk"
-	WorktreePath string `json:"worktree_path,omitempty"` // existing worktree path (mutually exclusive with Branch)
-	Branch       string `json:"branch,omitempty"`        // create new worktree with this branch name
-	BaseBranch   string `json:"base_branch,omitempty"`   // base branch for new worktree (default: main)
-	Prompt       string `json:"prompt"`
-	Model        string `json:"model,omitempty"`     // model ID (default: provider default)
-	Goal         string `json:"goal,omitempty"`      // worktree goal (used when creating)
-	RepoName     string `json:"repo_name,omitempty"` // target repo; auto-detected from cwd if empty
+	SessionType  string               `json:"session_type"`            // "planner", "builder", or "codetalk"
+	WorktreePath string               `json:"worktree_path,omitempty"` // existing worktree path (mutually exclusive with Branch)
+	Branch       string               `json:"branch,omitempty"`        // create new worktree with this branch name
+	BaseBranch   string               `json:"base_branch,omitempty"`   // base branch for new worktree (default: main)
+	Prompt       string               `json:"prompt"`
+	Model        string               `json:"model,omitempty"`     // model ID (default: provider default)
+	Backend      string               `json:"backend,omitempty"`   // CLI backend, independent of model
+	Goal         string               `json:"goal,omitempty"`      // worktree goal (used when creating)
+	RepoName     string               `json:"repo_name,omitempty"` // target repo; auto-detected from cwd if empty
+	LLMEndpoint  llmendpoint.Endpoint `json:"llm_endpoint,omitempty"`
 	// ParentSessionID makes the new session a subagent of that session: when it
 	// finishes, bramble delivers a completion report back there. When set with
 	// no Branch and no WorktreePath, the child inherits the parent's worktree.

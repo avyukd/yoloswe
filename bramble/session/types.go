@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 	"github.com/bazelment/yoloswe/bramble/sessionmodel"
 	"github.com/bazelment/yoloswe/multiagent/agent"
 )
@@ -132,6 +133,8 @@ type Session struct {
 	Prompt           string
 	Title            string
 	Model            string
+	Backend          string // explicitly selected CLI backend; empty means infer from Model
+	LLMEndpoint      llmendpoint.Endpoint
 	PlanFilePath     string // Path to plan file (planner sessions only)
 	TmuxWindowName   string // tmux window name (empty for TUI mode)
 	TmuxWindowID     string // tmux window ID like @1, @2 (empty for TUI mode)
@@ -234,6 +237,7 @@ type SessionInfo struct {
 	Prompt           string
 	Title            string
 	Model            string
+	Backend          string
 	PlanFilePath     string
 	TmuxWindowName   string    // tmux window name (empty for TUI mode)
 	TmuxWindowID     string    // tmux window ID like @1, @2 (empty for TUI mode)
@@ -263,6 +267,7 @@ func (s *Session) ToInfo() SessionInfo {
 		Prompt:           s.Prompt,
 		Title:            s.Title,
 		Model:            s.Model,
+		Backend:          s.Backend,
 		PlanFilePath:     s.PlanFilePath,
 		TmuxWindowName:   s.TmuxWindowName,
 		TmuxWindowID:     s.TmuxWindowID,

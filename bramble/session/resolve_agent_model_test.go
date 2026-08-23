@@ -7,13 +7,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 	"github.com/bazelment/yoloswe/multiagent/agent"
 )
 
 func TestResolveAgentModel_ExactMatchFromGlobalList(t *testing.T) {
 	t.Parallel()
 
-	m, err := resolveAgentModel("opus", nil)
+	m, err := resolveAgentModel("opus", "", nil)
 	require.NoError(t, err)
 	assert.Equal(t, "opus", m.ID)
 	assert.Equal(t, agent.ProviderClaude, m.Provider)
@@ -31,7 +32,7 @@ func TestResolveAgentModel_ExactMatchFromRegistry(t *testing.T) {
 	})
 	reg := agent.NewModelRegistry(avail, nil)
 
-	m, err := resolveAgentModel("opus", reg)
+	m, err := resolveAgentModel("opus", "", reg)
 	require.NoError(t, err)
 	assert.Equal(t, "opus", m.ID)
 	assert.Equal(t, agent.ProviderClaude, m.Provider)
@@ -56,7 +57,7 @@ func TestResolveAgentModel_PrefixFallback(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.modelID, func(t *testing.T) {
 			t.Parallel()
-			m, err := resolveAgentModel(tc.modelID, nil)
+			m, err := resolveAgentModel(tc.modelID, "", nil)
 			require.NoError(t, err)
 			assert.Equal(t, tc.modelID, m.ID)
 			assert.Equal(t, tc.provider, m.Provider)
@@ -68,7 +69,7 @@ func TestResolveAgentModel_PrefixFallback(t *testing.T) {
 func TestResolveAgentModel_UnknownModelFails(t *testing.T) {
 	t.Parallel()
 
-	_, err := resolveAgentModel("foo-bar", nil)
+	_, err := resolveAgentModel("foo-bar", "", nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "foo-bar")
 	assert.Contains(t, err.Error(), "gpt-")
@@ -77,8 +78,53 @@ func TestResolveAgentModel_UnknownModelFails(t *testing.T) {
 func TestResolveAgentModel_EmptyModelFails(t *testing.T) {
 	t.Parallel()
 
-	_, err := resolveAgentModel("", nil)
+	_, err := resolveAgentModel("", "", nil)
 	require.Error(t, err)
+}
+
+func TestManager_ExplicitBackendAllowsOpenRouterModelEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	mgr := NewManagerWithConfig(ManagerConfig{
+		Provider:    &silentEphemeralProvider{},
+		SessionMode: SessionModeTUI,
+		Backend:     ProviderCodex,
+		LLMEndpoint: llmendpoint.OpenRouter(),
+	})
+	t.Cleanup(mgr.Close)
+
+	sid, err := mgr.StartSession(SessionTypeBuilder, t.TempDir(), "test prompt", "stealth/ox-alpha")
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		info, ok := mgr.GetSessionInfo(sid)
+		return ok && info.Status == StatusIdle
+	}, 5*time.Second, 10*time.Millisecond)
+
+	info, ok := mgr.GetSessionInfo(sid)
+	require.True(t, ok)
+	assert.Equal(t, "stealth/ox-alpha", info.Model)
+	assert.Equal(t, ProviderCodex, info.Backend)
+	assert.NotContains(t, info.ErrorMsg, "unknown model")
+}
+
+func TestManager_CodexRejectsDeadChatWire(t *testing.T) {
+	t.Parallel()
+
+	endpoint := llmendpoint.OpenRouter()
+	endpoint.Wire = llmendpoint.WireAPIChat
+	mgr := NewManagerWithConfig(ManagerConfig{SessionMode: SessionModeTmux})
+	t.Cleanup(mgr.Close)
+
+	_, err := mgr.StartSessionWithOpts(
+		SessionTypeBuilder,
+		t.TempDir(),
+		"test prompt",
+		"stealth/ox-alpha",
+		SpawnOpts{Backend: ProviderCodex, LLMEndpoint: endpoint},
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no longer supported")
+	assert.Contains(t, err.Error(), "responses")
 }
 
 // TestManager_PrefixModelRoutesToCorrectProvider verifies that a model ID
