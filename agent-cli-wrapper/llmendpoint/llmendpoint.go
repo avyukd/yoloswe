@@ -15,6 +15,12 @@
 //     translating proxy is required to hit OpenAI/Anthropic endpoints.
 //   - cursor: best-effort OPENAI_BASE_URL/OPENAI_API_KEY (cursor-agent ignores
 //     these for non-Cursor models; the option exists for symmetry)
+//
+// OpenRouter serves both Anthropic Messages and OpenAI Chat Completions under
+// https://openrouter.ai/api/v1. OpenRouter returns WireAPIChat from its preset
+// because that is the wire codex uses. The claude wrapper strips the terminal
+// /v1 before setting ANTHROPIC_BASE_URL because claude-cli appends /v1/messages;
+// codex keeps the preset URL unchanged and appends /chat/completions itself.
 package llmendpoint
 
 import (
@@ -42,6 +48,29 @@ const (
 
 // DefaultProviderName is used when Endpoint.ProviderName is empty.
 const DefaultProviderName = "custom"
+
+const (
+	// OpenRouterBaseURL is the common base for OpenRouter's Anthropic Messages
+	// and OpenAI-compatible Chat Completions APIs.
+	OpenRouterBaseURL = "https://openrouter.ai/api/v1"
+	// OpenRouterAPIKeyEnv is the conventional environment variable for an
+	// OpenRouter API key.
+	OpenRouterAPIKeyEnv = "OPENROUTER_API_KEY"
+	// OpenRouterProviderName is the provider identifier emitted to CLI config.
+	OpenRouterProviderName = "openrouter"
+)
+
+// OpenRouter returns an endpoint configured for OpenRouter's OpenAI-compatible
+// Chat Completions API. Callers whose key uses another environment variable may
+// override APIKeyEnv on the returned Endpoint.
+func OpenRouter() Endpoint {
+	return Endpoint{
+		BaseURL:      OpenRouterBaseURL,
+		APIKeyEnv:    OpenRouterAPIKeyEnv,
+		ProviderName: OpenRouterProviderName,
+		Wire:         WireAPIChat,
+	}
+}
 
 // Endpoint describes a single third-party LLM endpoint.
 //

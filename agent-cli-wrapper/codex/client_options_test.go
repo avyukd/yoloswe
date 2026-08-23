@@ -371,6 +371,42 @@ func TestClientOption_WithLLMEndpoint_setsEnv(t *testing.T) {
 	}
 }
 
+func TestClientOption_WithLLMEndpoint_OpenRouter(t *testing.T) {
+	const (
+		apiKeyEnv = "CODEX_OPENROUTER_TEST_KEY"
+		apiKey    = "openrouter-test-key"
+		model     = "openai/gpt-4o-mini"
+	)
+	t.Setenv(apiKeyEnv, apiKey)
+
+	ep := llmendpoint.OpenRouter()
+	ep.APIKeyEnv = apiKeyEnv
+	cfg := defaultCodexClientConfig()
+	WithLLMEndpoint(ep)(&cfg)
+
+	want := []string{
+		`model_providers.openrouter.name="openrouter"`,
+		`model_providers.openrouter.base_url="https://openrouter.ai/api/v1"`,
+		`model_providers.openrouter.wire_api="chat"`,
+		`model_providers.openrouter.env_key="CODEX_OPENROUTER_TEST_KEY"`,
+		`model_provider="openrouter"`,
+	}
+	for _, value := range want {
+		if !appServerArgsContainConfig(cfg.AppServerArgs, value) {
+			t.Errorf("AppServerArgs missing %q\nfull: %v", value, cfg.AppServerArgs)
+		}
+	}
+	if got := cfg.Env[apiKeyEnv]; got != apiKey {
+		t.Errorf("Env[%s] = %q, want configured key", apiKeyEnv, got)
+	}
+
+	threadCfg := defaultCodexThreadConfig()
+	WithModel(model)(&threadCfg)
+	if threadCfg.Model != model {
+		t.Errorf("Model = %q, want slash-bearing OpenRouter model %q", threadCfg.Model, model)
+	}
+}
+
 func TestClientOption_WithLLMEndpoint_disablesThirdPartyIncompatibleFeatures(t *testing.T) {
 	cfg := defaultCodexClientConfig()
 	WithLLMEndpoint(llmendpoint.Endpoint{

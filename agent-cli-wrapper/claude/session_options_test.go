@@ -100,3 +100,38 @@ func TestWithLLMEndpoint_stripsTrailingV1(t *testing.T) {
 		}
 	}
 }
+
+func TestWithLLMEndpoint_OpenRouter(t *testing.T) {
+	const (
+		apiKeyEnv = "CLAUDE_OPENROUTER_TEST_KEY"
+		apiKey    = "openrouter-test-key"
+		model     = "anthropic/claude-sonnet-4.5"
+	)
+	t.Setenv(apiKeyEnv, apiKey)
+
+	ep := llmendpoint.OpenRouter()
+	ep.APIKeyEnv = apiKeyEnv
+	cfg := defaultConfig()
+	cfg.Model = model
+	WithLLMEndpoint(ep)(&cfg)
+
+	if got := cfg.Env["ANTHROPIC_BASE_URL"]; got != "https://openrouter.ai/api" {
+		t.Errorf("ANTHROPIC_BASE_URL = %q, want OpenRouter Anthropic base without /v1", got)
+	}
+	for _, name := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"} {
+		if got := cfg.Env[name]; got != apiKey {
+			t.Errorf("%s = %q, want configured key", name, got)
+		}
+	}
+	for _, name := range []string{
+		"ANTHROPIC_MODEL",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL",
+		"ANTHROPIC_SMALL_FAST_MODEL",
+	} {
+		if got := cfg.Env[name]; got != model {
+			t.Errorf("%s = %q, want slash-bearing OpenRouter model %q", name, got, model)
+		}
+	}
+}
