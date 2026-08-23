@@ -55,7 +55,6 @@ func TestLLMEndpoint_OpenRouter(t *testing.T) {
 	}
 
 	t.Run("claude/messages", func(t *testing.T) {
-		t.Parallel()
 		if _, err := exec.LookPath("claude"); err != nil {
 			t.Skip("claude CLI not on PATH")
 		}
@@ -63,7 +62,6 @@ func TestLLMEndpoint_OpenRouter(t *testing.T) {
 	})
 
 	t.Run("codex/responses", func(t *testing.T) {
-		t.Parallel()
 		if _, err := exec.LookPath("codex"); err != nil {
 			t.Skip("codex CLI not on PATH")
 		}
