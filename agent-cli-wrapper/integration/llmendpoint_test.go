@@ -51,13 +51,13 @@ import (
 )
 
 const (
-	basetenBaseURL  = "https://inference.baseten.co/v1"
+	basetenBaseURL   = "https://inference.baseten.co/v1"
 	basetenAPIKeyEnv = "BASETEN_API_KEY"
-	basetenModel    = "moonshotai/Kimi-K2.6"
+	basetenModel     = "moonshotai/Kimi-K2.6"
 
 	// llmSentinel is unique enough that only a real model round-trip can
 	// produce it. Keep it short so tiny max_tokens budgets reproduce it.
-	llmSentinel    = "PURPLE-RHINO-42"
+	llmSentinel       = "PURPLE-RHINO-42"
 	llmEndpointPrompt = "Reply with exactly this single token, nothing else: " + llmSentinel
 )
 
@@ -114,13 +114,33 @@ func TestLLMEndpoint_Baseten(t *testing.T) {
 //   - default-model envs are pinned so claude's preflight + post-turn calls
 //     don't 404 against Baseten's single-model endpoint
 func runClaudeBaseten(t *testing.T, ep llmendpoint.Endpoint) {
+	runClaudeLLMEndpoint(t, ep, llmEndpointSmokeConfig{
+		label:      "baseten",
+		model:      basetenModel,
+		prompt:     llmEndpointPrompt,
+		sentinel:   llmSentinel,
+		timeout:    90 * time.Second,
+		clientName: "agent-cli-wrapper-llmendpoint-test",
+	})
+}
+
+type llmEndpointSmokeConfig struct {
+	label      string
+	model      string
+	prompt     string
+	sentinel   string
+	timeout    time.Duration
+	clientName string
+}
+
+func runClaudeLLMEndpoint(t *testing.T, ep llmendpoint.Endpoint, smoke llmEndpointSmokeConfig) {
 	t.Helper()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), smoke.timeout)
 	defer cancel()
 
 	session := claude.NewSession(
-		claude.WithModel(basetenModel),
+		claude.WithModel(smoke.model),
 		claude.WithWorkDir(t.TempDir()),
 		claude.WithPermissionMode(claude.PermissionModeBypass),
 		claude.WithDisablePlugins(),
@@ -131,7 +151,7 @@ func runClaudeBaseten(t *testing.T, ep llmendpoint.Endpoint) {
 	}
 	defer session.Stop()
 
-	if _, err := session.SendMessage(ctx, llmEndpointPrompt); err != nil {
+	if _, err := session.SendMessage(ctx, smoke.prompt); err != nil {
 		t.Fatalf("claude SendMessage: %v", err)
 	}
 
@@ -139,11 +159,11 @@ func runClaudeBaseten(t *testing.T, ep llmendpoint.Endpoint) {
 	if err != nil {
 		t.Fatalf("claude turn drain: %v", err)
 	}
-	t.Logf("claude→baseten response: %s", truncate(response, 200))
+	t.Logf("claude→%s response: %s", smoke.label, truncate(response, 200))
 
-	if !containsSecret(response, llmSentinel) {
-		t.Fatalf("claude→baseten did not echo sentinel %q; got %s",
-			llmSentinel, truncate(response, 500))
+	if !containsSecret(response, smoke.sentinel) {
+		t.Fatalf("claude→%s did not echo sentinel %q; got %s",
+			smoke.label, smoke.sentinel, truncate(response, 500))
 	}
 }
 
@@ -179,13 +199,24 @@ func drainClaudeForLLMEndpoint(ctx context.Context, session *claude.Session) (st
 //     browser_use, ...) is auto-applied so Baseten's strict tool-schema
 //     parser doesn't 400 with `unknown variant "namespace"`
 func runCodexBaseten(t *testing.T, ep llmendpoint.Endpoint) {
+	runCodexLLMEndpoint(t, ep, llmEndpointSmokeConfig{
+		label:      "baseten",
+		model:      basetenModel,
+		prompt:     llmEndpointPrompt,
+		sentinel:   llmSentinel,
+		timeout:    90 * time.Second,
+		clientName: "agent-cli-wrapper-llmendpoint-test",
+	})
+}
+
+func runCodexLLMEndpoint(t *testing.T, ep llmendpoint.Endpoint, smoke llmEndpointSmokeConfig) {
 	t.Helper()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), smoke.timeout)
 	defer cancel()
 
 	client := codex.NewClient(
-		codex.WithClientName("agent-cli-wrapper-llmendpoint-test"),
+		codex.WithClientName(smoke.clientName),
 		codex.WithClientVersion("1.0.0"),
 		codex.WithLLMEndpoint(ep),
 	)
@@ -195,7 +226,7 @@ func runCodexBaseten(t *testing.T, ep llmendpoint.Endpoint) {
 	defer client.Stop()
 
 	thread, err := client.CreateThread(ctx,
-		codex.WithModel(basetenModel),
+		codex.WithModel(smoke.model),
 		codex.WithWorkDir(t.TempDir()),
 		codex.WithApprovalPolicy(codex.ApprovalPolicyFullAuto),
 		codex.WithSandbox("read-only"),
@@ -207,7 +238,7 @@ func runCodexBaseten(t *testing.T, ep llmendpoint.Endpoint) {
 		t.Fatalf("codex thread WaitReady: %v", err)
 	}
 
-	result, err := thread.Ask(ctx, llmEndpointPrompt)
+	result, err := thread.Ask(ctx, smoke.prompt)
 	if err != nil {
 		t.Fatalf("codex Ask: %v", err)
 	}
@@ -215,11 +246,11 @@ func runCodexBaseten(t *testing.T, ep llmendpoint.Endpoint) {
 		t.Fatalf("codex turn failed: %v\nfull text: %s",
 			result.Error, truncate(result.FullText, 500))
 	}
-	t.Logf("codex→baseten response: %s", truncate(result.FullText, 200))
+	t.Logf("codex→%s response: %s", smoke.label, truncate(result.FullText, 200))
 
-	if !containsSecret(result.FullText, llmSentinel) {
-		t.Fatalf("codex→baseten did not echo sentinel %q; got %s",
-			llmSentinel, truncate(result.FullText, 500))
+	if !containsSecret(result.FullText, smoke.sentinel) {
+		t.Fatalf("codex→%s did not echo sentinel %q; got %s",
+			smoke.label, smoke.sentinel, truncate(result.FullText, 500))
 	}
 }
 
