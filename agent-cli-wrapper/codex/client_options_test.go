@@ -126,11 +126,15 @@ func TestDefaultThreadConfig(t *testing.T) {
 }
 
 func TestThreadOption_WithModel(t *testing.T) {
-	cfg := defaultCodexThreadConfig()
-	WithModel("gpt-4o")(&cfg)
+	for _, want := range []string{"gpt-4o", "stealth/ox-alpha"} {
+		t.Run(want, func(t *testing.T) {
+			cfg := defaultCodexThreadConfig()
+			WithModel(want)(&cfg)
 
-	if cfg.Model != "gpt-4o" {
-		t.Errorf("unexpected Model: %q", cfg.Model)
+			if cfg.Model != want {
+				t.Errorf("unexpected Model: %q", cfg.Model)
+			}
+		})
 	}
 }
 
@@ -375,7 +379,6 @@ func TestClientOption_WithLLMEndpoint_OpenRouter(t *testing.T) {
 	const (
 		apiKeyEnv = "CODEX_OPENROUTER_TEST_KEY"
 		apiKey    = "openrouter-test-key"
-		model     = "openai/gpt-4o-mini"
 	)
 	t.Setenv(apiKeyEnv, apiKey)
 
@@ -398,12 +401,6 @@ func TestClientOption_WithLLMEndpoint_OpenRouter(t *testing.T) {
 	}
 	if got := cfg.Env[apiKeyEnv]; got != apiKey {
 		t.Errorf("Env[%s] = %q, want configured key", apiKeyEnv, got)
-	}
-
-	threadCfg := defaultCodexThreadConfig()
-	WithModel(model)(&threadCfg)
-	if threadCfg.Model != model {
-		t.Errorf("Model = %q, want slash-bearing OpenRouter model %q", threadCfg.Model, model)
 	}
 }
 
