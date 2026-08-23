@@ -1,6 +1,8 @@
 package session
 
 import (
+	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -9,6 +11,7 @@ import (
 
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 	"github.com/bazelment/yoloswe/multiagent/agent"
+	"github.com/bazelment/yoloswe/wt"
 )
 
 func TestResolveAgentModel_ExactMatchFromGlobalList(t *testing.T) {
@@ -357,4 +360,68 @@ func TestManager_ResumeChecksEndpointCredential(t *testing.T) {
 	require.True(t, ok)
 	assert.Contains(t, info.ErrorMsg, "BRAMBLE_TEST_ABSENT_OPENROUTER_KEY",
 		"a resumed session must name the unresolved variable, not fail on a remote 401")
+}
+
+// endpointRecordingProvider captures the ExecuteConfig its turn was given, so a
+// test can assert on what actually reached the provider rather than on what the
+// manager was asked for.
+type endpointRecordingProvider struct {
+	endpoint llmendpoint.Endpoint
+	mu       sync.Mutex
+	seen     bool
+}
+
+func (p *endpointRecordingProvider) Name() string                    { return "endpoint-recording" }
+func (p *endpointRecordingProvider) Events() <-chan agent.AgentEvent { return nil }
+func (p *endpointRecordingProvider) Close() error                    { return nil }
+
+func (p *endpointRecordingProvider) Execute(_ context.Context, prompt string, _ *wt.WorktreeContext, opts ...agent.ExecuteOption) (*agent.AgentResult, error) {
+	cfg := agent.ExecuteConfig{}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	p.mu.Lock()
+	p.endpoint = cfg.LLMEndpoint
+	p.seen = true
+	p.mu.Unlock()
+	return &agent.AgentResult{Text: "ok: " + prompt, Success: true}, nil
+}
+
+func (p *endpointRecordingProvider) observed() (llmendpoint.Endpoint, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.endpoint, p.seen
+}
+
+// Asserting on session metadata proves only that the flags were parsed. This
+// drives the whole TUI chain — session.LLMEndpoint to providerRunner to
+// WithProviderLLMEndpoint to the provider's ExecuteConfig — so deleting any
+// link fails here. The endpoint is attached once after the provider branch in
+// runSession, which is what makes this cover every branch rather than the one
+// this fake happens to take.
+func TestManager_EndpointReachesTheProviderTurn(t *testing.T) {
+	t.Parallel()
+
+	endpoint := llmendpoint.OpenRouter()
+	endpoint.APIKey = "openrouter-test-key"
+	provider := &endpointRecordingProvider{}
+	mgr := NewManagerWithConfig(ManagerConfig{
+		Provider:    provider,
+		SessionMode: SessionModeTUI,
+	})
+	t.Cleanup(mgr.Close)
+
+	_, err := mgr.StartSessionWithOpts(
+		SessionTypeBuilder, t.TempDir(), "test prompt", "stealth/ox-alpha",
+		SpawnOpts{Backend: ProviderCodex, LLMEndpoint: endpoint},
+	)
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		_, seen := provider.observed()
+		return seen
+	}, 5*time.Second, 10*time.Millisecond, "provider turn never ran")
+
+	got, _ := provider.observed()
+	assert.Equal(t, endpoint, got, "the session's endpoint must reach the provider turn intact")
 }

@@ -935,8 +935,10 @@ Use --backend to select the CLI independently from --model. Naming a backend
 makes --model required: the model ID is then that backend's own (an OpenRouter
 slug, say), and bramble's defaults are Claude aliases that would not resolve.
 Third-party endpoints can be supplied with --llm-* flags, or with
---llm-preset=openrouter. --llm-api-key-env is read in this process, so the key
-need not be exported in the shell that started the bramble TUI.
+--llm-preset=openrouter. --llm-api-key-env is read in this process, so *creating*
+a session does not require the key in the shell that started the bramble TUI.
+Resuming one after the TUI restarts does: the stored endpoint is redacted, so it
+re-resolves through the named variable in the server's environment.
 
 Interactive (tmux) Claude sessions authenticate to a third-party endpoint with
 Bearer only: exporting an x-api-key would park the CLI on its custom-API-key

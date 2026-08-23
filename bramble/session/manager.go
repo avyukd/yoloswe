@@ -1561,7 +1561,7 @@ func validateEndpointCredential(endpoint llmendpoint.Endpoint) error {
 	if endpoint.IsZero() || endpoint.ResolvedKey() != "" {
 		return nil
 	}
-	return fmt.Errorf("llm endpoint api key is unset: %s holds no value in the bramble server's environment (export it before starting bramble)", endpointKeySource(endpoint))
+	return fmt.Errorf("llm endpoint api key is unset: %s holds no value in the bramble server's environment (export it before starting bramble, or start a new session with --llm-api-key-env, which resolves the key in the client)", endpointKeySource(endpoint))
 }
 
 // endpointKeySource names where the endpoint's credential was meant to come
@@ -1735,7 +1735,6 @@ func (m *Manager) runSession(session *Session, prompt string) {
 			runner = &providerRunner{
 				provider:     m.config.Provider,
 				eventHandler: eventHandler,
-				llmEndpoint:  session.LLMEndpoint.Clone(),
 			}
 		} else if agentModel.Provider == ProviderCodex {
 			// Codex provider backend
@@ -1758,7 +1757,6 @@ func (m *Manager) runSession(session *Session, prompt string) {
 				provider:     agent.NewCodexProvider(codexOpts...),
 				eventHandler: eventHandler,
 				model:        session.Model,
-				llmEndpoint:  session.LLMEndpoint.Clone(),
 				permissionMode: func() string {
 					if session.Type == SessionTypePlanner || session.Type == SessionTypeCodeTalk {
 						return "plan"
@@ -1886,6 +1884,19 @@ func (m *Manager) runSession(session *Session, prompt string) {
 				return
 			}
 		}
+	}
+
+	// Attach the endpoint once, after the branch, rather than in each
+	// providerRunner literal. Five branches build one, and this PR wired only
+	// two of them — the other three are unreachable with a non-zero endpoint
+	// today (validateEndpointBackend above rejects anything but claude and
+	// codex), but nothing at those literals said so, and a later backend
+	// joining the allowed set would have had to remember. Setting it here
+	// makes forgetting impossible instead of merely unlikely. The non-provider
+	// runners (planner/builder/codetalk wrappers) take the endpoint through
+	// their own config structs in the default branch above.
+	if pr, ok := runner.(*providerRunner); ok {
+		pr.llmEndpoint = session.LLMEndpoint.Clone()
 	}
 
 	if err := runner.Start(session.ctx); err != nil {
