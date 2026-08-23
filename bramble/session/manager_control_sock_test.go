@@ -89,13 +89,16 @@ func TestManagerNewTmuxRunnerOmitsUnstartedControlSocket(t *testing.T) {
 	}
 }
 
-func TestManagerNewTmuxRunnerCarriesDefaultLLMEndpoint(t *testing.T) {
+// The endpoint reaches the tmux window only if newTmuxRunner copies it off the
+// session. Wiring every earlier layer and dropping it here would leave the
+// window pointed at the default provider with no error anywhere.
+func TestManagerNewTmuxRunnerCarriesSessionLLMEndpoint(t *testing.T) {
 	t.Parallel()
 
 	endpoint := llmendpoint.OpenRouter()
-	m := NewManagerWithConfig(ManagerConfig{LLMEndpoint: endpoint})
+	m := NewManagerWithConfig(ManagerConfig{})
 	runner := m.newTmuxRunner(
-		&Session{ID: "builder-openrouter", Model: "stealth/ox-alpha"},
+		&Session{ID: "builder-openrouter", Model: "stealth/ox-alpha", LLMEndpoint: endpoint},
 		"prompt",
 		"window",
 		agent.AgentModel{ID: "stealth/ox-alpha", Provider: ProviderCodex},

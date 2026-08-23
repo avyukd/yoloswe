@@ -48,6 +48,16 @@ func TestLiveOpenRouterNewSession(t *testing.T) {
 			sentinel := strings.Join(tokens, "-")
 			prompt := "Reply with exactly one line formed by joining these tokens with hyphens, in order: " +
 				strings.Join(tokens, ", ") + ". Do not read files or run commands."
+			// The assertion below scans the whole tmux pane, which also shows
+			// the prompt the CLI echoed back. The prompt therefore lists the
+			// tokens comma-separated while the sentinel joins them with
+			// hyphens, so only the model's own answer can match. That is the
+			// difference between this test proving the endpoint works and it
+			// passing on an empty turn — pin it rather than leave it to a
+			// future edit to preserve by accident.
+			if strings.Contains(prompt, sentinel) {
+				t.Fatalf("prompt contains the sentinel %q verbatim; the pane assertion would pass on the echoed prompt alone\nprompt: %s", sentinel, prompt)
+			}
 
 			maxAttempts := 1
 			if backend == session.ProviderClaude {

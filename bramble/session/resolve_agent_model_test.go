@@ -82,18 +82,27 @@ func TestResolveAgentModel_EmptyModelFails(t *testing.T) {
 	require.Error(t, err)
 }
 
+// Drives the SpawnOpts route, which is the one every real caller uses: bramble
+// main.go fills SpawnOpts from the IPC request. An earlier version of this test
+// went through per-manager defaults instead, so it would have stayed green if
+// the SpawnOpts plumbing were deleted outright.
 func TestManager_ExplicitBackendAllowsOpenRouterModelEndToEnd(t *testing.T) {
 	t.Parallel()
 
+	endpoint := llmendpoint.OpenRouter()
+	// Inline rather than t.Setenv so the test stays parallel-safe; the manager
+	// now refuses to launch an endpoint whose key resolves to nothing.
+	endpoint.APIKey = "openrouter-test-key"
 	mgr := NewManagerWithConfig(ManagerConfig{
 		Provider:    &silentEphemeralProvider{},
 		SessionMode: SessionModeTUI,
-		Backend:     ProviderCodex,
-		LLMEndpoint: llmendpoint.OpenRouter(),
 	})
 	t.Cleanup(mgr.Close)
 
-	sid, err := mgr.StartSession(SessionTypeBuilder, t.TempDir(), "test prompt", "stealth/ox-alpha")
+	sid, err := mgr.StartSessionWithOpts(
+		SessionTypeBuilder, t.TempDir(), "test prompt", "stealth/ox-alpha",
+		SpawnOpts{Backend: ProviderCodex, LLMEndpoint: endpoint},
+	)
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
 		info, ok := mgr.GetSessionInfo(sid)
@@ -231,4 +240,82 @@ func TestManager_UnknownModelLandsInStatusFailed(t *testing.T) {
 		}
 	}
 	assert.True(t, hasError, "expected at least one OutputTypeError line")
+}
+
+// Only the env var *name* is guaranteed to cross IPC from `bramble new-session`;
+// this process is the one that reads it. Without this guard the wrappers omit
+// the auth headers while still setting the base URL, and the session launches
+// pointed at the endpoint with no credential — a remote 401 that names nothing.
+func TestManager_UnresolvedEndpointKeyIsNamed(t *testing.T) {
+	t.Parallel()
+
+	endpoint := llmendpoint.OpenRouter()
+	endpoint.APIKeyEnv = "BRAMBLE_TEST_ABSENT_OPENROUTER_KEY"
+	mgr := NewManagerWithConfig(ManagerConfig{SessionMode: SessionModeTmux})
+	t.Cleanup(mgr.Close)
+
+	_, err := mgr.StartSessionWithOpts(
+		SessionTypeBuilder, t.TempDir(), "test prompt", "stealth/ox-alpha",
+		SpawnOpts{Backend: ProviderCodex, LLMEndpoint: endpoint},
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "BRAMBLE_TEST_ABSENT_OPENROUTER_KEY",
+		"the error must name the variable the operator typed")
+}
+
+// The guard must key off resolution, not off APIKeyEnv: an inline key (the
+// shape `bramble new-session` now sends after resolving in the client) has no
+// env var to read and must launch.
+func TestManager_InlineEndpointKeySatisfiesTheGuard(t *testing.T) {
+	t.Parallel()
+
+	endpoint := llmendpoint.OpenRouter()
+	endpoint.APIKeyEnv = "BRAMBLE_TEST_ABSENT_OPENROUTER_KEY"
+	endpoint.APIKey = "resolved-by-the-client"
+	mgr := NewManagerWithConfig(ManagerConfig{
+		Provider:    &silentEphemeralProvider{},
+		SessionMode: SessionModeTUI,
+	})
+	t.Cleanup(mgr.Close)
+
+	_, err := mgr.StartSessionWithOpts(
+		SessionTypeBuilder, t.TempDir(), "test prompt", "stealth/ox-alpha",
+		SpawnOpts{Backend: ProviderCodex, LLMEndpoint: endpoint},
+	)
+	require.NoError(t, err)
+}
+
+// An explicit --backend means the model ID is that backend's own, so there is
+// no sensible default to substitute. Defaulting anyway launched
+// `codex -m sonnet` against the endpoint and surfaced a remote 400 instead of
+// naming the missing flag — and left resolveAgentModel's empty-model guard
+// unreachable from this path.
+func TestManager_ExplicitBackendWithoutModelNamesTheMissingFlag(t *testing.T) {
+	t.Parallel()
+
+	endpoint := llmendpoint.OpenRouter()
+	endpoint.APIKey = "openrouter-test-key"
+	mgr := NewManagerWithConfig(ManagerConfig{
+		Provider:    &silentEphemeralProvider{},
+		SessionMode: SessionModeTUI,
+	})
+	t.Cleanup(mgr.Close)
+
+	// resolveAgentModel runs inside runSession, so the guard surfaces as a
+	// failed session rather than a StartSession error — the same route every
+	// other model-resolution failure takes.
+	sid, err := mgr.StartSessionWithOpts(
+		SessionTypeBuilder, t.TempDir(), "test prompt", "",
+		SpawnOpts{Backend: ProviderCodex, LLMEndpoint: endpoint},
+	)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		info, ok := mgr.GetSessionInfo(sid)
+		return ok && info.Status == StatusFailed
+	}, 5*time.Second, 10*time.Millisecond)
+
+	info, ok := mgr.GetSessionInfo(sid)
+	require.True(t, ok)
+	assert.Contains(t, info.ErrorMsg, "model must not be empty")
+	assert.Empty(t, info.Model, "the default must not have been substituted")
 }

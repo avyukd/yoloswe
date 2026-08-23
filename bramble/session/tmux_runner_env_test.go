@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/codex"
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 )
 
@@ -106,7 +107,6 @@ func TestTmuxRunnerNewWindowArgs_OpenRouterClaudeFullArgv(t *testing.T) {
 
 	want := []string{
 		"new-window", "-P", "-F", "#{window_id}",
-		"-e", "ANTHROPIC_API_KEY=openrouter-test-key",
 		"-e", "ANTHROPIC_AUTH_TOKEN=openrouter-test-key",
 		"-e", "ANTHROPIC_BASE_URL=https://openrouter.ai/api",
 		"-e", "ANTHROPIC_DEFAULT_HAIKU_MODEL=stealth/ox-alpha",
@@ -117,8 +117,20 @@ func TestTmuxRunnerNewWindowArgs_OpenRouterClaudeFullArgv(t *testing.T) {
 		"-n", "openrouter-claude", "-c", "/work/repo",
 		"claude '--model' 'stealth/ox-alpha' 'return sentinel'",
 	}
-	if got := r.newWindowArgs(); !slices.Equal(got, want) {
+	got := r.newWindowArgs()
+	if !slices.Equal(got, want) {
 		t.Fatalf("newWindowArgs() mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+	// Stated separately from the argv equality above because this one is a
+	// safety property, not a formatting detail: ANTHROPIC_API_KEY makes the
+	// interactive claude CLI block on a "Detected a custom API key in your
+	// environment" modal whose default answer declines the endpoint's key, and
+	// nothing outside the integration harness answers startup dialogs. A future
+	// edit that reinstates it should fail on a message that says why.
+	for _, a := range got {
+		if strings.Contains(a, "ANTHROPIC_API_KEY") {
+			t.Errorf("interactive claude window exports %q; it would park on the custom-API-key modal\ngot: %#v", a, got)
+		}
 	}
 }
 
@@ -137,7 +149,17 @@ func TestTmuxRunnerNewWindowArgs_OpenRouterCodexFullArgv(t *testing.T) {
 		"new-window", "-P", "-F", "#{window_id}",
 		"-e", "OPENROUTER_API_KEY=openrouter-test-key",
 		"-n", "openrouter-codex", "-c", "/work/repo",
-		"codex '-c' 'model_providers.openrouter.name=\"openrouter\"' " +
+		"codex '--disable' 'apps' '--disable' 'browser_use' " +
+			"'--disable' 'browser_use_external' '--disable' 'computer_use' " +
+			"'--disable' 'enable_request_compression' '--disable' 'fast_mode' " +
+			"'--disable' 'guardian_approval' '--disable' 'hooks' " +
+			"'--disable' 'image_generation' '--disable' 'in_app_browser' " +
+			"'--disable' 'multi_agent' '--disable' 'personality' " +
+			"'--disable' 'plugins' '--disable' 'shell_snapshot' " +
+			"'--disable' 'skill_mcp_dependency_install' " +
+			"'--disable' 'tool_call_mcp_elicitation' '--disable' 'tool_search' " +
+			"'--disable' 'tool_suggest' '--disable' 'unavailable_dummy_tools' " +
+			"'-c' 'model_providers.openrouter.name=\"openrouter\"' " +
 			"'-c' 'model_providers.openrouter.base_url=\"https://openrouter.ai/api/v1\"' " +
 			"'-c' 'model_providers.openrouter.wire_api=\"responses\"' " +
 			"'-c' 'model_providers.openrouter.env_key=\"OPENROUTER_API_KEY\"' " +
@@ -232,5 +254,47 @@ func TestCodexNotifyConfigQuotesValues(t *testing.T) {
 	want := `notify=["/opt/we\"ird\\path/bramble","notify","--silent","--session-id","id\"1"]`
 	if got != want {
 		t.Errorf("codexNotifyConfig() = %q, want %q", got, want)
+	}
+}
+
+// codexEndpointArgs forwards codex.WithLLMEndpoint's whole flag stream, not
+// just the --config half. The denylist is the part that matters and the part
+// that was missing: without it codex sends tool schemas that strict Responses
+// providers reject with HTTP 400 "unknown variant `namespace`", so the tmux
+// path 400s where the in-process path succeeds. OpenRouter is lenient enough
+// that the live test cannot catch this, which is why it is pinned here.
+func TestCodexEndpointArgs_ForwardsFeatureDenylist(t *testing.T) {
+	t.Setenv(llmendpoint.OpenRouterAPIKeyEnv, "openrouter-test-key")
+	r := &tmuxRunner{provider: ProviderCodex, llmEndpoint: llmendpoint.OpenRouter()}
+
+	cfg := codex.ClientConfig{}
+	codex.WithLLMEndpoint(llmendpoint.OpenRouter())(&cfg)
+	got := r.codexEndpointArgs()
+
+	// The translation walks AppServerArgs two tokens at a time, so a
+	// single-token flag would silently shift every later pair. Nothing in
+	// WithLLMEndpoint emits one today; assert that rather than assume it.
+	if len(cfg.AppServerArgs)%2 != 0 {
+		t.Fatalf("WithLLMEndpoint emitted an odd number of app-server args (%d); codexEndpointArgs pairs them\ngot: %#v",
+			len(cfg.AppServerArgs), cfg.AppServerArgs)
+	}
+	if len(got) != len(cfg.AppServerArgs) {
+		t.Fatalf("codexEndpointArgs dropped %d of %d app-server args\ngot: %#v\nfrom: %#v",
+			len(cfg.AppServerArgs)-len(got), len(cfg.AppServerArgs), got, cfg.AppServerArgs)
+	}
+
+	// Every --disable pair survives verbatim; --config is respelled -c.
+	for i := 0; i < len(cfg.AppServerArgs); i += 2 {
+		wantFlag := cfg.AppServerArgs[i]
+		if wantFlag == "--config" {
+			wantFlag = "-c"
+		}
+		if got[i] != wantFlag || got[i+1] != cfg.AppServerArgs[i+1] {
+			t.Errorf("arg %d: got %q %q, want %q %q", i/2, got[i], got[i+1], wantFlag, cfg.AppServerArgs[i+1])
+		}
+	}
+
+	if !slices.Contains(got, "--disable") {
+		t.Errorf("no --disable pairs reached the interactive CLI\ngot: %#v", got)
 	}
 }

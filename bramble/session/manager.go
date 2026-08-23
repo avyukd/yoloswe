@@ -430,10 +430,6 @@ type ManagerConfig struct { //nolint:govet // fieldalignment: readability over p
 	// ChildModel overrides the default model for child sessions spawned by
 	// the delegator. If empty, children default to the delegator's own model.
 	ChildModel string
-	// Backend and LLMEndpoint are defaults for sessions that do not override
-	// them through SpawnOpts. Overrides keep endpoint selection per-session.
-	Backend     string
-	LLMEndpoint llmendpoint.Endpoint
 }
 
 // Manager handles multiple concurrent sessions.
@@ -967,7 +963,18 @@ func (m *Manager) StartSessionWithOpts(sessionType SessionType, worktreePath, pr
 func (m *Manager) startSessionWithID(sessionID SessionID, sessionType SessionType, worktreePath, worktreeName, prompt, model string, opts SpawnOpts) (SessionID, error) {
 	ctx, cancel := context.WithCancel(m.ctx)
 
-	if model == "" {
+	backend := opts.Backend
+	if err := validateBackend(backend); err != nil {
+		cancel()
+		return "", err
+	}
+	// Resolve the backend before defaulting the model. An explicit backend
+	// means the model ID is the backend's own (an OpenRouter slug, say), so
+	// there is no sensible default to fall back to; substituting "sonnet"
+	// here would launch `codex -m sonnet` against the endpoint and surface a
+	// remote 400 instead of naming the missing flag. Leaving the model empty
+	// lets resolveAgentModel's guard fire with that name.
+	if model == "" && backend == "" {
 		switch sessionType {
 		case SessionTypePlanner, SessionTypeCodeTalk:
 			model = "opus"
@@ -975,18 +982,7 @@ func (m *Manager) startSessionWithID(sessionID SessionID, sessionType SessionTyp
 			model = "sonnet"
 		}
 	}
-	backend := opts.Backend
-	if backend == "" {
-		backend = m.config.Backend
-	}
-	if err := validateBackend(backend); err != nil {
-		cancel()
-		return "", err
-	}
 	endpoint := opts.LLMEndpoint
-	if endpoint.IsZero() {
-		endpoint = m.config.LLMEndpoint
-	}
 	if err := endpoint.Validate(); err != nil {
 		cancel()
 		return "", err
@@ -994,6 +990,18 @@ func (m *Manager) startSessionWithID(sessionID SessionID, sessionType SessionTyp
 	if err := validateEndpointBackend(endpoint, backend); err != nil {
 		cancel()
 		return "", err
+	}
+	// Validate shape AND credential. Only the env var *name* is guaranteed to
+	// cross the IPC boundary from `bramble new-session`, and this process is
+	// the one that reads it: a TUI started before the key was exported
+	// resolves nothing. Without this check the wrappers silently omit the auth
+	// headers while still setting the base URL, so the session launches
+	// pointed at the endpoint with no credential and fails remotely with a
+	// 401 that names nothing. Restarts hit the same hole, since a persisted
+	// endpoint is stored via Redacted() and re-resolves through APIKeyEnv.
+	if !endpoint.IsZero() && endpoint.ResolvedKey() == "" {
+		cancel()
+		return "", fmt.Errorf("llm endpoint api key is unset: %s holds no value in the bramble server's environment (export it before starting bramble)", endpointKeySource(endpoint))
 	}
 
 	session := &Session{
@@ -1532,6 +1540,18 @@ func validateBackend(backend string) error {
 	return nil
 }
 
+// endpointKeySource names where the endpoint's credential was meant to come
+// from, so an unresolved key reports the env var the operator actually typed
+// rather than a generic "no key". An inline APIKey can never be the unresolved
+// case (ResolvedKey returns it verbatim), so the fallback covers only an
+// endpoint that named neither — which Validate already rejects.
+func endpointKeySource(endpoint llmendpoint.Endpoint) string {
+	if endpoint.APIKeyEnv != "" {
+		return "$" + endpoint.APIKeyEnv
+	}
+	return "the endpoint's api key"
+}
+
 func validateEndpointBackend(endpoint llmendpoint.Endpoint, backend string) error {
 	if endpoint.IsZero() || backend == "" || backend == ProviderClaude {
 		return nil
@@ -1565,10 +1585,6 @@ func (m *Manager) newTmuxRunner(session *Session, prompt, tmuxName string, agent
 	if brambleBin == "" {
 		brambleBin = "bramble" // fallback to PATH lookup
 	}
-	endpoint := session.LLMEndpoint
-	if endpoint.IsZero() {
-		endpoint = m.config.LLMEndpoint
-	}
 	return &tmuxRunner{
 		windowName:      tmuxName,
 		workDir:         session.WorktreePath,
@@ -1581,7 +1597,7 @@ func (m *Manager) newTmuxRunner(session *Session, prompt, tmuxName string, agent
 		brambleBin:      brambleBin,
 		brambleSock:     m.config.IPCSockPath,
 		controlSock:     m.config.ControlSockPath,
-		llmEndpoint:     endpoint.Clone(),
+		llmEndpoint:     session.LLMEndpoint.Clone(),
 		yoloMode:        m.config.YoloMode,
 		killOnStop:      false, // Never kill on Stop(); cleanup happens in Close() if TmuxExitOnQuit is set
 	}

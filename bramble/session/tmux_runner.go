@@ -86,6 +86,16 @@ func (r *tmuxRunner) envArgs() []string {
 
 // endpointEnv delegates endpoint translation to the same wrapper options used
 // by in-process sessions, then returns the subprocess environment they produce.
+//
+// Secret exposure: the values below are spliced into `tmux new-window -e
+// NAME=VALUE`, so a resolved API key is present in the tmux *client's* argv
+// (readable via ps/proc by the same user) for the duration of that exec. tmux
+// offers no argv-free way to seed a new window's environment, and the
+// alternative — a transient on-disk key file the launched shell sources — buys
+// a narrower window at the cost of a file lifecycle to get wrong. Documented
+// rather than hidden; codex.WithLLMEndpoint's doc comment is corrected to
+// match, since its env_key indirection only keeps the key out of *codex's*
+// argv, not out of tmux's.
 func (r *tmuxRunner) endpointEnv() map[string]string {
 	if r.llmEndpoint.IsZero() {
 		return nil
@@ -99,6 +109,21 @@ func (r *tmuxRunner) endpointEnv() map[string]string {
 		cfg := claude.SessionConfig{}
 		claude.WithModel(r.model)(&cfg)
 		claude.WithLLMEndpoint(r.llmEndpoint)(&cfg)
+		// The wrapper sets both ANTHROPIC_AUTH_TOKEN (Bearer) and
+		// ANTHROPIC_API_KEY (x-api-key) because proxies differ on which they
+		// accept. That is right for `claude -p`, which never prompts, but the
+		// interactive CLI this runner launches reacts to ANTHROPIC_API_KEY on
+		// a machine that also has an account login by blocking on a modal
+		// ("Detected a custom API key in your environment"), whose default
+		// answer is No — which would decline the endpoint's key and leave the
+		// window pointed at ANTHROPIC_BASE_URL with the user's own
+		// credentials. Nothing outside the integration harness answers startup
+		// dialogs, so the window would simply park there. Bearer alone
+		// authenticates against OpenRouter (verified: 401 on a bad key, 429 on
+		// a good one), so drop the x-api-key half here. The cost is a
+		// hypothetical Bearer-rejecting proxy, which would need its own
+		// non-interactive path anyway.
+		delete(cfg.Env, "ANTHROPIC_API_KEY")
 		return cfg.Env
 	default:
 		return nil
@@ -355,9 +380,22 @@ func (r *tmuxRunner) buildCommand() (binary string, args []string) {
 	return binary, args
 }
 
-// codexEndpointArgs reuses codex.WithLLMEndpoint's config translation. The
-// interactive CLI spells app-server's --config flag as -c; only that shared
-// model-provider config applies here (the app-server feature denylist does not).
+// codexEndpointArgs reuses codex.WithLLMEndpoint's config translation for the
+// interactive CLI. Every flag that option emits applies here; only the spelling
+// of one differs, because app-server's --config is -c on the interactive CLI
+// (`codex --help`). In particular the third-party feature denylist applies:
+// --disable is a top-level interactive option ("Equivalent to
+// -c features.<name>=false"), and it is what keeps codex from sending tool
+// schemas that strict Responses providers reject with HTTP 400 "unknown
+// variant `namespace`" — see thirdPartyIncompatibleFeatures in
+// agent-cli-wrapper/codex/client_options.go. Dropping it made the tmux path
+// fail against gateways where the in-process path succeeds; OpenRouter's
+// leniency is why the live test never caught it.
+//
+// Translating the whole stream rather than filtering for --config is the point:
+// the previous filter silently dropped every flag it did not recognize, so a
+// future addition to WithLLMEndpoint would go missing here again with no
+// symptom until a request 400s. Unknown two-token flags pass through verbatim.
 func (r *tmuxRunner) codexEndpointArgs() []string {
 	if r.llmEndpoint.IsZero() {
 		return nil
@@ -365,11 +403,12 @@ func (r *tmuxRunner) codexEndpointArgs() []string {
 	cfg := codex.ClientConfig{}
 	codex.WithLLMEndpoint(r.llmEndpoint)(&cfg)
 	var args []string
-	for i := 0; i+1 < len(cfg.AppServerArgs); i++ {
-		if cfg.AppServerArgs[i] == "--config" {
-			args = append(args, "-c", cfg.AppServerArgs[i+1])
-			i++
+	for i := 0; i+1 < len(cfg.AppServerArgs); i += 2 {
+		flag, value := cfg.AppServerArgs[i], cfg.AppServerArgs[i+1]
+		if flag == "--config" {
+			flag = "-c"
 		}
+		args = append(args, flag, value)
 	}
 	return args
 }

@@ -1043,6 +1043,21 @@ func newSessionEndpoint(cmd *cobra.Command) (llmendpoint.Endpoint, error) {
 	if err := endpoint.Validate(); err != nil {
 		return llmendpoint.Endpoint{}, err
 	}
+	// Resolve the key here, in the client, and carry the literal value in the
+	// request. --llm-api-key-env is typed in the user's shell, but the session
+	// is launched by the long-running bramble TUI in another process: if that
+	// server was started before the key was exported, the name alone resolves
+	// to nothing there and the CLI gets no credential. Reading it on the side
+	// that has it makes the documented flow independent of the server's
+	// startup environment. The literal never outlives the request — the socket
+	// is not logged, and SessionToStored persists the endpoint via Redacted().
+	//
+	// When the client's environment has no value either, APIKeyEnv still
+	// crosses on its own so the server can try its own environment, and
+	// startSessionWithID reports by name if that fails too.
+	if endpoint.APIKey == "" && endpoint.APIKeyEnv != "" {
+		endpoint.APIKey = os.Getenv(endpoint.APIKeyEnv)
+	}
 	return endpoint, nil
 }
 
