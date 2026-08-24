@@ -425,3 +425,62 @@ func TestManager_EndpointReachesTheProviderTurn(t *testing.T) {
 	got, _ := provider.observed()
 	assert.Equal(t, endpoint, got, "the session's endpoint must reach the provider turn intact")
 }
+
+// agent.CLIModelArg drops the model flag entirely when the id belongs to
+// another provider, so without this rule `--backend codex --model opus`
+// launched codex with no -m — running codex's default model while bramble
+// recorded and displayed "opus". Rejecting the pair at the producer is what
+// keeps that unreachable rather than papering over it at each consumer.
+func TestManager_BackendAndModelMustAgree(t *testing.T) {
+	t.Parallel()
+
+	mgr := NewManagerWithConfig(ManagerConfig{SessionMode: SessionModeTmux})
+	t.Cleanup(mgr.Close)
+
+	_, err := mgr.StartSessionWithOpts(
+		SessionTypeBuilder, t.TempDir(), "test prompt", "opus",
+		SpawnOpts{Backend: ProviderCodex},
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "opus")
+	assert.Contains(t, err.Error(), ProviderCodex)
+	assert.Contains(t, err.Error(), ProviderClaude, "the error must name the backend the model does belong to")
+}
+
+// The rule must not reject the case the PR exists for: a third-party id the
+// curated registry has never heard of is exactly what --backend carries.
+func TestManager_UncuratedModelIsAllowedWithExplicitBackend(t *testing.T) {
+	t.Parallel()
+
+	require.NoError(t, validateBackendModel(ProviderCodex, "stealth/ox-alpha"))
+	require.NoError(t, validateBackendModel(ProviderClaude, "stealth/ox-alpha"))
+	// A curated id whose provider matches is equally fine.
+	require.NoError(t, validateBackendModel(ProviderClaude, "opus"))
+	// And no backend means no pairing to check.
+	require.NoError(t, validateBackendModel("", "opus"))
+}
+
+// Redacted() drops Headers, so a persisted header-bearing endpoint comes back
+// without them and fails opaquely against a gateway that requires one. Refuse
+// at creation, where the caller can still act on it.
+func TestManager_HeaderBearingEndpointIsRefusedWhenPersisted(t *testing.T) {
+	t.Parallel()
+
+	endpoint := llmendpoint.OpenRouter()
+	endpoint.APIKey = "openrouter-test-key"
+	endpoint.Headers = map[string]string{"X-Tenant": "acme"}
+
+	// The guard is about what survives the store, so it keys off the store.
+	require.NoError(t, validatePersistableEndpoint(endpoint, false),
+		"a manager with no store never rehydrates, so headers cannot vanish")
+	err := validatePersistableEndpoint(endpoint, true)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "header")
+	assert.Contains(t, err.Error(), "resume")
+
+	// Redacted() really does drop them — the premise of the guard, asserted
+	// rather than assumed, since a future change to Redacted would make this
+	// rule obsolete rather than merely wrong.
+	assert.Empty(t, endpoint.Redacted().Headers)
+	assert.NotEmpty(t, endpoint.Headers, "Redacted must not mutate the original")
+}

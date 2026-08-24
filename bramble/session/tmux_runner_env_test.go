@@ -107,6 +107,7 @@ func TestTmuxRunnerNewWindowArgs_OpenRouterClaudeFullArgv(t *testing.T) {
 
 	want := []string{
 		"new-window", "-P", "-F", "#{window_id}",
+		"-e", "ANTHROPIC_API_KEY=",
 		"-e", "ANTHROPIC_AUTH_TOKEN=openrouter-test-key",
 		"-e", "ANTHROPIC_BASE_URL=https://openrouter.ai/api",
 		"-e", "ANTHROPIC_DEFAULT_HAIKU_MODEL=stealth/ox-alpha",
@@ -122,14 +123,25 @@ func TestTmuxRunnerNewWindowArgs_OpenRouterClaudeFullArgv(t *testing.T) {
 		t.Fatalf("newWindowArgs() mismatch\n got: %#v\nwant: %#v", got, want)
 	}
 	// Stated separately from the argv equality above because this one is a
-	// safety property, not a formatting detail: ANTHROPIC_API_KEY makes the
-	// interactive claude CLI block on a "Detected a custom API key in your
-	// environment" modal whose default answer declines the endpoint's key, and
-	// nothing outside the integration harness answers startup dialogs. A future
-	// edit that reinstates it should fail on a message that says why.
+	// safety property, not a formatting detail: a non-empty ANTHROPIC_API_KEY
+	// makes the interactive claude CLI block on a "Detected a custom API key in
+	// your environment" modal whose default answer declines the endpoint's key,
+	// and nothing outside the integration harness answers startup dialogs.
+	//
+	// The pair must be PRESENT and EMPTY, not absent. A tmux window inherits
+	// the server's global environment, so an absent pair leaves whatever the
+	// user exported before starting tmux — asserting absence here is what let
+	// the earlier delete()-based version look correct while the window still
+	// received the user's own key.
+	idx := slices.Index(got, "ANTHROPIC_API_KEY=")
+	if idx < 0 {
+		t.Errorf("claude window does not shadow ANTHROPIC_API_KEY; an inherited value would survive\ngot: %#v", got)
+	} else if got[idx-1] != "-e" {
+		t.Errorf("ANTHROPIC_API_KEY= is not preceded by -e\ngot: %#v", got)
+	}
 	for _, a := range got {
-		if strings.Contains(a, "ANTHROPIC_API_KEY") {
-			t.Errorf("interactive claude window exports %q; it would park on the custom-API-key modal\ngot: %#v", a, got)
+		if strings.HasPrefix(a, "ANTHROPIC_API_KEY=") && a != "ANTHROPIC_API_KEY=" {
+			t.Errorf("interactive claude window exports a non-empty %q; it would park on the custom-API-key modal\ngot: %#v", a, got)
 		}
 	}
 }

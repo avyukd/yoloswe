@@ -130,7 +130,19 @@ func (r *tmuxRunner) endpointEnv() map[string]string {
 		// here and TestWithLLMEndpoint_setsEnv in the wrapper — so
 		// an x-api-key-only gateway fails on a documented decision rather than
 		// an accident. Such a gateway must use the in-process path.
-		delete(cfg.Env, "ANTHROPIC_API_KEY")
+		//
+		// Shadowed with an empty value, NOT deleted. A tmux window's
+		// environment is the server's global environment merged with the -e
+		// overrides, so omitting a pair only declines to *add* it — it cannot
+		// clear a value the user exported before the tmux server started,
+		// which is the common case for anyone who has used claude with an API
+		// key. Measured on tmux 3.4: with ANTHROPIC_API_KEY in the server
+		// environment, a window launched without the pair sees the user's own
+		// key, and one launched with `-e ANTHROPIC_API_KEY=` sees "". Deleting
+		// therefore produced exactly what this code exists to prevent — the
+		// modal fires anyway, and answering it sends the user's real Anthropic
+		// credential to the third-party endpoint as x-api-key.
+		cfg.Env["ANTHROPIC_API_KEY"] = ""
 		return cfg.Env
 	default:
 		return nil

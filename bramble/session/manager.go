@@ -998,13 +998,15 @@ func (m *Manager) startSessionWithID(sessionID SessionID, sessionType SessionTyp
 		cancel()
 		return "", err
 	}
-	// An explicit backend means the model ID is that backend's own, so there is
-	// no default to fall back to and the session cannot start. Reported here
-	// rather than left to resolveAgentModel inside runSession, so the operator
-	// sees it at the command line.
-	if model == "" && backend != "" {
+	if err := validatePersistableEndpoint(endpoint, m.config.Store != nil); err != nil {
 		cancel()
-		return "", fmt.Errorf("model must not be empty when backend %q is selected", backend)
+		return "", err
+	}
+	// Reported here rather than left to resolveAgentModel inside runSession, so
+	// the operator sees it at the command line.
+	if err := validateBackendModel(backend, model); err != nil {
+		cancel()
+		return "", err
 	}
 
 	session := &Session{
@@ -1493,8 +1495,8 @@ func resolveAgentModel(modelID, backend string, registry *agent.ModelRegistry) (
 		if err := validateBackend(backend); err != nil {
 			return agent.AgentModel{}, err
 		}
-		if modelID == "" {
-			return agent.AgentModel{}, fmt.Errorf("model must not be empty when backend %q is selected", backend)
+		if err := validateBackendModel(backend, modelID); err != nil {
+			return agent.AgentModel{}, err
 		}
 		return agent.AgentModel{ID: modelID, Provider: backend, Label: modelID}, nil
 	}
@@ -1541,6 +1543,64 @@ func validateBackend(backend string) error {
 		return fmt.Errorf("unknown backend %q (expected one of %s)", backend, strings.Join(agent.AllProviders, ", "))
 	}
 	return nil
+}
+
+// validateBackendModel rejects a (backend, model) pair that cannot launch.
+//
+// Two ways it cannot. An explicit backend means the model ID is that backend's
+// own — an OpenRouter slug, say — so an empty model has no default to fall back
+// to; bramble's own defaults are Claude aliases. And a model ID the curated
+// registry assigns to a *different* provider is a user error, not a request for
+// that CLI's default: agent.CLIModelArg drops the flag entirely in that case
+// (model_registry.go:47-49), so `--backend codex --model opus` would launch
+// codex with no -m at all, running codex's default while bramble recorded and
+// displayed "opus". The same split would let endpointEnv pin ANTHROPIC_MODEL
+// from the raw ID while --model carried the filtered one.
+//
+// Checked against the global registry rather than the manager's filtered one
+// because that is the registry CLIModelArg consults; validating against a
+// different set than the consumer uses is how the two drift apart. An ID absent
+// from the registry is fine — carrying third-party IDs is what --backend is for.
+//
+// Called from startSessionWithID (so the CLI gets a synchronous error) and from
+// resolveAgentModel (so every other caller is covered too). One function rather
+// than a check in each: this is one rule about one pair.
+func validateBackendModel(backend, model string) error {
+	if backend == "" {
+		return nil
+	}
+	if model == "" {
+		return fmt.Errorf("model must not be empty when backend %q is selected", backend)
+	}
+	if m, ok := agent.ModelByID(model); ok && m.Provider != backend {
+		return fmt.Errorf("model %q belongs to backend %q, not the requested backend %q: pass a model id that backend serves, or drop --backend", model, m.Provider, backend)
+	}
+	return nil
+}
+
+// validatePersistableEndpoint rejects an endpoint this manager cannot faithfully
+// reconstruct after a restart.
+//
+// SessionToStored persists via Endpoint.Redacted(), whose contract is
+// log-safety, not persistence: it clears APIKey *and* drops Headers entirely.
+// The credential survives that because APIKeyEnv re-resolves and
+// validateEndpointCredential names the failure when it cannot. Headers have
+// neither — a rehydrated endpoint simply has none, so a gateway that needs a
+// routing or tenant header would work on first launch and fail opaquely on
+// every resume, with the store's redaction test (which asserts only on APIKey)
+// blind to it.
+//
+// Refusing up front is the cheaper half of the trade: persisting the header
+// values instead would put arbitrary secrets in ~/.bramble/sessions/*.json,
+// which is the posture this whole path exists to avoid. Headers are not
+// reachable from `bramble new-session` — there is no --llm-header flag — so
+// this can only fire for a direct IPC caller that sets them, and it tells that
+// caller the constraint at the point it can still act on it.
+func validatePersistableEndpoint(endpoint llmendpoint.Endpoint, persists bool) error {
+	if !persists || len(endpoint.Headers) == 0 {
+		return nil
+	}
+	return fmt.Errorf("llm endpoint sets %d http header(s), which are not persisted (Redacted drops them) and would silently vanish on resume: drop the headers, or run this endpoint through the in-process path", len(endpoint.Headers))
 }
 
 // validateEndpointCredential rejects an endpoint whose key resolves to nothing.
