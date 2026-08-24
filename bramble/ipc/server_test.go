@@ -3,6 +3,7 @@ package ipc
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -169,4 +170,83 @@ func TestHandlerError(t *testing.T) {
 	require.False(t, resp.OK)
 	require.Equal(t, "req-err", resp.ID)
 	require.Contains(t, resp.Error, "worktree not found")
+}
+
+// TestStaleSocketIsRebound: a socket file left behind by a killed bramble has
+// no listener, so the path is free and must be reclaimed. Without this a crash
+// would make the stable path unusable until someone deleted it by hand.
+func TestStaleSocketIsRebound(t *testing.T) {
+	t.Parallel()
+	sockPath := filepath.Join(t.TempDir(), "test.sock")
+
+	// Abandon the file without unlinking, as a SIGKILL would. Go removes the
+	// socket on a graceful Close, so SetUnlinkOnClose(false) is what makes this
+	// a crash rather than a clean shutdown.
+	first := NewServer(sockPath)
+	require.NoError(t, first.Start())
+	unixLn, ok := first.listener.(*net.UnixListener)
+	require.True(t, ok, "expected a unix listener")
+	unixLn.SetUnlinkOnClose(false)
+	require.NoError(t, unixLn.Close())
+	require.FileExists(t, sockPath, "the socket file outlives the listener")
+
+	second := NewServer(sockPath)
+	second.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+		return "pong", nil
+	})
+	require.NoError(t, second.Start(), "a stale socket must be reclaimed")
+	defer second.Close()
+
+	require.NoError(t, NewClient(sockPath).Ping())
+}
+
+// TestLiveSocketIsNotStolen is what protects a second bramble from stranding
+// the first one's sessions. The path is stable across restarts and frozen into
+// every tmux window's environment, so unlinking a socket someone is still
+// serving would silently cut off every session that depends on it.
+func TestLiveSocketIsNotStolen(t *testing.T) {
+	t.Parallel()
+	sockPath := filepath.Join(t.TempDir(), "test.sock")
+
+	first := NewServer(sockPath)
+	first.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+		return "pong", nil
+	})
+	require.NoError(t, first.Start())
+	defer first.Close()
+
+	second := NewServer(sockPath)
+	err := second.Start()
+	require.Error(t, err, "a live socket must not be taken over")
+	require.ErrorIs(t, err, ErrSocketInUse, "callers fall back on this specific error")
+
+	// The incumbent is still serving: the whole point of refusing.
+	require.NoError(t, NewClient(sockPath).Ping(), "the first server still answers")
+}
+
+// TestSocketPathSurvivesRestart is the end-to-end shape of the bug this fixes:
+// a session holds one address for its whole life, and a bramble that comes back
+// at the same path must be reachable at it.
+func TestSocketPathSurvivesRestart(t *testing.T) {
+	t.Parallel()
+	sockPath := filepath.Join(t.TempDir(), "test.sock")
+
+	first := NewServer(sockPath)
+	first.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+		return "pong", nil
+	})
+	require.NoError(t, first.Start())
+	require.NoError(t, first.Close())
+
+	// What a session baked into its environment before the restart.
+	client := NewClient(sockPath)
+
+	second := NewServer(sockPath)
+	second.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+		return "pong", nil
+	})
+	require.NoError(t, second.Start())
+	defer second.Close()
+
+	require.NoError(t, client.Ping(), "the address a live session holds still works")
 }

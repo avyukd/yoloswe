@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 )
 
 // Handler processes an IPC request and returns a result or error.
@@ -45,9 +46,45 @@ func (s *Server) SocketPath() string {
 	return s.socketPath
 }
 
-// Start begins listening on the Unix domain socket. It removes any stale socket file first.
+// ErrSocketInUse reports that another live process is already serving the
+// socket path. Callers that can fall back to a different path check for this;
+// everything else treats it as fatal.
+var ErrSocketInUse = errors.New("socket is already served by a live process")
+
+// socketLiveness bounds the wait for an existing socket to answer. A live
+// server accepts immediately — this only has to outlast scheduling noise, not
+// a slow handler, because connecting at all is the whole signal.
+const socketLiveness = 250 * time.Millisecond
+
+// socketInUse reports whether something is already listening on path.
+//
+// Connecting is the test, not pinging: a Unix socket that accepts a connection
+// has a live listener behind it, and a stale file left by a killed process
+// refuses with ECONNREFUSED. Sending a request would additionally require the
+// peer to be a bramble that speaks this protocol, which is a stronger claim
+// than needed and would hang on a peer that accepts but never replies.
+func socketInUse(path string) bool {
+	conn, err := net.DialTimeout("unix", path, socketLiveness)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// Start begins listening on the Unix domain socket.
+//
+// A socket file left behind by a dead process is removed and rebound; one that
+// still answers belongs to a live server and is left strictly alone. The
+// distinction matters because the path is stable across restarts: unlinking it
+// blindly would steal every running session's callback address from whichever
+// bramble is still serving them, and those sessions have that path frozen in
+// their tmux window environment with no way to learn a new one.
 func (s *Server) Start() error {
-	// Remove stale socket if it exists
+	if socketInUse(s.socketPath) {
+		return fmt.Errorf("%w: %s", ErrSocketInUse, s.socketPath)
+	}
+	// Nothing answered, so any file here is stale.
 	if err := os.Remove(s.socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("failed to remove stale socket %s: %w", s.socketPath, err)
 	}

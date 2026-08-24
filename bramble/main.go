@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"expvar"
 	"fmt"
 	"io"
@@ -332,13 +333,14 @@ func runTUI(cmd *cobra.Command, args []string) error {
 
 	// The IPC server has not started yet, so its path is the one it is about to
 	// bind. Publish it up front; clear it below if the bind fails.
-	ipcSockPath := ipcSocketPath()
+	//
+	// Which path that is cannot be decided without trying to bind: the stable
+	// name is preferred, but if another bramble is still serving it this
+	// process must take a pid-scoped one instead of stealing it. Bind first,
+	// then publish whatever was actually bound.
+	ipcServer, ipcSockPath := bindIPCServer(registry, wtRoot, repoName)
 	publishSockPaths(sessionManager, &sharedManagerConfig, ipcSockPath, controlSockPath)
 
-	// Start IPC server so child processes can request new sessions.
-	// The registry aggregates all repo managers so IPC handlers can find
-	// sessions from any repo, including those opened later via Alt-R.
-	ipcServer := startIPCServer(registry, ipcSockPath, wtRoot, repoName)
 	if ipcServer != nil {
 		defer ipcServer.Close()
 		os.Setenv(ipc.SockEnvVar, ipcSockPath)
@@ -526,12 +528,44 @@ func socketDir() string {
 // Each is called exactly once per process, into a local that is then both
 // published and handed to the server, so the advertised path and the bound path
 // cannot diverge even though socketDir() re-reads the environment.
+// The stable names are what a tmux window's frozen BRAMBLE_SOCK keeps pointing
+// at across a restart of the TUI. The pid-scoped names are the fallback for a
+// second bramble started while the first still holds the stable path.
+const (
+	ipcSockName     = "bramble.sock"
+	controlSockName = "bramble-control.sock"
+)
+
+// ipcSocketPath and controlSocketPath return the path each server should try
+// first: a stable, per-user name rather than a pid-scoped one.
+//
+// Stable because the address is baked into every session's environment at
+// window creation and can never be updated afterwards — tmux set-environment
+// only reaches processes started later, and an agent CLI reads its hook
+// settings once at startup. A pid-scoped path therefore strands every window
+// the moment bramble comes back under a new pid: the Stop hook fires into a
+// socket that no longer exists, --silent swallows the failure, and the session
+// is never seen to go idle again, so its parent's mail never drains.
+//
+// syscall.Exec keeps the pid, so the in-place restart never had this problem.
+// A crash, a kill -9, or a fresh launch in another terminal did.
 func ipcSocketPath() string {
-	return filepath.Join(socketDir(), fmt.Sprintf("bramble-%d.sock", os.Getpid()))
+	return filepath.Join(socketDir(), ipcSockName)
 }
 
 func controlSocketPath() string {
-	return filepath.Join(socketDir(), fmt.Sprintf("bramble-control-%d.sock", os.Getpid()))
+	return filepath.Join(socketDir(), controlSockName)
+}
+
+// pidScopedSocketPath is where a server falls back when the stable path is
+// already served by a live bramble. Sessions this process starts get this
+// address in their environment and reach it correctly; sessions started by the
+// process holding the stable path keep reaching that one. Both work — what
+// must never happen is a second bramble unlinking a socket the first is still
+// serving, which would strand every one of its windows.
+func pidScopedSocketPath(name string) string {
+	base := strings.TrimSuffix(name, ".sock")
+	return filepath.Join(socketDir(), fmt.Sprintf("%s-%d.sock", base, os.Getpid()))
 }
 
 // publishSockPaths makes both socket paths visible to every session the manager
@@ -549,6 +583,24 @@ func publishSockPaths(m *session.Manager, shared *session.ManagerConfig, ipcSock
 	m.SetControlSockPath(controlSockPath)
 	shared.IPCSockPath = ipcSockPath
 	shared.ControlSockPath = controlSockPath
+}
+
+// bindIPCServer starts the IPC server on the stable socket path, falling back
+// to a pid-scoped one when another live bramble already serves it. It returns
+// the server and the path actually bound, so the caller publishes an address
+// that is really listening rather than the one it hoped for.
+func bindIPCServer(registry *session.SessionRegistry, wtRoot, repoName string) (*ipc.Server, string) {
+	sockPath := ipcSocketPath()
+	if srv := startIPCServer(registry, sockPath, wtRoot, repoName); srv != nil {
+		return srv, sockPath
+	}
+	fallback := pidScopedSocketPath(ipcSockName)
+	slog.Warn("stable IPC socket is served by another bramble; falling back",
+		"stable", sockPath, "fallback", fallback)
+	if srv := startIPCServer(registry, fallback, wtRoot, repoName); srv != nil {
+		return srv, fallback
+	}
+	return nil, ""
 }
 
 // startIPCServer binds the IPC server to sockPath, which the caller has already
@@ -664,9 +716,24 @@ func newDispatcher(registry *session.SessionRegistry, courier *session.Courier) 
 // startControlServer starts the control-protocol Unix server backed by the
 // session registry and a real tmux controller. Returns nil if it fails to
 // start (non-fatal — the TUI still runs, only remote/CLI control is absent).
+// startControlServer binds the control socket, preferring the stable path and
+// falling back to a pid-scoped one when another live bramble holds it. Same
+// reasoning as bindIPCServer: the two paths are published together, so they
+// must make the same choice rather than leaving a window with one live address
+// and one dead one.
 func startControlServer(registry *session.SessionRegistry, courier *session.Courier) *control.UnixServer {
-	srv := control.NewUnixServer(controlSocketPath(), newDispatcher(registry, courier))
-	if err := srv.Start(); err != nil {
+	dispatcher := newDispatcher(registry, courier)
+	sockPath := controlSocketPath()
+	srv := control.NewUnixServer(sockPath, dispatcher)
+	err := srv.Start()
+	if errors.Is(err, control.ErrSocketInUse) {
+		fallback := pidScopedSocketPath(controlSockName)
+		slog.Warn("stable control socket is served by another bramble; falling back",
+			"stable", sockPath, "fallback", fallback)
+		srv = control.NewUnixServer(fallback, dispatcher)
+		err = srv.Start()
+	}
+	if err != nil {
 		slog.Warn("control server failed to start", "err", err)
 		return nil
 	}

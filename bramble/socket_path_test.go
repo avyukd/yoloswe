@@ -37,11 +37,41 @@ func TestSocketPathDerivation(t *testing.T) {
 		t.Errorf("controlSocketPath() not deterministic: %q then %q", control, got)
 	}
 
-	// Both are pid-scoped, so concurrent bramble processes do not collide.
+	// Neither is pid-scoped. A session's callback address is frozen into its
+	// tmux window at creation and can never be updated, so a path that moved
+	// with the pid stranded every window whenever bramble came back under a new
+	// one. Collision between concurrent brambles is handled at bind time
+	// instead — see pidScopedSocketPath and TestPidScopedFallbackIsDistinct.
 	pid := strconv.Itoa(os.Getpid())
 	for _, p := range []string{ipc, control} {
+		if strings.Contains(filepath.Base(p), pid) {
+			t.Errorf("socket path %q is pid-scoped; it must survive a restart under a new pid", p)
+		}
+	}
+}
+
+// TestPidScopedFallbackIsDistinct covers the path a second bramble takes when
+// the stable one is already served. It must differ from the stable name and
+// from the other socket's fallback, or two live brambles would fight over one
+// address — the collision the pid used to prevent by construction.
+func TestPidScopedFallbackIsDistinct(t *testing.T) {
+	ipcFallback := pidScopedSocketPath(ipcSockName)
+	controlFallback := pidScopedSocketPath(controlSockName)
+
+	if ipcFallback == ipcSocketPath() || controlFallback == controlSocketPath() {
+		t.Errorf("fallback must differ from the stable path: ipc=%q control=%q", ipcFallback, controlFallback)
+	}
+	if ipcFallback == controlFallback {
+		t.Errorf("the two fallbacks collide, both = %q", ipcFallback)
+	}
+
+	pid := strconv.Itoa(os.Getpid())
+	for _, p := range []string{ipcFallback, controlFallback} {
 		if !strings.Contains(filepath.Base(p), pid) {
-			t.Errorf("socket path %q does not contain pid %s; concurrent bramble processes would collide", p, pid)
+			t.Errorf("fallback %q is not pid-scoped, so two brambles would collide", p)
+		}
+		if !strings.HasSuffix(p, ".sock") {
+			t.Errorf("fallback %q lost its .sock suffix", p)
 		}
 	}
 }

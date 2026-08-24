@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/bazelment/yoloswe/bramble/session"
 )
@@ -40,7 +41,33 @@ func NewUnixServer(socketPath string, disp *Dispatcher) *UnixServer {
 func (s *UnixServer) SocketPath() string { return s.socketPath }
 
 // Start removes any stale socket and begins accepting connections.
+// ErrSocketInUse reports that another live process already serves the socket
+// path, so this server must not unlink it. Mirrors ipc.ErrSocketInUse — the two
+// sockets are published together and have to make the same choice, but control
+// does not import ipc (ipc would be the odd dependency here, and the check is
+// six lines).
+var ErrSocketInUse = errors.New("control: socket is already served by a live process")
+
+// socketInUse reports whether something is already listening on path. A live
+// listener accepts; a socket file left by a killed process refuses.
+func socketInUse(path string) bool {
+	conn, err := net.DialTimeout("unix", path, 250*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// Start binds the control socket.
+//
+// A stale socket file is removed and rebound, but one that still answers is
+// left alone: the path is stable across restarts, and unlinking a live peer's
+// socket would strand every session that has it frozen in its environment.
 func (s *UnixServer) Start() error {
+	if socketInUse(s.socketPath) {
+		return fmt.Errorf("%w: %s", ErrSocketInUse, s.socketPath)
+	}
 	if err := os.Remove(s.socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("control: remove stale socket: %w", err)
 	}
