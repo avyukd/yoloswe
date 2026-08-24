@@ -71,6 +71,16 @@ func (f *fakeTarget) annotate(id SessionID, fn func(*SessionInfo)) {
 	f.sessions[id] = info
 }
 
+// setBackend records which agent CLI backs a session. Paste verification is
+// provider-specific — only a backend known to drop pastes is re-pasted — so a
+// test that exercises the strict path has to say which one it means.
+func (f *fakeTarget) setBackend(id SessionID, backend, model string) {
+	f.annotate(id, func(i *SessionInfo) {
+		i.Backend = backend
+		i.Model = model
+	})
+}
+
 func (f *fakeTarget) SessionInfo(id SessionID) (SessionInfo, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -185,6 +195,21 @@ func (p *fakePanes) SendEnter(_ context.Context, target string) error {
 		onSubmit()
 	}
 	return nil
+}
+
+// pasteCount reports how many pastes reached the pane. Counting the writes
+// rather than the echoes: a test whose echo is unset still needs to know
+// whether the courier pasted once or twice.
+func (p *fakePanes) pasteCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, w := range p.writes {
+		if strings.HasPrefix(w, "paste(") {
+			n++
+		}
+	}
+	return n
 }
 
 func (p *fakePanes) recorded() []string {
@@ -1708,6 +1733,9 @@ func TestDroppedPasteIsRetried(t *testing.T) {
 	t.Parallel()
 	target := newFakeTarget()
 	target.set("s1", StatusIdle, RunnerTypeTmux)
+	// Codex is the provider whose TUI drops pastes, and the only one the
+	// courier re-pastes for.
+	target.setBackend("s1", ProviderCodex, "gpt-5.4-mini")
 
 	panes := echoPanes(target)
 	var pastes int
@@ -1737,6 +1765,7 @@ func TestPersistentlyDroppedPasteKeepsDeliveryQueued(t *testing.T) {
 	t.Parallel()
 	target := newFakeTarget()
 	target.set("s1", StatusRunning, RunnerTypeTmux)
+	target.setBackend("s1", ProviderCodex, "gpt-5.4-mini")
 
 	panes := &fakePanes{} // echo unset: every paste is swallowed
 	c, err := NewCourier(target, panes, testCourierConfig(t))
@@ -1837,4 +1866,174 @@ func TestConcurrentDrainAndSendKeepsQueueConsistent(t *testing.T) {
 	require.NoError(t, err)
 	assert.Lenf(t, reloaded.Pending("parent"), len(inMemory),
 		"the persisted queue disagrees with the live one")
+}
+
+// TestCursorChipCountsAsPasteLanded: cursor-agent collapses a bracketed paste
+// into a "[Pasted text #N]" chip and never echoes the characters, so looking
+// for the text itself can never succeed. Before this was provider-aware every
+// cursor delivery pasted twice and then refused to submit.
+func TestCursorChipCountsAsPasteLanded(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderCursor, "cursor-composer-2")
+
+	panes := &fakePanes{}
+	var pastes int
+	panes.echo = func(string) {
+		pastes++
+		// What cursor actually shows: a chip standing in for the content.
+		target.appendPane("[Pasted text #1 +12 lines]")
+	}
+	panes.onSubmit = func() { target.appendPane("> ") }
+
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "the report body", true)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, pastes, "a chip is proof enough; the text must not be pasted twice")
+	assert.Contains(t, panes.recorded(), "enter(@7)", "the delivery must be submitted")
+	assert.Equal(t, []SessionID{"s1"}, target.markedRunning)
+	assert.Empty(t, c.Pending("s1"), "a delivered message must leave the queue")
+
+	// The chip is what makes this a *confirmed* delivery rather than one that
+	// merely proceeded because cursor is not verified strictly. Without the
+	// marker the courier would spend the whole verify budget scraping for text
+	// that is never echoed, so assert the recognition directly.
+	assert.True(t, pasteConfirmed(ProviderCursor,
+		[]string{"[Pasted text #1 +12 lines]"}, "the report body"),
+		"a chip stands in for the pasted text")
+	assert.False(t, pasteConfirmed(ProviderCodex,
+		[]string{"[Pasted text #1 +12 lines]"}, "the report body"),
+		"a chip is cursor's chrome; codex must not accept it as evidence")
+}
+
+// TestUnverifiablePasteStillSubmits is the regression test for the reported
+// bug. tmux reported the paste succeeded; a pane we cannot read back is
+// silence, not a negative. Re-pasting on silence is what put the message in
+// the composer twice and then never submitted it.
+func TestUnverifiablePasteStillSubmits(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		backend string
+		model   string
+	}{
+		{"cursor renders nothing we can match", ProviderCursor, "cursor-composer-2"},
+		{"unresolvable model has no known chrome", "", "not-a-real-model"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			target := newFakeTarget()
+			target.set("s1", StatusIdle, RunnerTypeTmux)
+			if tc.backend != "" || tc.model != "" {
+				target.setBackend("s1", tc.backend, tc.model)
+			}
+
+			panes := &fakePanes{} // echo unset: the pane never shows the text
+			c, err := NewCourier(target, panes, testCourierConfig(t))
+			require.NoError(t, err)
+
+			_, err = c.Send(context.Background(), "", "s1", "never echoed", true)
+			require.NoError(t, err)
+
+			assert.Equal(t, 1, panes.pasteCount(), "one paste only — never double-paste on silence")
+			assert.Contains(t, panes.recorded(), "enter(@7)", "the message must still be submitted")
+			assert.Empty(t, c.Pending("s1"), "the delivery must not stay queued")
+		})
+	}
+}
+
+// TestDeliveryHeldWhileComposerHasDraft: a paste appends to whatever the user
+// is typing, and the Enter that follows submits their half-written sentence
+// wearing the delivered text. The idle probe cannot catch this on its own —
+// a composer holding a draft still reads as idle.
+func TestDeliveryHeldWhileComposerHasDraft(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	// A real claude composer mid-sentence. The glyph is followed by U+00A0.
+	target.appendPane("❯ file the dev deprovisioning bug")
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	assert.Zero(t, panes.pasteCount(), "nothing may be pasted into a draft")
+	assert.NotContains(t, panes.recorded(), "enter(@7)", "the user's draft must not be submitted")
+	assert.Len(t, c.Pending("s1"), 1, "the message stays queued for the next transition")
+	assert.Empty(t, target.markedRunning, "no turn started")
+}
+
+// TestDeliveryProceedsOnceDraftIsCleared: holding is not dropping. Once the
+// composer is empty the queued message goes out on the next drain.
+func TestDeliveryProceedsOnceDraftIsCleared(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.appendPane("❯ half a thought")
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "queued while typing", true)
+	require.NoError(t, err)
+	require.Len(t, c.Pending("s1"), 1, "held while the draft was there")
+
+	// The user submits or clears the line: the composer is empty again.
+	target.appendPane("❯ ")
+	c.Drain(context.Background(), "s1")
+
+	assert.Contains(t, panes.recorded(), "enter(@7)", "delivery resumes once the composer is clear")
+	assert.Empty(t, c.Pending("s1"), "the queue drains")
+}
+
+// TestEmptyClaudeComposerIsNotADraft pins the byte that decides whether any
+// mail is ever delivered to a claude session. The prompt glyph is followed by
+// a non-breaking space (U+00A0), so trimming only ordinary spaces leaves
+// " " behind and reports a draft on every empty composer — holding back
+// every delivery on the host.
+func TestEmptyClaudeComposerIsNotADraft(t *testing.T) {
+	t.Parallel()
+	for _, line := range []string{
+		"❯ ", // real capture: glyph + NBSP
+		"❯ ", // glyph + ordinary space
+		"❯",  // bare glyph
+	} {
+		draft, known := composerDraft(ProviderClaude, []string{line})
+		assert.True(t, known, "a claude composer is readable: %q", line)
+		assert.False(t, draft, "an empty composer is not a draft: %q", line)
+	}
+
+	// Both spellings of the separator, so neither trim can regress to an
+	// ASCII-only cutset without a test noticing.
+	for _, line := range []string{
+		"❯ real text", // ordinary space
+		"❯ real text", // NBSP, as the real TUI writes it
+	} {
+		draft, known := composerDraft(ProviderClaude, []string{line})
+		assert.True(t, known, "%q", line)
+		assert.True(t, draft, "typed text is a draft: %q", line)
+	}
+}
+
+// TestComposerDraftUnknownForUnreadableProviders: cursor and codex render
+// placeholder text that disappears the moment the user types, so a draft is
+// indistinguishable from a CLI that has not finished booting. Unknown must mean
+// "deliver anyway" — refusing to write to every pane we cannot parse would
+// strand mail rather than protect it.
+func TestComposerDraftUnknownForUnreadableProviders(t *testing.T) {
+	t.Parallel()
+	for _, provider := range []string{ProviderCursor, ProviderCodex, ""} {
+		_, known := composerDraft(provider, []string{"  → Add a follow-up"})
+		assert.False(t, known, "provider %q composer is not judged", provider)
+	}
 }

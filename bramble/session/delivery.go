@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -388,7 +389,15 @@ func (c *Courier) Drain(ctx context.Context, to SessionID) {
 	}
 
 	if err := c.write(ctx, info, next.Text, next.Submit); err != nil {
-		logDeliveryWarn("failed to write queued delivery", to, err)
+		// A busy composer is not a failure — the recipient is simply mid
+		// sentence — but it looks exactly like one in the log, and a queue that
+		// stops draining because somebody left a half-typed line is otherwise
+		// very hard to explain.
+		if errors.Is(err, errComposerBusy) {
+			logDeliveryWarn("holding delivery: recipient has an unsubmitted draft", to, err)
+		} else {
+			logDeliveryWarn("failed to write queued delivery", to, err)
+		}
 		c.retryLater(ctx, to)
 		return
 	}
@@ -439,6 +448,15 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 		if err != nil {
 			return err
 		}
+		provider := providerForSession(info)
+		// Never write into a composer someone is typing in. A paste appends to
+		// their draft and the Enter below submits the pair as one prompt, so a
+		// half-written sentence goes out wearing this message. Holding the
+		// delivery is safe: the error keeps it queued and arms a retry, and the
+		// next transition delivers it once the line is clear.
+		if draft, known := c.composerHasDraft(info.ID, provider); known && draft {
+			return errComposerBusy
+		}
 		if err := c.panes.Paste(ctx, target, text); err != nil {
 			return err
 		}
@@ -451,11 +469,18 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 		// without this check the message is lost silently and, worse, the
 		// session is then marked running for a turn that never started,
 		// wedging it until something else moves it.
-		if !c.pasteLanded(ctx, info.ID, text) {
+		//
+		// Only codex is re-pasted, though. tmux already reported that
+		// paste-buffer succeeded, so for a CLI whose chrome cannot be read back
+		// — cursor renders a "[Pasted text #N]" chip instead of the characters
+		// — an empty scrape is silence, not a negative. Re-pasting on silence
+		// is what put the message in the composer twice and then never
+		// submitted it.
+		if !c.pasteLanded(ctx, info.ID, provider, text) && pasteVerifyRequired(provider) {
 			if err := c.panes.Paste(ctx, target, text); err != nil {
 				return err
 			}
-			if !c.pasteLanded(ctx, info.ID, text) {
+			if !c.pasteLanded(ctx, info.ID, provider, text) {
 				// Returning an error keeps the delivery queued for the next
 				// idle transition rather than dropping it.
 				return fmt.Errorf("paste did not reach session %s's prompt", info.ID)
@@ -490,6 +515,40 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 	}
 }
 
+// errComposerBusy is returned when the recipient's composer holds text the user
+// has typed but not submitted. Not a failure of the delivery — the message
+// stays queued and rides the next idle transition — but it must be an error so
+// the queue keeps it and arms a retry.
+var errComposerBusy = errors.New("composer holds an unsubmitted draft")
+
+// providerForSession resolves which agent CLI backs a session, so the courier
+// can ask provider-specific questions about its pane.
+//
+// The registry is deliberately nil: it only filters models by installed
+// provider, and every path that resolves an ID at all yields the same Provider
+// either way. An explicit Backend short-circuits before any registry lookup,
+// which is what makes third-party model IDs resolve correctly.
+func providerForSession(info SessionInfo) string {
+	agentModel, err := resolveAgentModel(info.Model, info.Backend, nil)
+	if err != nil {
+		// An unrecognized model has no chrome we can claim to know. Every
+		// provider-keyed check below treats "" as unknown and falls back to the
+		// permissive branch, which is the right default: deliver, do not wedge.
+		return ""
+	}
+	return agentModel.Provider
+}
+
+// composerHasDraft reports whether the recipient is mid-sentence in its
+// composer. known is false when this provider's composer cannot be read.
+func (c *Courier) composerHasDraft(id SessionID, provider string) (draft, known bool) {
+	lines, err := c.target.CapturePaneText(id, pasteVerifyLines)
+	if err != nil {
+		return false, false
+	}
+	return composerDraft(provider, lines)
+}
+
 // pasteVerify bounds how long a paste is given to show up in the pane before
 // it is treated as dropped. Short: this only covers a TUI finishing its
 // previous turn, not real latency.
@@ -498,19 +557,34 @@ const (
 	pasteVerifyInterval = 150 * time.Millisecond
 	pasteVerifyLines    = 40
 	pasteProbeLen       = 24
+	// pasteVerifyAttemptsBestEffort bounds the wait for a provider that does
+	// not require confirmation. The verdict there does not gate anything — the
+	// message is sent either way — so this is only long enough for a chip to
+	// render, not the full budget codex needs.
+	pasteVerifyAttemptsBestEffort = 4
 )
 
-// pasteLanded reports whether text is visible in the session's pane.
+// pasteLanded reports whether the paste is visible in the session's pane.
 //
 // It looks for a prefix of the first line rather than the whole message: a TUI
 // re-renders a long prompt with its own wrapping and decoration, so only a
-// short run of characters can be relied on to survive verbatim.
-func (c *Courier) pasteLanded(ctx context.Context, id SessionID, text string) bool {
+// short run of characters can be relied on to survive verbatim. Some CLIs never
+// echo a paste at all and show a chip instead, which pasteConfirmed accepts as
+// equivalent evidence.
+//
+// The attempt budget depends on whether this provider's verdict is load
+// bearing: a required check gets the full budget, a best-effort one only long
+// enough for a chip to paint.
+func (c *Courier) pasteLanded(ctx context.Context, id SessionID, provider, text string) bool {
 	probe := pasteProbe(text)
 	if probe == "" {
 		return true // nothing distinctive to look for; do not block delivery
 	}
-	for i := 0; i < pasteVerifyAttempts; i++ {
+	attempts := pasteVerifyAttemptsBestEffort
+	if pasteVerifyRequired(provider) {
+		attempts = pasteVerifyAttempts
+	}
+	for i := 0; i < attempts; i++ {
 		// Wait before every attempt but the first: a paste needs a frame to
 		// show up, and sleeping *after* the last one only delays the verdict.
 		if i > 0 {
@@ -524,10 +598,8 @@ func (c *Courier) pasteLanded(ctx context.Context, id SessionID, text string) bo
 		if err != nil {
 			continue
 		}
-		for _, line := range lines {
-			if strings.Contains(line, probe) {
-				return true
-			}
+		if pasteConfirmed(provider, lines, probe) {
+			return true
 		}
 	}
 	return false

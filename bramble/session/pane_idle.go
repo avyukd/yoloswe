@@ -282,3 +282,96 @@ func decidePaneIdlePoll(tracker *paneIdleTracker, status SessionStatus, lines []
 // on purpose: only the footer is read, and this runs every couple of seconds
 // for every session with a hookless or hook-correcting probe.
 const paneIdleCaptureLines = 12
+
+// pasteEvidence describes how a provider's pane shows that a paste arrived.
+//
+// Separate from paneIdleProbe because the questions are different: that table
+// asks "is a turn in flight", this one asks "did my text reach the composer".
+// A CLI can be perfectly readable for one and opaque for the other — cursor
+// announces its turns clearly but never echoes a paste.
+type pasteEvidence struct {
+	// chipMarkers are what a CLI renders *instead of* the pasted text.
+	// cursor-agent collapses a bracketed paste to "[Pasted text #N]", so the
+	// characters never appear in the pane and looking for them always fails.
+	chipMarkers []string
+	// required says a paste must be positively confirmed before Enter is sent.
+	// True only for codex, whose TUI drops a paste that arrives while the
+	// previous turn is finalizing — the case this verification exists for.
+	//
+	// False everywhere else on purpose. tmux reports whether paste-buffer
+	// succeeded, so for a provider whose chrome we cannot read an empty pane
+	// scrape is silence, not a negative, and re-pasting on silence puts the
+	// message in the composer twice.
+	required bool
+}
+
+var pasteEvidenceProbes = map[string]pasteEvidence{
+	ProviderCursor: {chipMarkers: []string{"[Pasted text"}},
+	ProviderCodex:  {required: true},
+}
+
+// pasteVerifyRequired reports whether a paste must be confirmed before Enter.
+func pasteVerifyRequired(provider string) bool {
+	return pasteEvidenceProbes[provider].required
+}
+
+// pasteConfirmed reports whether a captured pane shows the paste arrived,
+// either by echoing the text or by rendering a chip in its place.
+func pasteConfirmed(provider string, lines []string, probe string) bool {
+	if probe == "" {
+		return true // nothing distinctive to look for
+	}
+	chips := pasteEvidenceProbes[provider].chipMarkers
+	for _, line := range lines {
+		if strings.Contains(line, probe) {
+			return true
+		}
+		if len(chips) > 0 && containsAny(line, chips) {
+			return true
+		}
+	}
+	return false
+}
+
+// claudePromptGlyph is the composer prompt in claude-code's TUI, U+276F.
+const claudePromptGlyph = "❯"
+
+// composerDraft reports whether the user has typed something into the composer
+// that has not been submitted yet.
+//
+// Delivering into a non-empty composer appends to whatever the human was
+// writing and then presses Enter, submitting their half-finished sentence
+// wearing someone else's text. The idle probe cannot catch this: a composer
+// holding a draft is still a composer, so the session reads as maximally idle
+// at exactly the moment it is least safe to write to.
+//
+// known is false for a provider whose composer cannot be read, and callers must
+// treat that as "no draft" — refusing to deliver into every pane we cannot
+// parse would strand mail rather than protect it.
+//
+// Only claude is judged today. cursor and codex render *placeholder* text in an
+// empty composer ("Add a follow-up", "Ask Codex to do anything") which
+// disappears as soon as the user types, so a typed draft is indistinguishable
+// from a CLI that has not finished booting. Reading those needs a positive
+// anchor on the composer glyph, validated against a live capture first.
+func composerDraft(provider string, lines []string) (draft, known bool) {
+	if provider != ProviderClaude {
+		return false, false
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(line, claudePromptGlyph) {
+			continue
+		}
+		// The glyph is separated from the text by a non-breaking space
+		// (U+00A0), not an ordinary one -- see the fixtures in
+		// TestEmptyClaudeComposerIsNotADraft. The TrimSpace above is what
+		// handles it: it is Unicode-aware, so an empty composer is already bare
+		// by the time the prefix comes off. Trimming again here would be
+		// redundant, but an ASCII-only cutset anywhere in this path would leave
+		// " " behind and read every empty composer as a draft, holding back
+		// all mail on the host.
+		return strings.TrimPrefix(line, claudePromptGlyph) != "", true
+	}
+	return false, false
+}
