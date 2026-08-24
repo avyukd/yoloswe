@@ -206,13 +206,39 @@ func echoPanes(target *fakeTarget) *fakePanes {
 	return p
 }
 
+// testCourierResultDir names a result dir inside this test's temp dir without
+// creating it. Deliberately not pre-created: the courier's own MkdirAll must be
+// what brings it into existence, or TestResultArtifactsAreNotWorldReadable
+// would be asserting on the mode this helper chose rather than the one the
+// production code does.
+func testCourierResultDir(root string) string {
+	return filepath.Join(root, "results")
+}
+
+func testCourierConfig(t *testing.T) CourierConfig {
+	t.Helper()
+	root := t.TempDir()
+	return CourierConfig{
+		DeliveryDir: filepath.Join(root, "deliveries"),
+		ResultDir:   testCourierResultDir(root),
+	}
+}
+
+func testCourierConfigDeliveryDir(t *testing.T, deliveryDir string) CourierConfig {
+	t.Helper()
+	return CourierConfig{
+		DeliveryDir: deliveryDir,
+		ResultDir:   testCourierResultDir(t.TempDir()),
+	}
+}
+
 func newTestCourier(t *testing.T) (*Courier, *fakeTarget, *fakePanes) {
 	t.Helper()
 	target := newFakeTarget()
 	// By default the fake TUI accepts what is pasted, so paste verification
 	// passes. Tests that care about a dropped paste clear echo.
 	panes := echoPanes(target)
-	c, err := NewCourier(target, panes, t.TempDir())
+	c, err := NewCourier(target, panes, testCourierConfig(t))
 	require.NoError(t, err)
 	return c, target, panes
 }
@@ -235,9 +261,20 @@ func reportNow(c *Courier, target *fakeTarget, childID SessionID) {
 	c.reportToParent(context.Background(), child)
 }
 
-// ids returns session IDs unique to this test. Result files are written to a
-// shared directory keyed by session ID, so parallel tests reusing a literal
-// "child" would overwrite each other's output.
+func reportResultPath(t *testing.T, report string) string {
+	t.Helper()
+	for _, line := range strings.Split(report, "\n") {
+		path, ok := strings.CutPrefix(line, "result: ")
+		if ok {
+			return path
+		}
+	}
+	require.FailNow(t, "report did not include a result path", report)
+	return ""
+}
+
+// ids returns session IDs unique to this test so parallel runs get readable,
+// collision-free fixture names in logs and assertions.
 func ids(t *testing.T) (parent, child SessionID) {
 	t.Helper()
 	safe := strings.Map(func(r rune) rune {
@@ -446,7 +483,8 @@ func TestQueueSurvivesReload(t *testing.T) {
 	target := newFakeTarget()
 	target.set("s1", StatusRunning, RunnerTypeTmux)
 
-	c1, err := NewCourier(target, echoPanes(target), dir)
+	cfg := testCourierConfigDeliveryDir(t, dir)
+	c1, err := NewCourier(target, echoPanes(target), cfg)
 	require.NoError(t, err)
 	for _, msg := range []string{"first", "second"} {
 		_, err := c1.Send(context.Background(), "", "s1", msg, true)
@@ -454,7 +492,7 @@ func TestQueueSurvivesReload(t *testing.T) {
 	}
 
 	panes := echoPanes(target)
-	c2, err := NewCourier(target, panes, dir)
+	c2, err := NewCourier(target, panes, cfg)
 	require.NoError(t, err)
 
 	pending := c2.Pending("s1")
@@ -475,7 +513,7 @@ func TestEmptyQueueLeavesNoFile(t *testing.T) {
 	target := newFakeTarget()
 	target.set("s1", StatusRunning, RunnerTypeTmux)
 
-	c, err := NewCourier(target, echoPanes(target), dir)
+	c, err := NewCourier(target, echoPanes(target), testCourierConfigDeliveryDir(t, dir))
 	require.NoError(t, err)
 	_, err = c.Send(context.Background(), "", "s1", "hello", true)
 	require.NoError(t, err)
@@ -501,7 +539,7 @@ func TestQueueFileNameIsSanitized(t *testing.T) {
 	target := newFakeTarget()
 	target.set("../../escape", StatusRunning, RunnerTypeTmux)
 
-	c, err := NewCourier(target, &fakePanes{}, dir)
+	c, err := NewCourier(target, &fakePanes{}, testCourierConfigDeliveryDir(t, dir))
 	require.NoError(t, err)
 	_, err = c.Send(context.Background(), "", "../../escape", "hello", true)
 	require.NoError(t, err)
@@ -549,7 +587,7 @@ func TestWatchDrainsOnIdle(t *testing.T) {
 	t.Parallel()
 	target := newFakeTarget()
 	panes := echoPanes(target)
-	c, err := NewCourier(target, panes, t.TempDir())
+	c, err := NewCourier(target, panes, testCourierConfig(t))
 	require.NoError(t, err)
 
 	mgr := NewManagerWithConfig(ManagerConfig{RepoName: "repo"})
@@ -581,7 +619,7 @@ func TestWatchDrainsOnIdle(t *testing.T) {
 func TestWatchDiscardsOnTerminal(t *testing.T) {
 	t.Parallel()
 	target := newFakeTarget()
-	c, err := NewCourier(target, echoPanes(target), t.TempDir())
+	c, err := NewCourier(target, echoPanes(target), testCourierConfig(t))
 	require.NoError(t, err)
 
 	mgr := NewManagerWithConfig(ManagerConfig{RepoName: "repo"})
@@ -614,7 +652,7 @@ func TestNewCourierIgnoresJunkFiles(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("hi"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "broken.json"), []byte("{{{"), 0o644))
 
-	c, err := NewCourier(newFakeTarget(), &fakePanes{}, dir)
+	c, err := NewCourier(newFakeTarget(), &fakePanes{}, testCourierConfigDeliveryDir(t, dir))
 	require.NoError(t, err)
 	assert.Empty(t, c.Pending("s1"))
 }
@@ -813,7 +851,8 @@ func TestUnqueueableReportIsRetriedOnTheNextTransition(t *testing.T) {
 	t.Parallel()
 	queueDir := t.TempDir()
 	target := newFakeTarget()
-	c, err := NewCourier(target, &fakePanes{pasteErr: errors.New("tmux exploded")}, queueDir)
+	c, err := NewCourier(target, &fakePanes{pasteErr: errors.New("tmux exploded")},
+		testCourierConfigDeliveryDir(t, queueDir))
 	require.NoError(t, err)
 	parentID, childID := ids(t)
 	target.set(parentID, StatusIdle, RunnerTypeTmux)
@@ -885,7 +924,7 @@ func TestQueueThatCannotPersistIsNotReportedAsQueued(t *testing.T) {
 	t.Parallel()
 	target := newFakeTarget()
 	dir := t.TempDir()
-	c, err := NewCourier(target, &fakePanes{}, dir)
+	c, err := NewCourier(target, &fakePanes{}, testCourierConfigDeliveryDir(t, dir))
 	require.NoError(t, err)
 	target.set("s1", StatusRunning, RunnerTypeTmux)
 
@@ -945,7 +984,7 @@ func TestReAdoptionDoesNotReReportOnEveryRestart(t *testing.T) {
 	t.Parallel()
 	parentID, childID := ids(t)
 	target := newFakeTarget()
-	c, err := NewCourier(target, echoPanes(target), t.TempDir())
+	c, err := NewCourier(target, echoPanes(target), testCourierConfig(t))
 	require.NoError(t, err)
 	target.set(parentID, StatusRunning, RunnerTypeTmux)
 	target.setChild(childID, parentID, StatusIdle, RunnerTypeTmux)
@@ -1030,7 +1069,7 @@ func TestFailedDirectWriteIsQueuedAndRetried(t *testing.T) {
 func TestNoReportIsLostWhenManySubagentsFinishAtOnce(t *testing.T) {
 	t.Parallel()
 	target := newFakeTarget()
-	c, err := NewCourier(target, echoPanes(target), t.TempDir())
+	c, err := NewCourier(target, echoPanes(target), testCourierConfig(t))
 	require.NoError(t, err)
 
 	mgr := NewManagerWithConfig(ManagerConfig{RepoName: "repo"})
@@ -1154,7 +1193,7 @@ func TestStaleQueueIsReclaimedOnLoad(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "gone.json"), data, 0o600))
 
-	c, err := NewCourier(newFakeTarget(), &fakePanes{}, dir)
+	c, err := NewCourier(newFakeTarget(), &fakePanes{}, testCourierConfigDeliveryDir(t, dir))
 	require.NoError(t, err)
 
 	assert.Empty(t, c.Pending("gone"), "a delivery past its age should not be reloaded")
@@ -1174,14 +1213,15 @@ func TestUnknownRecipientKeepsItsQueue(t *testing.T) {
 	target := newFakeTarget()
 	target.set("s1", StatusRunning, RunnerTypeTmux)
 
-	c, err := NewCourier(target, echoPanes(target), dir)
+	cfg := testCourierConfigDeliveryDir(t, dir)
+	c, err := NewCourier(target, echoPanes(target), cfg)
 	require.NoError(t, err)
 	_, err = c.Send(context.Background(), "", "s1", "held for a repo that is not open yet", true)
 	require.NoError(t, err)
 
 	// A courier that cannot see the recipient at all — a not-yet-registered
 	// manager, or a sweep that beat reconciliation to it.
-	blind, err := NewCourier(newFakeTarget(), &fakePanes{}, dir)
+	blind, err := NewCourier(newFakeTarget(), &fakePanes{}, cfg)
 	require.NoError(t, err)
 	require.Len(t, blind.Pending("s1"), 1)
 
@@ -1244,14 +1284,15 @@ func TestDrainIdleDeliversAfterAReload(t *testing.T) {
 	target := newFakeTarget()
 	target.set("s1", StatusRunning, RunnerTypeTmux)
 
-	first, err := NewCourier(target, echoPanes(target), dir)
+	cfg := testCourierConfigDeliveryDir(t, dir)
+	first, err := NewCourier(target, echoPanes(target), cfg)
 	require.NoError(t, err)
 	queued, err := first.Send(context.Background(), "", "s1", "held over a restart", true)
 	require.NoError(t, err)
 	require.True(t, queued)
 
 	// A fresh courier over the same directory is what a restart looks like.
-	reloaded, err := NewCourier(target, echoPanes(target), dir)
+	reloaded, err := NewCourier(target, echoPanes(target), cfg)
 	require.NoError(t, err)
 	require.Len(t, reloaded.Pending("s1"), 1, "the queue should have been reloaded")
 
@@ -1265,27 +1306,21 @@ func TestDrainIdleDeliversAfterAReload(t *testing.T) {
 // TestResultArtifactsAreNotWorldReadable pins the privacy of what a subagent
 // leaves behind: a captured pane is the child's whole transcript, so neither it
 // nor the directory holding it may be readable by another local user.
+//
+// The assertion is about the mode a *fresh* directory is created with, since
+// os.MkdirAll leaves an existing one alone — a dir some earlier test had made
+// would let this pass with the fix reverted. An injected ResultDir gets that
+// without t.Setenv("HOME"), which would forbid t.Parallel: testCourierResultDir
+// names a path inside this test's temp dir and deliberately does not create it,
+// so the courier's own MkdirAll is what this measures.
 func TestResultArtifactsAreNotWorldReadable(t *testing.T) {
-	// Not parallel: HOME decides the result dir — ResultFilePath resolves
-	// ~/.bramble/research under it — and t.Setenv forbids t.Parallel. A private
-	// HOME here rather than TestMain's package-wide one because the assertion is
-	// about the mode a *fresh* directory is created with: os.MkdirAll leaves an
-	// existing directory alone, so a dir another test already made would let
-	// this pass with the fix reverted.
-	t.Setenv("HOME", t.TempDir())
+	t.Parallel()
 	c, target, _, childID := reportFixture(t, StatusIdle)
 	target.annotate(childID, func(i *SessionInfo) { i.RunnerType = RunnerTypeTmux })
 	target.captured[childID] = []string{"secret: hunter2"}
 
 	path := c.resultPathFor(target.mustInfo(childID))
 	require.NotEmpty(t, path, "the pane capture should have produced a result file")
-
-	// The location is half the invariant. Mode bits on a path in a shared temp
-	// dir prove nothing: another local user can own the directory they sit in.
-	home, err := os.UserHomeDir()
-	require.NoError(t, err)
-	require.True(t, strings.HasPrefix(path, filepath.Join(home, ".bramble", resultDirName)+string(filepath.Separator)),
-		"a result file must live under the user's private ~/.bramble, got %s", path)
 
 	fi, err := os.Stat(path)
 	require.NoError(t, err)
@@ -1296,6 +1331,27 @@ func TestResultArtifactsAreNotWorldReadable(t *testing.T) {
 	assert.Equal(t, os.FileMode(0o700), di.Mode().Perm(), "the result dir must not be traversable by other users")
 }
 
+// TestResultFilesLiveUnderThePrivateHome is the other half of the privacy
+// invariant, and it belongs here rather than on a courier: mode bits on a path
+// in a shared temp dir prove nothing, because another local user can own the
+// directory those bits sit in. Only $HOME is not writable by anyone else.
+//
+// Asserted against DefaultResultDir, which is the one place that decides the
+// location, rather than against a configured courier — a test that injects its
+// own dir necessarily cannot check this, and README and the design docs quote
+// ~/.bramble/research/<id>.md to users.
+func TestResultFilesLiveUnderThePrivateHome(t *testing.T) {
+	t.Parallel()
+
+	dir, err := DefaultResultDir()
+	require.NoError(t, err)
+
+	home, err := os.UserHomeDir()
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(home, ".bramble", resultDirName), dir,
+		"result files must land under the user's private ~/.bramble")
+}
+
 // TestCompletedChildIsReportedAfterTheManagerDropsIt is the window-close path
 // Gemini and Agy depend on, and the one the tmux monitor races: it emits
 // StatusCompleted and immediately deletes the session, so a subscriber that
@@ -1304,7 +1360,7 @@ func TestCompletedChildIsReportedAfterTheManagerDropsIt(t *testing.T) {
 	t.Parallel()
 	parentID, childID := ids(t)
 	target := newFakeTarget()
-	c, err := NewCourier(target, echoPanes(target), t.TempDir())
+	c, err := NewCourier(target, echoPanes(target), testCourierConfig(t))
 	require.NoError(t, err)
 	target.set(parentID, StatusRunning, RunnerTypeTmux)
 
@@ -1344,7 +1400,7 @@ func TestWatchReportsChildCompletion(t *testing.T) {
 	t.Parallel()
 	parentID, childID := ids(t)
 	target := newFakeTarget()
-	c, err := NewCourier(target, echoPanes(target), t.TempDir())
+	c, err := NewCourier(target, echoPanes(target), testCourierConfig(t))
 	require.NoError(t, err)
 
 	mgr := NewManagerWithConfig(ManagerConfig{RepoName: "repo"})
@@ -1384,14 +1440,11 @@ func TestTmuxChildResultComesFromPaneCapture(t *testing.T) {
 	pending := c.Pending(parentID)
 	require.Len(t, pending, 1)
 
-	path, err := ResultFilePath(childID)
-	require.NoError(t, err)
-	assert.Contains(t, pending[0].Text, "result: "+path)
+	path := reportResultPath(t, pending[0].Text)
 
 	body, err := os.ReadFile(path)
 	require.NoError(t, err)
 	assert.Equal(t, "codex here\nthe answer is 42\n", string(body))
-	t.Cleanup(func() { os.Remove(path) })
 }
 
 // TestCaptureFailureStillReports keeps a dead pane from swallowing the report:
@@ -1425,6 +1478,88 @@ func TestTUIChildDoesNotCapturePane(t *testing.T) {
 
 	require.Len(t, c.Pending(parentID), 1)
 	assert.Contains(t, c.Pending(parentID)[0].Text, "result: /tmp/transcript.md")
+}
+
+// TestRunningTransitionRearmsIdleReporting is the path a prematurely-reported
+// codex subagent takes: it announces idle, is reported, keeps working without
+// the courier writing to it, then goes idle again — and the parent must hear
+// about that second idle.
+func TestRunningTransitionRearmsIdleReporting(t *testing.T) {
+	t.Parallel()
+	c, target, parentID, childID := reportFixture(t, StatusRunning)
+
+	mgr := NewManagerWithConfig(ManagerConfig{RepoName: "repo"})
+	defer mgr.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	unsub := c.Watch(ctx, mgr)
+	defer unsub()
+
+	// Round 1: premature idle is reported.
+	target.setChild(childID, parentID, StatusIdle, RunnerTypeTmux)
+	mgr.emitSessionStateChange(SessionStateChangeEvent{
+		SessionID: childID, OldStatus: StatusRunning, NewStatus: StatusIdle,
+	})
+	require.Eventually(t, func() bool { return len(c.Pending(parentID)) == 1 },
+		5*time.Second, 10*time.Millisecond,
+		"first idle was never reported")
+
+	// The child keeps working — no courier write, just a status transition.
+	target.setChild(childID, parentID, StatusRunning, RunnerTypeTmux)
+	mgr.emitSessionStateChange(SessionStateChangeEvent{
+		SessionID: childID, OldStatus: StatusIdle, NewStatus: StatusRunning,
+	})
+
+	// Round 2: genuine completion must be reported too.
+	target.setChild(childID, parentID, StatusIdle, RunnerTypeTmux)
+	mgr.emitSessionStateChange(SessionStateChangeEvent{
+		SessionID: childID, OldStatus: StatusRunning, NewStatus: StatusIdle,
+	})
+	require.Eventually(t, func() bool { return len(c.Pending(parentID)) == 2 },
+		5*time.Second, 10*time.Millisecond,
+		"second idle after running without courier write was never reported")
+}
+
+// TestSyntheticSameStatusDoesNotRearmReporting pins that re-adoption's
+// same-status events neither re-report nor re-arm idle dedup.
+func TestSyntheticSameStatusDoesNotRearmReporting(t *testing.T) {
+	t.Parallel()
+	c, target, parentID, childID := reportFixture(t, StatusIdle)
+
+	mgr := NewManagerWithConfig(ManagerConfig{RepoName: "repo"})
+	defer mgr.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	unsub := c.Watch(ctx, mgr)
+	defer unsub()
+
+	mgr.emitSessionStateChange(SessionStateChangeEvent{
+		SessionID: childID, OldStatus: StatusRunning, NewStatus: StatusIdle,
+	})
+	require.Eventually(t, func() bool { return len(c.Pending(parentID)) == 1 },
+		5*time.Second, 10*time.Millisecond)
+
+	// Synthetic same-status idle (re-adoption): must not report again.
+	mgr.emitSessionStateChange(SessionStateChangeEvent{
+		SessionID: childID, OldStatus: StatusIdle, NewStatus: StatusIdle,
+	})
+	require.Never(t, func() bool { return len(c.Pending(parentID)) > 1 },
+		500*time.Millisecond, 10*time.Millisecond,
+		"synthetic idle must not re-report")
+
+	// Synthetic same-status running: must not re-arm (child stays idle after).
+	mgr.emitSessionStateChange(SessionStateChangeEvent{
+		SessionID: childID, OldStatus: StatusRunning, NewStatus: StatusRunning,
+	})
+	target.setChild(childID, parentID, StatusIdle, RunnerTypeTmux)
+	mgr.emitSessionStateChange(SessionStateChangeEvent{
+		SessionID: childID, OldStatus: StatusRunning, NewStatus: StatusIdle,
+	})
+	require.Never(t, func() bool { return len(c.Pending(parentID)) > 1 },
+		500*time.Millisecond, 10*time.Millisecond,
+		"synthetic running must not re-arm reporting")
 }
 
 // TestFollowUpToChildRearmsReporting is what makes a conversation possible
@@ -1583,7 +1718,7 @@ func TestDroppedPasteIsRetried(t *testing.T) {
 			target.appendPane(text)
 		}
 	}
-	c, err := NewCourier(target, panes, t.TempDir())
+	c, err := NewCourier(target, panes, testCourierConfig(t))
 	require.NoError(t, err)
 
 	_, err = c.Send(context.Background(), "", "s1", "the real message", true)
@@ -1604,7 +1739,7 @@ func TestPersistentlyDroppedPasteKeepsDeliveryQueued(t *testing.T) {
 	target.set("s1", StatusRunning, RunnerTypeTmux)
 
 	panes := &fakePanes{} // echo unset: every paste is swallowed
-	c, err := NewCourier(target, panes, t.TempDir())
+	c, err := NewCourier(target, panes, testCourierConfig(t))
 	require.NoError(t, err)
 
 	_, err = c.Send(context.Background(), "", "s1", "never lands", true)
@@ -1637,7 +1772,8 @@ func TestConcurrentSendsToOneRecipientAllPersist(t *testing.T) {
 	target := newFakeTarget()
 	target.set("parent", StatusRunning, RunnerTypeTmux)
 
-	c, err := NewCourier(target, echoPanes(target), dir)
+	cfg := testCourierConfigDeliveryDir(t, dir)
+	c, err := NewCourier(target, echoPanes(target), cfg)
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
@@ -1654,7 +1790,7 @@ func TestConcurrentSendsToOneRecipientAllPersist(t *testing.T) {
 	require.Len(t, c.Pending("parent"), senders, "in-memory queue lost a report")
 
 	// Reload from disk: this is what a restarted bramble would see.
-	reloaded, err := NewCourier(target, echoPanes(target), dir)
+	reloaded, err := NewCourier(target, echoPanes(target), cfg)
 	require.NoError(t, err)
 	assert.Lenf(t, reloaded.Pending("parent"), senders,
 		"the persisted queue lost reports; a restart would drop them")
@@ -1671,7 +1807,8 @@ func TestConcurrentDrainAndSendKeepsQueueConsistent(t *testing.T) {
 	target := newFakeTarget()
 	target.set("parent", StatusIdle, RunnerTypeTmux)
 
-	c, err := NewCourier(target, echoPanes(target), dir)
+	cfg := testCourierConfigDeliveryDir(t, dir)
+	c, err := NewCourier(target, echoPanes(target), cfg)
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
@@ -1696,7 +1833,7 @@ func TestConcurrentDrainAndSendKeepsQueueConsistent(t *testing.T) {
 	// Whatever is still queued in memory must match what is on disk: a stale
 	// write would leave a restart with a different queue than this process has.
 	inMemory := c.Pending("parent")
-	reloaded, err := NewCourier(target, echoPanes(target), dir)
+	reloaded, err := NewCourier(target, echoPanes(target), cfg)
 	require.NoError(t, err)
 	assert.Lenf(t, reloaded.Pending("parent"), len(inMemory),
 		"the persisted queue disagrees with the live one")

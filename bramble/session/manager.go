@@ -415,6 +415,10 @@ type ManagerConfig struct { //nolint:govet // fieldalignment: readability over p
 	// RecordingDir enables JSONL session recording for all sessions.
 	// If empty, recording is disabled.
 	RecordingDir string
+	// ResearchDir is where subagent result files are written. If empty it
+	// defaults to ~/.bramble/research. Injectable so a test can point it at
+	// its own directory rather than writing into the real one.
+	ResearchDir string
 	// IPCSockPath is the path to the bramble IPC Unix domain socket.
 	// Used to propagate BRAMBLE_SOCK to tmux windows so hook commands
 	// can call back to the TUI. Set by main after startIPCServer.
@@ -2125,9 +2129,11 @@ func (m *Manager) runSession(session *Session, prompt string) {
 		m.tryUpdateSessionStatus(session, StatusPending, StatusRunning)
 		startTime := time.Now()
 
-		// Backends with no turn-completion hook (cursor) have their idleness
-		// read off the pane instead. nil for claude and codex, which report it
-		// themselves; see pane_idle.go for why this is a last resort.
+		// Pane probes cover hookless backends (cursor) and premature-idle
+		// correction for codex, whose notify hook can fire before the pane
+		// shows idle. nil for claude, which reports turn ends reliably. Built
+		// from the stored model and backend so the re-adopt path — which never
+		// sees a resolved agent model — gets the same tracker.
 		idleTracker := m.newPaneIdleTrackerForModel(session.Model, session.Backend)
 
 		// Periodically check if tmux window still exists
@@ -2748,19 +2754,29 @@ func (m *Manager) SetSessionRunning(id SessionID) {
 	m.trySetStatus(id, StatusIdle, StatusRunning)
 }
 
-// pollPaneIdle reads idleness off a hookless backend's pane, for one tick of
-// the monitor loop. tracker is nil for a provider that reports its own turn
-// ends, in which case this does nothing.
+// pollPaneIdle reads idleness off a backend's pane, for one tick of the
+// monitor loop. tracker is nil for a provider with no probe, in which case
+// this does nothing.
 //
-// Only a running session is a candidate: once idle it stays idle until
-// something delivers work and marks it running again. turnEpoch is what makes
-// that re-arming reliable — the delivery and the transition it causes both
-// happen between two polls, so the status alone cannot show the boundary.
+// A running session may be marked idle after consecutive idle observations.
+// turnEpoch is what makes re-arming across turns reliable — a delivery and the
+// transition it causes both happen between two polls, so status alone cannot
+// show that boundary.
+//
+// An *idle* session is a candidate only for a provider whose completion hook
+// can fire early: reading its pane is the one thing that can put it back to
+// running, correcting a premature idle without relaxing SetSessionIdle's
+// compare-and-set. Terminal sessions are never resurrected.
 func (m *Manager) pollPaneIdle(tracker *paneIdleTracker, id SessionID, status SessionStatus, turnEpoch uint64, windowTarget string) {
 	if tracker == nil {
 		return
 	}
-	if status != StatusRunning {
+	// A provider whose hook can fire early needs a pane read even once marked
+	// idle — that read is the only thing that can put it back to running.
+	// Everything else is probed only while running, when the pane can
+	// establish the idle transition. Which providers those are is the probe
+	// table's business, not this loop's.
+	if status != StatusRunning && !(status == StatusIdle && tracker.correctsPrematureIdle()) {
 		tracker.reset()
 		return
 	}
@@ -2772,8 +2788,11 @@ func (m *Manager) pollPaneIdle(tracker *paneIdleTracker, id SessionID, status Se
 	if err != nil {
 		return
 	}
-	if tracker.observe(lines) {
+	switch decidePaneIdlePoll(tracker, status, lines) {
+	case paneIdleActionMarkIdle:
 		m.SetSessionIdle(id)
+	case paneIdleActionMarkRunning:
+		m.SetSessionRunning(id)
 	}
 }
 
@@ -2860,9 +2879,9 @@ func (m *Manager) RecentOutputLines(id SessionID, n int) []string {
 }
 
 // writeResearchFile writes a codetalk session's text output to a markdown file
-// under ~/.bramble/research/. Returns the file path on success.
+// under the manager's result dir (~/.bramble/research by default).
 func (m *Manager) writeResearchFile(session *Session) (string, error) {
-	researchPath, err := ResultFilePath(session.ID)
+	researchPath, err := ResultFilePath(m.config.ResearchDir, session.ID)
 	if err != nil {
 		return "", err
 	}

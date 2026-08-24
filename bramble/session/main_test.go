@@ -1,6 +1,7 @@
 package session
 
 import (
+	"fmt"
 	"os"
 	"testing"
 )
@@ -24,6 +25,36 @@ func TestMain(m *testing.M) {
 		panic("set test home: " + err.Error())
 	}
 	code := m.Run()
+	if code == 0 {
+		if err := assertDefaultResultDirClean(); err != nil {
+			fmt.Fprintf(os.Stderr, "session test pollution: %v\n", err)
+			code = 1
+		}
+	}
 	os.RemoveAll(home)
 	os.Exit(code)
+}
+
+// assertDefaultResultDirClean fails if any test wrote a subagent result file
+// into the shared default dir instead of an isolated temp dir.
+func assertDefaultResultDirClean() error {
+	dir, err := DefaultResultDir()
+	if err != nil {
+		return fmt.Errorf("resolve default result dir: %w", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read default result dir %s: %w", dir, err)
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = e.Name()
+	}
+	return fmt.Errorf("default result dir %s has %d file(s) after tests: %v", dir, len(entries), names)
 }

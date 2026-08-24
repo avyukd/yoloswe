@@ -7,6 +7,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// codexPane renders codex's footer chrome. working=true adds the status line
+// codex shows above the composer while a turn runs.
+func codexPane(working bool, transcript ...string) []string {
+	lines := append([]string{}, transcript...)
+	if working {
+		lines = append(lines, "  ◦ Working (2m 29s • esc to interrupt)")
+	}
+	return append(lines,
+		"  › Ask Codex to do anything",
+		"  gpt-5.4 · /tmp/wt",
+	)
+}
+
 // cursorPane renders the footer cursor-agent keeps at the bottom of its pane.
 // working=true adds the hint it shows for exactly as long as a turn runs.
 func cursorPane(working bool, transcript ...string) []string {
@@ -61,15 +74,17 @@ func TestUnpaintedPaneIsUnknown(t *testing.T) {
 	assert.False(t, known, "a pane with no recognizable chrome tells us nothing")
 }
 
-// TestProvidersWithHooksHaveNoProbe: claude and codex report their own turn
-// ends, and a second, weaker signal could only contradict them.
+// TestProvidersWithHooksHaveNoProbe: claude reports its own turn ends, and a
+// second, weaker signal could only contradict it. Codex has a hook too, but its
+// probe corrects premature hook idles — see pane_idle.go.
 func TestProvidersWithHooksHaveNoProbe(t *testing.T) {
 	t.Parallel()
 
-	for _, provider := range []string{ProviderClaude, ProviderCodex} {
-		assert.False(t, providerHasIdleProbe(provider), "provider %s", provider)
-		assert.Nil(t, newPaneIdleTracker(provider), "provider %s", provider)
-	}
+	assert.False(t, providerHasIdleProbe(ProviderClaude))
+	assert.Nil(t, newPaneIdleTracker(ProviderClaude))
+
+	assert.True(t, providerHasIdleProbe(ProviderCodex))
+	assert.NotNil(t, newPaneIdleTracker(ProviderCodex))
 	assert.True(t, providerHasIdleProbe(ProviderCursor))
 	assert.NotNil(t, newPaneIdleTracker(ProviderCursor))
 }
@@ -156,6 +171,93 @@ func TestCursorPlanModeIdleIsIdle(t *testing.T) {
 	idle, known := paneShowsIdle(ProviderCursor, cursorPaneMode(false, true, "  done"))
 	require.True(t, known)
 	assert.True(t, idle)
+}
+
+func TestCodexPaneWorkingIsNotIdle(t *testing.T) {
+	t.Parallel()
+
+	idle, known := paneShowsIdle(ProviderCodex, codexPane(true, "  running a subagent review"))
+	require.True(t, known, "the composer line is present")
+	assert.False(t, idle, "a running turn must never read as idle")
+}
+
+func TestCodexPaneIdleIsIdle(t *testing.T) {
+	t.Parallel()
+
+	idle, known := paneShowsIdle(ProviderCodex, codexPane(false, "  done"))
+	require.True(t, known)
+	assert.True(t, idle)
+}
+
+// TestCodexFooterWorkingMarkerNotOnComposer: the working hint is on its own
+// line above the composer, not on "Ask Codex to do anything".
+func TestCodexFooterWorkingMarkerNotOnComposer(t *testing.T) {
+	t.Parallel()
+
+	working, known := paneShowsWorking(ProviderCodex, codexPane(true))
+	require.True(t, known)
+	assert.True(t, working)
+
+	probe := paneIdleProbes[ProviderCodex]
+	prompt, ok := findPromptLine(codexPane(true), probe.promptMarkers)
+	require.True(t, ok)
+	assert.False(t, containsAny(prompt, probe.workingInFooter))
+}
+
+// TestCodexTranscriptDoesNotReadAsWorking keeps scrollback that quotes the
+// working line from resurrecting an idle session.
+func TestCodexTranscriptDoesNotReadAsWorking(t *testing.T) {
+	t.Parallel()
+
+	transcript := []string{"  old: Working (8s • esc to interrupt)"}
+	for i := 0; i < 12; i++ {
+		transcript = append(transcript, "  line of output")
+	}
+	working, known := paneShowsWorking(ProviderCodex, codexPane(false, transcript...))
+	require.True(t, known)
+	assert.False(t, working, "a quoted line in scrollback must not read as working")
+}
+
+func TestCodexPrematureIdleReturnsToRunning(t *testing.T) {
+	t.Parallel()
+
+	tr := newPaneIdleTracker(ProviderCodex)
+	action := decidePaneIdlePoll(tr, StatusIdle, codexPane(true, "  still going"))
+	assert.Equal(t, paneIdleActionMarkRunning, action)
+}
+
+func TestCodexGenuinelyIdleStaysIdle(t *testing.T) {
+	t.Parallel()
+
+	tr := newPaneIdleTracker(ProviderCodex)
+	action := decidePaneIdlePoll(tr, StatusIdle, codexPane(false, "  all done"))
+	assert.Equal(t, paneIdleActionNone, action)
+}
+
+func TestTerminalSessionNeverResurrectedByProbe(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []SessionStatus{StatusCompleted, StatusFailed, StatusStopped} {
+		tr := newPaneIdleTracker(ProviderCodex)
+		action := decidePaneIdlePoll(tr, status, codexPane(true))
+		assert.Equal(t, paneIdleActionNone, action, "status %s", status)
+	}
+}
+
+// TestOnlyHookCorrectingProvidersArePolledWhileIdle pins which providers the
+// monitor reads a pane for after a session is already idle. That poll exists
+// solely to undo a hook that fired early, so a provider without one buys tmux
+// I/O for every idle session on the host and learns nothing. Cursor has no hook
+// at all — an idle cursor session has nothing to correct.
+func TestOnlyHookCorrectingProvidersArePolledWhileIdle(t *testing.T) {
+	t.Parallel()
+
+	assert.True(t, newPaneIdleTracker(ProviderCodex).correctsPrematureIdle(),
+		"codex's notify hook fires early; its pane must still be read when idle")
+	assert.False(t, newPaneIdleTracker(ProviderCursor).correctsPrematureIdle(),
+		"cursor has no hook to correct; polling it while idle is pure cost")
+	assert.False(t, newPaneIdleTracker(ProviderClaude).correctsPrematureIdle(),
+		"a provider with no probe at all has no tracker to ask")
 }
 
 // TestPaneIdleTrackerComesFromTheStoredModel pins the input the re-adopt path
