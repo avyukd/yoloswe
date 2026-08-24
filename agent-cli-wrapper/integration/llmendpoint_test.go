@@ -142,9 +142,6 @@ type llmEndpointSmokeConfig struct {
 func runClaudeLLMEndpoint(t *testing.T, ep llmendpoint.Endpoint, smoke llmEndpointSmokeConfig) {
 	t.Helper()
 
-	ctx, cancel := context.WithTimeout(context.Background(), smoke.timeout)
-	defer cancel()
-
 	maxAttempts := smoke.claudeMaxAttempts
 	if maxAttempts < 1 {
 		maxAttempts = 1
@@ -152,14 +149,38 @@ func runClaudeLLMEndpoint(t *testing.T, ep llmendpoint.Endpoint, smoke llmEndpoi
 
 	var response string
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		var err error
-		response, err = runClaudeLLMEndpointAttempt(ctx, t, ep, smoke)
+		// One deadline PER ATTEMPT, not one shared across all of them. The
+		// retry exists for a CLI/wrapper defect that finalizes a turn with no
+		// text, so each retry is a fresh session that needs a full turn's worth
+		// of budget; sharing smoke.timeout meant only the first two or three of
+		// the declared attempts could ever run, and the rest died on a deadline
+		// that had already expired. The sibling bramble test
+		// (bramble/integration/openrouter_test.go) gives each attempt its own
+		// deadline for the same reason — the two live tests this PR describes
+		// identically must behave identically.
+		response = ""
+		err := func() error {
+			ctx, cancel := context.WithTimeout(context.Background(), smoke.timeout)
+			defer cancel()
+			var attemptErr error
+			response, attemptErr = runClaudeLLMEndpointAttempt(ctx, t, ep, smoke)
+			return attemptErr
+		}()
 		if err == nil {
 			break
 		}
 
 		var noText *claudeNoTextError
 		if !errors.As(err, &noText) {
+			// A deadline here is this attempt's own budget running out, not a
+			// transport failure — say so, or the message sends the next reader
+			// to debug OpenRouter, which is exactly what the retry's comments
+			// exist to prevent.
+			if errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("claude→%s attempt %d/%d exceeded its %s budget: %v "+
+					"(this is the per-attempt deadline, not an endpoint or transport fault)",
+					smoke.label, attempt, maxAttempts, smoke.timeout, err)
+			}
 			failLLMEndpointTurn(t, "claude", smoke.label, "turn", err)
 			return
 		}

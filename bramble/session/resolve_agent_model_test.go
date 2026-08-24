@@ -367,6 +367,7 @@ func TestManager_ResumeChecksEndpointCredential(t *testing.T) {
 // manager was asked for.
 type endpointRecordingProvider struct {
 	endpoint llmendpoint.Endpoint
+	model    string
 	mu       sync.Mutex
 	seen     bool
 }
@@ -382,15 +383,16 @@ func (p *endpointRecordingProvider) Execute(_ context.Context, prompt string, _ 
 	}
 	p.mu.Lock()
 	p.endpoint = cfg.LLMEndpoint
+	p.model = cfg.Model
 	p.seen = true
 	p.mu.Unlock()
 	return &agent.AgentResult{Text: "ok: " + prompt, Success: true}, nil
 }
 
-func (p *endpointRecordingProvider) observed() (llmendpoint.Endpoint, bool) {
+func (p *endpointRecordingProvider) observed() (llmendpoint.Endpoint, string, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.endpoint, p.seen
+	return p.endpoint, p.model, p.seen
 }
 
 // Asserting on session metadata proves only that the flags were parsed. This
@@ -418,12 +420,20 @@ func TestManager_EndpointReachesTheProviderTurn(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
-		_, seen := provider.observed()
+		_, _, seen := provider.observed()
 		return seen
 	}, 5*time.Second, 10*time.Millisecond, "provider turn never ran")
 
-	got, _ := provider.observed()
-	assert.Equal(t, endpoint, got, "the session's endpoint must reach the provider turn intact")
+	gotEndpoint, gotModel, _ := provider.observed()
+	assert.Equal(t, endpoint, gotEndpoint, "the session's endpoint must reach the provider turn intact")
+	// The model must arrive WITH the endpoint, not merely alongside it in the
+	// session record. claude.WithLLMEndpoint skips the ANTHROPIC_MODEL and
+	// ANTHROPIC_DEFAULT_* side-call pins when Model is empty — the condition its
+	// own doc comment says surfaces as a misleading "model may not exist" error
+	// against a single-model endpoint — and codex would get no -m. Asserting
+	// only the endpoint let this branch omit the model unnoticed.
+	assert.Equal(t, "stealth/ox-alpha", gotModel,
+		"the session's model must reach the provider turn alongside the endpoint")
 }
 
 // agent.CLIModelArg drops the model flag entirely when the id belongs to
@@ -483,4 +493,34 @@ func TestManager_HeaderBearingEndpointIsRefusedWhenPersisted(t *testing.T) {
 	// rule obsolete rather than merely wrong.
 	assert.Empty(t, endpoint.Redacted().Headers)
 	assert.NotEmpty(t, endpoint.Headers, "Redacted must not mutate the original")
+}
+
+// Redacted() drops an inline APIKey, and unlike the env-var form there is
+// nothing to re-resolve from — so an inline-only endpoint launches and then
+// cannot be resumed. Same rule as the header case: what the store cannot
+// reconstruct must be refused where the caller can still act on it.
+func TestManager_InlineOnlyKeyIsRefusedWhenPersisted(t *testing.T) {
+	t.Parallel()
+
+	inlineOnly := llmendpoint.Endpoint{
+		BaseURL: llmendpoint.OpenRouterBaseURL,
+		APIKey:  "inline-only-key",
+		Wire:    llmendpoint.WireAPIResponses,
+	}
+	require.NoError(t, inlineOnly.Validate(), "the endpoint is otherwise valid; only persistence rejects it")
+	require.NoError(t, validatePersistableEndpoint(inlineOnly, false),
+		"a manager with no store never rehydrates, so an inline key cannot go missing")
+
+	err := validatePersistableEndpoint(inlineOnly, true)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "APIKeyEnv")
+
+	// The recoverable shape — which is what `bramble new-session` sends after
+	// resolving the key client-side — must still pass.
+	recoverable := inlineOnly
+	recoverable.APIKeyEnv = llmendpoint.OpenRouterAPIKeyEnv
+	require.NoError(t, validatePersistableEndpoint(recoverable, true))
+
+	// The premise, asserted rather than assumed.
+	assert.Empty(t, inlineOnly.Redacted().APIKey)
 }

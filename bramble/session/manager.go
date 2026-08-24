@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -1597,10 +1598,20 @@ func validateBackendModel(backend, model string) error {
 // this can only fire for a direct IPC caller that sets them, and it tells that
 // caller the constraint at the point it can still act on it.
 func validatePersistableEndpoint(endpoint llmendpoint.Endpoint, persists bool) error {
-	if !persists || len(endpoint.Headers) == 0 {
+	if !persists || endpoint.IsZero() {
 		return nil
 	}
-	return fmt.Errorf("llm endpoint sets %d http header(s), which are not persisted (Redacted drops them) and would silently vanish on resume: drop the headers, or run this endpoint through the in-process path", len(endpoint.Headers))
+	// Two things Redacted() removes, so two ways an endpoint can fail to
+	// survive its own session. The credential normally survives because
+	// APIKeyEnv re-resolves; an inline-only key has nothing to re-resolve
+	// from, so the session launches and then cannot be resumed.
+	if endpoint.APIKey != "" && endpoint.APIKeyEnv == "" {
+		return errors.New("llm endpoint carries an inline api key with no APIKeyEnv, which is not persisted (Redacted drops it) and cannot be re-resolved on resume: set APIKeyEnv so the key can be recovered from the environment")
+	}
+	if len(endpoint.Headers) > 0 {
+		return fmt.Errorf("llm endpoint sets %d http header(s), which are not persisted (Redacted drops them) and would silently vanish on resume: drop the headers, or run this endpoint through the in-process path", len(endpoint.Headers))
+	}
+	return nil
 }
 
 // validateEndpointCredential rejects an endpoint whose key resolves to nothing.
@@ -1791,10 +1802,20 @@ func (m *Manager) runSession(session *Session, prompt string) {
 		eventHandler = newSessionEventHandler(m, session.ID)
 
 		if m.config.Provider != nil {
-			// Use the pluggable provider backend
+			// Use the pluggable provider backend. model and workDir are set
+			// here for the same reason the four branches below set them: a
+			// third-party endpoint only works when the model travels with it —
+			// claude.WithLLMEndpoint skips the ANTHROPIC_MODEL and
+			// ANTHROPIC_DEFAULT_* side-call pins when Model is empty, and codex
+			// gets no -m. This branch is test-only today (nothing outside tests
+			// sets ManagerConfig.Provider), which is precisely why it mattered:
+			// it is the branch the manager-level endpoint tests run through, so
+			// an omission here made those tests unable to observe the pairing.
 			runner = &providerRunner{
 				provider:     m.config.Provider,
 				eventHandler: eventHandler,
+				model:        session.Model,
+				workDir:      session.WorktreePath,
 			}
 		} else if agentModel.Provider == ProviderCodex {
 			// Codex provider backend
