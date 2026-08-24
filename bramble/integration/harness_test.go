@@ -199,16 +199,15 @@ func (h *harness) restart() {
 	out0, err := exec.Command("kill", "-TERM", pid).CombinedOutput()
 	require.NoError(h.t, err, "signal bramble: %s", out0)
 
-	// Its sockets are pid-scoped with no well-known name, so the stale ones
-	// would still be globbed and picked over the new bramble's. Nothing else
-	// writes into this runtime dir.
 	require.Eventually(h.t, func() bool {
 		return ipc.NewClient(h.ipcSock).Ping() != nil
 	}, settleTimeout, pollInterval, "the old bramble kept answering after it was signalled")
-	socks, _ := filepath.Glob(filepath.Join(h.runtimeDir, "bramble-*.sock"))
-	for _, s := range socks {
-		require.NoError(h.t, os.Remove(s))
-	}
+
+	// The socket files are deliberately left in place. They carry a stable
+	// name now, and reclaiming a dead one is exactly what lets a session
+	// started before the restart still reach bramble afterwards — its window
+	// env froze that path and can never learn a new one. Deleting them here
+	// would hide the very behaviour the restart tests depend on.
 	h.ipcSock, h.controlSock = "", ""
 
 	out, err := exec.Command("tmux", "-S", h.tmuxSocket, "new-window", "-d",
@@ -221,12 +220,19 @@ func (h *harness) restart() {
 }
 
 // awaitSockets waits for bramble to bind both of its sockets and answer a ping.
-// The paths are pid-scoped with no well-known name, so they are discovered by
-// globbing the private runtime dir — which can only ever hold this bramble.
+// Discovered by globbing the private runtime dir, which can only ever hold this
+// bramble.
+//
+// The pattern is "bramble*.sock", not "bramble-*.sock": the IPC socket is
+// plain "bramble.sock" now that the names are stable, and a hyphen in the glob
+// silently matches only the control socket — leaving the harness waiting out
+// its whole timeout for an IPC path that was bound all along. The glob still
+// has to span both spellings, because a bramble that finds the stable path
+// already served falls back to a pid-scoped name.
 func (h *harness) awaitSockets(runtimeDir string) {
 	h.t.Helper()
 	require.Eventually(h.t, func() bool {
-		socks, _ := filepath.Glob(filepath.Join(runtimeDir, "bramble-*.sock"))
+		socks, _ := filepath.Glob(filepath.Join(runtimeDir, "bramble*.sock"))
 		for _, s := range socks {
 			if strings.Contains(filepath.Base(s), "control") {
 				h.controlSock = s

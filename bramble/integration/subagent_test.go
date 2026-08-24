@@ -617,3 +617,130 @@ func TestSubagentWorktreeIsReusedNotDuplicated(t *testing.T) {
 	assert.NotEqual(t, first, second, "each spawn is still its own session")
 	h.awaitPane(second, "STUB-REPLY SECOND-ATTEMPT", "the second subagent never ran")
 }
+
+// TestCursorDeliveryIsPastedOnceAndSubmitted covers the delivery path for the
+// hookless backend end to end: one paste, submitted, queue drained.
+//
+// It cannot reproduce the exact failure that made cursor unreachable. Real
+// cursor-agent collapses a bracketed paste into a "[Pasted text #N]" chip and
+// never echoes the characters, so paste verification had nothing to find, gave
+// up, pasted a second time and returned before pressing Enter. A shell
+// stand-in cannot reproduce that: the terminal echoes the line it reads, so the
+// text is in the pane no matter what the stub prints, and verification always
+// succeeds by the text rather than by the chip. Printing a decorative chip on
+// top would only look like coverage.
+//
+// The chip logic is pinned where it can be isolated, on captured pane text:
+// TestCursorChipCountsAsPasteLanded and TestUnverifiablePasteStillSubmits in
+// bramble/session. What this adds is the part those cannot reach — that a real
+// cursor session, driven through tmux, takes exactly one paste and one Enter.
+func TestCursorDeliveryIsPastedOnceAndSubmitted(t *testing.T) {
+	h := newHarness(t, true)
+
+	target := h.spawn("builder", stubCursorModel, "", "BOOT")
+	h.awaitStatus(target, "idle")
+	dumpPanesOnFailure(t, h, target)
+
+	_, err := h.send("", target, "CURSOR-DELIVERY", true)
+	require.NoError(t, err)
+
+	h.awaitPane(target, "CURSOR-STUB-REPLY CURSOR-DELIVERY",
+		"the delivery was never submitted to the cursor session")
+
+	// Exactly one turn ran. A re-paste would drive a second, which is what the
+	// double-paste bug did on every retry.
+	assert.Equal(t, 1, h.countInPane(target, "CURSOR-STUB-REPLY CURSOR-DELIVERY"),
+		"the message must be delivered once, not re-pasted and run twice")
+
+	require.Eventually(t, func() bool { return h.deliveryQueueLen() == 0 },
+		settleTimeout, pollInterval, "a delivered message must leave the queue")
+}
+
+// TestDeliveryIntoADraftIsHeldOnlyWhereTheComposerCanBeRead documents a real
+// and deliberate limit.
+//
+// A paste appends to whatever the user has typed and the Enter that follows
+// submits their half-written sentence wearing the delivered text. The idle gate
+// actively selects for that moment, because a composer holding a draft still
+// reads as idle. Claude is protected: its "❯" is a real prompt glyph, so a
+// non-empty composer is detectable and the delivery is held (see
+// TestDeliveryHeldWhileComposerHasDraft and TestEmptyClaudeComposerIsNotADraft,
+// which pin it against bytes captured from a live pane).
+//
+// Codex and cursor are NOT protected, and this test pins that rather than
+// pretending otherwise. Their composers show placeholder text — "Ask Codex to
+// do anything", "Add a follow-up" — which disappears the moment the user types,
+// so a typed draft is indistinguishable from a CLI that has not finished
+// booting. Guessing there would hold mail forever on any pane bramble failed to
+// parse, which is worse than the bug. Detecting it needs a positive anchor on
+// the composer glyph, validated against a live capture first.
+//
+// The stand-in uses "> " for its composer, so this exercises the unprotected
+// path: the delivery lands on top of the draft. When codex gains a validated
+// draft check, this test should start failing and be rewritten to assert the
+// message is held.
+func TestDeliveryIntoADraftIsHeldOnlyWhereTheComposerCanBeRead(t *testing.T) {
+	h := newHarness(t, true)
+
+	target := h.spawn("builder", stubModel, "", "BOOT")
+	h.awaitStatus(target, "idle")
+	h.awaitPane(target, "STUB-REPLY BOOT", "the agent never answered its opening prompt")
+	dumpPanesOnFailure(t, h, target)
+
+	// Type into the composer without submitting, exactly as a human would.
+	tmuxTarget := h.tmuxTargetOf(target)
+	_, err := h.tmux("send-keys", "-t", tmuxTarget, "HALF-TYPED-THOUGHT")
+	require.NoError(t, err)
+	h.awaitPane(target, "HALF-TYPED-THOUGHT", "the draft never appeared in the composer")
+
+	_, err = h.send("", target, "ARRIVES-MID-SENTENCE", true)
+	require.NoError(t, err)
+
+	// The unprotected outcome, stated exactly: the two run together into one
+	// prompt. Asserting the concatenation rather than a vague "something was
+	// submitted" is what makes this test start failing the day codex is
+	// covered, instead of quietly passing against the wrong behaviour.
+	h.awaitPane(target, "STUB-REPLY HALF-TYPED-THOUGHTARRIVES-MID-SENTENCE",
+		"expected the known-unprotected path: a codex-shaped composer cannot be read for a draft")
+
+	require.Eventually(t, func() bool { return h.deliveryQueueLen() == 0 },
+		settleTimeout, pollInterval, "the delivery still leaves the queue")
+}
+
+// TestSessionsStillReachBrambleAfterARestart is the stranded-parent bug end to
+// end.
+//
+// A session's callback address is frozen into its tmux window when the window
+// is created and can never be updated: tmux set-environment reaches only
+// processes started later, and an agent CLI reads its hook settings once at
+// startup. While the socket path was pid-scoped, a bramble that came back under
+// a new pid was unreachable from every existing window — the Stop hook fired
+// into a socket that no longer existed, --silent swallowed the failure, and
+// since the notify handler is the only caller of SetSessionIdle the session
+// never left "running". Its parent's mail then sat undeliverable, because Drain
+// refuses anything that is not idle.
+func TestSessionsStillReachBrambleAfterARestart(t *testing.T) {
+	h := newHarness(t, true)
+
+	parent := h.spawn("builder", stubModel, "", "PARENT-BOOT")
+	h.awaitStatus(parent, "idle")
+	dumpPanesOnFailure(t, h, parent)
+
+	// The address this window froze at creation.
+	sockBefore := h.ipcSock
+
+	h.restart()
+
+	assert.Equal(t, sockBefore, h.ipcSock,
+		"the restarted bramble must bind the same path its live windows still point at")
+
+	// The real proof: a session started before the restart still drives its own
+	// status through the hook, which only works if its frozen socket resolves.
+	h.awaitStatus(parent, "idle")
+	_, err := h.send("", parent, "AFTER-RESTART", true)
+	require.NoError(t, err)
+	h.awaitPane(parent, "STUB-REPLY AFTER-RESTART", "a pre-restart session was unreachable afterwards")
+
+	require.Eventually(t, func() bool { return h.deliveryQueueLen() == 0 },
+		settleTimeout, pollInterval, "the queue must drain, which needs the session to be seen going idle")
+}
