@@ -67,11 +67,27 @@ func TestDelegatorScenario_RetriableError(t *testing.T) {
 		AutoNotify:    true,
 		MaxTurns:      20,
 		TurnTimeout:   180 * time.Second,
+		// See TestDelegatorScenario_MultiSession: a purely conversational turn
+		// used to end the run before any session was started.
+		Nudge:     "Use your tools now: call start_session to carry that out.",
+		MaxNudges: 3,
 		Behaviors: map[string][]*session.MockSessionBehavior{
 			"planner": {
 				{States: []session.MockSessionState{
 					{Status: "completed", TurnCount: 2, TotalCostUSD: 0.03,
 						RecentOutput: []string{"Plan complete: refactor auth to middleware."}},
+				}},
+			},
+			// A refactor prompt makes the delegator explore before it builds,
+			// and it reaches for codetalk to do that. Without a behaviour here
+			// that child never reaches a notifiable state, so
+			// AdvanceUntilNotification returns nothing, the scenario ends on
+			// turn one, and no builder is ever started — which is what made
+			// this test fail every run rather than intermittently.
+			"codetalk": {
+				{States: []session.MockSessionState{
+					{Status: "completed", TurnCount: 2, TotalCostUSD: 0.02,
+						RecentOutput: []string{"Auth module uses inline checks in each handler; no middleware layer exists."}},
 				}},
 			},
 			"builder": {
@@ -194,6 +210,15 @@ func TestDelegatorScenario_MultiSession(t *testing.T) {
 		AutoNotify:    true,
 		MaxTurns:      20,
 		TurnTimeout:   120 * time.Second,
+		// Without this the test is a coin flip: haiku often opens by
+		// acknowledging the task in prose, and a turn with no tool calls used
+		// to end the scenario at turn one with nothing started. The nudge
+		// answers that opening so the delegation this test is about actually
+		// happens.
+		Nudge: "Use your tools now: call start_session for each part of that task.",
+		// A small model sometimes needs telling twice. Bounded so a model that
+		// will not delegate at all ends the run rather than burning MaxTurns.
+		MaxNudges: 3,
 		Behaviors: map[string][]*session.MockSessionBehavior{
 			"planner": {
 				{States: []session.MockSessionState{
@@ -201,6 +226,14 @@ func TestDelegatorScenario_MultiSession(t *testing.T) {
 						RecentOutput: []string{
 							"Plan: 1) Add auth middleware 2) Update API docs",
 						}},
+				}},
+			},
+			// The delegator may explore before building; give that child a
+			// terminal state too, or the run ends before any builder starts.
+			"codetalk": {
+				{States: []session.MockSessionState{
+					{Status: "completed", TurnCount: 2, TotalCostUSD: 0.02,
+						RecentOutput: []string{"App uses session cookies; API docs live in docs/api.md."}},
 				}},
 			},
 			"builder": {

@@ -321,15 +321,39 @@ func TestErrorCases(t *testing.T) {
 		require.ErrorIs(t, err, wt.ErrRepoNotInitialized)
 	})
 
-	t.Run("worktree already exists", func(t *testing.T) {
+	// Creating the same worktree twice is idempotent, not an error: #78 made
+	// New reuse a worktree whose branch already matches, so that a retried
+	// `bramble new-session --create-worktree` succeeds instead of failing with
+	// an opaque git error. ErrWorktreeExists is reserved for the case below,
+	// where the path is occupied by a *different* branch and reuse would hand
+	// back the wrong tree.
+	t.Run("existing worktree with the same branch is reused", func(t *testing.T) {
 		repo := newTestRepo(t)
 		repo.init()
 
-		_, err := repo.manager.New(repo.ctx, "feature-a", "main", "")
+		first, err := repo.manager.New(repo.ctx, "feature-a", "main", "")
+		require.NoError(t, err)
+
+		second, err := repo.manager.New(repo.ctx, "feature-a", "main", "")
+		require.NoError(t, err, "re-creating the same worktree must be idempotent")
+		require.Equal(t, first, second, "reuse must hand back the same path")
+	})
+
+	t.Run("worktree already exists on a different branch", func(t *testing.T) {
+		repo := newTestRepo(t)
+		repo.init()
+
+		path, err := repo.manager.New(repo.ctx, "feature-a", "main", "")
+		require.NoError(t, err)
+
+		// Move the existing worktree off the branch New would ask for, so the
+		// path is occupied by something else entirely.
+		_, err = repo.git.Run(repo.ctx, []string{"checkout", "-b", "someone-elses-work"}, path)
 		require.NoError(t, err)
 
 		_, err = repo.manager.New(repo.ctx, "feature-a", "main", "")
-		require.ErrorIs(t, err, wt.ErrWorktreeExists)
+		require.ErrorIs(t, err, wt.ErrWorktreeExists,
+			"a path held by a different branch must not be silently reused")
 	})
 
 	t.Run("branch not found", func(t *testing.T) {
