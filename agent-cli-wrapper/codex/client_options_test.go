@@ -126,11 +126,15 @@ func TestDefaultThreadConfig(t *testing.T) {
 }
 
 func TestThreadOption_WithModel(t *testing.T) {
-	cfg := defaultCodexThreadConfig()
-	WithModel("gpt-4o")(&cfg)
+	for _, want := range []string{"gpt-4o", "stealth/ox-alpha"} {
+		t.Run(want, func(t *testing.T) {
+			cfg := defaultCodexThreadConfig()
+			WithModel(want)(&cfg)
 
-	if cfg.Model != "gpt-4o" {
-		t.Errorf("unexpected Model: %q", cfg.Model)
+			if cfg.Model != want {
+				t.Errorf("unexpected Model: %q", cfg.Model)
+			}
+		})
 	}
 }
 
@@ -368,6 +372,35 @@ func TestClientOption_WithLLMEndpoint_setsEnv(t *testing.T) {
 	})(&cfg)
 	if cfg.Env["BASETEN_API_KEY"] != "key-secret" {
 		t.Errorf("Env[BASETEN_API_KEY] = %q", cfg.Env["BASETEN_API_KEY"])
+	}
+}
+
+func TestClientOption_WithLLMEndpoint_OpenRouter(t *testing.T) {
+	const (
+		apiKeyEnv = "CODEX_OPENROUTER_TEST_KEY"
+		apiKey    = "openrouter-test-key"
+	)
+	t.Setenv(apiKeyEnv, apiKey)
+
+	ep := llmendpoint.OpenRouter()
+	ep.APIKeyEnv = apiKeyEnv
+	cfg := defaultCodexClientConfig()
+	WithLLMEndpoint(ep)(&cfg)
+
+	want := []string{
+		`model_providers.openrouter.name="openrouter"`,
+		`model_providers.openrouter.base_url="https://openrouter.ai/api/v1"`,
+		`model_providers.openrouter.wire_api="responses"`,
+		`model_providers.openrouter.env_key="CODEX_OPENROUTER_TEST_KEY"`,
+		`model_provider="openrouter"`,
+	}
+	for _, value := range want {
+		if !appServerArgsContainConfig(cfg.AppServerArgs, value) {
+			t.Errorf("AppServerArgs missing %q\nfull: %v", value, cfg.AppServerArgs)
+		}
+	}
+	if got := cfg.Env[apiKeyEnv]; got != apiKey {
+		t.Errorf("Env[%s] = %q, want configured key", apiKeyEnv, got)
 	}
 }
 

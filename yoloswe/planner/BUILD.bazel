@@ -11,6 +11,7 @@ go_library(
     deps = [
         "//agent-cli-wrapper/claude",
         "//agent-cli-wrapper/claude/render",
+        "//agent-cli-wrapper/llmendpoint",
     ],
 )
 

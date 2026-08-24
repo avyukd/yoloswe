@@ -163,8 +163,15 @@ var thirdPartyIncompatibleFeatures = []string{
 
 // WithLLMEndpoint configures the codex app-server to route inference through
 // a third-party LLM endpoint by injecting `--config model_providers.<name>.*`
-// overrides at app-server boot. The API key is exposed via env var
-// (named by ep.APIKeyEnv) so it never lands in process args.
+// overrides at app-server boot. The API key is passed by env_key indirection —
+// the config names the variable, and the resolved value goes in ClientConfig.Env
+// — so the key never lands in *codex's* argv.
+//
+// That is a statement about codex's own command line, not a guarantee about
+// every launcher: a caller that has to materialize ClientConfig.Env into some
+// other process's arguments (bramble's tmux runner passes it to
+// `tmux new-window -e NAME=VALUE`) puts the value in *that* argv. Check the
+// launcher, not just this option.
 //
 // The final `--config model_provider="<name>"` ensures the new provider
 // becomes the default, overriding any value in ~/.codex/config.toml.

@@ -6,9 +6,80 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 )
+
+func newEndpointFlagsTestCommand(t *testing.T, args ...string) *cobra.Command {
+	t.Helper()
+	cmd := &cobra.Command{}
+	registerLLMEndpointFlags(cmd.Flags())
+	require.NoError(t, cmd.Flags().Parse(args))
+	return cmd
+}
+
+// Not parallel: newSessionEndpoint reads the named env var, so these tests pin
+// it rather than inherit whatever the machine happens to export.
+func TestNewSessionEndpointOpenRouterPreset(t *testing.T) {
+	t.Setenv(llmendpoint.OpenRouterAPIKeyEnv, "")
+
+	endpoint, err := newSessionEndpoint(newEndpointFlagsTestCommand(t, "--llm-preset", "openrouter"))
+	require.NoError(t, err)
+	assert.Equal(t, llmendpoint.OpenRouter(), endpoint)
+}
+
+func TestNewSessionEndpointCustomFlags(t *testing.T) {
+	t.Setenv("GATEWAY_KEY", "")
+
+	endpoint, err := newSessionEndpoint(newEndpointFlagsTestCommand(t,
+		"--llm-base-url", "https://gateway.example/v1",
+		"--llm-api-key-env", "GATEWAY_KEY",
+		"--llm-provider-name", "gateway",
+		"--llm-wire-api", "responses",
+	))
+	require.NoError(t, err)
+	assert.Equal(t, llmendpoint.Endpoint{
+		BaseURL:      "https://gateway.example/v1",
+		APIKeyEnv:    "GATEWAY_KEY",
+		ProviderName: "gateway",
+		Wire:         llmendpoint.WireAPIResponses,
+	}, endpoint)
+}
+
+// --llm-api-key-env is typed in the user's shell, but the session is launched
+// by the long-running bramble TUI in another process. Resolving the name here,
+// on the side that has the value, is what makes the documented flow independent
+// of whether the server was started before the key was exported.
+func TestNewSessionEndpointResolvesKeyInTheClient(t *testing.T) {
+	t.Setenv("GATEWAY_KEY", "gateway-secret")
+
+	endpoint, err := newSessionEndpoint(newEndpointFlagsTestCommand(t,
+		"--llm-base-url", "https://gateway.example/v1",
+		"--llm-api-key-env", "GATEWAY_KEY",
+	))
+	require.NoError(t, err)
+	assert.Equal(t, "gateway-secret", endpoint.APIKey)
+	assert.Equal(t, "GATEWAY_KEY", endpoint.APIKeyEnv,
+		"the name must still cross so the server can fall back to its own environment")
+}
+
+// A key the client cannot see is not an error here: the server may have it, and
+// startSessionWithID reports by name if neither side does. Sending an endpoint
+// with an empty APIKey and a live APIKeyEnv is what preserves that fallback.
+func TestNewSessionEndpointKeepsEnvNameWhenClientCannotResolve(t *testing.T) {
+	t.Setenv("GATEWAY_KEY", "")
+
+	endpoint, err := newSessionEndpoint(newEndpointFlagsTestCommand(t,
+		"--llm-base-url", "https://gateway.example/v1",
+		"--llm-api-key-env", "GATEWAY_KEY",
+	))
+	require.NoError(t, err)
+	assert.Empty(t, endpoint.APIKey)
+	assert.Equal(t, "GATEWAY_KEY", endpoint.APIKeyEnv)
+}
 
 // mkBareRepo creates a fake wt-managed repo under wtRoot:
 //

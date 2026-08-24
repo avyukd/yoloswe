@@ -169,12 +169,35 @@ func TestPaneIdleTrackerComesFromTheStoredModel(t *testing.T) {
 	m := NewManagerWithConfig(ManagerConfig{RepoName: "repo"})
 	defer m.Close()
 
-	assert.NotNil(t, m.newPaneIdleTrackerForModel("composer-3"),
+	assert.NotNil(t, m.newPaneIdleTrackerForModel("composer-3", ""),
 		"a stored cursor model must still produce a pane-idle tracker")
-	assert.Nil(t, m.newPaneIdleTrackerForModel("sonnet"),
+	assert.Nil(t, m.newPaneIdleTrackerForModel("sonnet", ""),
 		"claude reports its own turn ends; a second signal could only contradict it")
-	assert.Nil(t, m.newPaneIdleTrackerForModel("not-a-model"),
+	assert.Nil(t, m.newPaneIdleTrackerForModel("not-a-model", ""),
 		"an unresolvable model is not grounds for guessing at a pane's chrome")
+}
+
+// TestPaneIdleTrackerUsesTheSessionBackend covers the case the two features
+// only create together: a session started with an explicit --backend carries a
+// third-party model id the curated registry has never heard of, so resolving on
+// the model alone yields nothing. Without the backend the re-adopt path would
+// hand back a nil tracker for a hookless backend — the exact silent
+// never-seen-to-finish failure the tracker exists to prevent, reachable only
+// once per-session endpoints made unrecognized model ids legal.
+func TestPaneIdleTrackerUsesTheSessionBackend(t *testing.T) {
+	t.Parallel()
+
+	m := NewManagerWithConfig(ManagerConfig{RepoName: "repo"})
+	defer m.Close()
+
+	const thirdPartyModel = "stealth/ox-alpha"
+
+	assert.Nil(t, m.newPaneIdleTrackerForModel(thirdPartyModel, ""),
+		"precondition: the model alone does not resolve, which is why the backend has to travel with it")
+	assert.NotNil(t, m.newPaneIdleTrackerForModel(thirdPartyModel, ProviderCursor),
+		"an explicit backend names the provider the model cannot")
+	assert.Nil(t, m.newPaneIdleTrackerForModel(thirdPartyModel, ProviderClaude),
+		"a backend that reports its own turn ends still gets no pane probe")
 }
 
 // TestTrackerDoesNotCarryObservationsAcrossATurn is the boundary the monitor

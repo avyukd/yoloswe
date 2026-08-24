@@ -6,6 +6,12 @@ import (
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 )
 
+// Both auth schemes, because proxies differ on which they accept and
+// `claude -p` never prompts for either. Interactive launchers must narrow this:
+// bramble's tmux runner drops ANTHROPIC_API_KEY so the CLI does not park on its
+// custom-API-key approval modal (endpointEnv in bramble/session/tmux_runner.go).
+// If this test ever stops requiring both, that narrowing becomes a no-op and
+// x-api-key-only gateways lose the in-process path too.
 func TestWithLLMEndpoint_setsEnv(t *testing.T) {
 	t.Parallel()
 	cfg := defaultConfig()
@@ -97,6 +103,41 @@ func TestWithLLMEndpoint_stripsTrailingV1(t *testing.T) {
 		WithLLMEndpoint(llmendpoint.Endpoint{BaseURL: tc.in, APIKey: "k"})(&cfg)
 		if got := cfg.Env["ANTHROPIC_BASE_URL"]; got != tc.want {
 			t.Errorf("BaseURL %q -> ANTHROPIC_BASE_URL=%q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestWithLLMEndpoint_OpenRouter(t *testing.T) {
+	const (
+		apiKeyEnv = "CLAUDE_OPENROUTER_TEST_KEY"
+		apiKey    = "openrouter-test-key"
+		model     = "anthropic/claude-sonnet-4.5"
+	)
+	t.Setenv(apiKeyEnv, apiKey)
+
+	ep := llmendpoint.OpenRouter()
+	ep.APIKeyEnv = apiKeyEnv
+	cfg := defaultConfig()
+	cfg.Model = model
+	WithLLMEndpoint(ep)(&cfg)
+
+	if got := cfg.Env["ANTHROPIC_BASE_URL"]; got != "https://openrouter.ai/api" {
+		t.Errorf("ANTHROPIC_BASE_URL = %q, want OpenRouter Anthropic base without /v1", got)
+	}
+	for _, name := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"} {
+		if got := cfg.Env[name]; got != apiKey {
+			t.Errorf("%s = %q, want configured key", name, got)
+		}
+	}
+	for _, name := range []string{
+		"ANTHROPIC_MODEL",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL",
+		"ANTHROPIC_SMALL_FAST_MODEL",
+	} {
+		if got := cfg.Env[name]; got != model {
+			t.Errorf("%s = %q, want slash-bearing OpenRouter model %q", name, got, model)
 		}
 	}
 }

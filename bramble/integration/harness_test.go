@@ -451,6 +451,10 @@ type startupDialog struct {
 	match []string
 	// keys are sent, in order, to answer it.
 	keys []string
+	// fatal, when set, means this dialog must never appear: seeing it is
+	// itself the failure, so the harness reports it instead of clearing it.
+	// An entry with fatal set sends no keys.
+	fatal string
 }
 
 // startupDialogs is the set answered automatically. Each entry names the choice
@@ -470,6 +474,27 @@ var startupDialogs = []startupDialog{
 		name:  "claude folder trust",
 		match: []string{"Is this a project you created or one you trust", "I trust this folder"},
 		keys:  []string{"Enter"},
+	},
+	{
+		// Claude asks before using API-key authentication when its usual
+		// account login is also available. Recognized, never answered.
+		//
+		// In a correct run this modal is unreachable: tmuxRunner.endpointEnv
+		// shadows ANTHROPIC_API_KEY with an empty value precisely so the
+		// interactive CLI never asks. So it appears only when that shadow has
+		// regressed — and answering it is worse than either alternative.
+		// "Yes" is what the shadow exists to prevent: newHarness(t, false)
+		// keeps the developer's real HOME, so it would forward their own
+		// Anthropic credential to the third-party endpoint as x-api-key. "No"
+		// is quieter but no better for a live test: the session would carry on
+		// against ANTHROPIC_BASE_URL with the account login, and the test would
+		// pass while asserting nothing about the endpoint it exists to
+		// exercise. Fail instead, naming the regression.
+		name:  "claude custom API key",
+		match: []string{"Detected a custom API key in your environment", "Do you want to use this API key"},
+		fatal: "claude prompted for a custom API key: the ANTHROPIC_API_KEY shadow in tmuxRunner.endpointEnv has regressed. " +
+			"Answering it would either send this machine's real Anthropic credential to the third-party endpoint (Yes) " +
+			"or run the session against the default provider while the test still passes (No).",
 	},
 	{
 		// Codex, on a directory it has not seen before. Option 1, the default,
@@ -545,6 +570,10 @@ func (h *harness) answerStartupDialogs(id session.SessionID, pane string) bool {
 			return false // already answered; waiting for it to go away
 		}
 
+		if d.fatal != "" {
+			h.t.Fatalf("%s dialog in %s: %s\n--- pane ---\n%s", d.name, id, d.fatal, pane)
+		}
+
 		target := h.tmuxTargetOf(id)
 		h.t.Logf("answering %q dialog in %s with %v", d.name, id, d.keys)
 		for _, k := range d.keys {
@@ -580,7 +609,12 @@ func (h *harness) answerStartupDialogs(id session.SessionID, pane string) bool {
 // on rather than a fresh one taken afterwards.
 func (h *harness) awaitClearingDialogs(id session.SessionID, cond func(pane string) bool, failf string, args ...any) {
 	h.t.Helper()
-	deadline := time.Now().Add(settleTimeout)
+	h.awaitClearingDialogsFor(id, settleTimeout, cond, failf, args...)
+}
+
+func (h *harness) awaitClearingDialogsFor(id session.SessionID, timeout time.Duration, cond func(pane string) bool, failf string, args ...any) {
+	h.t.Helper()
+	deadline := time.Now().Add(timeout)
 	var pane string
 	for time.Now().Before(deadline) {
 		pane = h.pane(id)

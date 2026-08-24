@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -18,6 +19,7 @@ import (
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/acp"
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude"
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/codex"
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 	"github.com/bazelment/yoloswe/bramble/selfexec"
 	"github.com/bazelment/yoloswe/bramble/sessionmodel"
 	"github.com/bazelment/yoloswe/multiagent/agent"
@@ -78,6 +80,7 @@ type providerRunner struct { //nolint:govet // fieldalignment: keep related life
 	model           string // model ID for provider (e.g. "gpt-5.5")
 	permissionMode  string // execution permissions (e.g. "bypass", "plan")
 	workDir         string // working directory for provider
+	llmEndpoint     llmendpoint.Endpoint
 	eventBridgeWg   sync.WaitGroup
 	turnObsMu       sync.Mutex
 	turnObsSeq      uint64
@@ -221,6 +224,9 @@ func (r *providerRunner) RunTurn(ctx context.Context, message string) (*claude.T
 	}
 	if r.workDir != "" {
 		opts = append(opts, agent.WithProviderWorkDir(r.workDir))
+	}
+	if !r.llmEndpoint.IsZero() {
+		opts = append(opts, agent.WithProviderLLMEndpoint(r.llmEndpoint))
 	}
 
 	var result *agent.AgentResult
@@ -700,27 +706,16 @@ func (m *Manager) ReconcileTmuxSessions() error {
 
 			// Re-adopt: create in-memory session and start monitoring
 			ctx, cancel := context.WithCancel(m.ctx)
-			session := &Session{
-				ID:              stored.ID,
-				Type:            stored.Type,
-				Status:          stored.Status,
-				WorktreePath:    stored.WorktreePath,
-				WorktreeName:    stored.WorktreeName,
-				Prompt:          stored.Prompt,
-				Title:           stored.Title,
-				Model:           stored.Model,
-				TmuxWindowName:  stored.TmuxWindowName,
-				TmuxWindowID:    stored.TmuxWindowID,
-				RunnerType:      stored.RunnerType,
-				RepoName:        m.config.RepoName,
-				CLISessionID:    stored.CLISessionID,
-				ParentSessionID: stored.ParentSessionID,
-				Progress:        &SessionProgress{LastActivity: time.Now()},
-				CreatedAt:       stored.CreatedAt,
-				StartedAt:       stored.StartedAt,
-				ctx:             ctx,
-				cancel:          cancel,
-			}
+			session := storedToSession(stored)
+			session.TmuxWindowName = stored.TmuxWindowName
+			session.TmuxWindowID = stored.TmuxWindowID
+			session.RunnerType = stored.RunnerType
+			// The manager's name, not the record's: this loop only ever loads
+			// sessions filed under m.config.RepoName, and the in-memory session
+			// is keyed by it.
+			session.RepoName = m.config.RepoName
+			session.ctx = ctx
+			session.cancel = cancel
 
 			m.mu.Lock()
 			m.sessions[session.ID] = session
@@ -926,7 +921,7 @@ func (m *Manager) StartSession(sessionType SessionType, worktreePath, prompt, mo
 // SpawnOpts carries the optional attributes of a new session that only some
 // callers set. The zero value means a plain, top-level session, so callers with
 // nothing to say can keep using StartSession.
-type SpawnOpts struct {
+type SpawnOpts struct { //nolint:govet // fieldalignment: keep endpoint next to its backend.
 	// ParentSessionID makes the new session a subagent of that parent: its
 	// completion is reported back there. Leave empty for a top-level session.
 	//
@@ -934,6 +929,10 @@ type SpawnOpts struct {
 	// watcher (watchChildSessionChanges) and would otherwise be told about
 	// every child transition twice.
 	ParentSessionID SessionID
+	// Backend selects the CLI independently from the model ID. This matters for
+	// gateways where one model is reachable through more than one CLI/wire API.
+	Backend     string
+	LLMEndpoint llmendpoint.Endpoint
 }
 
 // StartSessionWithOpts is StartSession with the optional attributes in SpawnOpts.
@@ -950,13 +949,65 @@ func (m *Manager) StartSessionWithOpts(sessionType SessionType, worktreePath, pr
 func (m *Manager) startSessionWithID(sessionID SessionID, sessionType SessionType, worktreePath, worktreeName, prompt, model string, opts SpawnOpts) (SessionID, error) {
 	ctx, cancel := context.WithCancel(m.ctx)
 
-	if model == "" {
+	backend := opts.Backend
+	if err := validateBackend(backend); err != nil {
+		cancel()
+		return "", err
+	}
+	// Resolve the backend before defaulting the model. An explicit backend
+	// means the model ID is the backend's own (an OpenRouter slug, say), so
+	// there is no sensible default to fall back to; substituting "sonnet"
+	// here would launch `codex -m sonnet` against the endpoint and surface a
+	// remote 400 instead of naming the missing flag. Leaving the model empty
+	// lets resolveAgentModel's guard fire with that name.
+	if model == "" && backend == "" {
 		switch sessionType {
 		case SessionTypePlanner, SessionTypeCodeTalk:
 			model = "opus"
 		default:
 			model = "sonnet"
 		}
+	}
+	endpoint := opts.LLMEndpoint
+	if err := endpoint.Validate(); err != nil {
+		cancel()
+		return "", err
+	}
+	// validateEndpointBackend is a no-op on an empty backend, but runSession
+	// re-runs it against the *resolved* provider -- so without this, an
+	// endpoint on a gemini/cursor/agy model id with no --backend passed every
+	// check here, printed a session ID, and only failed in the background.
+	// That is the exact split the duplicate checks below exist to close, and
+	// startSessionWithID already holds the registry needed to close it.
+	endpointBackend := backend
+	if endpointBackend == "" && !endpoint.IsZero() {
+		agentModel, err := resolveAgentModel(model, "", m.config.ModelRegistry)
+		if err != nil {
+			cancel()
+			return "", err
+		}
+		endpointBackend = agentModel.Provider
+	}
+	if err := validateEndpointBackend(endpoint, endpointBackend); err != nil {
+		cancel()
+		return "", err
+	}
+	// Fail here as well as in runSession so `bramble new-session` gets the
+	// error on stderr instead of a session ID followed by a background
+	// failure. runSession carries the same check for the resume path.
+	if err := validateEndpointCredential(endpoint); err != nil {
+		cancel()
+		return "", err
+	}
+	if err := validatePersistableEndpoint(endpoint, m.config.Store != nil); err != nil {
+		cancel()
+		return "", err
+	}
+	// Reported here rather than left to resolveAgentModel inside runSession, so
+	// the operator sees it at the command line.
+	if err := validateBackendModel(backend, model); err != nil {
+		cancel()
+		return "", err
 	}
 
 	session := &Session{
@@ -968,6 +1019,8 @@ func (m *Manager) startSessionWithID(sessionID SessionID, sessionType SessionTyp
 		Prompt:          prompt,
 		Title:           generateTitle(prompt, 20),
 		Model:           model,
+		Backend:         backend,
+		LLMEndpoint:     endpoint.Clone(),
 		RepoName:        m.config.RepoName,
 		ParentSessionID: opts.ParentSessionID,
 		Progress:        &SessionProgress{LastActivity: time.Now()},
@@ -1097,23 +1150,7 @@ func (m *Manager) rehydrateSession(id SessionID) (*Session, bool) {
 		// Do not allocate a context here — the session is in a terminal state
 		// (completed/failed/stopped) and ResumeSession will set ctx/cancel
 		// before running. Allocating one here would leak it immediately.
-		session := &Session{
-			ID:              stored.ID,
-			Type:            stored.Type,
-			Status:          stored.Status,
-			WorktreePath:    stored.WorktreePath,
-			WorktreeName:    stored.WorktreeName,
-			Prompt:          stored.Prompt,
-			Title:           stored.Title,
-			Model:           stored.Model,
-			RepoName:        stored.RepoName,
-			CLISessionID:    stored.CLISessionID,
-			ParentSessionID: stored.ParentSessionID,
-			CreatedAt:       stored.CreatedAt,
-			StartedAt:       stored.StartedAt,
-			CompletedAt:     stored.CompletedAt,
-			Progress:        &SessionProgress{LastActivity: time.Now()},
-		}
+		session := storedToSession(stored)
 
 		m.mu.Lock()
 		m.sessions[id] = session
@@ -1123,6 +1160,45 @@ func (m *Manager) rehydrateSession(id SessionID) (*Session, bool) {
 	}
 
 	return nil, false
+}
+
+// storedToSession rebuilds the in-memory Session a persisted record describes.
+//
+// One function rather than a literal at each restore site. Both callers —
+// ReconcileTmuxSessions re-adopting a live tmux window, and rehydrateSession
+// loading a terminal session for resume — restore the same fields, and the two
+// copies had already drifted once. What makes a shared helper worth it here is
+// that a field dropped on restore is silent: Backend is fail-loud (an
+// uncurated model id fails to resolve), but a dropped LLMEndpoint is
+// indistinguishable from a session that never had one, because every
+// validateEndpoint* guard short-circuits on IsZero. The session simply runs
+// against the default provider with the user's own credentials.
+//
+// Callers add what is theirs: the tmux window identity and a context for a
+// re-adopted session, nothing for one awaiting ResumeSession.
+func storedToSession(stored *StoredSession) *Session {
+	session := &Session{
+		ID:              stored.ID,
+		Type:            stored.Type,
+		Status:          stored.Status,
+		WorktreePath:    stored.WorktreePath,
+		WorktreeName:    stored.WorktreeName,
+		Prompt:          stored.Prompt,
+		Title:           stored.Title,
+		Model:           stored.Model,
+		Backend:         stored.Backend,
+		RepoName:        stored.RepoName,
+		CLISessionID:    stored.CLISessionID,
+		ParentSessionID: stored.ParentSessionID,
+		CreatedAt:       stored.CreatedAt,
+		StartedAt:       stored.StartedAt,
+		CompletedAt:     stored.CompletedAt,
+		Progress:        &SessionProgress{LastActivity: time.Now()},
+	}
+	if stored.LLMEndpoint != nil {
+		session.LLMEndpoint = stored.LLMEndpoint.Clone()
+	}
+	return session
 }
 
 // StartPlannerSession creates and starts a new planner session.
@@ -1290,8 +1366,9 @@ func (m *Manager) monitorTrackedTmuxWindow(session *Session) {
 	// no live agentModel on the re-adopt path.
 	session.mu.RLock()
 	storedModel := session.Model
+	storedBackend := session.Backend
 	session.mu.RUnlock()
-	idleTracker := m.newPaneIdleTrackerForModel(storedModel)
+	idleTracker := m.newPaneIdleTrackerForModel(storedModel, storedBackend)
 
 	// Do an initial capture so the command center has data immediately.
 	captureRecentOutput()
@@ -1433,7 +1510,16 @@ func (m *Manager) monitorTrackedTmuxWindow(session *Session) {
 	}
 }
 
-func resolveAgentModel(modelID string, registry *agent.ModelRegistry) (agent.AgentModel, error) {
+func resolveAgentModel(modelID, backend string, registry *agent.ModelRegistry) (agent.AgentModel, error) {
+	if backend != "" {
+		if err := validateBackend(backend); err != nil {
+			return agent.AgentModel{}, err
+		}
+		if err := validateBackendModel(backend, modelID); err != nil {
+			return agent.AgentModel{}, err
+		}
+		return agent.AgentModel{ID: modelID, Provider: backend, Label: modelID}, nil
+	}
 	if registry != nil {
 		if m, ok := registry.ModelByID(modelID); ok {
 			return m, nil
@@ -1458,12 +1544,185 @@ func resolveAgentModel(modelID string, registry *agent.ModelRegistry) (agent.Age
 // nil for a provider that reports its own turn ends, and nil for a model that
 // no longer resolves — an unrecognized model is not grounds for guessing at a
 // pane's chrome.
-func (m *Manager) newPaneIdleTrackerForModel(model string) *paneIdleTracker {
-	agentModel, err := resolveAgentModel(model, m.config.ModelRegistry)
+//
+// backend is the session's explicit --backend, empty when it has none. It has
+// to come along: with one set, the model ID is that backend's own (a
+// third-party slug the curated registry has never heard of), so resolving on
+// the model alone would fail and hand back a nil tracker — silently turning a
+// hookless backend into one that is never seen to finish.
+func (m *Manager) newPaneIdleTrackerForModel(model, backend string) *paneIdleTracker {
+	agentModel, err := resolveAgentModel(model, backend, m.config.ModelRegistry)
 	if err != nil {
 		return nil
 	}
 	return newPaneIdleTracker(agentModel.Provider)
+}
+
+func validateBackend(backend string) error {
+	if backend != "" && !slices.Contains(agent.AllProviders, backend) {
+		return fmt.Errorf("unknown backend %q (expected one of %s)", backend, strings.Join(agent.AllProviders, ", "))
+	}
+	return nil
+}
+
+// validateBackendModel rejects a (backend, model) pair that cannot launch.
+//
+// Two ways it cannot. An explicit backend means the model ID is that backend's
+// own — an OpenRouter slug, say — so an empty model has no default to fall back
+// to; bramble's own defaults are Claude aliases. And a model ID the curated
+// registry assigns to a *different* provider is a user error, not a request for
+// that CLI's default: agent.CLIModelArg drops the flag entirely in that case
+// (model_registry.go:47-49), so `--backend codex --model opus` would launch
+// codex with no -m at all, running codex's default while bramble recorded and
+// displayed "opus". The same split would let endpointEnv pin ANTHROPIC_MODEL
+// from the raw ID while --model carried the filtered one.
+//
+// Checked against the global registry rather than the manager's filtered one
+// because that is the registry CLIModelArg consults; validating against a
+// different set than the consumer uses is how the two drift apart. An ID absent
+// from the registry is fine — carrying third-party IDs is what --backend is for.
+//
+// Called from startSessionWithID (so the CLI gets a synchronous error) and from
+// resolveAgentModel (so every other caller is covered too). One function rather
+// than a check in each: this is one rule about one pair.
+func validateBackendModel(backend, model string) error {
+	if backend == "" {
+		return nil
+	}
+	if model == "" {
+		return fmt.Errorf("model must not be empty when backend %q is selected", backend)
+	}
+	if m, ok := agent.ModelByID(model); ok && m.Provider != backend {
+		return fmt.Errorf("model %q belongs to backend %q, not the requested backend %q: pass a model id that backend serves, or drop --backend", model, m.Provider, backend)
+	}
+	return nil
+}
+
+// validatePersistableEndpoint rejects an endpoint this manager cannot faithfully
+// reconstruct after a restart.
+//
+// SessionToStored persists via Endpoint.Redacted(), whose contract is
+// log-safety, not persistence: it clears APIKey *and* drops Headers entirely.
+// The credential survives that because APIKeyEnv re-resolves and
+// validateEndpointCredential names the failure when it cannot. Headers have
+// neither — a rehydrated endpoint simply has none, so a gateway that needs a
+// routing or tenant header would work on first launch and fail opaquely on
+// every resume, with the store's redaction test (which asserts only on APIKey)
+// blind to it.
+//
+// Refusing up front is the cheaper half of the trade: persisting the header
+// values instead would put arbitrary secrets in ~/.bramble/sessions/*.json,
+// which is the posture this whole path exists to avoid. Headers are not
+// reachable from `bramble new-session` — there is no --llm-header flag — so
+// this can only fire for a direct IPC caller that sets them, and it tells that
+// caller the constraint at the point it can still act on it.
+func validatePersistableEndpoint(endpoint llmendpoint.Endpoint, persists bool) error {
+	if !persists || endpoint.IsZero() {
+		return nil
+	}
+	// Two things Redacted() removes, so two ways an endpoint can fail to
+	// survive its own session. The credential normally survives because
+	// APIKeyEnv re-resolves; an inline-only key has nothing to re-resolve
+	// from, so the session launches and then cannot be resumed.
+	if endpoint.APIKey != "" && endpoint.APIKeyEnv == "" {
+		return errors.New("llm endpoint carries an inline api key with no APIKeyEnv, which is not persisted (Redacted drops it) and cannot be re-resolved on resume: set APIKeyEnv so the key can be recovered from the environment")
+	}
+	if len(endpoint.Headers) > 0 {
+		return fmt.Errorf("llm endpoint sets %d http header(s), which are not persisted (Redacted drops them) and would silently vanish on resume: drop the headers, or run this endpoint through the in-process path", len(endpoint.Headers))
+	}
+	return nil
+}
+
+// validateEndpointCredential rejects an endpoint whose key resolves to nothing.
+//
+// Only the env var *name* is guaranteed to cross the IPC boundary from
+// `bramble new-session`; this process is the one that reads it, so a TUI
+// started before the key was exported resolves nothing. Resume is the same
+// hole reached by a different route: SessionToStored persists the endpoint via
+// Redacted(), so a rehydrated session has APIKey=="" and re-resolves through
+// APIKeyEnv. Either way the wrappers would omit the auth headers while still
+// setting the base URL, and the window would talk to the endpoint with the
+// user's own credentials and fail on an opaque remote 401.
+//
+// Called from startSessionWithID (so the CLI gets a synchronous error) and
+// from runSession (so ResumeSession, the other caller, is covered too). One
+// function rather than two copies: this is one rule about one invariant.
+func validateEndpointCredential(endpoint llmendpoint.Endpoint) error {
+	if endpoint.IsZero() || endpoint.ResolvedKey() != "" {
+		return nil
+	}
+	return fmt.Errorf("llm endpoint api key is unset: %s holds no value in the bramble server's environment (export it before starting bramble, or start a new session with --llm-api-key-env, which resolves the key in the client)", endpointKeySource(endpoint))
+}
+
+// endpointKeySource names where the endpoint's credential was meant to come
+// from, so an unresolved key reports the env var the operator actually typed
+// rather than a generic "no key". An inline APIKey can never be the unresolved
+// case (ResolvedKey returns it verbatim), so the fallback covers only an
+// endpoint that named neither — which Validate already rejects.
+func endpointKeySource(endpoint llmendpoint.Endpoint) string {
+	if endpoint.APIKeyEnv != "" {
+		return "$" + endpoint.APIKeyEnv
+	}
+	return "the endpoint's api key"
+}
+
+func validateEndpointBackend(endpoint llmendpoint.Endpoint, backend string) error {
+	if endpoint.IsZero() || backend == "" || backend == ProviderClaude {
+		return nil
+	}
+	if backend != ProviderCodex {
+		return fmt.Errorf("LLM endpoints support only %q and %q tmux backends, got %q", ProviderClaude, ProviderCodex, backend)
+	}
+	if endpoint.WireAPI() != llmendpoint.WireAPIResponses {
+		return fmt.Errorf("codex requires llm-wire-api=%q; %q is no longer supported", llmendpoint.WireAPIResponses, endpoint.WireAPI())
+	}
+	return nil
+}
+
+// plannerConfigFor, builderConfigFor and codeTalkConfigFor build the wrapper
+// configs for the default (non-provider) TUI branch of runSession.
+//
+// Split out of the switch so the session -> config carry can be asserted
+// without launching a real CLI. Each is the only place a session's model and
+// endpoint reach its wrapper, and the two travel together for the reason the
+// provider branch states: claude.WithLLMEndpoint skips the ANTHROPIC_MODEL and
+// ANTHROPIC_DEFAULT_* side-call pins when Model is empty. A dropped endpoint is
+// also indistinguishable from no endpoint -- the wrapper just runs against the
+// default provider with the user's own credentials -- so while these were
+// inline literals, deleting any LLMEndpoint line left the whole suite green.
+// TestManager_TUIWrapperConfigsCarrySessionEndpoint now fails if one goes.
+func (m *Manager) plannerConfigFor(session *Session, eventHandler *sessionEventHandler) planner.Config {
+	return planner.Config{
+		Model:           session.Model,
+		LLMEndpoint:     session.LLMEndpoint.Clone(),
+		WorkDir:         session.WorktreePath,
+		Simple:          true,
+		BuildMode:       planner.BuildModeReturn,
+		Output:          io.Discard,
+		EventHandler:    eventHandler,
+		ResumeSessionID: session.CLISessionID,
+		RecordingDir:    m.config.RecordingDir,
+	}
+}
+
+func (m *Manager) builderConfigFor(session *Session) yoloswe.BuilderConfig {
+	return yoloswe.BuilderConfig{
+		Model:           session.Model,
+		LLMEndpoint:     session.LLMEndpoint.Clone(),
+		WorkDir:         session.WorktreePath,
+		ResumeSessionID: session.CLISessionID,
+		RecordingDir:    m.config.RecordingDir,
+	}
+}
+
+func (m *Manager) codeTalkConfigFor(session *Session) yoloswe.CodeTalkConfig {
+	return yoloswe.CodeTalkConfig{
+		Model:           session.Model,
+		LLMEndpoint:     session.LLMEndpoint.Clone(),
+		WorkDir:         session.WorktreePath,
+		ResumeSessionID: session.CLISessionID,
+		RecordingDir:    m.config.RecordingDir,
+	}
 }
 
 // newTmuxRunner builds the runner for a tmux-mode session, copying the
@@ -1498,6 +1757,7 @@ func (m *Manager) newTmuxRunner(session *Session, prompt, tmuxName string, agent
 		brambleBin:      brambleBin,
 		brambleSock:     m.config.IPCSockPath,
 		controlSock:     m.config.ControlSockPath,
+		llmEndpoint:     session.LLMEndpoint.Clone(),
 		yoloMode:        m.config.YoloMode,
 		killOnStop:      false, // Never kill on Stop(); cleanup happens in Close() if TmuxExitOnQuit is set
 	}
@@ -1515,7 +1775,7 @@ func (m *Manager) runSession(session *Session, prompt string) {
 
 	// Resolve model provider for runner routing.
 	// Prefer the filtered registry if available, fall back to the full list.
-	agentModel, resolveErr := resolveAgentModel(session.Model, m.config.ModelRegistry)
+	agentModel, resolveErr := resolveAgentModel(session.Model, session.Backend, m.config.ModelRegistry)
 	if resolveErr != nil {
 		m.failSession(session, resolveErr)
 		m.addOutput(session.ID, OutputLine{
@@ -1523,6 +1783,21 @@ func (m *Manager) runSession(session *Session, prompt string) {
 			Type:      OutputTypeError,
 			Content:   resolveErr.Error(),
 		})
+		m.persistSession(session)
+		return
+	}
+	if err := validateEndpointBackend(session.LLMEndpoint, agentModel.Provider); err != nil {
+		m.failSession(session, err)
+		m.addOutput(session.ID, OutputLine{Timestamp: time.Now(), Type: OutputTypeError, Content: err.Error()})
+		m.persistSession(session)
+		return
+	}
+	// Both callers of runSession pass through here; ResumeSession does not go
+	// through startSessionWithID, so this is the only place a resumed endpoint
+	// session's credential is checked.
+	if err := validateEndpointCredential(session.LLMEndpoint); err != nil {
+		m.failSession(session, err)
+		m.addOutput(session.ID, OutputLine{Timestamp: time.Now(), Type: OutputTypeError, Content: err.Error()})
 		m.persistSession(session)
 		return
 	}
@@ -1559,6 +1834,19 @@ func (m *Manager) runSession(session *Session, prompt string) {
 			unsupported = "pluggable provider backend"
 		case agentModel.Provider != ProviderClaude:
 			unsupported = fmt.Sprintf("provider %q (only Claude is supported for delegator sessions)", agentModel.Provider)
+		case !session.LLMEndpoint.IsZero():
+			// The fourth arm of the switch below, and the only one that does
+			// not carry the endpoint into its runner: delegatorRunner builds
+			// its claude.Session from DelegatorBaseSessionOpts, which has no
+			// endpoint seam, and its spawned children get their own sessions
+			// with no endpoint either. Dropping it silently would run the
+			// session against the default provider with the user's own
+			// credentials -- a zero endpoint and a discarded one are
+			// indistinguishable downstream, since every validate* guard
+			// short-circuits on IsZero. Refuse instead, so adding endpoint
+			// support to the delegator is a deliberate act rather than the
+			// repair of a silent fallback.
+			unsupported = "a per-session LLM endpoint"
 		}
 		if unsupported != "" {
 			err := fmt.Errorf("delegator sessions are not supported with %s", unsupported)
@@ -1592,10 +1880,20 @@ func (m *Manager) runSession(session *Session, prompt string) {
 		eventHandler = newSessionEventHandler(m, session.ID)
 
 		if m.config.Provider != nil {
-			// Use the pluggable provider backend
+			// Use the pluggable provider backend. model and workDir are set
+			// here for the same reason the four branches below set them: a
+			// third-party endpoint only works when the model travels with it —
+			// claude.WithLLMEndpoint skips the ANTHROPIC_MODEL and
+			// ANTHROPIC_DEFAULT_* side-call pins when Model is empty, and codex
+			// gets no -m. This branch is test-only today (nothing outside tests
+			// sets ManagerConfig.Provider), which is precisely why it mattered:
+			// it is the branch the manager-level endpoint tests run through, so
+			// an omission here made those tests unable to observe the pairing.
 			runner = &providerRunner{
 				provider:     m.config.Provider,
 				eventHandler: eventHandler,
+				model:        session.Model,
+				workDir:      session.WorktreePath,
 			}
 		} else if agentModel.Provider == ProviderCodex {
 			// Codex provider backend
@@ -1688,26 +1986,10 @@ func (m *Manager) runSession(session *Session, prompt string) {
 			// Default: use hardcoded planner/builder runners with model from session
 			switch session.Type {
 			case SessionTypePlanner:
-				pw := planner.NewPlannerWrapper(planner.Config{
-					Model:           session.Model,
-					WorkDir:         session.WorktreePath,
-					Simple:          true,
-					BuildMode:       planner.BuildModeReturn,
-					Output:          io.Discard,
-					EventHandler:    eventHandler,
-					ResumeSessionID: session.CLISessionID,
-					RecordingDir:    m.config.RecordingDir,
-				})
-				runner = &plannerRunner{pw: pw}
+				runner = &plannerRunner{pw: planner.NewPlannerWrapper(m.plannerConfigFor(session, eventHandler))}
 			case SessionTypeBuilder:
 				builderHandler := newSessionEventHandlerNoTurnEnd(m, session.ID)
-				builder := yoloswe.NewBuilderSessionWithEvents(yoloswe.BuilderConfig{
-					Model:           session.Model,
-					WorkDir:         session.WorktreePath,
-					ResumeSessionID: session.CLISessionID,
-					RecordingDir:    m.config.RecordingDir,
-				}, nil, builderHandler)
-				runner = builder
+				runner = yoloswe.NewBuilderSessionWithEvents(m.builderConfigFor(session), nil, builderHandler)
 			case SessionTypeDelegator:
 				childModel := session.Model
 				if m.config.ChildModel != "" {
@@ -1723,13 +2005,7 @@ func (m *Manager) runSession(session *Session, prompt string) {
 				}
 			case SessionTypeCodeTalk:
 				codetalkHandler := newSessionEventHandlerNoTurnEnd(m, session.ID)
-				ct := yoloswe.NewCodeTalkSessionWithEvents(yoloswe.CodeTalkConfig{
-					Model:           session.Model,
-					WorkDir:         session.WorktreePath,
-					ResumeSessionID: session.CLISessionID,
-					RecordingDir:    m.config.RecordingDir,
-				}, nil, codetalkHandler)
-				runner = ct
+				runner = yoloswe.NewCodeTalkSessionWithEvents(m.codeTalkConfigFor(session), nil, codetalkHandler)
 			default:
 				err := fmt.Errorf("unknown session type: %s", session.Type)
 				m.failSession(session, err)
@@ -1742,6 +2018,19 @@ func (m *Manager) runSession(session *Session, prompt string) {
 				return
 			}
 		}
+	}
+
+	// Attach the endpoint once, after the branch, rather than in each
+	// providerRunner literal. Five branches build one, and this PR wired only
+	// two of them — the other three are unreachable with a non-zero endpoint
+	// today (validateEndpointBackend above rejects anything but claude and
+	// codex), but nothing at those literals said so, and a later backend
+	// joining the allowed set would have had to remember. Setting it here
+	// makes forgetting impossible instead of merely unlikely. The non-provider
+	// runners (planner/builder/codetalk wrappers) take the endpoint through
+	// their own config structs in the default branch above.
+	if pr, ok := runner.(*providerRunner); ok {
+		pr.llmEndpoint = session.LLMEndpoint.Clone()
 	}
 
 	if err := runner.Start(session.ctx); err != nil {
@@ -1839,7 +2128,7 @@ func (m *Manager) runSession(session *Session, prompt string) {
 		// Backends with no turn-completion hook (cursor) have their idleness
 		// read off the pane instead. nil for claude and codex, which report it
 		// themselves; see pane_idle.go for why this is a last resort.
-		idleTracker := m.newPaneIdleTrackerForModel(session.Model)
+		idleTracker := m.newPaneIdleTrackerForModel(session.Model, session.Backend)
 
 		// Periodically check if tmux window still exists
 		ticker := time.NewTicker(2 * time.Second)

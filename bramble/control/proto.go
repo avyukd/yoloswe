@@ -149,6 +149,7 @@ type SessionSummary struct {
 	Status       string `json:"status"`
 	WorktreeName string `json:"worktree_name"`
 	Model        string `json:"model"`
+	Backend      string `json:"backend,omitempty"`
 	RunnerType   string `json:"runner_type"`
 	TmuxTarget   string `json:"tmux_target"`
 }

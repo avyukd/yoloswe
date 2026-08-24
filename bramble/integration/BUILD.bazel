@@ -14,9 +14,18 @@ load("@rules_go//go:def.bzl", "go_test")
 #   --test_env=BRAMBLE_IT_CODEX_MODEL=gpt-5.5
 go_test(
     name = "integration_test",
-    timeout = "long",
+    # "eternal" (3600s), not "long" (900s): TestLiveOpenRouterNewSession retries
+    # a known CLI defect up to claudeMaxAttempts=10 times at
+    # openRouterSettleTimeout=3m each, so its claude leg alone is worth 1800s
+    # worst case, plus 180s for the codex leg. shard_count below does not help —
+    # both legs are subtests of one function and therefore land in one shard. A
+    # budget under the declared retry count cannot be reached: bazel kills the
+    # shard first, with a timeout that names neither the retries nor the CLI
+    # defect they exist for. Changing either constant means redoing this sum.
+    timeout = "eternal",
     srcs = [
         "harness_test.go",
+        "openrouter_test.go",
         "subagent_test.go",
         "support_test.go",
     ],
@@ -29,6 +38,7 @@ go_test(
     # logged-out one that hangs on a login prompt.
     env_inherit = [
         "HOME",
+        "OPEN_ROUTER_KEY",
         "PATH",
         "USER",
     ],
@@ -41,6 +51,7 @@ go_test(
         "manual",
     ],
     deps = [
+        "//agent-cli-wrapper/llmendpoint",
         "//bramble/control",
         "//bramble/ipc",
         "//bramble/session",
