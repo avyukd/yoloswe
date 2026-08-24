@@ -706,31 +706,16 @@ func (m *Manager) ReconcileTmuxSessions() error {
 
 			// Re-adopt: create in-memory session and start monitoring
 			ctx, cancel := context.WithCancel(m.ctx)
-			session := &Session{
-				ID:              stored.ID,
-				Type:            stored.Type,
-				Status:          stored.Status,
-				WorktreePath:    stored.WorktreePath,
-				WorktreeName:    stored.WorktreeName,
-				Prompt:          stored.Prompt,
-				Title:           stored.Title,
-				Model:           stored.Model,
-				Backend:         stored.Backend,
-				TmuxWindowName:  stored.TmuxWindowName,
-				TmuxWindowID:    stored.TmuxWindowID,
-				RunnerType:      stored.RunnerType,
-				RepoName:        m.config.RepoName,
-				CLISessionID:    stored.CLISessionID,
-				ParentSessionID: stored.ParentSessionID,
-				Progress:        &SessionProgress{LastActivity: time.Now()},
-				CreatedAt:       stored.CreatedAt,
-				StartedAt:       stored.StartedAt,
-				ctx:             ctx,
-				cancel:          cancel,
-			}
-			if stored.LLMEndpoint != nil {
-				session.LLMEndpoint = stored.LLMEndpoint.Clone()
-			}
+			session := storedToSession(stored)
+			session.TmuxWindowName = stored.TmuxWindowName
+			session.TmuxWindowID = stored.TmuxWindowID
+			session.RunnerType = stored.RunnerType
+			// The manager's name, not the record's: this loop only ever loads
+			// sessions filed under m.config.RepoName, and the in-memory session
+			// is keyed by it.
+			session.RepoName = m.config.RepoName
+			session.ctx = ctx
+			session.cancel = cancel
 
 			m.mu.Lock()
 			m.sessions[session.ID] = session
@@ -988,7 +973,22 @@ func (m *Manager) startSessionWithID(sessionID SessionID, sessionType SessionTyp
 		cancel()
 		return "", err
 	}
-	if err := validateEndpointBackend(endpoint, backend); err != nil {
+	// validateEndpointBackend is a no-op on an empty backend, but runSession
+	// re-runs it against the *resolved* provider -- so without this, an
+	// endpoint on a gemini/cursor/agy model id with no --backend passed every
+	// check here, printed a session ID, and only failed in the background.
+	// That is the exact split the duplicate checks below exist to close, and
+	// startSessionWithID already holds the registry needed to close it.
+	endpointBackend := backend
+	if endpointBackend == "" && !endpoint.IsZero() {
+		agentModel, err := resolveAgentModel(model, "", m.config.ModelRegistry)
+		if err != nil {
+			cancel()
+			return "", err
+		}
+		endpointBackend = agentModel.Provider
+	}
+	if err := validateEndpointBackend(endpoint, endpointBackend); err != nil {
 		cancel()
 		return "", err
 	}
@@ -1150,27 +1150,7 @@ func (m *Manager) rehydrateSession(id SessionID) (*Session, bool) {
 		// Do not allocate a context here — the session is in a terminal state
 		// (completed/failed/stopped) and ResumeSession will set ctx/cancel
 		// before running. Allocating one here would leak it immediately.
-		session := &Session{
-			ID:              stored.ID,
-			Type:            stored.Type,
-			Status:          stored.Status,
-			WorktreePath:    stored.WorktreePath,
-			WorktreeName:    stored.WorktreeName,
-			Prompt:          stored.Prompt,
-			Title:           stored.Title,
-			Model:           stored.Model,
-			Backend:         stored.Backend,
-			RepoName:        stored.RepoName,
-			CLISessionID:    stored.CLISessionID,
-			ParentSessionID: stored.ParentSessionID,
-			CreatedAt:       stored.CreatedAt,
-			StartedAt:       stored.StartedAt,
-			CompletedAt:     stored.CompletedAt,
-			Progress:        &SessionProgress{LastActivity: time.Now()},
-		}
-		if stored.LLMEndpoint != nil {
-			session.LLMEndpoint = stored.LLMEndpoint.Clone()
-		}
+		session := storedToSession(stored)
 
 		m.mu.Lock()
 		m.sessions[id] = session
@@ -1180,6 +1160,45 @@ func (m *Manager) rehydrateSession(id SessionID) (*Session, bool) {
 	}
 
 	return nil, false
+}
+
+// storedToSession rebuilds the in-memory Session a persisted record describes.
+//
+// One function rather than a literal at each restore site. Both callers —
+// ReconcileTmuxSessions re-adopting a live tmux window, and rehydrateSession
+// loading a terminal session for resume — restore the same fields, and the two
+// copies had already drifted once. What makes a shared helper worth it here is
+// that a field dropped on restore is silent: Backend is fail-loud (an
+// uncurated model id fails to resolve), but a dropped LLMEndpoint is
+// indistinguishable from a session that never had one, because every
+// validateEndpoint* guard short-circuits on IsZero. The session simply runs
+// against the default provider with the user's own credentials.
+//
+// Callers add what is theirs: the tmux window identity and a context for a
+// re-adopted session, nothing for one awaiting ResumeSession.
+func storedToSession(stored *StoredSession) *Session {
+	session := &Session{
+		ID:              stored.ID,
+		Type:            stored.Type,
+		Status:          stored.Status,
+		WorktreePath:    stored.WorktreePath,
+		WorktreeName:    stored.WorktreeName,
+		Prompt:          stored.Prompt,
+		Title:           stored.Title,
+		Model:           stored.Model,
+		Backend:         stored.Backend,
+		RepoName:        stored.RepoName,
+		CLISessionID:    stored.CLISessionID,
+		ParentSessionID: stored.ParentSessionID,
+		CreatedAt:       stored.CreatedAt,
+		StartedAt:       stored.StartedAt,
+		CompletedAt:     stored.CompletedAt,
+		Progress:        &SessionProgress{LastActivity: time.Now()},
+	}
+	if stored.LLMEndpoint != nil {
+		session.LLMEndpoint = stored.LLMEndpoint.Clone()
+	}
+	return session
 }
 
 // StartPlannerSession creates and starts a new planner session.
@@ -1660,6 +1679,52 @@ func validateEndpointBackend(endpoint llmendpoint.Endpoint, backend string) erro
 	return nil
 }
 
+// plannerConfigFor, builderConfigFor and codeTalkConfigFor build the wrapper
+// configs for the default (non-provider) TUI branch of runSession.
+//
+// Split out of the switch so the session -> config carry can be asserted
+// without launching a real CLI. Each is the only place a session's model and
+// endpoint reach its wrapper, and the two travel together for the reason the
+// provider branch states: claude.WithLLMEndpoint skips the ANTHROPIC_MODEL and
+// ANTHROPIC_DEFAULT_* side-call pins when Model is empty. A dropped endpoint is
+// also indistinguishable from no endpoint -- the wrapper just runs against the
+// default provider with the user's own credentials -- so while these were
+// inline literals, deleting any LLMEndpoint line left the whole suite green.
+// TestManager_TUIWrapperConfigsCarrySessionEndpoint now fails if one goes.
+func (m *Manager) plannerConfigFor(session *Session, eventHandler *sessionEventHandler) planner.Config {
+	return planner.Config{
+		Model:           session.Model,
+		LLMEndpoint:     session.LLMEndpoint.Clone(),
+		WorkDir:         session.WorktreePath,
+		Simple:          true,
+		BuildMode:       planner.BuildModeReturn,
+		Output:          io.Discard,
+		EventHandler:    eventHandler,
+		ResumeSessionID: session.CLISessionID,
+		RecordingDir:    m.config.RecordingDir,
+	}
+}
+
+func (m *Manager) builderConfigFor(session *Session) yoloswe.BuilderConfig {
+	return yoloswe.BuilderConfig{
+		Model:           session.Model,
+		LLMEndpoint:     session.LLMEndpoint.Clone(),
+		WorkDir:         session.WorktreePath,
+		ResumeSessionID: session.CLISessionID,
+		RecordingDir:    m.config.RecordingDir,
+	}
+}
+
+func (m *Manager) codeTalkConfigFor(session *Session) yoloswe.CodeTalkConfig {
+	return yoloswe.CodeTalkConfig{
+		Model:           session.Model,
+		LLMEndpoint:     session.LLMEndpoint.Clone(),
+		WorkDir:         session.WorktreePath,
+		ResumeSessionID: session.CLISessionID,
+		RecordingDir:    m.config.RecordingDir,
+	}
+}
+
 // newTmuxRunner builds the runner for a tmux-mode session, copying the
 // manager's configured sockets into the runner that exports them to the
 // window. It is a method rather than inline construction so the
@@ -1769,6 +1834,19 @@ func (m *Manager) runSession(session *Session, prompt string) {
 			unsupported = "pluggable provider backend"
 		case agentModel.Provider != ProviderClaude:
 			unsupported = fmt.Sprintf("provider %q (only Claude is supported for delegator sessions)", agentModel.Provider)
+		case !session.LLMEndpoint.IsZero():
+			// The fourth arm of the switch below, and the only one that does
+			// not carry the endpoint into its runner: delegatorRunner builds
+			// its claude.Session from DelegatorBaseSessionOpts, which has no
+			// endpoint seam, and its spawned children get their own sessions
+			// with no endpoint either. Dropping it silently would run the
+			// session against the default provider with the user's own
+			// credentials -- a zero endpoint and a discarded one are
+			// indistinguishable downstream, since every validate* guard
+			// short-circuits on IsZero. Refuse instead, so adding endpoint
+			// support to the delegator is a deliberate act rather than the
+			// repair of a silent fallback.
+			unsupported = "a per-session LLM endpoint"
 		}
 		if unsupported != "" {
 			err := fmt.Errorf("delegator sessions are not supported with %s", unsupported)
@@ -1908,28 +1986,10 @@ func (m *Manager) runSession(session *Session, prompt string) {
 			// Default: use hardcoded planner/builder runners with model from session
 			switch session.Type {
 			case SessionTypePlanner:
-				pw := planner.NewPlannerWrapper(planner.Config{
-					Model:           session.Model,
-					LLMEndpoint:     session.LLMEndpoint.Clone(),
-					WorkDir:         session.WorktreePath,
-					Simple:          true,
-					BuildMode:       planner.BuildModeReturn,
-					Output:          io.Discard,
-					EventHandler:    eventHandler,
-					ResumeSessionID: session.CLISessionID,
-					RecordingDir:    m.config.RecordingDir,
-				})
-				runner = &plannerRunner{pw: pw}
+				runner = &plannerRunner{pw: planner.NewPlannerWrapper(m.plannerConfigFor(session, eventHandler))}
 			case SessionTypeBuilder:
 				builderHandler := newSessionEventHandlerNoTurnEnd(m, session.ID)
-				builder := yoloswe.NewBuilderSessionWithEvents(yoloswe.BuilderConfig{
-					Model:           session.Model,
-					LLMEndpoint:     session.LLMEndpoint.Clone(),
-					WorkDir:         session.WorktreePath,
-					ResumeSessionID: session.CLISessionID,
-					RecordingDir:    m.config.RecordingDir,
-				}, nil, builderHandler)
-				runner = builder
+				runner = yoloswe.NewBuilderSessionWithEvents(m.builderConfigFor(session), nil, builderHandler)
 			case SessionTypeDelegator:
 				childModel := session.Model
 				if m.config.ChildModel != "" {
@@ -1945,14 +2005,7 @@ func (m *Manager) runSession(session *Session, prompt string) {
 				}
 			case SessionTypeCodeTalk:
 				codetalkHandler := newSessionEventHandlerNoTurnEnd(m, session.ID)
-				ct := yoloswe.NewCodeTalkSessionWithEvents(yoloswe.CodeTalkConfig{
-					Model:           session.Model,
-					LLMEndpoint:     session.LLMEndpoint.Clone(),
-					WorkDir:         session.WorktreePath,
-					ResumeSessionID: session.CLISessionID,
-					RecordingDir:    m.config.RecordingDir,
-				}, nil, codetalkHandler)
-				runner = ct
+				runner = yoloswe.NewCodeTalkSessionWithEvents(m.codeTalkConfigFor(session), nil, codetalkHandler)
 			default:
 				err := fmt.Errorf("unknown session type: %s", session.Type)
 				m.failSession(session, err)

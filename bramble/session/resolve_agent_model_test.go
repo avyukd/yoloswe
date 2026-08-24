@@ -524,3 +524,176 @@ func TestManager_InlineOnlyKeyIsRefusedWhenPersisted(t *testing.T) {
 	// The premise, asserted rather than assumed.
 	assert.Empty(t, inlineOnly.Redacted().APIKey)
 }
+
+// The TUI wrapper configs are the only place a session's endpoint reaches the
+// planner, builder and codetalk wrappers, and until they were split out of
+// runSession's switch nothing failed when one of them lost its LLMEndpoint
+// line: a session with a dropped endpoint runs against the default provider
+// with the user's own credentials, which is indistinguishable from a session
+// that never had one. Table-driven over all three so a fourth wrapper arm is
+// one row, not a fourth forgotten literal.
+func TestManager_TUIWrapperConfigsCarrySessionEndpoint(t *testing.T) {
+	t.Parallel()
+
+	endpoint := llmendpoint.OpenRouter()
+	endpoint.APIKey = "openrouter-test-key"
+	session := &Session{
+		ID:           "wrapper-cfg",
+		Model:        "stealth/ox-alpha",
+		Backend:      ProviderClaude,
+		LLMEndpoint:  endpoint,
+		WorktreePath: t.TempDir(),
+		CLISessionID: "cli-resume-id",
+	}
+	mgr := NewManagerWithConfig(ManagerConfig{RecordingDir: t.TempDir()})
+	t.Cleanup(mgr.Close)
+
+	// Each row reduces one wrapper's config to the four values that must
+	// travel with the session, so the assertions do not depend on config
+	// types that differ between the three wrappers.
+	type carried struct {
+		endpoint                               llmendpoint.Endpoint
+		model, workDir, resumeID, recordingDir string
+	}
+	plannerCfg := mgr.plannerConfigFor(session, nil)
+	builderCfg := mgr.builderConfigFor(session)
+	codeTalkCfg := mgr.codeTalkConfigFor(session)
+	for _, tc := range []struct {
+		got  carried
+		name string
+	}{
+		{carried{plannerCfg.LLMEndpoint, plannerCfg.Model, plannerCfg.WorkDir, plannerCfg.ResumeSessionID, plannerCfg.RecordingDir}, "planner"},
+		{carried{builderCfg.LLMEndpoint, builderCfg.Model, builderCfg.WorkDir, builderCfg.ResumeSessionID, builderCfg.RecordingDir}, "builder"},
+		{carried{codeTalkCfg.LLMEndpoint, codeTalkCfg.Model, codeTalkCfg.WorkDir, codeTalkCfg.ResumeSessionID, codeTalkCfg.RecordingDir}, "codetalk"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, endpoint, tc.got.endpoint,
+				"the session's endpoint must reach the %s wrapper config", tc.name)
+			// The model must travel WITH the endpoint: claude.WithLLMEndpoint
+			// skips the ANTHROPIC_MODEL and ANTHROPIC_DEFAULT_* side-call pins
+			// when Model is empty, which surfaces as a misleading "model may
+			// not exist" against a single-model endpoint.
+			assert.Equal(t, "stealth/ox-alpha", tc.got.model,
+				"the session's model must reach the %s wrapper config", tc.name)
+			assert.Equal(t, session.WorktreePath, tc.got.workDir)
+			assert.Equal(t, "cli-resume-id", tc.got.resumeID)
+			assert.Equal(t, mgr.config.RecordingDir, tc.got.recordingDir)
+		})
+	}
+}
+
+// A zero endpoint is the same as no endpoint everywhere downstream — every
+// validateEndpoint* guard short-circuits on IsZero — so a restore that drops
+// it fails silently against the default provider. storedToSession is the one
+// place both restore paths (ReconcileTmuxSessions re-adopting a tmux window,
+// rehydrateSession loading a terminal session for resume) rebuild a Session,
+// so pinning it pins both.
+func TestStoredToSession_CarriesBackendAndEndpoint(t *testing.T) {
+	t.Parallel()
+
+	// Shaped like what LoadSession returns: no literal key (persistSession
+	// stores Redacted(), asserted on the serialized JSON in store_test.go),
+	// the env reference kept, and a header map. Redacted() drops Headers, so
+	// today's writer never emits one — but storedToSession's input is a JSON
+	// file on disk, not that writer's return value, and its job is to not hand
+	// the caller a map it shares with the record.
+	storedEndpoint := llmendpoint.OpenRouter()
+	storedEndpoint.APIKeyEnv = "OPENROUTER_API_KEY"
+	storedEndpoint.Headers = map[string]string{"HTTP-Referer": "https://example.test"}
+	require.Empty(t, storedEndpoint.APIKey, "a persisted endpoint never holds a literal key")
+
+	stored := &StoredSession{
+		ID:           "restored",
+		Type:         SessionTypeBuilder,
+		Status:       StatusCompleted,
+		RepoName:     "test-repo",
+		WorktreePath: "/path/wt",
+		WorktreeName: "feature",
+		Prompt:       "do the thing",
+		Model:        "stealth/ox-alpha",
+		Backend:      ProviderCodex,
+		CLISessionID: "cli-abc123",
+		LLMEndpoint:  &storedEndpoint,
+	}
+
+	session := storedToSession(stored)
+	require.NotNil(t, session)
+	assert.Equal(t, ProviderCodex, session.Backend)
+	assert.Equal(t, "stealth/ox-alpha", session.Model)
+	assert.Equal(t, storedEndpoint, session.LLMEndpoint,
+		"a restored session must carry the persisted endpoint, credential reference included")
+	assert.Equal(t, "OPENROUTER_API_KEY", session.LLMEndpoint.APIKeyEnv,
+		"without the env reference the restored session has no way to obtain a key")
+
+	// Cloned, not merely copied: the stored record outlives the restore and is
+	// handed to other callers, so a mutation through the session must not reach
+	// it. Headers is the only field that distinguishes the two — Endpoint is a
+	// value type, so a plain `*stored.LLMEndpoint` already isolates every
+	// scalar. An earlier version of this assertion mutated APIKeyEnv and so
+	// passed with or without the Clone, which is worse than no assertion.
+	require.NotNil(t, session.LLMEndpoint.Headers)
+	session.LLMEndpoint.Headers["HTTP-Referer"] = "https://mutated.test"
+	assert.Equal(t, "https://example.test", stored.LLMEndpoint.Headers["HTTP-Referer"],
+		"storedToSession must clone the endpoint rather than share its header map")
+}
+
+// A nil stored endpoint is the common case (every session without one), and
+// must produce a zero endpoint rather than panicking on the Clone.
+func TestStoredToSession_NoEndpoint(t *testing.T) {
+	t.Parallel()
+
+	session := storedToSession(&StoredSession{ID: "plain", Type: SessionTypeBuilder})
+	require.NotNil(t, session)
+	assert.True(t, session.LLMEndpoint.IsZero())
+}
+
+// An endpoint on a delegator session was the one arm of runSession's wrapper
+// switch that carried nothing: delegatorRunner builds its claude.Session from
+// DelegatorBaseSessionOpts, which has no endpoint seam. Refused rather than
+// dropped, so adding support is a deliberate act instead of the repair of a
+// silent fallback.
+func TestManager_DelegatorRejectsEndpoint(t *testing.T) {
+	t.Parallel()
+
+	endpoint := llmendpoint.OpenRouter()
+	endpoint.APIKey = "openrouter-test-key"
+	mgr := NewManagerWithConfig(ManagerConfig{SessionMode: SessionModeTUI})
+	t.Cleanup(mgr.Close)
+
+	sid, err := mgr.StartSessionWithOpts(
+		SessionTypeDelegator, t.TempDir(), "test prompt", "opus",
+		SpawnOpts{Backend: ProviderClaude, LLMEndpoint: endpoint},
+	)
+	require.NoError(t, err, "the endpoint is refused in runSession, not at spawn")
+	require.Eventually(t, func() bool {
+		info, ok := mgr.GetSessionInfo(sid)
+		return ok && info.Status == StatusFailed
+	}, 5*time.Second, 10*time.Millisecond, "delegator session never failed")
+
+	info, ok := mgr.GetSessionInfo(sid)
+	require.True(t, ok)
+	assert.Contains(t, info.ErrorMsg, "per-session LLM endpoint",
+		"the refusal must name the endpoint, not fail later against the default provider")
+}
+
+// startSessionWithID validated the endpoint against opts.Backend, which may be
+// empty — so an endpoint on a model belonging to an unsupported provider
+// passed every synchronous check, printed a session ID, and only failed in the
+// background. That is the split the duplicated checks exist to close.
+func TestStartSession_EndpointRejectedForInferredProvider(t *testing.T) {
+	t.Parallel()
+
+	endpoint := llmendpoint.OpenRouter()
+	endpoint.APIKey = "openrouter-test-key"
+	mgr := NewManagerWithConfig(ManagerConfig{SessionMode: SessionModeTUI})
+	t.Cleanup(mgr.Close)
+
+	// No Backend: the provider comes from the model id, which is gemini's.
+	_, err := mgr.StartSessionWithOpts(
+		SessionTypeBuilder, t.TempDir(), "test prompt", "gemini-2.5-pro",
+		SpawnOpts{LLMEndpoint: endpoint},
+	)
+	require.Error(t, err, "an endpoint on a gemini model must be refused at the call, not in the background")
+	assert.Contains(t, err.Error(), ProviderGemini,
+		"the error must name the provider the model resolved to")
+}
