@@ -74,19 +74,24 @@ func TestUnpaintedPaneIsUnknown(t *testing.T) {
 	assert.False(t, known, "a pane with no recognizable chrome tells us nothing")
 }
 
-// TestProvidersWithHooksHaveNoProbe: claude reports its own turn ends, and a
-// second, weaker signal could only contradict it. Codex has a hook too, but its
-// probe corrects premature hook idles — see pane_idle.go.
-func TestProvidersWithHooksHaveNoProbe(t *testing.T) {
+// TestEveryTmuxProviderHasAProbe. Claude's is a fallback, not a second opinion:
+// its hook is authoritative when it arrives, but when it does not — the socket
+// moved, the window outlived its TUI — nothing else could ever mark the session
+// idle, so its parent's mail was undeliverable forever. The probe only ever
+// adds an idle that would otherwise never come; it cannot contradict a hook,
+// because a hook that fired already moved the session on.
+func TestEveryTmuxProviderHasAProbe(t *testing.T) {
 	t.Parallel()
 
-	assert.False(t, providerHasIdleProbe(ProviderClaude))
-	assert.Nil(t, newPaneIdleTracker(ProviderClaude))
+	for _, provider := range []string{ProviderClaude, ProviderCodex, ProviderCursor} {
+		assert.True(t, providerHasIdleProbe(provider), "provider %q", provider)
+		assert.NotNil(t, newPaneIdleTracker(provider), "provider %q", provider)
+	}
 
-	assert.True(t, providerHasIdleProbe(ProviderCodex))
-	assert.NotNil(t, newPaneIdleTracker(ProviderCodex))
-	assert.True(t, providerHasIdleProbe(ProviderCursor))
-	assert.NotNil(t, newPaneIdleTracker(ProviderCursor))
+	// Only codex's hook fires early enough to need correcting.
+	assert.True(t, newPaneIdleTracker(ProviderCodex).correctsPrematureIdle())
+	assert.False(t, newPaneIdleTracker(ProviderClaude).correctsPrematureIdle(),
+		"claude's hook is not premature; re-reading every idle claude pane buys nothing")
 }
 
 // TestTrackerNeedsConsecutiveObservations stops one half-painted frame from
@@ -273,8 +278,8 @@ func TestPaneIdleTrackerComesFromTheStoredModel(t *testing.T) {
 
 	assert.NotNil(t, m.newPaneIdleTrackerForModel("composer-3", ""),
 		"a stored cursor model must still produce a pane-idle tracker")
-	assert.Nil(t, m.newPaneIdleTrackerForModel("sonnet", ""),
-		"claude reports its own turn ends; a second signal could only contradict it")
+	assert.NotNil(t, m.newPaneIdleTrackerForModel("sonnet", ""),
+		"claude needs the fallback too: a window whose hook cannot reach bramble has no other way to be seen idle")
 	assert.Nil(t, m.newPaneIdleTrackerForModel("not-a-model", ""),
 		"an unresolvable model is not grounds for guessing at a pane's chrome")
 }
@@ -298,8 +303,8 @@ func TestPaneIdleTrackerUsesTheSessionBackend(t *testing.T) {
 		"precondition: the model alone does not resolve, which is why the backend has to travel with it")
 	assert.NotNil(t, m.newPaneIdleTrackerForModel(thirdPartyModel, ProviderCursor),
 		"an explicit backend names the provider the model cannot")
-	assert.Nil(t, m.newPaneIdleTrackerForModel(thirdPartyModel, ProviderClaude),
-		"a backend that reports its own turn ends still gets no pane probe")
+	assert.NotNil(t, m.newPaneIdleTrackerForModel(thirdPartyModel, ProviderClaude),
+		"an explicit backend names the provider for claude too")
 }
 
 // TestTrackerDoesNotCarryObservationsAcrossATurn is the boundary the monitor
@@ -338,4 +343,116 @@ func TestTrackerRearmsForEveryTurn(t *testing.T) {
 	tr.forTurn(2)
 	assert.False(t, tr.observe(cursorPane(false)))
 	assert.True(t, tr.observe(cursorPane(false)), "the second turn was never seen to end")
+}
+
+// claudePane renders claude-code's footer as it really appears, taken from a
+// live capture: an input separator, the composer, the status separator, the
+// info line, and the permissions line. state picks what sits above the
+// separator, which is the only thing that distinguishes idle from working.
+func claudePane(state string, transcript ...string) []string {
+	lines := append([]string{}, transcript...)
+	if state != "" {
+		lines = append(lines, state)
+	}
+	return append(lines,
+		"────────────────────────────────────────────",
+		"  ~/wt/branch  main  Opus 4.6  ctx:43%  tokens:20k",
+		"  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+	)
+}
+
+// TestClaudePaneJudge covers each shape the parser can see. The last group is
+// the one that matters: claude's spinner is sub-second and was never caught in
+// 400+ samples of live monitoring, so a frame with no marker at all is the
+// normal appearance of a *working* session. Reading it as idle would release
+// queued mail into a running turn.
+func TestClaudePaneJudge(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		lines   []string
+		working bool
+		known   bool
+	}{
+		// Positive idle markers.
+		{"empty composer", claudePane("❯ "), false, true},
+		{"composer with a draft", claudePane("❯ half a thought"), false, true},
+		{"turn just finished", claudePane("✻ Worked for 36m 36s"), false, true},
+
+		// Positive working markers.
+		{"spinner", claudePane("* Frosting… (2m 30s)"), true, true},
+		{"braille spinner", claudePane("⠋ Thinking…"), true, true},
+		{"tool line", claudePane("● Bash(git status)"), true, true},
+
+		// Ambiguous: agent output, no marker either way. Must be unknown.
+		{"agent prose mid-turn", claudePane("Let me check the delivery path."), false, false},
+		{"wrapped output", claudePane("  ...and that is why it failed."), false, false},
+
+		// Not claude's pane at all.
+		{"no separator", []string{"$ ", "some shell"}, false, false},
+		{"empty pane", []string{}, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			working, known := paneShowsWorking(ProviderClaude, tc.lines)
+			assert.Equal(t, tc.known, known, "known")
+			if tc.known {
+				assert.Equal(t, tc.working, working, "working")
+			}
+		})
+	}
+}
+
+// TestClaudeAmbiguousFrameResetsTheStreak is caveat 3 turned into a test. A
+// working claude session usually shows no marker at all, so those frames must
+// not accumulate toward idle — one of them mid-streak sends the count back to
+// zero.
+func TestClaudeAmbiguousFrameResetsTheStreak(t *testing.T) {
+	t.Parallel()
+
+	tr := newPaneIdleTracker(ProviderClaude)
+	need := tr.confirmationsNeeded()
+	require.Greater(t, need, paneIdleConfirmations,
+		"claude needs more agreement than a provider whose working chrome is always on screen")
+
+	// One short of firing...
+	for i := 0; i < need-1; i++ {
+		require.False(t, tr.observe(claudePane("❯ ")), "observation %d", i+1)
+	}
+	// ...then a frame of plain agent output, which says nothing.
+	require.False(t, tr.observe(claudePane("still working on it")))
+
+	// The count restarted, so the very next idle frame must not fire.
+	assert.False(t, tr.observe(claudePane("❯ ")), "the streak restarted")
+	for i := 0; i < need-2; i++ {
+		assert.False(t, tr.observe(claudePane("❯ ")))
+	}
+	assert.True(t, tr.observe(claudePane("❯ ")), "a full fresh streak fires")
+}
+
+// TestClaudeNeedsAFullStreakToGoIdle: a single idle-looking frame is not
+// enough, which is what keeps a half-painted repaint from releasing mail.
+func TestClaudeNeedsAFullStreakToGoIdle(t *testing.T) {
+	t.Parallel()
+
+	tr := newPaneIdleTracker(ProviderClaude)
+	need := tr.confirmationsNeeded()
+
+	for i := 0; i < need-1; i++ {
+		assert.False(t, tr.observe(claudePane("❯ ")), "observation %d of %d", i+1, need)
+	}
+	assert.True(t, tr.observe(claudePane("❯ ")), "the %dth consecutive idle frame fires", need)
+}
+
+// TestClaudeWorkingFrameIsNeverIdle: the direct statement of the bug this probe
+// must not introduce.
+func TestClaudeWorkingFrameIsNeverIdle(t *testing.T) {
+	t.Parallel()
+
+	for _, working := range []string{"* Frosting… (2m 30s)", "● Bash(git status)", "⠹ Thinking…"} {
+		idle, known := paneShowsIdle(ProviderClaude, claudePane(working))
+		require.True(t, known, "%q", working)
+		assert.False(t, idle, "a running turn must never read as idle: %q", working)
+	}
 }

@@ -20,6 +20,11 @@ import "strings"
 // must positively recognize the CLI's chrome before it will judge anything, and
 // it reports "unknown" rather than guessing.
 type paneIdleProbe struct {
+	// judge, when set, replaces the substring matching below entirely. An
+	// escape hatch for a CLI whose chrome cannot be expressed as "this string
+	// on that line" — claude's needs anchored regexes over multi-byte glyphs
+	// and a real notion of "the pane is ambiguous right now".
+	judge func(lines []string) (working, known bool)
 	// promptMarkers identify the composer line itself. Until one appears the
 	// pane says nothing useful — the CLI may still be booting.
 	promptMarkers []string
@@ -34,6 +39,11 @@ type paneIdleProbe struct {
 	// interrupt)" on its own line above the composer; the tail bound keeps
 	// scrollback that quotes these markers out of reach.
 	workingInFooter []string
+	// confirmations is how many consecutive idle observations this provider
+	// needs before it is called idle. Zero means paneIdleConfirmations. Raised
+	// for a CLI whose working chrome is often missing from a given frame, where
+	// agreement has to be sustained before it means anything.
+	confirmations int
 	// correctsPrematureIdle marks a provider whose completion hook can fire
 	// before its turn is really over, so the pane is worth reading even after
 	// the session is already idle — the only way such a session ever gets back
@@ -66,6 +76,52 @@ var paneIdleProbes = map[string]paneIdleProbe{
 		workingInFooter:       []string{"esc to interrupt"},
 		correctsPrematureIdle: true,
 	},
+	// Claude reports its own turn ends through a Stop hook, so this probe is
+	// not how it normally goes idle — it is the fallback for a session whose
+	// hook never arrived, which used to leave the session running forever with
+	// its parent's mail undeliverable.
+	//
+	// Its chrome cannot be matched by substring: the markers are multi-byte
+	// glyphs that must be anchored to the start of a line, and "no spinner" is
+	// emphatically not "idle" (see claudePaneJudge). Hence the judge.
+	//
+	// correctsPrematureIdle stays off: the hook is not premature, and
+	// captureRecentOutput already revives an idle claude session from the same
+	// parser every 15s. Turning it on would re-read every idle claude pane on
+	// the host every couple of seconds for nothing.
+	ProviderClaude: {
+		judge: claudePaneJudge,
+		// Five, not two. Claude's working chrome is often absent from any given
+		// frame, so agreement has to be sustained before it means anything.
+		confirmations: 5,
+	},
+}
+
+// claudePaneJudge reads claude-code's pane through the parser that already
+// backs the status line, rather than a second set of markers that could drift
+// away from it.
+//
+// The critical case is the third one. A capture taken mid-turn frequently shows
+// neither a spinner nor a prompt — just agent output — because the spinner is
+// sub-second and was never caught once in 400+ samples of live monitoring (see
+// .claude/memory/tmux-capture-learnings.md, caveat 3). Read as idle, that would
+// release queued mail into a running turn, which is exactly what this whole
+// table exists to prevent. So ambiguity reports known=false, and observe()
+// resets the streak on it.
+func claudePaneJudge(lines []string) (working, known bool) {
+	ps := ParseClaudeStatusBar(lines)
+	if ps == nil {
+		return false, false // no separator: not claude's prompt, or still booting
+	}
+	switch {
+	case ps.IsWorking:
+		return true, true
+	case ps.IsIdle:
+		return false, true
+	default:
+		// Agent output above the separator, and no positive marker either way.
+		return false, false
+	}
 }
 
 // paneIdleConfirmations is how many consecutive polls must agree before a
@@ -92,6 +148,9 @@ func paneShowsWorking(provider string, lines []string) (working, known bool) {
 	probe, ok := paneIdleProbes[provider]
 	if !ok {
 		return false, false
+	}
+	if probe.judge != nil {
+		return probe.judge(lines)
 	}
 
 	prompt, ok := findPromptLine(lines, probe.promptMarkers)
@@ -231,7 +290,18 @@ func (p *paneIdleTracker) observe(lines []string) bool {
 		return false
 	}
 	p.streak++
-	return p.streak == paneIdleConfirmations
+	return p.streak == p.confirmationsNeeded()
+}
+
+// confirmationsNeeded is how many consecutive idle observations this provider
+// needs. Per-probe because the cost of being wrong is not symmetric: calling a
+// working session idle releases queued mail into a live turn, while calling an
+// idle one working costs only a poll of latency.
+func (p *paneIdleTracker) confirmationsNeeded() int {
+	if n := paneIdleProbes[p.provider].confirmations; n > 0 {
+		return n
+	}
+	return paneIdleConfirmations
 }
 
 // reset forgets the current streak, so a session that went idle and was then
