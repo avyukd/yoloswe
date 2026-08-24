@@ -2,6 +2,8 @@ package session
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -1590,4 +1592,48 @@ func assertNoStateChangeEvent(t *testing.T, m *Manager) {
 func TestReposNeedingTmuxReconcile_NilStore(t *testing.T) {
 	liveRepos := ReposNeedingTmuxReconcile(nil, "active-repo", SessionModeTmux)
 	assert.Nil(t, liveRepos)
+}
+
+// TestWriteResearchFileUsesTheInjectedDir is what keeps codetalk transcripts out
+// of the real ~/.bramble/research while the suite runs. writeResearchFile is the
+// last path that still resolved the shared default, which is exactly the
+// pollution TestMain's assertDefaultResultDirClean guard was added to catch —
+// and until this test existed, nothing exercised ManagerConfig.ResearchDir at
+// all, so the seam was there but never pulled.
+func TestWriteResearchFileUsesTheInjectedDir(t *testing.T) {
+	t.Parallel()
+
+	researchDir := filepath.Join(t.TempDir(), "research")
+	m := NewManagerWithConfig(ManagerConfig{RepoName: "repo", ResearchDir: researchDir})
+	defer m.Close()
+
+	session := &Session{ID: "codetalk-1", Type: SessionTypeCodeTalk}
+	m.mu.Lock()
+	m.sessions[session.ID] = session
+	m.mu.Unlock()
+	// addOutput only appends to an existing entry, so the buffer has to be
+	// registered the way a real session's start does it.
+	m.outputsMu.Lock()
+	m.outputs[session.ID] = nil
+	m.outputsMu.Unlock()
+
+	m.addOutput(session.ID, OutputLine{Type: OutputTypeText, Content: "the finding"})
+	m.addOutput(session.ID, OutputLine{Type: OutputTypeText, Content: "asked for", IsUserPrompt: true})
+
+	path, err := m.writeResearchFile(session)
+	require.NoError(t, err)
+
+	assert.Equal(t, researchDir, filepath.Dir(path),
+		"the file must land in the injected dir, not the shared default")
+
+	body, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(body), "the finding")
+	assert.NotContains(t, string(body), "asked for", "a user prompt is not research output")
+
+	// A transcript is the session's whole output, so it stays owner-only even
+	// inside a private ~/.bramble.
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
 }

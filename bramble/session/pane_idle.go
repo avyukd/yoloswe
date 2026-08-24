@@ -210,17 +210,19 @@ func forEachPaneTailLine(lines []string, visit func(string) bool) {
 // the pane so the most recent one wins.
 func findPromptLine(lines, markers []string) (string, bool) {
 	var prompt string
+	var found bool
 	forEachPaneTailLine(lines, func(line string) bool {
 		if containsAny(line, markers) {
 			prompt = line
+			found = true
 			return true
 		}
 		return false
 	})
-	if prompt != "" {
-		return prompt, true
-	}
-	return "", false
+	// A found flag rather than prompt != "": a matched line is by definition
+	// non-empty today, but making emptiness stand in for "no match" is the kind
+	// of sentinel that silently becomes wrong when a marker changes.
+	return prompt, found
 }
 
 func containsAny(haystack string, needles []string) bool {
@@ -304,6 +306,23 @@ func (p *paneIdleTracker) confirmationsNeeded() int {
 	return paneIdleConfirmations
 }
 
+// observeWorking feeds one capture in and reports whether a session already
+// marked idle should be put back to running. Symmetric with observe: the same
+// number of consecutive agreeing frames, for the same reason — one half-painted
+// frame must not drive a state change on its own.
+func (p *paneIdleTracker) observeWorking(lines []string) bool {
+	if p == nil {
+		return false
+	}
+	working, known := paneShowsWorking(p.provider, lines)
+	if !known || !working {
+		p.streak = 0
+		return false
+	}
+	p.streak++
+	return p.streak == p.confirmationsNeeded()
+}
+
 // reset forgets the current streak, so a session that went idle and was then
 // given more work must be observed idle afresh.
 func (p *paneIdleTracker) reset() {
@@ -331,8 +350,11 @@ func decidePaneIdlePoll(tracker *paneIdleTracker, status SessionStatus, lines []
 		return paneIdleActionNone
 	}
 	if status == StatusIdle {
-		working, known := paneShowsWorking(tracker.provider, lines)
-		if known && working {
+		// Confirmed, like the idle direction. A single stray frame showing
+		// working chrome used to resurrect the session on the spot, while
+		// getting back to idle needed two — and every resurrection re-arms idle
+		// reporting, so a flapping pane sent the parent one report per flap.
+		if tracker.observeWorking(lines) {
 			tracker.reset()
 			return paneIdleActionMarkRunning
 		}

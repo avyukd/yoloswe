@@ -227,8 +227,31 @@ func TestCodexPrematureIdleReturnsToRunning(t *testing.T) {
 	t.Parallel()
 
 	tr := newPaneIdleTracker(ProviderCodex)
-	action := decidePaneIdlePoll(tr, StatusIdle, codexPane(true, "  still going"))
-	assert.Equal(t, paneIdleActionMarkRunning, action)
+	pane := codexPane(true, "  still going")
+
+	// Confirmed, like the idle direction: one frame is not a state change.
+	require.Equal(t, paneIdleActionNone, decidePaneIdlePoll(tr, StatusIdle, pane),
+		"one observation is not enough to resurrect a session")
+	assert.Equal(t, paneIdleActionMarkRunning, decidePaneIdlePoll(tr, StatusIdle, pane),
+		"two in a row means the turn really is still running")
+}
+
+// TestStrayWorkingFrameDoesNotResurrect is why the correction is confirmed. It
+// used to fire on a single frame while going idle needed two, and because every
+// resurrection re-arms idle reporting, a pane flapping around the marker sent
+// the parent one report per flap.
+func TestStrayWorkingFrameDoesNotResurrect(t *testing.T) {
+	t.Parallel()
+
+	tr := newPaneIdleTracker(ProviderCodex)
+	require.Equal(t, paneIdleActionNone,
+		decidePaneIdlePoll(tr, StatusIdle, codexPane(true, "  a half-painted frame")))
+	// The next frame shows it really was idle, so the streak dies with it.
+	require.Equal(t, paneIdleActionNone,
+		decidePaneIdlePoll(tr, StatusIdle, codexPane(false, "  all done")))
+	assert.Equal(t, paneIdleActionNone,
+		decidePaneIdlePoll(tr, StatusIdle, codexPane(true, "  another stray")),
+		"the count restarted, so a lone frame still cannot resurrect")
 }
 
 func TestCodexGenuinelyIdleStaysIdle(t *testing.T) {
