@@ -259,3 +259,83 @@ func TestOnlyHookCorrectingProvidersArePolledWhileIdle(t *testing.T) {
 	assert.False(t, newPaneIdleTracker(ProviderClaude).correctsPrematureIdle(),
 		"a provider with no probe at all has no tracker to ask")
 }
+
+// TestPaneIdleTrackerComesFromTheStoredModel pins the input the re-adopt path
+// has to work from. monitorTrackedTmuxWindow never sees a resolved agent model
+// — only the model string the session was persisted with — so if that string
+// does not yield a provider, a cursor session that survives a bramble restart
+// gets no idle signal at all and its parent is never told it finished.
+func TestPaneIdleTrackerComesFromTheStoredModel(t *testing.T) {
+	t.Parallel()
+
+	m := NewManagerWithConfig(ManagerConfig{RepoName: "repo"})
+	defer m.Close()
+
+	assert.NotNil(t, m.newPaneIdleTrackerForModel("composer-3", ""),
+		"a stored cursor model must still produce a pane-idle tracker")
+	assert.Nil(t, m.newPaneIdleTrackerForModel("sonnet", ""),
+		"claude reports its own turn ends; a second signal could only contradict it")
+	assert.Nil(t, m.newPaneIdleTrackerForModel("not-a-model", ""),
+		"an unresolvable model is not grounds for guessing at a pane's chrome")
+}
+
+// TestPaneIdleTrackerUsesTheSessionBackend covers the case the two features
+// only create together: a session started with an explicit --backend carries a
+// third-party model id the curated registry has never heard of, so resolving on
+// the model alone yields nothing. Without the backend the re-adopt path would
+// hand back a nil tracker for a hookless backend — the exact silent
+// never-seen-to-finish failure the tracker exists to prevent, reachable only
+// once per-session endpoints made unrecognized model ids legal.
+func TestPaneIdleTrackerUsesTheSessionBackend(t *testing.T) {
+	t.Parallel()
+
+	m := NewManagerWithConfig(ManagerConfig{RepoName: "repo"})
+	defer m.Close()
+
+	const thirdPartyModel = "stealth/ox-alpha"
+
+	assert.Nil(t, m.newPaneIdleTrackerForModel(thirdPartyModel, ""),
+		"precondition: the model alone does not resolve, which is why the backend has to travel with it")
+	assert.NotNil(t, m.newPaneIdleTrackerForModel(thirdPartyModel, ProviderCursor),
+		"an explicit backend names the provider the model cannot")
+	assert.Nil(t, m.newPaneIdleTrackerForModel(thirdPartyModel, ProviderClaude),
+		"a backend that reports its own turn ends still gets no pane probe")
+}
+
+// TestTrackerDoesNotCarryObservationsAcrossATurn is the boundary the monitor
+// cannot see in the pane. A delivery is written while the recipient is idle and
+// marks it running again between two polls, so an idle frame observed before
+// the write must not count towards calling the turn that write started idle —
+// the CLI has not necessarily repainted yet.
+func TestTrackerDoesNotCarryObservationsAcrossATurn(t *testing.T) {
+	t.Parallel()
+
+	tr := newPaneIdleTracker(ProviderCursor)
+	tr.forTurn(1)
+	require.False(t, tr.observe(cursorPane(false)), "one observation is never enough")
+
+	// A message is delivered; the session is marked running again.
+	tr.forTurn(2)
+	assert.False(t, tr.observe(cursorPane(false)),
+		"the frame before the delivery must not be counted towards the new turn")
+	assert.True(t, tr.observe(cursorPane(false)), "two fresh observations agree")
+}
+
+// TestTrackerRearmsForEveryTurn keeps a turn too short to be caught working
+// from latching the session as never-idle-again: the streak counts past the
+// confirmation count, and only a new turn brings it back.
+func TestTrackerRearmsForEveryTurn(t *testing.T) {
+	t.Parallel()
+
+	tr := newPaneIdleTracker(ProviderCursor)
+	tr.forTurn(1)
+	require.False(t, tr.observe(cursorPane(false)))
+	require.True(t, tr.observe(cursorPane(false)), "the first turn is seen to end")
+	require.False(t, tr.observe(cursorPane(false)), "it fires once per run of observations")
+
+	// A second turn runs and finishes between polls, so no working frame is ever
+	// captured — the only signal that it happened is the turn bump.
+	tr.forTurn(2)
+	assert.False(t, tr.observe(cursorPane(false)))
+	assert.True(t, tr.observe(cursorPane(false)), "the second turn was never seen to end")
+}

@@ -2,7 +2,10 @@
 // for communication between the bramble TUI server and CLI clients.
 package ipc
 
-import "github.com/bazelment/yoloswe/bramble/session"
+import (
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
+	"github.com/bazelment/yoloswe/bramble/session"
+)
 
 // RequestType identifies the kind of IPC request.
 type RequestType string
@@ -44,19 +47,35 @@ type RestartParams struct {
 
 // NewSessionParams are the parameters for a new-session request.
 type NewSessionParams struct {
-	SessionType  string `json:"session_type"`            // "planner", "builder", or "codetalk"
-	WorktreePath string `json:"worktree_path,omitempty"` // existing worktree path (mutually exclusive with Branch)
-	Branch       string `json:"branch,omitempty"`        // create new worktree with this branch name
-	BaseBranch   string `json:"base_branch,omitempty"`   // base branch for new worktree (default: main)
-	Prompt       string `json:"prompt"`
-	Model        string `json:"model,omitempty"`     // model ID (default: provider default)
-	Goal         string `json:"goal,omitempty"`      // worktree goal (used when creating)
-	RepoName     string `json:"repo_name,omitempty"` // target repo; auto-detected from cwd if empty
+	SessionType  string               `json:"session_type"`            // "planner", "builder", or "codetalk"
+	WorktreePath string               `json:"worktree_path,omitempty"` // existing worktree path (mutually exclusive with Branch)
+	Branch       string               `json:"branch,omitempty"`        // create new worktree with this branch name
+	BaseBranch   string               `json:"base_branch,omitempty"`   // base branch for new worktree (default: main)
+	Prompt       string               `json:"prompt"`
+	Model        string               `json:"model,omitempty"`     // model ID (default: provider default)
+	Backend      string               `json:"backend,omitempty"`   // CLI backend, independent of model
+	Goal         string               `json:"goal,omitempty"`      // worktree goal (used when creating)
+	RepoName     string               `json:"repo_name,omitempty"` // target repo; auto-detected from cwd if empty
+	LLMEndpoint  llmendpoint.Endpoint `json:"llm_endpoint,omitempty"`
 	// ParentSessionID makes the new session a subagent of that session: when it
 	// finishes, bramble delivers a completion report back there. When set with
 	// no Branch and no WorktreePath, the child inherits the parent's worktree.
 	ParentSessionID string `json:"parent_session_id,omitempty"`
-	CreateWorktree  bool   `json:"create_worktree,omitempty"` // if true, create a new worktree for Branch
+	// ParentInherited says ParentSessionID came from $BRAMBLE_SESSION_ID rather
+	// than an explicit --parent. The two must be told apart on the server: an
+	// explicitly named parent that does not resolve is a mistake worth failing
+	// on, while an inherited one is only a default — and a default that cannot
+	// be honored must not cost the caller a spawn that would have worked without
+	// it. The registry sees only sessions adopted into an open manager, so any
+	// agent whose own repo is not open in this bramble hits that case.
+	ParentInherited bool `json:"parent_inherited,omitempty"`
+	// RepoInferred says RepoName was auto-detected from the caller's cwd rather
+	// than typed as --repo. Same rule as ParentInherited, and for the same
+	// reason: a value the client guessed must not be weighed as a claim the user
+	// made. A resolved parent knows its own repo exactly, and a cwd that happens
+	// to sit in another worktree does not.
+	RepoInferred   bool `json:"repo_inferred,omitempty"`
+	CreateWorktree bool `json:"create_worktree,omitempty"` // if true, create a new worktree for Branch
 }
 
 // NewSessionResult is the result of a successful new-session request.
@@ -78,6 +97,7 @@ type SessionSummary struct {
 	WorktreeName string `json:"worktree_name"`
 	Prompt       string `json:"prompt"`
 	Model        string `json:"model"`
+	Backend      string `json:"backend,omitempty"`
 	// ParentSessionID is the session that spawned this one, so a caller can
 	// pick its own subagents out of the list. Empty for a top-level session.
 	ParentSessionID string `json:"parent_session_id,omitempty"`

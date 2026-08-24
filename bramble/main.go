@@ -21,10 +21,12 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"golang.org/x/term"
 
 	"github.com/bazelment/yoloswe/logging/klogfmt"
 
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 	"github.com/bazelment/yoloswe/bramble/app"
 	"github.com/bazelment/yoloswe/bramble/cmd/codereview"
 	"github.com/bazelment/yoloswe/bramble/cmd/delegator"
@@ -238,15 +240,18 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	sessionManager := session.NewManagerWithConfig(initialConfig)
 	defer sessionManager.Close()
 
-	// Discover repos (other than the initial one) that have live tmux sessions,
-	// so the TUI can auto-open them and fully re-adopt their sessions. This is
-	// a read-only probe: a dead session in an unopened repo is left alone for
-	// that repo's own manager to reconcile, which is what lets a subagent that
-	// finished while bramble was down still report to its parent.
-	resumeRepos := session.ReposWithLiveTmuxSessions(store, repoName)
+	// Discover repos (other than the initial one) still holding a non-terminal
+	// tmux session, so the TUI can auto-open them and fully re-adopt those
+	// sessions. This is a read-only probe: it never marks a dead session
+	// completed, because that transition is what carries a subagent's report to
+	// its parent and there is no courier here to hear it. That is also why a
+	// repo whose window already died is returned — its manager still owes the
+	// transition.
+	resumeRepos := session.ReposNeedingTmuxReconcile(store, repoName, sharedManagerConfig.SessionMode)
 
-	// The scan above only finds repos with a live tmux window, so without the
-	// handoff a repo the user had opened but left idle would disappear.
+	// The scan above only finds repos with a session still to reconcile, so
+	// without the handoff a repo the user had opened but left idle would
+	// disappear.
 	resumeRepos = mergeResumeRepos(resumeRepos, restored, repoName)
 
 	// Start the AI task router using the best available provider.
@@ -565,18 +570,12 @@ func startIPCServer(registry *session.SessionRegistry, sockPath, wtRoot, repoNam
 		// A parent pins the repo more precisely than the process-wide default:
 		// a subagent belongs with its parent, which may live under a different
 		// manager than the repo bramble was launched on.
-		parent, hasParent := resolveParentSession(registry, params.ParentSessionID)
-		if params.ParentSessionID != "" && !hasParent {
-			return nil, fmt.Errorf("parent session %q not found", params.ParentSessionID)
+		parent, hasParent, err := parentForSpawn(registry, params)
+		if err != nil {
+			return nil, err
 		}
 
-		targetRepo := params.RepoName
-		if targetRepo == "" && hasParent {
-			targetRepo = parent.RepoName
-		}
-		if targetRepo == "" {
-			targetRepo = repoName // fall back to initial repo
-		}
+		targetRepo := repoForSpawn(params, parent, hasParent, repoName)
 
 		mgr, ok := registry.FindManagerByRepo(targetRepo)
 		if !ok {
@@ -747,6 +746,49 @@ func resolveParentSession(registry *session.SessionRegistry, id string) (session
 	return info, true
 }
 
+// repoForSpawn picks the repo a new session is filed under, and so which
+// manager starts it.
+//
+// A resolved parent outranks a repo the client only inferred from its cwd: a
+// subagent belongs with its parent, the parent knows its own repo exactly, and
+// an agent's cwd is merely wherever its worktree happens to be. A --repo the
+// caller typed outranks both — and if that then contradicts an inherited
+// worktree, handleNewSession refuses rather than guessing.
+func repoForSpawn(params *ipc.NewSessionParams, parent session.SessionInfo, hasParent bool, fallbackRepo string) string {
+	repo := params.RepoName
+	if hasParent && (repo == "" || params.RepoInferred) && parent.RepoName != "" {
+		repo = parent.RepoName
+	}
+	if repo == "" {
+		repo = fallbackRepo
+	}
+	return repo
+}
+
+// parentForSpawn resolves the parent a new session should be filed under, and
+// clears params.ParentSessionID when there is none — so the rest of the spawn
+// sees one answer rather than an ID nothing can be looked up by.
+//
+// An explicitly named parent that does not resolve is an error: the caller
+// asked for that session and got something else. An inherited one is only a
+// default, and a default that cannot be honored must not cost the caller a
+// spawn that would have worked without it — the registry sees only sessions
+// adopted into an open manager, so an agent whose own repo is not open in this
+// bramble would otherwise lose the ability to start any session at all.
+func parentForSpawn(registry *session.SessionRegistry, params *ipc.NewSessionParams) (session.SessionInfo, bool, error) {
+	parent, ok := resolveParentSession(registry, params.ParentSessionID)
+	if ok || params.ParentSessionID == "" {
+		return parent, ok, nil
+	}
+	if !params.ParentInherited {
+		return session.SessionInfo{}, false, fmt.Errorf("parent session %q not found", params.ParentSessionID)
+	}
+	slog.Warn("spawning a top-level session: inherited parent is not adopted in this bramble; pass --no-parent to silence this",
+		"parent_session_id", params.ParentSessionID)
+	params.ParentSessionID = ""
+	return session.SessionInfo{}, false, nil
+}
+
 func handleNewSession(ctx context.Context, mgr *session.Manager, wtRoot, repoName string, params *ipc.NewSessionParams, parent session.SessionInfo) (*ipc.NewSessionResult, error) {
 	worktreePath := params.WorktreePath
 
@@ -765,6 +807,20 @@ func handleNewSession(ctx context.Context, mgr *session.Manager, wtRoot, repoNam
 	// still explicit (--create-worktree -b), so this never surprises a caller
 	// who wanted isolation.
 	if worktreePath == "" && parent.WorktreePath != "" {
+		// A child living in its parent's tree must be filed under its parent's
+		// repo. repoName picked mgr, and a --repo naming a different one would
+		// register the session — and persist its history — under a repo whose
+		// worktree it is not in.
+		//
+		// Only reachable for a repo the caller actually typed: an inferred one
+		// has already lost to the parent's when the manager was chosen, so a
+		// mismatch here means two explicit, incompatible requests and there is no
+		// safe guess between them.
+		if parent.RepoName != "" && parent.RepoName != repoName {
+			return nil, fmt.Errorf("cannot spawn into repo %q while inheriting parent %s's worktree in repo %q: "+
+				"drop --repo, or give the subagent a tree of its own with --worktree or --create-worktree --branch",
+				repoName, parent.ID, parent.RepoName)
+		}
 		worktreePath = parent.WorktreePath
 	}
 
@@ -785,7 +841,11 @@ func handleNewSession(ctx context.Context, mgr *session.Manager, wtRoot, repoNam
 	}
 
 	id, err := mgr.StartSessionWithOpts(sessionType, worktreePath, params.Prompt, params.Model,
-		session.SpawnOpts{ParentSessionID: session.SessionID(params.ParentSessionID)})
+		session.SpawnOpts{
+			ParentSessionID: session.SessionID(params.ParentSessionID),
+			Backend:         params.Backend,
+			LLMEndpoint:     params.LLMEndpoint,
+		})
 	if err != nil {
 		return nil, fmt.Errorf("failed to start session: %w", err)
 	}
@@ -808,6 +868,7 @@ func handleListSessions(registry *session.SessionRegistry) *ipc.ListSessionsResu
 			WorktreeName:    s.WorktreeName,
 			Prompt:          s.Prompt,
 			Model:           s.Model,
+			Backend:         s.Backend,
 			ParentSessionID: string(s.ParentSessionID),
 		}
 	}
@@ -868,6 +929,27 @@ was requested, not necessarily that it happened.`,
 var newSessionCmd = &cobra.Command{
 	Use:   "new-session",
 	Short: "Request the running bramble TUI to create a new session",
+	Long: `Request the running bramble TUI to create a new session.
+
+Use --backend to select the CLI independently from --model. Naming a backend
+makes --model required: the model ID is then that backend's own (an OpenRouter
+slug, say), and bramble's defaults are Claude aliases that would not resolve.
+Third-party endpoints can be supplied with --llm-* flags, or with
+--llm-preset=openrouter. --llm-api-key-env is read in this process, so *creating*
+a session does not require the key in the shell that started the bramble TUI.
+Resuming one after the TUI restarts does: the stored endpoint is redacted, so it
+re-resolves through the named variable in the server's environment.
+
+Interactive (tmux) Claude sessions authenticate to a third-party endpoint with
+Bearer only: exporting an x-api-key would park the CLI on its custom-API-key
+approval modal, which nothing answers. A gateway that requires x-api-key must
+use the in-process path.
+
+Claude Code does not know stealth/ox-alpha's one-million-token context window.
+For long Claude sessions, pass --model 'stealth/ox-alpha[1m]' to prevent early
+auto-compaction. Codex does not need this suffix.`,
+	Example: `  bramble new-session --backend claude --model stealth/ox-alpha --llm-preset openrouter -w "$PWD" -p "help me"
+  bramble new-session --backend codex --model stealth/ox-alpha --llm-preset openrouter -w "$PWD" -p "help me"`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		client, err := ipc.NewClientFromEnv()
 		if err != nil {
@@ -880,18 +962,27 @@ var newSessionCmd = &cobra.Command{
 		worktreePath, _ := cmd.Flags().GetString("worktree")
 		prompt, _ := cmd.Flags().GetString("prompt")
 		model, _ := cmd.Flags().GetString("model")
+		backend, _ := cmd.Flags().GetString("backend")
 		goal, _ := cmd.Flags().GetString("goal")
 		createWT, _ := cmd.Flags().GetBool("create-worktree")
 		repo, _ := cmd.Flags().GetString("repo")
 		parentFlag, _ := cmd.Flags().GetString("parent")
 		noParent, _ := cmd.Flags().GetBool("no-parent")
-		parent := resolveParentSessionID(parentFlag, os.Getenv(session.SessionIDEnvVar), noParent)
+		parent, parentInherited := resolveParentSessionID(parentFlag, os.Getenv(session.SessionIDEnvVar), noParent)
+		endpoint, err := newSessionEndpoint(cmd)
+		if err != nil {
+			return err
+		}
 
-		// Auto-detect repo from cwd if not explicitly specified.
+		// Auto-detect repo from cwd if not explicitly specified. Flagged as
+		// inferred: an agent's cwd is wherever its worktree is, which is not the
+		// same claim as a --repo the caller typed.
+		repoInferred := false
 		if repo == "" {
 			if wtRoot, err := resolveWTRoot(); err == nil {
 				cwd, _ := os.Getwd()
 				repo, _ = detectRepoFromPath(cwd, wtRoot)
+				repoInferred = repo != ""
 			}
 		}
 
@@ -906,9 +997,13 @@ var newSessionCmd = &cobra.Command{
 				CreateWorktree:  createWT,
 				Prompt:          prompt,
 				Model:           model,
+				Backend:         backend,
+				LLMEndpoint:     endpoint,
 				Goal:            goal,
 				RepoName:        repo,
+				RepoInferred:    repoInferred,
 				ParentSessionID: parent,
+				ParentInherited: parentInherited,
 			},
 		})
 		if err != nil {
@@ -922,6 +1017,67 @@ var newSessionCmd = &cobra.Command{
 		fmt.Println(string(out))
 		return nil
 	},
+}
+
+func newSessionEndpoint(cmd *cobra.Command) (llmendpoint.Endpoint, error) {
+	preset, _ := cmd.Flags().GetString("llm-preset")
+	var endpoint llmendpoint.Endpoint
+	switch preset {
+	case "":
+	case "openrouter":
+		endpoint = llmendpoint.OpenRouter()
+	default:
+		return llmendpoint.Endpoint{}, fmt.Errorf("unknown LLM preset %q (expected openrouter)", preset)
+	}
+
+	llmFlags := []string{"llm-base-url", "llm-api-key-env", "llm-provider-name", "llm-wire-api"}
+	configured := preset != ""
+	for _, name := range llmFlags {
+		configured = configured || cmd.Flags().Changed(name)
+	}
+	if !configured {
+		return llmendpoint.Endpoint{}, nil
+	}
+	if cmd.Flags().Changed("llm-base-url") {
+		endpoint.BaseURL, _ = cmd.Flags().GetString("llm-base-url")
+	}
+	if cmd.Flags().Changed("llm-api-key-env") {
+		endpoint.APIKeyEnv, _ = cmd.Flags().GetString("llm-api-key-env")
+	}
+	if cmd.Flags().Changed("llm-provider-name") {
+		endpoint.ProviderName, _ = cmd.Flags().GetString("llm-provider-name")
+	}
+	if cmd.Flags().Changed("llm-wire-api") || preset == "" {
+		wire, _ := cmd.Flags().GetString("llm-wire-api")
+		endpoint.Wire = llmendpoint.WireAPI(wire)
+	}
+	if err := endpoint.Validate(); err != nil {
+		return llmendpoint.Endpoint{}, err
+	}
+	// Resolve the key here, in the client, and carry the literal value in the
+	// request. --llm-api-key-env is typed in the user's shell, but the session
+	// is launched by the long-running bramble TUI in another process: if that
+	// server was started before the key was exported, the name alone resolves
+	// to nothing there and the CLI gets no credential. Reading it on the side
+	// that has it makes the documented flow independent of the server's
+	// startup environment. The literal never outlives the request — the socket
+	// is not logged, and SessionToStored persists the endpoint via Redacted().
+	//
+	// When the client's environment has no value either, APIKeyEnv still
+	// crosses on its own so the server can try its own environment, and
+	// startSessionWithID reports by name if that fails too.
+	if endpoint.APIKey == "" && endpoint.APIKeyEnv != "" {
+		endpoint.APIKey = os.Getenv(endpoint.APIKeyEnv)
+	}
+	return endpoint, nil
+}
+
+func registerLLMEndpointFlags(flags *pflag.FlagSet) {
+	flags.String("llm-preset", "", "Third-party LLM endpoint preset: openrouter")
+	flags.String("llm-base-url", "", "Custom LLM endpoint base URL")
+	flags.String("llm-api-key-env", "", "Env var name holding the LLM API key")
+	flags.String("llm-provider-name", "", "Provider name label (codex model_providers.<name>)")
+	flags.String("llm-wire-api", "responses", "Wire API (current Codex requires responses)")
 }
 
 // resolveOwnSessionID picks the session a self-referential command (notify)
@@ -944,14 +1100,18 @@ func resolveOwnSessionID(flagID, envID string) (string, error) {
 // terminal is simply top-level — so this returns "" rather than an error.
 // --no-parent is the escape hatch for spawning a top-level session from inside
 // a bramble session, which would otherwise always inherit a parent.
-func resolveParentSessionID(flagID, envID string, noParent bool) string {
+//
+// inherited says the ID came from the environment rather than the flag. The
+// server needs that distinction to decide whether an unresolvable parent is an
+// error or just a default it should drop — see ipc.NewSessionParams.
+func resolveParentSessionID(flagID, envID string, noParent bool) (id string, inherited bool) {
 	if noParent {
-		return ""
+		return "", false
 	}
 	if flagID != "" {
-		return flagID
+		return flagID, false
 	}
-	return envID
+	return envID, envID != ""
 }
 
 var notifyCmd = &cobra.Command{
@@ -1128,7 +1288,7 @@ var listSessionsCmd = &cobra.Command{
 			parentFlag, _ := cmd.Flags().GetString("parent")
 			// --parent= (empty) means "my own children", so a caller inside a
 			// bramble session need not echo its own ID back.
-			parent := resolveParentSessionID(parentFlag, os.Getenv(session.SessionIDEnvVar), false)
+			parent, _ := resolveParentSessionID(parentFlag, os.Getenv(session.SessionIDEnvVar), false)
 			if parent == "" {
 				return fmt.Errorf("--parent needs an ID, or $%s must be set", session.SessionIDEnvVar)
 			}
@@ -1158,9 +1318,11 @@ func filterSessionsByParent(result any, parent string) (*ipc.ListSessionsResult,
 		return nil, err
 	}
 	children := make([]ipc.SessionSummary, 0, len(list.Sessions))
-	for _, s := range list.Sessions {
-		if s.ParentSessionID == parent {
-			children = append(children, s)
+	// Index rather than range-by-value: SessionSummary is over gocritic's
+	// 128-byte rangeValCopy threshold.
+	for i := range list.Sessions {
+		if list.Sessions[i].ParentSessionID == parent {
+			children = append(children, list.Sessions[i])
 		}
 	}
 	return &ipc.ListSessionsResult{Sessions: children}, nil
@@ -1226,7 +1388,7 @@ the recipient should read as part of its own work.`,
 			return err
 		}
 		if result.Queued {
-			fmt.Printf("queued for %s; it will be delivered when that session goes idle\n", sessionID)
+			fmt.Printf("queued for %s; it will be delivered when that session can take it\n", sessionID)
 		}
 		return nil
 	},
@@ -1360,6 +1522,8 @@ func init() {
 	newSessionCmd.Flags().StringP("worktree", "w", "", "Existing worktree path")
 	newSessionCmd.Flags().StringP("prompt", "p", "", "Prompt for the session")
 	newSessionCmd.Flags().StringP("model", "m", "", "Model ID (e.g. opus, sonnet)")
+	newSessionCmd.Flags().String("backend", "", "CLI backend, independent of model: claude or codex (empty infers from model; naming one requires --model)")
+	registerLLMEndpointFlags(newSessionCmd.Flags())
 	newSessionCmd.Flags().StringP("goal", "g", "", "Goal for new worktree")
 	newSessionCmd.Flags().Bool("create-worktree", false, "Create a new worktree for the branch")
 	newSessionCmd.Flags().StringP("repo", "r", "", "Target repo name (auto-detected from cwd if omitted)")

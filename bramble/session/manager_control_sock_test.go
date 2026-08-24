@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 	"github.com/bazelment/yoloswe/multiagent/agent"
 )
 
@@ -86,4 +87,22 @@ func TestManagerNewTmuxRunnerOmitsUnstartedControlSocket(t *testing.T) {
 	for _, a := range runner.envArgs() {
 		assert.NotContains(t, a, ControlSockEnvVar, "unset control socket should be omitted, got %q", a)
 	}
+}
+
+// The endpoint reaches the tmux window only if newTmuxRunner copies it off the
+// session. Wiring every earlier layer and dropping it here would leave the
+// window pointed at the default provider with no error anywhere.
+func TestManagerNewTmuxRunnerCarriesSessionLLMEndpoint(t *testing.T) {
+	t.Parallel()
+
+	endpoint := llmendpoint.OpenRouter()
+	m := NewManagerWithConfig(ManagerConfig{})
+	runner := m.newTmuxRunner(
+		&Session{ID: "builder-openrouter", Model: "stealth/ox-alpha", LLMEndpoint: endpoint},
+		"prompt",
+		"window",
+		agent.AgentModel{ID: "stealth/ox-alpha", Provider: ProviderCodex},
+	)
+
+	assert.Equal(t, endpoint, runner.llmEndpoint)
 }

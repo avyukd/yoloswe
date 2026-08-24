@@ -14,13 +14,28 @@ load("@rules_go//go:def.bzl", "go_test")
 #       --test_tag_filters=integration --test_output=streamed
 go_test(
     name = "integration_test",
-    # Each subtest spends 10–60s waiting on a real model; the full suite
-    # sequences four backends, so use the "large" 900s budget rather than
-    # bazel's default 60s. Without this override the test fails with a
-    # timeout under standard `bazel test --test_tag_filters=integration`.
+    # Each subtest spends 10–60s waiting on a real model, and the full suite
+    # sequences four backends, so bazel's default 60s is far too small.
+    #
+    # "eternal" (3600s), not the "large" default of 900s, because the OpenRouter
+    # claude leg retries a known CLI defect and its declared budget must FIT
+    # this number — a retry count larger than the target timeout cannot be
+    # reached, and bazel kills the target with a message naming neither the
+    # retries nor the endpoint. Worst case, summed:
+    #
+    #   OpenRouter claude   10 attempts x 180s (claudeMaxAttempts,
+    #                                          openRouterTimeout)   1800s
+    #   OpenRouter codex     1 attempt  x 180s                       180s
+    #   Baseten both legs    1 attempt  x  90s x 2                   180s
+    #   resume_test.go       4 backends x ~60s                       240s
+    #                                                        total  2400s
+    #
+    # Changing claudeMaxAttempts or openRouterTimeout means redoing this sum.
     size = "large",
+    timeout = "eternal",
     srcs = [
         "llmendpoint_test.go",
+        "openrouter_test.go",
         "resume_test.go",
     ],
     # The agent CLIs need real user state to authenticate and run:
@@ -34,6 +49,9 @@ go_test(
         # cleanly when unset so the rest of the suite still runs.
         "BASETEN_API_KEY",
         "HOME",
+        # OPEN_ROUTER_KEY: gates TestLLMEndpoint_OpenRouter and deliberately
+        # exercises overriding the preset's conventional API key env var.
+        "OPEN_ROUTER_KEY",
         "PATH",
         "USER",
         "XDG_CACHE_HOME",

@@ -133,6 +133,7 @@ func (d *Dispatcher) sessionList() SessionListResult {
 			Status:       string(s.Status),
 			WorktreeName: s.WorktreeName,
 			Model:        s.Model,
+			Backend:      s.Backend,
 			RunnerType:   s.RunnerType,
 			TmuxTarget:   target,
 		})

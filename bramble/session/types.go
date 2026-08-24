@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 	"github.com/bazelment/yoloswe/bramble/sessionmodel"
 	"github.com/bazelment/yoloswe/multiagent/agent"
 )
@@ -132,6 +133,8 @@ type Session struct {
 	Prompt           string
 	Title            string
 	Model            string
+	Backend          string // explicitly selected CLI backend; empty means infer from Model
+	LLMEndpoint      llmendpoint.Endpoint
 	PlanFilePath     string // Path to plan file (planner sessions only)
 	TmuxWindowName   string // tmux window name (empty for TUI mode)
 	TmuxWindowID     string // tmux window ID like @1, @2 (empty for TUI mode)
@@ -147,7 +150,13 @@ type Session struct {
 	WorktreePath    string
 	Status          SessionStatus
 	Type            SessionType
-	mu              sync.RWMutex
+	// turnEpoch counts the turns this session has been started on: it is bumped
+	// every time the session enters StatusRunning. It exists so a watcher that
+	// only ever samples the session — the pane-idle probe, which is all a
+	// hookless backend has — can tell one turn's observations from the next
+	// one's. Guarded by mu.
+	turnEpoch uint64
+	mu        sync.RWMutex
 }
 
 // SessionProgress tracks real-time progress.
@@ -228,6 +237,7 @@ type SessionInfo struct {
 	Prompt           string
 	Title            string
 	Model            string
+	Backend          string
 	PlanFilePath     string
 	TmuxWindowName   string    // tmux window name (empty for TUI mode)
 	TmuxWindowID     string    // tmux window ID like @1, @2 (empty for TUI mode)
@@ -257,6 +267,7 @@ func (s *Session) ToInfo() SessionInfo {
 		Prompt:           s.Prompt,
 		Title:            s.Title,
 		Model:            s.Model,
+		Backend:          s.Backend,
 		PlanFilePath:     s.PlanFilePath,
 		TmuxWindowName:   s.TmuxWindowName,
 		TmuxWindowID:     s.TmuxWindowID,

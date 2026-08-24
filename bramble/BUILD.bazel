@@ -11,6 +11,7 @@ go_library(
     importpath = "github.com/bazelment/yoloswe/bramble",
     visibility = ["//visibility:private"],
     deps = [
+        "//agent-cli-wrapper/llmendpoint",
         "//bramble/app",
         "//bramble/cmd/codereview",
         "//bramble/cmd/delegator",
@@ -28,6 +29,7 @@ go_library(
         "//wt",
         "//yoloswe",
         "@com_github_spf13_cobra//:cobra",
+        "@com_github_spf13_pflag//:pflag",
         "@land_charm_bubbletea_v2//:bubbletea",
         "@org_golang_x_term//:term",
     ],
@@ -43,6 +45,7 @@ go_test(
     name = "bramble_test",
     srcs = [
         "main_test.go",
+        "new_session_test.go",
         "notify_cmd_test.go",
         "notify_session_id_test.go",
         "restart_test.go",
@@ -50,9 +53,11 @@ go_test(
     ],
     embed = [":bramble_lib"],
     deps = [
+        "//agent-cli-wrapper/llmendpoint",
         "//bramble/app",
         "//bramble/ipc",
         "//bramble/session",
+        "@com_github_spf13_cobra//:cobra",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
     ],

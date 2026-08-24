@@ -64,14 +64,14 @@ func TestBuildShellCommandCodex(t *testing.T) {
 		{
 			name: "codex with model",
 			cmd:  "codex",
-			args: []string{"--model", "gpt-5.5", "fix the bug"},
-			want: "codex '--model' 'gpt-5.5' 'fix the bug'",
+			args: []string{"-m", "gpt-5.5", "fix the bug"},
+			want: "codex '-m' 'gpt-5.5' 'fix the bug'",
 		},
 		{
 			name: "codex with yolo",
 			cmd:  "codex",
-			args: []string{"--model", "gpt-5.4", "--dangerously-bypass-approvals-and-sandbox", "build feature"},
-			want: "codex '--model' 'gpt-5.4' '--dangerously-bypass-approvals-and-sandbox' 'build feature'",
+			args: []string{"-m", "gpt-5.4", "--dangerously-bypass-approvals-and-sandbox", "build feature"},
+			want: "codex '-m' 'gpt-5.4' '--dangerously-bypass-approvals-and-sandbox' 'build feature'",
 		},
 		{
 			name: "claude with model flag",
@@ -116,7 +116,7 @@ func TestTmuxRunnerBuildCommand(t *testing.T) {
 				prompt:   "build it",
 			},
 			wantBin:  "codex",
-			wantArgs: []string{"--model", "gpt-5.5", "build it"},
+			wantArgs: []string{"-m", "gpt-5.5", "build it"},
 		},
 		{
 			name: "codex with yolo",
@@ -127,7 +127,7 @@ func TestTmuxRunnerBuildCommand(t *testing.T) {
 				yoloMode: true,
 			},
 			wantBin:  "codex",
-			wantArgs: []string{"--model", "gpt-5.4", "--dangerously-bypass-approvals-and-sandbox", "build it"},
+			wantArgs: []string{"-m", "gpt-5.4", "--dangerously-bypass-approvals-and-sandbox", "build it"},
 		},
 		{
 			name: "claude with yolo",

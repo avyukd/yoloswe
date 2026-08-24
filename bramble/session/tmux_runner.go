@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude"
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/codex"
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 	"github.com/bazelment/yoloswe/multiagent/agent"
 )
 
@@ -31,7 +34,7 @@ const SessionIDEnvVar = "BRAMBLE_SESSION_ID"
 const IPCSockEnvVar = "BRAMBLE_SOCK"
 
 // tmuxRunner implements sessionRunner by creating a tmux window that runs the agent CLI.
-type tmuxRunner struct {
+type tmuxRunner struct { //nolint:govet // fieldalignment: keep launch configuration readable.
 	windowName      string // tmux window name (e.g., "happy-tiger")
 	workDir         string // working directory for the window
 	prompt          string // initial prompt
@@ -44,8 +47,9 @@ type tmuxRunner struct {
 	brambleBin      string // absolute path to the bramble binary for hook commands
 	brambleSock     string // IPC socket path to pass to hook commands
 	controlSock     string // control socket path, so the session can drive peers
-	yoloMode        bool   // skip all permission prompts
-	killOnStop      bool   // kill tmux window on Stop()
+	llmEndpoint     llmendpoint.Endpoint
+	yoloMode        bool // skip all permission prompts
+	killOnStop      bool // kill tmux window on Stop()
 }
 
 // envArgs returns the "-e VAR=value" pairs that give the agent inside the
@@ -68,7 +72,81 @@ func (r *tmuxRunner) envArgs() []string {
 			args = append(args, "-e", kv[0]+"="+kv[1])
 		}
 	}
+	endpointEnv := r.endpointEnv()
+	names := make([]string, 0, len(endpointEnv))
+	for name := range endpointEnv {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		args = append(args, "-e", name+"="+endpointEnv[name])
+	}
 	return args
+}
+
+// endpointEnv delegates endpoint translation to the same wrapper options used
+// by in-process sessions, then returns the subprocess environment they produce.
+//
+// Secret exposure: the values below are spliced into `tmux new-window -e
+// NAME=VALUE`, so a resolved API key is present in the tmux *client's* argv
+// (readable via ps/proc by the same user) for the duration of that exec. tmux
+// offers no argv-free way to seed a new window's environment, and the
+// alternative — a transient on-disk key file the launched shell sources — buys
+// a narrower window at the cost of a file lifecycle to get wrong. Documented
+// rather than hidden; codex.WithLLMEndpoint's doc comment is corrected to
+// match, since its env_key indirection only keeps the key out of *codex's*
+// argv, not out of tmux's.
+func (r *tmuxRunner) endpointEnv() map[string]string {
+	if r.llmEndpoint.IsZero() {
+		return nil
+	}
+	switch r.provider {
+	case ProviderCodex:
+		cfg := codex.ClientConfig{}
+		codex.WithLLMEndpoint(r.llmEndpoint)(&cfg)
+		return cfg.Env
+	case ProviderClaude, "":
+		cfg := claude.SessionConfig{}
+		claude.WithModel(r.model)(&cfg)
+		claude.WithLLMEndpoint(r.llmEndpoint)(&cfg)
+		// The wrapper sets both ANTHROPIC_AUTH_TOKEN (Bearer) and
+		// ANTHROPIC_API_KEY (x-api-key) because proxies differ on which they
+		// accept. That is right for `claude -p`, which never prompts, but the
+		// interactive CLI this runner launches reacts to ANTHROPIC_API_KEY on
+		// a machine that also has an account login by blocking on a modal
+		// ("Detected a custom API key in your environment"), whose default
+		// answer is No — which would decline the endpoint's key and leave the
+		// window pointed at ANTHROPIC_BASE_URL with the user's own
+		// credentials. Nothing outside the integration harness answers startup
+		// dialogs, so the window would simply park there. Bearer alone
+		// authenticates against OpenRouter (verified: 401 on a bad key, 429 on
+		// a good one), so drop the x-api-key half here. The cost is a
+		// hypothetical Bearer-rejecting proxy, which would need its own
+		// non-interactive path anyway.
+		//
+		// This is a deliberate divergence from the in-process path, which keeps
+		// both variables because `claude -p` never prompts. It is pinned from
+		// both sides — see TestTmuxRunnerNewWindowArgs_OpenRouterClaudeFullArgv
+		// here and TestWithLLMEndpoint_setsEnv in the wrapper — so
+		// an x-api-key-only gateway fails on a documented decision rather than
+		// an accident. Such a gateway must use the in-process path.
+		//
+		// Shadowed with an empty value, NOT deleted. A tmux window's
+		// environment is the server's global environment merged with the -e
+		// overrides, so omitting a pair only declines to *add* it — it cannot
+		// clear a value the user exported before the tmux server started,
+		// which is the common case for anyone who has used claude with an API
+		// key. Measured on tmux 3.4: with ANTHROPIC_API_KEY in the server
+		// environment, a window launched without the pair sees the user's own
+		// key, and one launched with `-e ANTHROPIC_API_KEY=` sees "". Deleting
+		// therefore produced exactly what this code exists to prevent — the
+		// modal fires anyway, and answering it sends the user's real Anthropic
+		// credential to the third-party endpoint as x-api-key.
+		cfg.Env["ANTHROPIC_API_KEY"] = ""
+		return cfg.Env
+	default:
+		return nil
+	}
 }
 
 // newWindowArgs builds the full argv for the `tmux new-window` that launches
@@ -189,7 +267,13 @@ func (r *tmuxRunner) buildCommand() (binary string, args []string) {
 	// Add the model flag. Some of bramble's IDs are placeholders for "the CLI's
 	// own default", and some name another provider's model, so let the registry
 	// decide whether this CLI can be given anything at all.
-	if model := agent.CLIModelArg(r.model, provider); model != "" {
+	model := agent.CLIModelArg(r.model, provider)
+	if provider == ProviderCodex {
+		args = append(args, r.codexEndpointArgs()...)
+		if model != "" {
+			args = append(args, "-m", model)
+		}
+	} else if model != "" {
 		args = append(args, "--model", model)
 	}
 
@@ -313,6 +397,45 @@ func (r *tmuxRunner) buildCommand() (binary string, args []string) {
 	// the prompt so the user's message is not silently discarded.
 	args = append(args, r.prompt)
 	return binary, args
+}
+
+// codexEndpointArgs reuses codex.WithLLMEndpoint's config translation for the
+// interactive CLI. Every flag that option emits applies here; only the spelling
+// of one differs, because app-server's --config is -c on the interactive CLI
+// (`codex --help`). In particular the third-party feature denylist applies:
+// --disable is a top-level interactive option ("Equivalent to
+// -c features.<name>=false"), and it is what keeps codex from sending tool
+// schemas that strict Responses providers reject with HTTP 400 "unknown
+// variant `namespace`" — see thirdPartyIncompatibleFeatures in
+// agent-cli-wrapper/codex/client_options.go. Dropping it made the tmux path
+// fail against gateways where the in-process path succeeds; OpenRouter's
+// leniency is why the live test never caught it.
+//
+// Translating the whole stream rather than filtering for --config is the point:
+// the previous filter silently dropped every flag it did not recognize, so a
+// future addition to WithLLMEndpoint would go missing here again with no
+// symptom until a request 400s.
+//
+// The walk is element-wise on purpose. Reading the stream as flag/value pairs
+// would trade the silent drop for a silent desync — one single-token flag and
+// every later pair reverses into `value flag`. Rewriting each token
+// independently has no arity to get wrong: --config is the only spelling that
+// differs, and no value WithLLMEndpoint emits (a model_providers.* assignment
+// or a feature name) can collide with that literal.
+func (r *tmuxRunner) codexEndpointArgs() []string {
+	if r.llmEndpoint.IsZero() {
+		return nil
+	}
+	cfg := codex.ClientConfig{}
+	codex.WithLLMEndpoint(r.llmEndpoint)(&cfg)
+	args := make([]string, 0, len(cfg.AppServerArgs))
+	for _, a := range cfg.AppServerArgs {
+		if a == "--config" {
+			a = "-c"
+		}
+		args = append(args, a)
+	}
+	return args
 }
 
 // buildShellCommand constructs a shell command string with properly escaped arguments.

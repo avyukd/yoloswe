@@ -1,9 +1,65 @@
 package llmendpoint
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestOpenRouter(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		apiKeyEnv string
+		want      Endpoint
+		wantText  string
+	}{
+		{
+			name: "default key environment",
+			want: Endpoint{
+				BaseURL:      "https://openrouter.ai/api/v1",
+				APIKeyEnv:    "OPENROUTER_API_KEY",
+				ProviderName: "openrouter",
+				Wire:         WireAPIResponses,
+			},
+			wantText: "llmendpoint{base=https://openrouter.ai/api/v1 provider=openrouter wire=responses key=$OPENROUTER_API_KEY}",
+		},
+		{
+			name:      "overridden key environment",
+			apiKeyEnv: "HOST_OPENROUTER_KEY",
+			want: Endpoint{
+				BaseURL:      "https://openrouter.ai/api/v1",
+				APIKeyEnv:    "HOST_OPENROUTER_KEY",
+				ProviderName: "openrouter",
+				Wire:         WireAPIResponses,
+			},
+			wantText: "llmendpoint{base=https://openrouter.ai/api/v1 provider=openrouter wire=responses key=$HOST_OPENROUTER_KEY}",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := OpenRouter()
+			if tt.apiKeyEnv != "" {
+				got.APIKeyEnv = tt.apiKeyEnv
+			}
+
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("OpenRouter() = %#v, want %#v", got, tt.want)
+			}
+			if err := got.Validate(); err != nil {
+				t.Fatalf("OpenRouter().Validate() returned %v", err)
+			}
+			if redacted := got.Redacted(); !reflect.DeepEqual(redacted, tt.want) {
+				t.Errorf("OpenRouter().Redacted() = %#v, want %#v", redacted, tt.want)
+			}
+			if text := got.String(); text != tt.wantText {
+				t.Errorf("OpenRouter().String() = %q, want %q", text, tt.wantText)
+			}
+		})
+	}
+}
 
 func TestEndpoint_Validate(t *testing.T) {
 	t.Parallel()

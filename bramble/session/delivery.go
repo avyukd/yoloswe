@@ -202,6 +202,15 @@ func (c *Courier) Send(ctx context.Context, from, to SessionID, text string, sub
 
 // deliver is Send without the child-spoke bookkeeping: it writes to an idle
 // recipient and queues for a busy one, reporting which it did.
+//
+// A write that fails queues instead of returning the failure, and arms the same
+// retry Drain does. Both of this file's write sites make that trade for one
+// reason: the recipient of a failed write is a session that was idle and will
+// stay idle, so there is no later transition for the message to ride. Dropping
+// it here would strand exactly the caller this queue exists for — reportToParent
+// reaches an idle parent through this branch, and a child in a terminal state
+// gets no second chance to report. The caller still learns the message was not
+// written, from queued == true.
 func (c *Courier) deliver(ctx context.Context, from, to SessionID, text string, submit bool) (queued bool, err error) {
 	info, ok := c.target.SessionInfo(to)
 	if !ok {
@@ -215,17 +224,26 @@ func (c *Courier) deliver(ctx context.Context, from, to SessionID, text string, 
 	// callers can both have seen StatusIdle above, and only one of them may
 	// write. The loser queues, which is the right answer — the winner's write
 	// starts a turn, so the recipient is no longer idle.
+	writeFailed := false
 	if info.Status == StatusIdle && c.claimWrite(to) {
 		defer c.releaseWrite(to)
 		if fresh, ok := c.target.SessionInfo(to); ok && fresh.Status == StatusIdle {
-			if err := c.write(ctx, fresh, text, submit); err != nil {
-				return false, err
+			err := c.write(ctx, fresh, text, submit)
+			if err == nil {
+				return false, nil
 			}
-			return false, nil
+			logDeliveryWarn("failed to write delivery, queueing it instead", to, err)
+			writeFailed = true
 		}
 	}
 	if err := c.enqueue(from, to, text, submit); err != nil {
 		return false, err
+	}
+	if writeFailed {
+		// The write claim is still held — releaseWrite is deferred to this
+		// function's return — so the retry must be a later one. retryLater's
+		// timer fires well after that, and Drain reclaims the write itself.
+		c.retryLater(ctx, to)
 	}
 	return true, nil
 }
@@ -572,6 +590,11 @@ func (c *Courier) DrainIdle(ctx context.Context) {
 // Watch drains a session's queue whenever it becomes idle. It returns an
 // unsubscribe function and runs until ctx is canceled.
 func (c *Courier) Watch(ctx context.Context, mgr *Manager) func() {
+	// Everything below is slow — a report captures two thousand lines of pane and
+	// writes a file, a drain pastes into a pane and reads it back — and the
+	// transition a parent's report rides is the one event that never comes again.
+	// watchStateChanges is what makes that safe: it queues events for this
+	// handler rather than letting a full buffer drop them.
 	return watchStateChanges(ctx, mgr, func(evt SessionStateChangeEvent) {
 		// A session is both a recipient of queued mail and, when it has a
 		// parent, a subagent whose progress that parent is waiting on. One
@@ -726,27 +749,36 @@ func (s *Session) parentSessionID() SessionID {
 
 // resultDirName is the ~/.bramble/ subdirectory that holds the files a
 // subagent's parent is pointed at: the transcript of a TUI session, or the
-// captured pane of a tmux one.
+// captured pane of a tmux one. It sits alongside the delivery queue
+// NewCourier creates.
 //
 // Under the user's home rather than os.TempDir(). A world-writable temp dir
 // cannot be secured from inside this process: another local user can
 // pre-create the directory — or a symlink standing in for it — and no amount
 // of MkdirAll/Chmod on that path fixes it, because both follow the symlink and
 // would hand an attacker's directory our transcripts. $HOME is not writable by
-// anyone else, so the question does not arise.
+// anyone else, so the question does not arise. It is also the only location
+// that survives: a parent is handed this path and may not read it for hours,
+// and a temp dir is swept out from under it.
 const resultDirName = "research"
 
 // DefaultResultDir returns ~/.bramble/research.
+//
+// os.UserHomeDir rather than a configurable root, mirroring NewCourier's
+// default queue dir: README and the design docs quote ~/.bramble/research/<id>.md
+// to users, so this is the one place that decides it.
 func DefaultResultDir() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("failed to get home directory: %w", err)
+		return "", fmt.Errorf("resolve home for result dir: %w", err)
 	}
 	return filepath.Join(home, ".bramble", resultDirName), nil
 }
 
 // ResultFilePath returns the path a session's result file is written to under
-// dir, creating the directory. If dir is empty, defaults to ~/.bramble/research.
+// dir, creating the directory. An empty dir means the default above, which is
+// what every production caller passes; the parameter exists so a test can point
+// it at its own directory instead of writing into the one real sessions use.
 //
 // Shared by the TUI transcript writer and the tmux pane capture so a parent is
 // handed the same shape of path either way. It re-creates the directory on

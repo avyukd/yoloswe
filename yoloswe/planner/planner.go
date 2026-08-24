@@ -36,6 +36,7 @@ import (
 
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude"
 	"github.com/bazelment/yoloswe/agent-cli-wrapper/claude/render"
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 )
 
 // readLineWithContext reads a line from stdin with context cancellation support.
@@ -159,6 +160,7 @@ type Config struct {
 	Output              io.Writer
 	EventHandler        render.EventHandler
 	Model               string
+	LLMEndpoint         llmendpoint.Endpoint
 	WorkDir             string
 	RecordingDir        string
 	SystemPrompt        string
@@ -303,6 +305,10 @@ func (h *plannerInteractiveHandler) HandleExitPlanMode(ctx context.Context, plan
 // (vs starting directly with --permission-mode plan) demonstrates dynamic
 // permission mode changes through the protocol.
 func (p *PlannerWrapper) Start(ctx context.Context) error {
+	if err := p.config.LLMEndpoint.Validate(); err != nil {
+		return err
+	}
+
 	opts := []claude.SessionOption{
 		claude.WithModel(p.config.Model),
 		// Start in default mode - we'll switch to plan mode via control message
@@ -326,6 +332,10 @@ func (p *PlannerWrapper) Start(ctx context.Context) error {
 
 	if p.config.ResumeSessionID != "" {
 		opts = append(opts, claude.WithResume(p.config.ResumeSessionID))
+	}
+
+	if !p.config.LLMEndpoint.IsZero() {
+		opts = append(opts, claude.WithLLMEndpoint(p.config.LLMEndpoint))
 	}
 
 	p.session = claude.NewSession(opts...)
@@ -721,6 +731,9 @@ func (p *PlannerWrapper) executeInNewSession(ctx context.Context) (bool, error) 
 	}
 	if p.config.SystemPrompt != "" {
 		newOpts = append(newOpts, claude.WithSystemPrompt(p.config.SystemPrompt))
+	}
+	if !p.config.LLMEndpoint.IsZero() {
+		newOpts = append(newOpts, claude.WithLLMEndpoint(p.config.LLMEndpoint))
 	}
 
 	p.session = claude.NewSession(newOpts...)

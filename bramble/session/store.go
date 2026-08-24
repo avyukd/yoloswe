@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/bazelment/yoloswe/agent-cli-wrapper/llmendpoint"
 )
 
 // Store provides persistence for session history.
@@ -20,23 +22,25 @@ type Store struct {
 
 // StoredSession is the serializable representation of a session.
 type StoredSession struct {
-	ID             SessionID     `json:"id"`
-	Type           SessionType   `json:"type"`
-	Status         SessionStatus `json:"status"`
-	RepoName       string        `json:"repo_name"`
-	WorktreePath   string        `json:"worktree_path"`
-	WorktreeName   string        `json:"worktree_name"`
-	Prompt         string        `json:"prompt"`
-	Title          string        `json:"title,omitempty"`
-	Model          string        `json:"model,omitempty"`
-	CreatedAt      time.Time     `json:"created_at"`
-	StartedAt      *time.Time    `json:"started_at,omitempty"`
-	CompletedAt    *time.Time    `json:"completed_at,omitempty"`
-	ErrorMsg       string        `json:"error_msg,omitempty"`
-	CLISessionID   string        `json:"cli_session_id,omitempty"`
-	TmuxWindowName string        `json:"tmux_window_name,omitempty"`
-	TmuxWindowID   string        `json:"tmux_window_id,omitempty"`
-	RunnerType     string        `json:"runner_type,omitempty"`
+	ID             SessionID             `json:"id"`
+	Type           SessionType           `json:"type"`
+	Status         SessionStatus         `json:"status"`
+	RepoName       string                `json:"repo_name"`
+	WorktreePath   string                `json:"worktree_path"`
+	WorktreeName   string                `json:"worktree_name"`
+	Prompt         string                `json:"prompt"`
+	Title          string                `json:"title,omitempty"`
+	Model          string                `json:"model,omitempty"`
+	Backend        string                `json:"backend,omitempty"`
+	LLMEndpoint    *llmendpoint.Endpoint `json:"llm_endpoint,omitempty"`
+	CreatedAt      time.Time             `json:"created_at"`
+	StartedAt      *time.Time            `json:"started_at,omitempty"`
+	CompletedAt    *time.Time            `json:"completed_at,omitempty"`
+	ErrorMsg       string                `json:"error_msg,omitempty"`
+	CLISessionID   string                `json:"cli_session_id,omitempty"`
+	TmuxWindowName string                `json:"tmux_window_name,omitempty"`
+	TmuxWindowID   string                `json:"tmux_window_id,omitempty"`
+	RunnerType     string                `json:"runner_type,omitempty"`
 	// ParentSessionID names the session that spawned this one. Persisted so a
 	// subagent's lineage survives a TUI restart and its completion report still
 	// has somewhere to go.
@@ -65,6 +69,7 @@ type SessionMeta struct {
 	Prompt         string        `json:"prompt"`
 	Title          string        `json:"title,omitempty"`
 	Model          string        `json:"model,omitempty"`
+	Backend        string        `json:"backend,omitempty"`
 	CLISessionID   string        `json:"cli_session_id,omitempty"`
 	TmuxWindowName string        `json:"tmux_window_name,omitempty"`
 	TmuxWindowID   string        `json:"tmux_window_id,omitempty"`
@@ -473,6 +478,7 @@ func storedToMeta(stored *StoredSession) *SessionMeta {
 		Prompt:          stored.Prompt,
 		Title:           stored.Title,
 		Model:           stored.Model,
+		Backend:         stored.Backend,
 		CLISessionID:    stored.CLISessionID,
 		TmuxWindowName:  stored.TmuxWindowName,
 		TmuxWindowID:    stored.TmuxWindowID,
@@ -502,6 +508,7 @@ func SessionToStored(session *Session, repoName string, output []OutputLine) *St
 		Prompt:          session.Prompt,
 		Title:           session.Title,
 		Model:           session.Model,
+		Backend:         session.Backend,
 		CLISessionID:    session.CLISessionID,
 		TmuxWindowName:  session.TmuxWindowName,
 		TmuxWindowID:    session.TmuxWindowID,
@@ -511,6 +518,10 @@ func SessionToStored(session *Session, repoName string, output []OutputLine) *St
 		StartedAt:       session.StartedAt,
 		CompletedAt:     session.CompletedAt,
 		Output:          output,
+	}
+	if !session.LLMEndpoint.IsZero() {
+		ep := session.LLMEndpoint.Redacted()
+		stored.LLMEndpoint = &ep
 	}
 
 	if session.Error != nil {
@@ -545,6 +556,7 @@ func StoredToSessionInfo(stored *StoredSession) SessionInfo {
 		Prompt:          stored.Prompt,
 		Title:           stored.Title,
 		Model:           stored.Model,
+		Backend:         stored.Backend,
 		CLISessionID:    stored.CLISessionID,
 		TmuxWindowName:  stored.TmuxWindowName,
 		TmuxWindowID:    stored.TmuxWindowID,
