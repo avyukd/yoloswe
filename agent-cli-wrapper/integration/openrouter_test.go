@@ -31,7 +31,12 @@ const (
 	openRouterModel     = "stealth/ox-alpha"
 	openRouterSentinel  = "OPENROUTER-ORANGE-FALCON-83"
 	openRouterPrompt    = "Reply with exactly this single token, nothing else: " + openRouterSentinel
-	openRouterTimeout   = 3 * time.Minute
+	// openRouterTimeout is the budget for ONE attempt; runClaudeLLMEndpoint
+	// builds a fresh deadline per retry, so the claude leg's worst case is
+	// this times claudeMaxAttempts below (10 x 3m = 1800s). That product must
+	// fit this target's bazel timeout — BUILD.bazel sets "eternal" (3600s) and
+	// shows the sum across every case sharing it. Raise one, redo the other.
+	openRouterTimeout = 3 * time.Minute
 )
 
 // TestLLMEndpoint_OpenRouter proves that both wrappers can drive their real
@@ -46,12 +51,14 @@ func TestLLMEndpoint_OpenRouter(t *testing.T) {
 	endpoint := llmendpoint.OpenRouter()
 	endpoint.APIKeyEnv = openRouterAPIKeyEnv
 	smoke := llmEndpointSmokeConfig{
-		label:             "openrouter",
-		model:             openRouterModel,
-		prompt:            openRouterPrompt,
-		sentinel:          openRouterSentinel,
-		timeout:           openRouterTimeout,
-		clientName:        "agent-cli-wrapper-openrouter-test",
+		label:      "openrouter",
+		model:      openRouterModel,
+		prompt:     openRouterPrompt,
+		sentinel:   openRouterSentinel,
+		timeout:    openRouterTimeout,
+		clientName: "agent-cli-wrapper-openrouter-test",
+		// 10 x openRouterTimeout = 1800s worst case; see the budget sum in
+		// BUILD.bazel, which must cover it.
 		claudeMaxAttempts: 10,
 	}
 

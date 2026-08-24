@@ -17,7 +17,14 @@ import (
 
 const (
 	openRouterSettleTimeout = 3 * time.Minute
-	claudeMaxAttempts       = 10
+	// claudeMaxAttempts retries the CLI's intermittent no-text turn (see the
+	// comment in the retry loop below). Each attempt gets its own
+	// openRouterSettleTimeout, so the worst case is the product — 10 x 3m =
+	// 1800s — and that product must fit this target's bazel timeout, which
+	// BUILD.bazel sets to "eternal" (3600s) and justifies with the same sum.
+	// Raising either constant without raising the budget makes the extra
+	// attempts unreachable: bazel kills the shard first, naming nothing.
+	claudeMaxAttempts = 10
 )
 
 type openRouterAttemptResult struct {
