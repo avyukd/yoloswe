@@ -2119,13 +2119,27 @@ func TestDraftHoldIsBoundedByElapsedTime(t *testing.T) {
 	require.Zero(t, panes.pasteCount(), "50 attempts inside the grace period must not release")
 	require.Len(t, c.Pending("s1"), 1)
 
-	// Past the grace period, the same unchanged draft releases.
+	// Past the grace period the delivery is STILL held, and deliberately so.
+	//
+	// This branch used to paste anyway, on the reasoning that a delivery never
+	// made is worse than one landing beside typed text. That trade does not
+	// survive contact with tmux: paste-buffer APPENDS, so the Enter that
+	// follows submits this message joined to the human's half-written sentence
+	// — their words, sent under their name, with no way to take it back. There
+	// is no keystroke bramble may send to clear the line first, because
+	// clearing a composer destroys the draft to deliver a report.
+	//
+	// So an unchanged HUMAN draft holds, the operator is told which session is
+	// blocked, and the queue's own maxDeliveryAge is the backstop rather than
+	// this branch. A composer holding only a stale paste chip is the separate,
+	// decidable case that does release — see
+	// TestAStaleChipIsSubmittedRatherThanPastedOverOrHeldForever.
 	now = now.Add(composerHoldGrace + time.Second)
 	c.Drain(context.Background(), "s1")
 
-	assert.NotZero(t, panes.pasteCount(),
-		"an unchanged draft held past %s must release rather than wait forever", composerHoldGrace)
-	assert.Empty(t, c.Pending("s1"), "the queue must not stay wedged")
+	assert.Zero(t, panes.pasteCount(),
+		"a human's draft is never pasted over, however long it has sat there")
+	assert.Len(t, c.Pending("s1"), 1, "the delivery stays queued and keeps retrying")
 }
 
 // TestActivelyEditedDraftHoldsIndefinitely: a changing draft means somebody is
@@ -2880,4 +2894,69 @@ func TestAChippedPasteLeavesNoStagedRecord(t *testing.T) {
 
 	assert.Empty(t, c.stagedText("s1"),
 		"a record no later comparison could use must not survive the attempt that made it")
+}
+
+// TestAStaleChipIsRedeliveredRatherThanHeldForever is the other half of the
+// grace-period decision, and the case that made it necessary.
+//
+// When claude collapses a delivery to "[Pasted text #N]" and the Enter then
+// fails, the composer holds a chip that no text comparison can match — so every
+// retry reads it as an unidentified draft. But a chip is not a human draft:
+// nobody is at the keyboard to clear it, so holding is holding forever, and the
+// old behaviour of pasting after the grace period appended the message to a
+// chip that already represented it, submitting it twice in one prompt.
+//
+// A composer holding ONLY a chip is therefore SUBMITTED — not pasted into, and
+// not held forever. Anything else holds.
+func TestAStaleChipIsSubmittedRatherThanPastedOverOrHeldForever(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.setPane(claudeComposerPane("[Pasted text #1 +80 lines]"))
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+	require.Zero(t, panes.pasteCount(), "precondition: an unidentified composer holds at first")
+
+	now = now.Add(composerHoldGrace + time.Second)
+	c.Drain(context.Background(), "s1")
+
+	assert.Zero(t, panes.pasteCount(),
+		"pasting would append this message to a chip that already represents it, submitting it twice")
+	assert.Contains(t, panes.recorded(), "enter(@7)",
+		"the text is already in the composer; it only ever needed its Enter")
+	assert.Empty(t, c.Pending("s1"), "and the delivery leaves the queue")
+}
+
+// TestAChipBesideTypedTextIsStillAHumanDraft: "only a chip" is what makes the
+// release decidable. A chip with text next to it says a paste happened AND
+// somebody has been typing, which is a composer with an author — hold it.
+func TestAChipBesideTypedTextIsStillAHumanDraft(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.setPane(claudeComposerPane("[Pasted text #1 +80 lines] and my own question"))
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+	now = now.Add(composerHoldGrace + time.Second)
+	c.Drain(context.Background(), "s1")
+
+	assert.Zero(t, panes.pasteCount(),
+		"a chip beside typed text has an author at the keyboard; never paste over it")
+	assert.Len(t, c.Pending("s1"), 1, "the delivery stays queued")
 }

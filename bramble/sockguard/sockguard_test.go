@@ -223,9 +223,18 @@ func TestConcurrentReclaimYieldsExactlyOneWinner(t *testing.T) {
 		defer func() { _ = os.WriteFile(done, nil, 0o600) }()
 		// Wait for the window to close, not for a duration: once every child
 		// has recorded a verdict, none can still be about to unlink.
-		require.Eventually(t, func() bool {
-			return childrenSettled(gate, racers)
-		}, 30*time.Second, 5*time.Millisecond, "every child must settle")
+		//
+		// Plain polling rather than require.Eventually: testify's require
+		// variants end in t.FailNow, which the testing package documents as
+		// callable only from the goroutine running the test. From here it would
+		// run runtime.Goexit, and a genuine timeout would surface as a confused
+		// partial failure instead of the assertion below. Releasing the winner
+		// on the deadline is the right behaviour anyway — the assertion on the
+		// win count is what reports the result.
+		deadline := time.Now().Add(30 * time.Second)
+		for !childrenSettled(gate, racers) && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
 	}()
 	wg.Wait()
 

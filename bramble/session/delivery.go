@@ -388,6 +388,29 @@ func composerHoldsThisDelivery(provider, composer, staged, text string) bool {
 	return body == first
 }
 
+// isBareChip reports whether a composer holds a paste chip and nothing else.
+//
+// "Nothing else" is what makes it decidable. A chip beside typed text says a
+// paste happened AND somebody has been typing, which is a human's composer; a
+// chip alone is the residue of a paste with nobody behind it. Only the second
+// may be pasted over, and only after the grace period has already shown that
+// nothing is going to clear it.
+func isBareChip(provider, composer string) bool {
+	body := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(composer), claudePromptGlyph))
+	for _, chip := range pasteEvidenceProbes[provider].chipMarkers {
+		if !strings.HasPrefix(body, chip) {
+			continue
+		}
+		// The chip must run to the end of the composer: "[Pasted text #3 +45
+		// lines]" and no more. Anything past the closing bracket is content the
+		// chip does not account for.
+		if end := strings.IndexByte(body, ']'); end == len(body)-1 {
+			return true
+		}
+	}
+	return false
+}
+
 // composerHoldGrace is how long one unchanged draft may hold a delivery.
 //
 // Wall clock, not a retry count. Drain has four callers — the retry timer, every
@@ -444,6 +467,14 @@ type paneHold struct {
 // elapsed timer moves every second — so it restarts this clock continuously and
 // is never released by it, however long it runs. What expires is a verdict on a
 // pane that has stopped changing, which is the shape of a false positive:
+//
+// Measured, not assumed. Sampled against live panes on 2026-08-25: two idle
+// claude panes were byte-identical across a 2s interval, while a working one
+// changed on every sample and its sparkle line advanced every ~3s
+// ("Quantumizing… (1m 1s · ↓ 3.9k tokens)" -> "(1m 4s · ↓ 4.0k)" -> "(1m 7s ·
+// ↓ 4.2k)") — including while a tool call was in flight, which is the case a
+// turn is most often accused of sitting still through. A pane that goes
+// paneHoldGrace without a single character changing is not a turn in progress.
 // claudeLineVerdict reports work for a bare tool line left by an interrupted
 // turn, and spinnerRe matches any line opening "* " or "· ". Those panes are
 // static precisely because nothing is running, and holding on one forever is
@@ -775,15 +806,66 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 				c.clearStaged(info.ID)
 				return errComposerBusy
 			default:
-				// The same draft has now held this delivery for
-				// composerHoldGrace without changing, so nobody is at the
-				// keyboard: a composer is cleared only by a keypress. Holding
-				// longer trades a small risk of landing beside typed text
-				// against never delivering at all, which is the failure class
-				// this PR exists to close. Say so plainly — this is the one
-				// path where a message can join a draft.
-				logDeliveryWarn("composer has held an unchanged draft past the grace period; delivering anyway",
+				// The same content has held this delivery for composerHoldGrace
+				// without changing. Whatever it is, pasting is not the way out
+				// of it: tmux paste-buffer APPENDS, so the Enter that follows
+				// submits this message joined to whatever was already there —
+				// a human's half-written sentence wearing the delivery, or, when
+				// the composer holds a chip of our own earlier paste, the same
+				// message twice in one prompt. That second case is the
+				// double-paste symptom section 1 exists to remove, and an
+				// earlier version of this branch reached it after a five-minute
+				// delay while logging that a human's line had been typed over.
+				//
+				// So the grace period no longer buys a paste. It buys a
+				// WARNING: the delivery stays queued and keeps retrying, and an
+				// operator is told which session is blocked and by what, which
+				// is the actionable half of what this branch was for. Nothing
+				// here can clear the composer safely — the only way is a
+				// keystroke into somebody's pane, which would destroy a draft
+				// to deliver a report — so a composer that never clears is a
+				// situation to surface, not to overwrite.
+				// Two very different things reach this branch, and only one of
+				// them may be pasted over.
+				//
+				// A composer holding ONLY a paste chip is not a human draft at
+				// all: it is the residue of a paste, and the only paste in play
+				// here is one of ours that failed to submit. Nobody is going to
+				// clear it — a chip has no author at the keyboard — so holding
+				// is holding forever, and pasting appends this message to a
+				// chip that already represents it: the same message twice in
+				// one prompt, which is the double-paste symptom section 1
+				// exists to remove.
+				//
+				// Anything else is text a person may still come back to. tmux
+				// paste-buffer APPENDS, so pasting there submits a half-written
+				// sentence wearing this delivery, and no keystroke that could
+				// clear it first is bramble's to send: clearing a composer
+				// destroys a draft to deliver a report. Keep holding and say
+				// which session is blocked; the queue's own maxDeliveryAge is
+				// the backstop, not this branch.
+				if isBareChip(provider, composerText) {
+					// SUBMIT it, do not paste again. The chip is a paste that
+					// was never sent, and the only paste in play here is one of
+					// ours — this branch is reached after composerHoldGrace has
+					// already shown nobody is clearing it. Pasting would append
+					// this message to a chip that already represents it and
+					// submit both as one prompt, which is the double-paste
+					// symptom section 1 exists to remove; an earlier version of
+					// this branch did exactly that, five minutes late and while
+					// logging that a human's line had been typed over.
+					//
+					// Submitting is the action that makes the queue's own
+					// intent true — the text is in the composer, it just never
+					// got its Enter.
+					logDeliveryWarn("composer holds only a stale paste chip past the grace period; submitting it",
+						info.ID, errComposerBusy)
+					alreadyStaged = true
+					break
+				}
+				logDeliveryWarn("composer has held an unchanged human draft past the grace period; delivery still queued",
 					info.ID, errComposerBusy)
+				return errComposerBusy
 			}
 		}
 		c.clearDraftHold(info.ID)
