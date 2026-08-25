@@ -704,13 +704,18 @@ func pasteEvidenceObscured(provider string, lines []string) bool {
 // MarkRunning wedges the session on a turn that never started, which is the
 // failure this check exists to prevent.
 //
-// Where it cannot be located, the pane TAIL is scanned instead. That is the
+// Where it cannot be located, the pane tail is scanned instead. That is the
 // weaker test, but for a CLI whose chrome bramble cannot read it is the only
 // one available — and codex, which is required:true, is exactly such a CLI, so
-// the fallback must be sound rather than merely unreached. Bounding it to the
-// tail is what makes it sound: the transcript above holds every prompt the
-// agent has ever echoed, and letting those confirm a paste means submitting an
-// empty composer on the strength of a delivery that already happened.
+// the fallback must be sound rather than merely unreached.
+//
+// Bounding it is what makes it sound in one direction: the transcript above
+// holds every prompt the agent has ever echoed, and letting those confirm means
+// submitting an empty composer on the strength of a delivery that already
+// happened. Sizing that bound against the CAPTURE rather than against a typical
+// pane is what keeps it sound in the other: see pasteConfirmTailLines, since a
+// bound too tight turns an ordinary wrapped delivery into a false negative and
+// re-pastes it forever.
 func pasteConfirmed(provider string, lines []string, probe string) bool {
 	if probe == "" {
 		return true // nothing distinctive to look for
@@ -748,18 +753,44 @@ func pasteConfirmed(provider string, lines []string, probe string) bool {
 	// empty composer, and the parent wedges at running with the report lost.
 	// That is precisely the failure required:true exists to catch.
 	//
-	// paneIdleTailLines is the same bound the idle probe uses for the same
-	// reason: what is near the bottom is now, what is above it is history.
+	// The bound is pasteConfirmTailLines, NOT paneIdleTailLines. They answer
+	// different questions and so cannot share a depth: the idle probe looks for
+	// footer chrome, which sits a row or two off the bottom whatever the pane
+	// holds, while this looks for the FIRST line of a composer that grows
+	// upward as the delivery wraps. Reusing the footer depth here put an
+	// ordinary wrapped report out of reach and scored it a false negative,
+	// which re-pastes and re-queues — the same trap claudeComposerMaxLines
+	// documents having fallen into at 6.
 	confirmed := false
-	forEachPaneTailLine(lines, func(line string) bool {
-		if confirms(line) {
-			confirmed = true
-			return true
+	seen := 0
+	for i := len(lines) - 1; i >= 0 && seen < pasteConfirmTailLines; i-- {
+		if strings.TrimSpace(lines[i]) == "" {
+			continue
 		}
-		return false
-	})
+		seen++
+		if confirms(lines[i]) {
+			confirmed = true
+			break
+		}
+	}
 	return confirmed
 }
+
+// pasteConfirmTailLines bounds how far up pasteConfirmed's fallback reads.
+//
+// Sized against the capture, exactly as claudeComposerMaxLines is and for the
+// same reason: the thing being reached for is the top of a composer holding
+// THIS delivery, and a composer grows with the message, so any depth picked
+// from a typical pane is a guess about message length. A subagent report is
+// already two or three lines once a result path is set, an error line adds
+// another, and a queued CLI message has no bound at all.
+//
+// What it must still exclude is the transcript, where a previously submitted
+// delivery is echoed and would confirm a paste that never arrived — the probe
+// cannot tell two subagent reports apart. The capture is pasteVerifyLines deep
+// and the composer sits at the bottom of it, so leaving a handful of rows
+// unread at the top keeps history out while giving the composer the rest.
+const pasteConfirmTailLines = pasteVerifyLines - 8
 
 // confirmsComposer is confirms for a LOCATED composer line, where the probe may
 // legitimately be cut short.

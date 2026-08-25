@@ -238,12 +238,16 @@ func (h *harness) restart() {
 // "bramble-<uid>-<pid>.sock". Both are names this harness may meet, which is
 // why the glob is "bramble*.sock" and not "bramble-<uid>.sock".
 //
-// The ping at the end is what settles which one is live, so the loop must not
-// overwrite a candidate it has already accepted: the pid-scoped name sorts
-// BEFORE the stable one, so a last-match-wins loop in a directory holding both
-// would hand the ping whichever came last rather than letting it choose. Taking
-// the first match and letting the ping reject it leaves the retry to
-// require.Eventually, which is where this function's waiting already lives.
+// Which IPC candidate to take is settled by the ping, not by glob order, and
+// the loop must therefore be able to reach past a candidate that does not
+// answer. Retrying does not do it: every Eventually iteration globs the same
+// directory and would re-pick the same first name, so a stale pid-scoped socket
+// — which sorts BEFORE the stable one — would be chosen forever while the live
+// path sat one entry later. So the candidates are pinged in order and the first
+// that answers wins.
+//
+// The single-candidate case, which is every ordinary run, still costs exactly
+// one ping: the same one this function ended with before.
 func (h *harness) awaitSockets(runtimeDir string) {
 	h.t.Helper()
 	require.Eventually(h.t, func() bool {
@@ -256,14 +260,11 @@ func (h *harness) awaitSockets(runtimeDir string) {
 				}
 				continue
 			}
-			if h.ipcSock == "" {
+			if h.ipcSock == "" && ipc.NewClient(s).Ping() == nil {
 				h.ipcSock = s
 			}
 		}
-		if h.ipcSock == "" || h.controlSock == "" {
-			return false
-		}
-		return ipc.NewClient(h.ipcSock).Ping() == nil
+		return h.ipcSock != "" && h.controlSock != ""
 	}, settleTimeout, pollInterval, "bramble never came up on its sockets")
 }
 

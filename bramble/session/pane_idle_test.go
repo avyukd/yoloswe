@@ -915,18 +915,30 @@ func TestCodexTranscriptDoesNotConfirmAPaste(t *testing.T) {
 	report := "[bramble] subagent wt-builder-a1b2c3d4 (builder) is completed"
 	probe := pasteProbe(report)
 
-	// A deep pane: the previous delivery is echoed far above the composer, with
-	// enough intervening rows to put it out of the tail's reach — which is what
-	// a real transcript looks like after the agent has answered it.
+	// A full-depth capture: the previous delivery is echoed at the TOP, with the
+	// agent's answer filling the rows between it and the composer. That is what
+	// a real transcript looks like once the agent has replied, and the capture
+	// is pasteVerifyLines deep, so the fixture has to be too — a shallow
+	// stand-in would sit inside any bound and prove nothing.
 	deep := []string{"  › " + report, "  • I read the report and acted on it."}
-	for i := 0; i < 20; i++ {
+	for len(deep) < pasteVerifyLines {
 		deep = append(deep, "  • still working through it")
 	}
 	assert.False(t, pasteConfirmed(ProviderCodex, codexPane(false, deep...), probe),
 		"a delivery echoed into the transcript must not confirm the NEXT one, which may have been dropped")
 
-	// The paste that actually just arrived sits at the bottom, where the tail
-	// reaches it. Bounding the scan must not cost the real confirmation.
+	// A delivery that WRAPS must still confirm. The composer holds the message
+	// and grows upward, so the probe-bearing first line sits as many rows up as
+	// the message is tall — this is the case a footer-sized bound turned into a
+	// false negative, which re-pastes and re-queues forever.
+	wrapped := []string{"  › " + report}
+	for i := 0; i < 12; i++ {
+		wrapped = append(wrapped, "    continuation of the wrapped delivery")
+	}
+	assert.True(t, pasteConfirmed(ProviderCodex, codexPane(false, wrapped...), probe),
+		"a wrapped delivery's first line is still the composer, however far up it sits")
+
+	// And the ordinary case: the paste just arrived at the bottom.
 	assert.True(t, pasteConfirmed(ProviderCodex,
 		codexPane(false, "  • an earlier turn", "  › "+report), probe),
 		"a paste sitting at the bottom of the pane is what the check is for")
