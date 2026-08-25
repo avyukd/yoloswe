@@ -59,8 +59,8 @@ func TestSocketPathDerivation(t *testing.T) {
 // from the other socket's fallback, or two live brambles would fight over one
 // address — the collision the pid used to prevent by construction.
 func TestPidScopedFallbackIsDistinct(t *testing.T) {
-	ipcFallback := pidScopedSocketPath(userSockName(ipcSockBase))
-	controlFallback := pidScopedSocketPath(userSockName(controlSockBase))
+	ipcFallback := pidScopedSocketPath(ipcSockBase)
+	controlFallback := pidScopedSocketPath(controlSockBase)
 
 	if ipcFallback == ipcSocketPath() || controlFallback == controlSocketPath() {
 		t.Errorf("fallback must differ from the stable path: ipc=%q control=%q", ipcFallback, controlFallback)
@@ -284,7 +284,7 @@ func TestNoSocketIsPublishedWithoutAPrivateDirectory(t *testing.T) {
 
 	assert.Empty(t, ipcSocketPath(), "no IPC socket may be published")
 	assert.Empty(t, controlSocketPath(), "no control socket may be published")
-	assert.Empty(t, pidScopedSocketPath(userSockName(ipcSockBase)),
+	assert.Empty(t, pidScopedSocketPath(ipcSockBase),
 		"the collision fallback derives its own path and must refuse too")
 }
 

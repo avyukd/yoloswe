@@ -3,10 +3,9 @@
 //
 // It exists because bramble publishes two such sockets — the IPC socket and the
 // control socket — and they are published together, so they must make the same
-// decision about a path they find occupied. The logic used to be copied into
-// both servers; the copies had already drifted (one named the liveness timeout,
-// the other inlined it), and a future change to the liveness test or the lock
-// would have landed on one and silently not the other.
+// decision about a path they find occupied. Keeping the logic in one place is
+// what stops a change to the liveness test or the lock from landing on one
+// socket and silently not the other.
 package sockguard
 
 import (

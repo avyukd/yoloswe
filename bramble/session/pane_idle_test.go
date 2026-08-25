@@ -412,6 +412,48 @@ func claudePaneComposer(composer, state string, transcript ...string) []string {
 	)
 }
 
+// composerDraft reports whether claude's composer holds text the user has typed
+// but not yet submitted. A test-only view of composerDraftText, which is what
+// production calls: the draft-detection cases turn on the verdict alone, and
+// the body stays in one place because it carries non-obvious safety rules (the
+// located-but-unreadable composer that reports a hold, and the bounded tail
+// fallback) that must not be duplicated.
+func composerDraft(provider string, lines []string) (draft, known bool) {
+	_, draft, known = composerDraftText(provider, lines)
+	return draft, known
+}
+
+// TestClaudeJudgeSeesAWrappedComposer pins the capture depth to the walk it
+// feeds. A queued delivery routinely wraps claude's composer onto many rows,
+// and every row pushes the rule above it further up: capture too little and
+// claudeComposerIdx never meets that rule, so the judge answers known=false on
+// every poll and the confirmations required to fire can never accumulate. At a
+// 12-line capture a composer 8 rows tall was already invisible.
+func TestClaudeJudgeSeesAWrappedComposer(t *testing.T) {
+	t.Parallel()
+
+	const composer = "\u276f hello"
+	for _, rows := range []int{1, 8, 16} {
+		lines := claudePaneComposer(composer, "\u273b Baking\u2026 (1m 55s)")
+		var wrapped []string
+		for _, l := range lines {
+			wrapped = append(wrapped, l)
+			if l == composer {
+				for i := 1; i < rows; i++ {
+					wrapped = append(wrapped, "  wrapped continuation text")
+				}
+			}
+		}
+		if len(wrapped) > paneIdleCaptureLines {
+			wrapped = wrapped[len(wrapped)-paneIdleCaptureLines:]
+		}
+
+		working, known := claudePaneJudge(wrapped)
+		require.True(t, known, "composer wrapped onto %d rows must stay legible within a %d-line capture", rows, paneIdleCaptureLines)
+		require.True(t, working, "spinner above a %d-row composer must still read as working", rows)
+	}
+}
+
 // TestClaudePaneJudge covers each shape the parser can see. The last group is
 // the one that matters: claude's spinner is sub-second and was never caught in
 // 400+ samples of live monitoring, so a frame with no marker at all is the

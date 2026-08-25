@@ -333,9 +333,9 @@ func (c *Courier) Pending(to SessionID) []Delivery {
 // This is not a matter of taste. Pane appearance cannot distinguish our paste
 // from a user's: a "[Pasted text #N]" chip is what claude renders for ANY
 // paste, so accepting a chip as proof meant a user who pasted a block and had
-// not yet hit Enter got that block submitted for them — the exact harm section
-// 2 of this change exists to prevent — while the delivery was dropped as
-// though it had been written. A short typed line that happens to prefix the
+// not yet hit Enter got that block submitted for them — the exact harm this
+// check exists to prevent — while the delivery was dropped as though it had
+// been written. A short typed line that happens to prefix the
 // message had the same effect in miniature.
 //
 // Matched against the message itself, never against the "[bramble]" prefix. Two
@@ -487,7 +487,7 @@ type paneHold struct {
 // claudeLineVerdict reports work for a bare tool line left by an interrupted
 // turn, and spinnerRe matches any line opening "* " or "· ". Those panes are
 // static precisely because nothing is running, and holding on one forever is
-// the "parent's mail never drains" failure this PR exists to close.
+// the "parent's mail never drains" failure.
 //
 // Longer than composerHoldGrace: a human draft is cleared by a keystroke that
 // may never come, while a genuinely working pane clears this by simply
@@ -755,12 +755,12 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 		// Only a POSITIVE working verdict holds. An unknown pane — a provider
 		// with no probe, a capture that failed, chrome that has not painted —
 		// delivers as before: refusing to deliver into every unreadable pane
-		// would strand mail, which is the failure class this PR exists to
+		// would strand mail, which is the failure class this guard exists to
 		// close.
 		// ONE capture, read by both checks below. They ask different questions
 		// of the same pane and must not disagree about it: two captures
 		// milliseconds apart can show a turn ending between them, and the
-		// second round-trip also widens the paste-to-Enter window this change
+		// second round-trip also widens the paste-to-Enter window the checks
 		// set out to narrow. Empty when nothing here can read this provider's
 		// pane, in which case both checks report unknown without touching tmux.
 		paneLines := c.capturePaneFor(info.ID, provider)
@@ -783,7 +783,7 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 			// ordinary echoed content can read as a spinner. Such a pane is
 			// static because the session is idle, so it never changes its mind,
 			// and holding on it forever is the "parent's mail never drains"
-			// failure this PR exists to close, re-entered through a different
+			// failure this guard exists to close, re-entered through a different
 			// door.
 			//
 			// Deliver anyway and say so. This is the same trade the composer
@@ -806,7 +806,7 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 				// previous attempt pasted it and then failed before pressing
 				// Enter. Do NOT paste again: tmux paste-buffer appends, so a
 				// second copy would be submitted alongside the first as one
-				// prompt, which is the double-paste symptom this change set out
+				// prompt, which is the double-paste symptom the staged record
 				// to remove. The text is already where it needs to be, so skip
 				// straight to submitting it.
 				//
@@ -825,43 +825,23 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 				return errComposerBusy
 			default:
 				// The same content has held this delivery for composerHoldGrace
-				// without changing. Whatever it is, pasting is not the way out
-				// of it: tmux paste-buffer APPENDS, so the Enter that follows
-				// submits this message joined to whatever was already there —
-				// a human's half-written sentence wearing the delivery, or, when
-				// the composer holds a chip of our own earlier paste, the same
-				// message twice in one prompt. That second case is the
-				// double-paste symptom section 1 exists to remove, and an
-				// earlier version of this branch reached it after a five-minute
-				// delay while logging that a human's line had been typed over.
+				// without changing, and neither pasting nor submitting is a way
+				// out. tmux paste-buffer APPENDS, so pasting would submit this
+				// message joined to whatever is already there; and a
+				// "[Pasted text #N]" chip is what claude renders for ANY paste,
+				// so submitting one presses Enter on text that may be a user's
+				// and drops this delivery as though it had been sent. The pane
+				// cannot say whose text it is.
 				//
-				// The grace period no longer buys a paste, and does not buy a
-				// submit either. Both were attempts to decide from the pane
-				// whose text this is, and the pane cannot answer: tmux
-				// paste-buffer APPENDS, so pasting submits this message joined
-				// to a half-written sentence, and a "[Pasted text #N]" chip is
-				// what claude renders for ANY paste, so submitting one presses
-				// Enter on whatever a user pasted and drops this delivery as
-				// though it had been sent. That second reading was tried here
-				// and removed: it is the same chip-as-provenance reasoning
-				// removed from composerHoldsThisDelivery, and by then this file
-				// had already destroyed the one thing that could tell the cases
-				// apart, since a chipped paste deliberately leaves no record.
+				// So the grace period buys a REPORT, once — the delivery stays
+				// queued and keeps retrying. Once, because this branch is
+				// reached on every retry while the composer sits there, and a
+				// warning every retryDelay reads as a recurring fault rather
+				// than one standing condition (same reasoning as the Debug-level
+				// errPaneBusy below).
 				//
-				// So what the grace period buys is a REPORT, once. The
-				// delivery stays queued and keeps retrying, and an operator is
-				// told which session is blocked and by what — but only the
-				// first time, because this branch is reached on every retry for
-				// as long as the composer sits there and a warning every
-				// retryDelay reads like a recurring fault rather than one
-				// standing condition. That is the same reasoning errPaneBusy is
-				// logged at Debug for, a few lines below.
-				//
-				// Say plainly that nothing will retire this on its own. The
-				// queue's maxDeliveryAge only prunes at process start and
-				// DELETES rather than delivers, so it is not a backstop for a
-				// running bramble — an earlier version of this comment claimed
-				// it was, which was worse than saying nothing.
+				// Nothing retires this on its own: maxDeliveryAge only prunes at
+				// process start, and it DELETES rather than delivers.
 				if c.noteBlockedReport(info.ID, composerText) {
 					logDeliveryWarn("composer has held unchanged text past the grace period; delivery stays queued until the composer clears",
 						info.ID, errComposerBusy)
@@ -909,7 +889,7 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 		// probe for everyone — several sleeps plus a CapturePaneText
 		// round-trip per attempt, on every delivery — and
 		// then threw the answer away, while widening the very window between
-		// the draft check and SendEnter that this change set out to close.
+		// the draft check and SendEnter that the claim exists to close.
 		// alreadyStaged means the composer was READ and found to hold this very
 		// message, which is a stronger confirmation than the probe can give:
 		// the probe looks for a fixed-length prefix and a wrapped or truncated
@@ -1109,16 +1089,11 @@ func (c *Courier) pasteIsReadableAsText(ctx context.Context, id SessionID, provi
 	if err != nil {
 		return false
 	}
-	if composerReadable(provider) {
-		composerIdx, _ := claudeComposerIdx(lines)
-		return composerIdx >= 0 && strings.Contains(lines[composerIdx], probe)
-	}
-	for _, line := range lines {
-		if strings.Contains(line, probe) {
-			return true
-		}
-	}
-	return false
+	// Shares pasteConfirmed's scoping so the two cannot disagree about which
+	// rows may answer, but with a text-only predicate: a chip means the paste
+	// arrived, which is precisely what does NOT make it recognizable later.
+	textOnly := func(line string) bool { return strings.Contains(line, probe) }
+	return scanForPaste(provider, lines, textOnly, textOnly)
 }
 
 // pasteVerdict reports whether the paste is visible in the session's pane, and
@@ -1139,7 +1114,7 @@ func (c *Courier) pasteIsReadableAsText(ctx context.Context, id SessionID, provi
 // composer could not be located in it. That is silence, not a negative, and the
 // two must not be conflated: a caller that re-pastes on silence appends a
 // second copy of the message on every attempt and never submits any of them,
-// which is the loop this change set out to remove. Only a readable pane that
+// which is the re-paste loop this distinction exists to remove. Only a readable pane that
 // does NOT show the paste is a real negative.
 func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text string) (landed, readable bool) {
 	var obscured bool
@@ -1147,12 +1122,9 @@ func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text
 	if probe == "" {
 		return true, true // nothing distinctive to look for; do not block delivery
 	}
-	// One budget, because there is only one caller shape. write probes inside
+	// One budget, because there is only one caller shape: write probes inside
 	// `if !alreadyStaged && pasteVerifyRequired(provider)`, so a provider whose
-	// verdict is discarded never reaches here at all — it is not given a
-	// shortened probe, it is given none. A second, best-effort budget lived
-	// here for a caller that does not exist and read as though cursor still
-	// paid a probe per delivery.
+	// verdict is discarded never reaches here at all.
 	for i := 0; i < pasteVerifyAttempts; i++ {
 		// Wait before every attempt but the first: a paste needs a frame to
 		// show up, and sleeping *after* the last one only delays the verdict.
@@ -1197,21 +1169,17 @@ func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text
 // on a turn that never started. Measured: with the head anchor, report #2's
 // probe was found verbatim in report #1's echo four rows up.
 //
-// The tail is better but not a guarantee, and this is not the whole fix — see
-// TestCodexPaneVerdictIsBoundedByWhatBrambleCanSee for the part that is not
-// closed. Two reports differing only in bytes that fall outside the window
-// still collide; what makes that survivable is that the window now spans the
-// varying region for the shapes measured, rather than sitting entirely inside
-// the constant one.
+// The tail is better but not a guarantee: two reports differing only in bytes
+// outside the window still collide. What makes that survivable is that the
+// window spans the varying region for the shapes measured, rather than sitting
+// entirely inside the constant one. See
+// TestCodexPaneVerdictIsBoundedByWhatBrambleCanSee for the residual gap.
 //
 // Still ONE line and still a bounded slice of it: a TUI re-renders a long
 // prompt with its own wrapping and decoration, so only a short run of
 // characters survives verbatim.
 func pasteProbe(text string) string {
-	first := text
-	if i := strings.IndexByte(first, '\n'); i >= 0 {
-		first = first[:i]
-	}
+	first, _, _ := strings.Cut(text, "\n")
 	first = strings.TrimSpace(first)
 	if len(first) > pasteProbeLen {
 		first = first[len(first)-pasteProbeLen:]

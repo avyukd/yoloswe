@@ -152,15 +152,23 @@ func isClaudeSeparator(trimmed string) bool {
 // contentEndIdx is -1 when no rule sits above the composer, which happens when
 // a multi-line composer absorbs it. Callers must treat that as "content region
 // unknown" rather than "no content".
-func claudeComposerIdx(lines []string) (composerIdx, contentEndIdx int) {
-	statusSepIdx := -1
+// statusSepIdx returns the index of the lowest claude status separator, or -1
+// when the capture holds none. Every composer question starts from this line:
+// claude draws the live composer directly above it, so the lowest rule is the
+// only anchor that distinguishes it from an identically-rendered transcript
+// prompt further up.
+func statusSepIdx(lines []string) int {
 	for i := len(lines) - 1; i >= 0; i-- {
 		if isClaudeSeparator(strings.TrimSpace(lines[i])) {
-			statusSepIdx = i
-			break
+			return i
 		}
 	}
-	if statusSepIdx < 0 {
+	return -1
+}
+
+func claudeComposerIdx(lines []string) (composerIdx, contentEndIdx int) {
+	sepIdx := statusSepIdx(lines)
+	if sepIdx < 0 {
 		return -1, -1
 	}
 	// Walk up from the status separator to the rule above it. Everything
@@ -173,7 +181,7 @@ func claudeComposerIdx(lines []string) (composerIdx, contentEndIdx int) {
 	composerIdx = -1
 	seen := 0
 	sawUpperRule := false
-	for i := statusSepIdx - 1; i >= 0 && seen < claudeComposerMaxLines; i-- {
+	for i := sepIdx - 1; i >= 0 && seen < claudeComposerMaxLines; i-- {
 		trimmed := strings.TrimSpace(lines[i])
 		if trimmed == "" {
 			continue
@@ -608,10 +616,20 @@ func decidePaneIdlePoll(tracker *paneIdleTracker, status SessionStatus, lines []
 	return paneIdleActionNone
 }
 
-// paneIdleCaptureLines is how much scrollback the monitor pulls per poll. Small
-// on purpose: only the footer is read, and this runs every couple of seconds
-// for every session with a hookless or hook-correcting probe.
-const paneIdleCaptureLines = 12
+// paneIdleCaptureLines is how much scrollback the monitor pulls per poll.
+//
+// Sized against the walk it feeds, not against a typical footer. claudePaneJudge
+// has to locate the composer, the rule above it, and then up to
+// claudePaneContentTailLines content lines above that — and the composer wraps,
+// which a queued delivery makes it do routinely. Below this depth the walk runs
+// out of capture before it meets the upper rule, claudeComposerIdx reports the
+// composer unfound, and the judge returns known=false on every poll: the
+// confirmations never accumulate, so the probe cannot fire at all. Measured: a
+// composer 8 rows tall was already past a 12-line capture.
+//
+// This is the same depth the delivery path captures at, and for the same
+// reason — claudeComposerMaxLines is sized against it.
+const paneIdleCaptureLines = pasteVerifyLines
 
 // pasteEvidence describes how a provider's pane shows that a paste arrived.
 //
@@ -652,7 +670,7 @@ var pasteEvidenceProbes = map[string]pasteEvidence{
 	// does not apply.
 	//
 	// It has to be required, because this is the same composer composerDraftText
-	// reads: the rest of this change rests on claude's composer being legible,
+	// reads: draft detection rests on claude's composer being legible,
 	// so declining to check it would mean a paste claude's TUI dropped goes
 	// unnoticed — deliver() writes directly rather than queueing, so the
 	// message is lost and MarkRunning wedges the session on a turn that never
@@ -665,7 +683,7 @@ var pasteEvidenceProbes = map[string]pasteEvidence{
 	// cannot produce a false positive that matters — a chip in the pane means
 	// the paste reached the composer, which is exactly what is being asked —
 	// while a false NEGATIVE here re-pastes and re-queues, which is the loop
-	// section 1 of this PR exists to remove.
+	// this verification exists to remove.
 	ProviderClaude: {required: true, chipMarkers: []string{"[Pasted text"}},
 }
 
@@ -720,8 +738,8 @@ func pasteEvidenceObscured(provider string, lines []string) bool {
 // The depth is NOT what separates those two cases, and it cannot be. Both
 // scale with things this code cannot see — a composer grows with the message,
 // an echo's depth shrinks with a short reply — so any constant fails one of
-// them; two rounds of this change picked a number and each reopened the other
-// side. What actually separates them is the PROBE, which now tells two
+// them, and a number picked for either one alone reopens the other. What
+// actually separates them is the PROBE, which now tells two
 // deliveries apart (see pasteProbe). The bound only keeps the scan from
 // wandering arbitrarily far up a capture.
 //
@@ -738,12 +756,24 @@ func pasteConfirmed(provider string, lines []string, probe string) bool {
 		return true // nothing distinctive to look for
 	}
 	chips := pasteEvidenceProbes[provider].chipMarkers
-	confirms := func(line string) bool {
-		return strings.Contains(line, probe) || containsAny(line, chips)
-	}
+	return scanForPaste(provider, lines,
+		func(line string) bool { return confirmsComposer(line, probe, chips) },
+		func(line string) bool { return strings.Contains(line, probe) || containsAny(line, chips) })
+}
+
+// scanForPaste applies a paste predicate to the part of a capture that can
+// legitimately answer for it: a located composer where one is readable, and a
+// bounded tail of the pane otherwise.
+//
+// Both callers must scope the same way, and for the same reason — the region
+// excluded here is the transcript, where an echo of a PREVIOUS delivery matches
+// a probe just as well as the live composer does. See pasteConfirmTailLines.
+// They differ only in what counts as a match on one line, which is the
+// predicate: pasteConfirmed accepts a chip, pasteIsReadableAsText must not.
+func scanForPaste(provider string, lines []string, onComposer, onTail func(string) bool) bool {
 	if composerReadable(provider) {
 		if composerIdx, _ := claudeComposerIdx(lines); composerIdx >= 0 {
-			return confirmsComposer(lines[composerIdx], probe, chips)
+			return onComposer(lines[composerIdx])
 		}
 		// The composer could not be located, so there is nothing to read. Do
 		// not fall back to the whole-pane scan here: this provider's verdict
@@ -778,19 +808,17 @@ func pasteConfirmed(provider string, lines []string, probe string) bool {
 	// ordinary wrapped report out of reach and scored it a false negative,
 	// which re-pastes and re-queues — the same trap claudeComposerMaxLines
 	// documents having fallen into at 6.
-	confirmed := false
 	seen := 0
 	for i := len(lines) - 1; i >= 0 && seen < pasteConfirmTailLines; i-- {
 		if strings.TrimSpace(lines[i]) == "" {
 			continue
 		}
 		seen++
-		if confirms(lines[i]) {
-			confirmed = true
-			break
+		if onTail(lines[i]) {
+			return true
 		}
 	}
-	return confirmed
+	return false
 }
 
 // pasteConfirmTailLines bounds how far up pasteConfirmed's fallback reads.
@@ -856,20 +884,8 @@ func composerReadable(provider string) bool {
 	return provider == ProviderClaude
 }
 
-// composerDraft reports whether claude's composer holds text the user has
-// typed but not yet submitted.
-//
-// A thin wrapper over composerDraftText, which is what production calls. It
-// exists so the draft-detection tests read as the question they are asking; the
-// body lives in one place because both copies carried the same non-obvious
-// safety rules (the located-but-unreadable composer that reports a hold, and
-// the bounded tail fallback), and two copies of a safety rule is one too many.
-func composerDraft(provider string, lines []string) (draft, known bool) {
-	_, draft, known = composerDraftText(provider, lines)
-	return draft, known
-}
-
-// composerDraftText is composerDraft plus the draft's text, for callers that
+// composerDraftText reports whether claude's composer holds an unsubmitted
+// draft, plus the draft's text, for callers that
 // must tell one draft from another — a hold restarts when the text changes,
 // since a changing draft means somebody is still typing.
 func composerDraftText(provider string, lines []string) (text string, draft, known bool) {
@@ -938,17 +954,11 @@ func composerDraftText(provider string, lines []string) (text string, draft, kno
 // with the same `❯`, so a scan that takes the nearest glyph latches onto
 // scrollback and reports a draft that never clears.
 func lineAboveStatusRule(lines []string) (string, bool) {
-	statusSepIdx := -1
-	for i := len(lines) - 1; i >= 0; i-- {
-		if isClaudeSeparator(strings.TrimSpace(lines[i])) {
-			statusSepIdx = i
-			break
-		}
-	}
-	if statusSepIdx < 0 {
+	sepIdx := statusSepIdx(lines)
+	if sepIdx < 0 {
 		return "", false
 	}
-	for i := statusSepIdx - 1; i >= 0; i-- {
+	for i := sepIdx - 1; i >= 0; i-- {
 		if strings.TrimSpace(lines[i]) == "" {
 			continue
 		}
@@ -963,12 +973,7 @@ func lineAboveStatusRule(lines []string) (string, bool) {
 // (a booting CLI, a cleared screen, a capture that raced a redraw), and
 // claiming a draft there would hold mail against a pane that has no composer.
 func searchedForComposer(lines []string) bool {
-	for i := len(lines) - 1; i >= 0; i-- {
-		if isClaudeSeparator(strings.TrimSpace(lines[i])) {
-			return true
-		}
-	}
-	return false
+	return statusSepIdx(lines) >= 0
 }
 
 // judgeComposerLine reports whether one composer line holds a draft.

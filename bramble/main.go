@@ -608,9 +608,9 @@ func ownedByCurrentUser(info os.FileInfo) bool {
 // isolates per user when XDG_RUNTIME_DIR is set; its fallback is os.TempDir(),
 // which on a host without systemd is the shared /tmp. Without the uid, two
 // users on such a host contend for one name: the loser takes the pid-scoped
-// fallback, which silently restores the stranding bug this change fixes, and
-// any local user can force every bramble on the box onto that fallback just by
-// binding the name first.
+// fallback, which silently restores the stranding bug, and any local user can
+// force every bramble on the box onto that fallback just by binding the name
+// first.
 const (
 	ipcSockBase     = "bramble"
 	controlSockBase = "bramble-control"
@@ -683,7 +683,7 @@ func stableOrPidScoped(base string) string {
 // process holding the stable path keep reaching that one. Both work — what
 // must never happen is a second bramble unlinking a socket the first is still
 // serving, which would strand every one of its windows.
-func pidScopedSocketPath(name string) string {
+func pidScopedSocketPath(base string) string {
 	// Same rule as stableOrPidScoped: no private directory, no socket. This is
 	// the collision fallback, so it only runs when a stable path was already
 	// published — but it derives its own path, and deriving it from bare
@@ -693,8 +693,9 @@ func pidScopedSocketPath(name string) string {
 	if !private {
 		return ""
 	}
-	base := strings.TrimSuffix(name, ".sock")
-	return filepath.Join(dir, fmt.Sprintf("%s-%d.sock", base, os.Getpid()))
+	// Keeps the uid qualifier userSockName adds, so the fallback stays per-user
+	// exactly as the stable path is.
+	return filepath.Join(dir, fmt.Sprintf("%s-%d-%d.sock", base, os.Getuid(), os.Getpid()))
 }
 
 // publishSockPaths makes both socket paths visible to every session the manager
@@ -714,43 +715,58 @@ func publishSockPaths(m *session.Manager, shared *session.ManagerConfig, ipcSock
 	shared.ControlSockPath = controlSockPath
 }
 
-// bindIPCServer starts the IPC server on the stable socket path, falling back
-// to a pid-scoped one when another live bramble already serves it. It returns
-// the server and the path actually bound, so the caller publishes an address
-// that is really listening rather than the one it hoped for.
-func bindIPCServer(registry *session.SessionRegistry, wtRoot, repoName string) (*ipc.Server, string) {
-	sockPath := ipcSocketPath()
-	if sockPath == "" {
+// bindWithFallback binds a socket server to the stable path, falling back to a
+// pid-scoped one when another live bramble already serves it. It returns the
+// path actually bound, or "" when nothing could be bound.
+//
+// The two sockets are published together and must make the SAME choice — a
+// window left with one live address and one dead one is the drift sockguard was
+// extracted to stop — so the decision lives here once rather than being written
+// out per caller. bind reports its own errors by class; inUse is the sentinel
+// that means "another live process holds this path", and it is the ONLY cause
+// that earns a fallback. Falling back on any failure would take the collision
+// path for a cause it does not fix (a missing directory, a permission error).
+func bindWithFallback(kind, stable, base string, inUse error, bind func(path string) error) string {
+	if stable == "" {
 		// No private directory: stableOrPidScoped has already said so, loudly.
-		return nil, ""
+		return ""
 	}
-	srv, err := startIPCServer(registry, sockPath, wtRoot, repoName)
+	err := bind(stable)
 	if err == nil {
-		return srv, sockPath
+		return stable
 	}
-	// The fallback is for ONE cause — another live bramble holds the stable
-	// path — and the error class is what says so. Falling back on any failure
-	// would take the collision path for a cause the collision path does not
-	// fix (a missing directory, a permission error), and would diverge from
-	// startControlServer, which branches on its own ErrSocketInUse. These two
-	// paths are published together; a window with one live address and one dead
-	// one is the drift sockguard was extracted to stop.
-	if !errors.Is(err, ipc.ErrSocketInUse) {
-		slog.Warn("IPC server failed to bind", "path", sockPath, "err", err)
-		return nil, ""
+	if !errors.Is(err, inUse) {
+		slog.Warn("socket failed to bind", "kind", kind, "path", stable, "err", err)
+		return ""
 	}
-	fallback := pidScopedSocketPath(userSockName(ipcSockBase))
+	fallback := pidScopedSocketPath(base)
 	if fallback == "" {
+		return ""
+	}
+	slog.Warn("stable socket is served by another bramble; falling back",
+		"kind", kind, "stable", stable, "fallback", fallback)
+	if err := bind(fallback); err != nil {
+		slog.Warn("socket failed to bind", "kind", kind, "path", fallback, "err", err)
+		return ""
+	}
+	return fallback
+}
+
+// bindIPCServer starts the IPC server via bindWithFallback. It returns the
+// server and the path actually bound, so the caller publishes an address that
+// is really listening rather than the one it hoped for.
+func bindIPCServer(registry *session.SessionRegistry, wtRoot, repoName string) (*ipc.Server, string) {
+	var srv *ipc.Server
+	bound := bindWithFallback("ipc", ipcSocketPath(), ipcSockBase, ipc.ErrSocketInUse,
+		func(path string) error {
+			var err error
+			srv, err = startIPCServer(registry, path, wtRoot, repoName)
+			return err
+		})
+	if bound == "" {
 		return nil, ""
 	}
-	slog.Warn("stable IPC socket is served by another bramble; falling back",
-		"stable", sockPath, "fallback", fallback)
-	srv, err = startIPCServer(registry, fallback, wtRoot, repoName)
-	if err != nil {
-		slog.Warn("IPC server failed to bind", "path", fallback, "err", err)
-		return nil, ""
-	}
-	return srv, fallback
+	return srv, bound
 }
 
 // startIPCServer binds the IPC server to sockPath but does NOT begin accepting.
@@ -867,35 +883,18 @@ func newDispatcher(registry *session.SessionRegistry, courier *session.Courier) 
 	return disp
 }
 
-// startControlServer starts the control-protocol Unix server backed by the
-// session registry and a real tmux controller. Returns nil if it fails to
-// start (non-fatal — the TUI still runs, only remote/CLI control is absent).
-// startControlServer binds the control socket, preferring the stable path and
-// falling back to a pid-scoped one when another live bramble holds it. Same
-// reasoning as bindIPCServer: the two paths are published together, so they
-// must make the same choice rather than leaving a window with one live address
-// and one dead one.
+// startControlServer binds the control socket via bindWithFallback, which is
+// also what binds the IPC socket — the two are published together and must make
+// the same choice about an occupied path.
 func startControlServer(registry *session.SessionRegistry, courier *session.Courier) *control.UnixServer {
 	dispatcher := newDispatcher(registry, courier)
-	sockPath := controlSocketPath()
-	if sockPath == "" {
-		// No private directory: stableOrPidScoped has already said so, loudly.
-		return nil
-	}
-	srv := control.NewUnixServer(sockPath, dispatcher)
-	err := srv.Start()
-	if errors.Is(err, control.ErrSocketInUse) {
-		fallback := pidScopedSocketPath(userSockName(controlSockBase))
-		if fallback == "" {
-			return nil
-		}
-		slog.Warn("stable control socket is served by another bramble; falling back",
-			"stable", sockPath, "fallback", fallback)
-		srv = control.NewUnixServer(fallback, dispatcher)
-		err = srv.Start()
-	}
-	if err != nil {
-		slog.Warn("control server failed to start", "err", err)
+	var srv *control.UnixServer
+	bound := bindWithFallback("control", controlSocketPath(), controlSockBase, control.ErrSocketInUse,
+		func(path string) error {
+			srv = control.NewUnixServer(path, dispatcher)
+			return srv.Start()
+		})
+	if bound == "" {
 		return nil
 	}
 	return srv

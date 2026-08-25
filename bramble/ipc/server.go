@@ -24,9 +24,6 @@ type Server struct {
 	cancel     context.CancelFunc
 	socketPath string
 	wg         sync.WaitGroup
-	// bound records that this server actually acquired the socket, so Close
-	// unlinks only a path this process owns. See Close.
-	bound bool
 }
 
 // NewServer creates a new IPC server but does not start listening.
@@ -92,7 +89,7 @@ func (s *Server) Start() error {
 // across restarts — so a tmux window left by a previous bramble can fire into
 // it the instant it binds. A session built in that window before the path was
 // published would carry an empty address and stay mute forever, which is the
-// failure deliverable 3 exists to close.
+// failure this split exists to close.
 //
 // Call Serve once the path has been published. Start does both, for callers
 // with nothing to publish.
@@ -105,7 +102,6 @@ func (s *Server) Bind() error {
 		return err
 	}
 	s.listener = ln
-	s.bound = true
 	return nil
 }
 
@@ -118,7 +114,6 @@ func (s *Server) Serve() {
 	go s.acceptLoop()
 }
 
-// Close shuts down the server, closes the listener, waits for in-flight connections, and removes the socket file.
 // Close shuts down the server, waits for in-flight connections, and removes the
 // socket file — but only if this server is the one that bound it.
 //
@@ -131,11 +126,14 @@ func (s *Server) Serve() {
 func (s *Server) Close() error {
 	s.cancel()
 	var err error
-	if s.listener != nil {
+	bound := s.listener != nil
+	if bound {
 		err = s.listener.Close()
 	}
 	s.wg.Wait()
-	if s.bound {
+	// Only a server that bound the path may unlink it; the listener is assigned
+	// on nothing but a successful bind.
+	if bound {
 		os.Remove(s.socketPath)
 	}
 	return err

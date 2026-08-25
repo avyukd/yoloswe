@@ -29,9 +29,6 @@ type UnixServer struct {
 	cancel     context.CancelFunc
 	socketPath string
 	wg         sync.WaitGroup
-	// bound records that this server actually acquired the socket, so Close
-	// unlinks only a path this process owns. See Close.
-	bound bool
 }
 
 // NewUnixServer creates a control server bound to socketPath (not yet started).
@@ -71,7 +68,6 @@ func (s *UnixServer) Start() error {
 		return fmt.Errorf("control: %w", err)
 	}
 	s.ln = ln
-	s.bound = true
 	s.wg.Add(1)
 	go s.acceptLoop()
 	return nil
@@ -96,19 +92,20 @@ func (s *UnixServer) acceptLoop() {
 	}
 }
 
-// Close stops the server, closes the listener, waits for in-flight connections,
-// and removes the socket file.
 // Close stops the server and removes the socket file, but only if this server
 // bound it. Mirrors ipc.Server.Close: a server whose Start lost to a live peer
 // never owned the path, and unlinking it would strand that peer's sessions.
 func (s *UnixServer) Close() error {
 	s.cancel()
 	var err error
-	if s.ln != nil {
+	bound := s.ln != nil
+	if bound {
 		err = s.ln.Close()
 	}
 	s.wg.Wait()
-	if s.bound {
+	// Only a server that bound the path may unlink it; ln is assigned on nothing
+	// but a successful bind.
+	if bound {
 		os.Remove(s.socketPath)
 	}
 	return err
