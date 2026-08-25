@@ -303,10 +303,21 @@ func claudePaneJudge(lines []string) (working, known bool) {
 	return false, false
 }
 
-// claudeComposerMaxLines bounds the composer walk. A composer wraps over a few
-// lines at most before claude scrolls it; without a bound, a capture with no
-// upper rule walks to the top and calls arbitrary transcript the composer.
-const claudeComposerMaxLines = 6
+// claudeComposerMaxLines bounds the composer walk. Without a bound, a capture
+// with no upper rule walks to the top and calls arbitrary transcript the
+// composer.
+//
+// Sized against the capture, not against a typical composer. The walk is what
+// separates "a composer taller than this" from "not a composer at all", and a
+// composer genuinely does grow past a handful of lines — a wrapped 500-char
+// delivery, or a long human draft, does it routinely. At 6 those ordinary panes
+// came back unfound, and every consumer of unfound then failed in the unsafe
+// direction: the paste check re-pasted in a loop, and the draft check delivered
+// into the draft. Both are now fail-safe on their own (see pasteEvidenceObscured and
+// composerDraftText), but the bound should not be manufacturing the case in the
+// first place, so it is the capture depth the walk actually gets — deliveries
+// capture pasteVerifyLines — less the few rows of chrome below the composer.
+const claudeComposerMaxLines = pasteVerifyLines - 6
 
 // claudePaneContentTailLines bounds how far up the content region is read.
 // Deep enough that a sparkle line pushed up by a recap or a tip is still found
@@ -677,6 +688,25 @@ func pasteVerifyRequired(provider string) bool {
 // Where it cannot be located, the whole capture is scanned as before. That is
 // the weaker test, but for a CLI whose chrome bramble cannot read it is the
 // only one available, and those providers are not required:true.
+// pasteEvidenceObscured reports the one shape in which a capture says nothing
+// about a paste rather than denying it: this provider's chrome is on screen —
+// so the pane is painted and the CLI is up — yet the composer could not be
+// located within it, which is what a composer taller than the walk looks like.
+//
+// Every other unreadable capture stays a negative. An empty or half-painted
+// pane is exactly what a dropped paste looks like, and calling that silence
+// would press Enter on an empty prompt: a turn starts with no message, the
+// delivery is dropped as sent, and MarkRunning wedges the session.
+func pasteEvidenceObscured(provider string, lines []string) bool {
+	if !composerReadable(provider) {
+		return false
+	}
+	if composerIdx, _ := claudeComposerIdx(lines); composerIdx >= 0 {
+		return false
+	}
+	return searchedForComposer(lines)
+}
+
 func pasteConfirmed(provider string, lines []string, probe string) bool {
 	if probe == "" {
 		return true // nothing distinctive to look for
@@ -692,6 +722,12 @@ func pasteConfirmed(provider string, lines []string, probe string) bool {
 		// The composer could not be located, so there is nothing to read. Do
 		// not fall back to the whole-pane scan here: this provider's verdict
 		// gates Enter, and a transcript match would submit an empty composer.
+		//
+		// Nor is this a negative. Callers must treat an unlocatable composer as
+		// unreadable rather than as "the paste is absent" — see
+		// Courier.pasteVerdict, which stops re-pasting once the pane has stopped
+		// being legible. Answering false here and letting a caller read it as a
+		// negative is what re-pasted a message on every retry forever.
 		return false
 	}
 	for _, line := range lines {
@@ -746,6 +782,41 @@ func composerDraftText(provider string, lines []string) (text string, draft, kno
 		}
 		return line, draft, known
 	}
+	// The composer could not be located by the bounded walk.
+	if searchedForComposer(lines) {
+		// The walk failed, but position still says where the composer must be:
+		// claude draws it immediately above the status rule. Read that line
+		// directly. When it carries the glyph the composer IS legible — the
+		// walk only failed to bound the region above — and its verdict is the
+		// real one, which is what keeps an empty composer under an unbounded
+		// region from holding mail forever.
+		if line, ok := lineAboveStatusRule(lines); ok {
+			if draft, known := judgeComposerLine(line); known {
+				return strings.TrimSpace(line), draft, known
+			}
+		}
+		// No glyph there either: something is in the composer region this
+		// parser cannot read, and the commonest reason is a composer holding
+		// many lines — precisely a long draft, the case most worth protecting.
+		//
+		// The tail scan that used to run here read the last paneIdleTailLines
+		// rows, three of which are chrome (status rule, status line,
+		// permissions line) on a real pane. A composer taller than the
+		// remainder never showed its `❯` line, so the scan reported
+		// known=false — which means deliver — straight into that draft.
+		//
+		// Report a hold instead. The cost of being wrong is bounded and
+		// visible: a delivery waits out composerHoldGrace and is then written
+		// anyway with a logged warning. The cost of the other error is a
+		// human's half-written sentence submitted with a message stapled to
+		// it, which is unrecoverable.
+		return "", true, true
+	}
+	// No status rule anywhere in the capture, so this is not the bounded-walk
+	// failure above — it is a capture with no claude chrome to walk at all: a
+	// bare fixture, a pane mid-redraw, a CLI still booting. The tail scan is
+	// the only reader left, and it is sound here precisely because there is no
+	// chrome below the composer competing for those rows.
 	forEachPaneTailLine(lines, func(line string) bool {
 		if !strings.HasPrefix(strings.TrimSpace(line), claudePromptGlyph) {
 			return false
@@ -755,6 +826,47 @@ func composerDraftText(provider string, lines []string) (text string, draft, kno
 		return true
 	})
 	return text, draft, known
+}
+
+// lineAboveStatusRule returns the first non-empty line above the lowest status
+// rule — where claude always draws its live composer, whether or not the rule
+// bounding the region above it survived the capture.
+//
+// Position is the whole point: claude renders every submitted transcript prompt
+// with the same `❯`, so a scan that takes the nearest glyph latches onto
+// scrollback and reports a draft that never clears.
+func lineAboveStatusRule(lines []string) (string, bool) {
+	statusSepIdx := -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		if isClaudeSeparator(strings.TrimSpace(lines[i])) {
+			statusSepIdx = i
+			break
+		}
+	}
+	if statusSepIdx < 0 {
+		return "", false
+	}
+	for i := statusSepIdx - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) == "" {
+			continue
+		}
+		return lines[i], true
+	}
+	return "", false
+}
+
+// searchedForComposer reports whether the capture is one where claude's
+// composer should have been findable — i.e. it shows the status separator the
+// walk starts from. Without that rule the pane is not claude chrome at all
+// (a booting CLI, a cleared screen, a capture that raced a redraw), and
+// claiming a draft there would hold mail against a pane that has no composer.
+func searchedForComposer(lines []string) bool {
+	for i := len(lines) - 1; i >= 0; i-- {
+		if isClaudeSeparator(strings.TrimSpace(lines[i])) {
+			return true
+		}
+	}
+	return false
 }
 
 // judgeComposerLine reports whether one composer line holds a draft.
@@ -778,6 +890,6 @@ func judgeComposerLine(line string) (draft, known bool) {
 	// decided here. The prefix alone is user-controllable — anyone can type
 	// "[bramble] ..." into their composer — so only the courier, which knows
 	// what it actually queued for this recipient, can tell its own message from
-	// a draft that merely looks like one. See Courier.draftIsOurOwnDelivery.
+	// a draft that merely looks like one. See composerHoldsThisDelivery.
 	return true, true
 }

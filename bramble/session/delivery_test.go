@@ -2350,11 +2350,17 @@ func TestUnreadableComposerCostsNoPaneCapture(t *testing.T) {
 	require.NoError(t, err)
 
 	// Cursor's composer cannot be read and its paste evidence is not required,
-	// so neither check should reach tmux.
+	// so neither of those checks may reach tmux.
 	require.False(t, composerReadable(ProviderCursor), "precondition")
 	require.False(t, pasteVerifyRequired(ProviderCursor), "precondition")
-	assert.Zero(t, target.captures(),
-		"no pane capture may be made for a provider whose verdict is discarded")
+	// One capture, and only one: the pane's own working verdict, which cursor
+	// does have a probe for and which is the ONLY thing standing between a
+	// delivery and a live cursor turn — cursor reports no turn ends at all, so
+	// info.Status can say idle for a session that is running. Every other check
+	// must still cost nothing here.
+	require.True(t, providerHasIdleProbe(ProviderCursor), "precondition")
+	assert.Equal(t, 1, target.captures(),
+		"exactly the working check captures; a provider whose composer and paste verdict are both discarded pays for neither")
 }
 
 // TestStagedDeliveryIsSubmittedNotRePasted: tmux paste-buffer APPENDS into the
@@ -2470,4 +2476,113 @@ func TestPlainQueuedMessageIsNotDuplicated(t *testing.T) {
 	// holding it — so the queue never drains. Assert it was actually delivered.
 	assert.Contains(t, panes.recorded(), "enter(@7)", "it must be submitted, not held")
 	assert.Empty(t, c.Pending("s1"), "and must leave the queue")
+}
+
+// TestUserPasteIsNotMistakenForOurOwnStagedDelivery pins the ownership rule
+// that decides whether a non-empty composer gets Enter pressed on it.
+//
+// A "[Pasted text #N]" chip is what claude renders for ANY paste, including one
+// the USER made and has not yet submitted. Accepting a chip as proof that
+// bramble staged the delivery meant that user's block was submitted for them —
+// the exact harm the draft hold exists to prevent — while the delivery itself
+// was never written yet was dropped from the queue as though it had been.
+//
+// The only thing that can answer "did bramble put this here" is bramble's own
+// record of having pasted it, which this courier has not.
+func TestUserPasteIsNotMistakenForOurOwnStagedDelivery(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	// The user pasted something and has not hit Enter.
+	target.appendPane(claudeComposerPane("[Pasted text #3 +45 lines]"))
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	assert.NotContains(t, panes.recorded(), "enter(@7)",
+		"a chip is not proof the composer is ours; submitting it sends the user's paste")
+	assert.Len(t, c.Pending("s1"), 1,
+		"and the delivery must stay queued rather than be dropped as delivered")
+}
+
+// TestShortDraftPrefixingTheMessageIsNotOurs is the same rule in miniature: a
+// one-sided prefix match let a short typed line that happens to begin the
+// message pass as bramble's own staged text.
+func TestShortDraftPrefixingTheMessageIsNotOurs(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.appendPane(claudeComposerPane("a report"))
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	assert.NotContains(t, panes.recorded(), "enter(@7)",
+		"a typed line that merely prefixes the message must not be submitted")
+	assert.Len(t, c.Pending("s1"), 1, "the delivery stays queued")
+}
+
+// TestPaneShowingAWorkingTurnHoldsTheDelivery covers the loop seen in
+// production: bramble's bookkeeping said idle (codex's notify hook fires ahead
+// of its prompt being ready), so a delivery was pasted into a live turn, the
+// TUI discarded it, verification failed, and the pair repeated every retryDelay
+// for as long as the turn ran — one "paste did not reach ...'s prompt" warning
+// per retry, per stuck session.
+//
+// The recipient's own pane is the authority on whether its turn is over.
+func TestPaneShowingAWorkingTurnHoldsTheDelivery(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux) // bookkeeping says idle...
+	target.setBackend("s1", ProviderCodex, "gpt-5.6-terra")
+	// ...but codex's own pane says otherwise.
+	target.appendPane(strings.Join([]string{
+		"• Ran 3 commands · ctrl + t to view transcript",
+		"◦ Working (28s • esc to interrupt)",
+		"",
+		"› Ask Codex to do anything",
+	}, "\n"))
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	assert.Zero(t, panes.pasteCount(),
+		"nothing may be pasted into a pane whose CLI says a turn is in flight")
+	assert.Len(t, c.Pending("s1"), 1, "the delivery rides the next idle transition")
+}
+
+// TestUnknownPaneStillDelivers is the other half of that rule. Only a POSITIVE
+// working verdict holds; refusing to deliver into every pane bramble cannot
+// read would strand mail, which is the failure class this PR exists to close.
+func TestUnknownPaneStillDelivers(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderCodex, "gpt-5.6-terra")
+	// No codex chrome at all: the pane says nothing either way.
+	target.appendPane("some unrelated output")
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	assert.Contains(t, panes.recorded(), "enter(@7)", "an unreadable pane must not wedge the queue")
+	assert.Empty(t, c.Pending("s1"))
 }

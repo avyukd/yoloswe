@@ -9,8 +9,8 @@ import (
 	"net"
 	"os"
 	"sync"
-	"syscall"
-	"time"
+
+	"github.com/bazelment/yoloswe/bramble/sockguard"
 )
 
 // Handler processes an IPC request and returns a result or error.
@@ -53,28 +53,11 @@ func (s *Server) SocketPath() string {
 // ErrSocketInUse reports that another live process is already serving the
 // socket path. Callers that can fall back to a different path check for this;
 // everything else treats it as fatal.
-var ErrSocketInUse = errors.New("socket is already served by a live process")
-
-// socketLiveness bounds the wait for an existing socket to answer. A live
-// server accepts immediately — this only has to outlast scheduling noise, not
-// a slow handler, because connecting at all is the whole signal.
-const socketLiveness = 250 * time.Millisecond
-
-// socketInUse reports whether something is already listening on path.
 //
-// Connecting is the test, not pinging: a Unix socket that accepts a connection
-// has a live listener behind it, and a stale file left by a killed process
-// refuses with ECONNREFUSED. Sending a request would additionally require the
-// peer to be a bramble that speaks this protocol, which is a stronger claim
-// than needed and would hang on a peer that accepts but never replies.
-func socketInUse(path string) bool {
-	conn, err := net.DialTimeout("unix", path, socketLiveness)
-	if err != nil {
-		return false
-	}
-	conn.Close()
-	return true
-}
+// Wraps sockguard.ErrInUse: the bind logic is shared with the control socket
+// (the two are published together and must make the same decision), while this
+// package keeps its own sentinel because callers already match on it.
+var ErrSocketInUse = fmt.Errorf("ipc: %w", sockguard.ErrInUse)
 
 // Start begins listening on the Unix domain socket.
 //
@@ -114,15 +97,12 @@ func (s *Server) Start() error {
 // Call Serve once the path has been published. Start does both, for callers
 // with nothing to publish.
 func (s *Server) Bind() error {
-	ln, err := net.Listen("unix", s.socketPath)
+	ln, err := sockguard.Listen(s.socketPath)
 	if err != nil {
-		if !isAddrInUse(err) {
-			return fmt.Errorf("failed to listen on %s: %w", s.socketPath, err)
+		if errors.Is(err, sockguard.ErrInUse) {
+			return fmt.Errorf("%w: %s", ErrSocketInUse, s.socketPath)
 		}
-		ln, err = reclaimStaleSocket(s.socketPath)
-		if err != nil {
-			return err
-		}
+		return err
 	}
 	s.listener = ln
 	s.bound = true
@@ -136,51 +116,6 @@ func (s *Server) Serve() {
 	}
 	s.wg.Add(1)
 	go s.acceptLoop()
-}
-
-// reclaimStaleSocket takes the path if nothing is listening on it, holding a
-// lock file across the whole check-unlink-bind sequence so two processes cannot
-// both decide the same file is stale.
-//
-// The lock is advisory (flock) and its file is never removed: unlinking a lock
-// is what reintroduces the race it prevents, since two processes can then hold
-// locks on different inodes for the same name. One empty file per socket path
-// is a small price.
-func reclaimStaleSocket(socketPath string) (net.Listener, error) {
-	lock, err := os.OpenFile(socketPath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open socket lock for %s: %w", socketPath, err)
-	}
-	defer lock.Close()
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
-		return nil, fmt.Errorf("failed to lock socket %s: %w", socketPath, err)
-	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-
-	// Re-test under the lock. Another process may have reclaimed and bound the
-	// path while this one waited, in which case it is live and must be left be.
-	if socketInUse(socketPath) {
-		return nil, fmt.Errorf("%w: %s", ErrSocketInUse, socketPath)
-	}
-	// Nothing answered and no other reclaimer can be running, so the file is
-	// stale.
-	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("failed to remove stale socket %s: %w", socketPath, err)
-	}
-	ln, err := net.Listen("unix", socketPath)
-	if err != nil {
-		if isAddrInUse(err) {
-			return nil, fmt.Errorf("%w: %s", ErrSocketInUse, socketPath)
-		}
-		return nil, fmt.Errorf("failed to listen on %s: %w", socketPath, err)
-	}
-	return ln, nil
-}
-
-// isAddrInUse reports whether a listen failed because the path is already
-// taken, which for a Unix socket is any existing file at that path.
-func isAddrInUse(err error) bool {
-	return errors.Is(err, syscall.EADDRINUSE) || errors.Is(err, os.ErrExist)
 }
 
 // Close shuts down the server, closes the listener, waits for in-flight connections, and removes the socket file.

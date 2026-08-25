@@ -304,3 +304,27 @@ func TestUnprivateRuntimeDirIsNotTrusted(t *testing.T) {
 	assert.True(t, private, "the private fallback directory should still be available")
 	assert.True(t, isPrivateDir(dir))
 }
+
+// TestSymlinkedSocketDirIsNotPrivate: os.Stat resolves symlinks, so judging the
+// socket directory with it judged whatever the link POINTED at. A local user
+// who wins the race to create /tmp/bramble-$UID as a link to any 0700 directory
+// this user owns then has MkdirAll succeed on the link, both privacy checks
+// pass on the target, and bramble publish its stable IPC and control sockets at
+// a path the attacker chose — the symlink/TOCTOU hazard socketDir()'s own doc
+// says the private directory exists to prevent.
+func TestSymlinkedSocketDirIsNotPrivate(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	// A directory that is genuinely private by every other measure: 0700 and
+	// owned by this user. Reached through a link it must still be refused.
+	target := filepath.Join(root, "attacker-chosen")
+	require.NoError(t, os.Mkdir(target, 0o700))
+	require.True(t, isPrivateDir(target), "the target itself is private; only the link is the problem")
+
+	link := filepath.Join(root, "bramble-link")
+	require.NoError(t, os.Symlink(target, link))
+
+	assert.False(t, isPrivateDir(link),
+		"a symlink is never a private directory we created, however private its target")
+}

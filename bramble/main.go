@@ -574,7 +574,16 @@ func socketDirPrivate() (dir string, private bool) {
 // traverse. Both halves matter: 0700 owned by somebody else is not private to
 // us, and a directory we own with looser bits is not private at all.
 func isPrivateDir(path string) bool {
-	info, err := os.Stat(path)
+	// Lstat, not Stat. Stat resolves symlinks, so a name pre-created as a link
+	// is judged by its TARGET: a local user who wins the race to create
+	// /tmp/bramble-$UID as a link to any 0700 directory this user owns gets
+	// MkdirAll to succeed on the existing link, both checks below to pass on
+	// the target, and bramble to publish its stable sockets at a path they
+	// chose — which is the symlink/TOCTOU hazard this whole directory exists
+	// to avoid, re-entered through the shared-temp fallback. Refusing a symlink
+	// outright is correct here: this function's only callers are asking
+	// "is this name a private directory we made", and a link never is.
+	info, err := os.Lstat(path)
 	if err != nil || !info.IsDir() {
 		return false
 	}

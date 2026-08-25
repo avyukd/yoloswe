@@ -125,6 +125,13 @@ type Courier struct { //nolint:govet // fieldalignment: grouping by role reads b
 	// away would otherwise block every later delivery to that session for the
 	// life of the process.
 	heldForDraft map[SessionID]draftHold
+	// staged records, per recipient, text this courier pasted into the
+	// composer and did not manage to submit. It is the ONLY evidence that a
+	// non-empty composer holds our delivery rather than a human's draft — the
+	// pane cannot tell the two apart, since a paste chip and a typed line look
+	// the same whoever produced them. Cleared as soon as the text is submitted
+	// or the delivery stops being ours to finish.
+	staged map[SessionID]string
 	// now is the clock, injectable so a test can assert the elapsed-time
 	// property rather than a call count.
 	now func() time.Time
@@ -161,6 +168,7 @@ func NewCourier(target DeliveryTarget, panes PaneWriter, config CourierConfig) (
 		resultDir:    resultDir,
 		pending:      make(map[SessionID][]Delivery),
 		heldForDraft: make(map[SessionID]draftHold),
+		staged:       make(map[SessionID]string),
 		now:          time.Now,
 		reported:     make(map[SessionID]map[SessionStatus]bool),
 		writing:      make(map[SessionID]bool),
@@ -305,6 +313,19 @@ func (c *Courier) Pending(to SessionID) []Delivery {
 // composerHoldsThisDelivery reports whether the text sitting in a recipient's
 // composer is the very message about to be written there.
 //
+// The question is "did BRAMBLE put this here", and only bramble's own record
+// can answer it. staged is what a previous attempt recorded when it pasted this
+// text and then failed before pressing Enter; without such a record the
+// composer is somebody else's and the answer is no, whatever it looks like.
+//
+// This is not a matter of taste. Pane appearance cannot distinguish our paste
+// from a user's: a "[Pasted text #N]" chip is what claude renders for ANY
+// paste, so accepting a chip as proof meant a user who pasted a block and had
+// not yet hit Enter got that block submitted for them — the exact harm section
+// 2 of this change exists to prevent — while the delivery was dropped as
+// though it had been written. A short typed line that happens to prefix the
+// message had the same effect in miniature.
+//
 // Matched against the message itself, never against the "[bramble]" prefix. Two
 // reasons, pulling in opposite directions and both satisfied by comparing the
 // text: the prefix is user-controllable, so a person who types it must still be
@@ -314,28 +335,48 @@ func (c *Courier) Pending(to SessionID) []Delivery {
 //
 // A pane capture truncates at the pane width and a composer wraps, so only the
 // first line is compared, prefix-wise in both directions — either side may be
-// the truncated one.
-//
-// A chip counts too. When a CLI collapses a paste to "[Pasted text #N]" the
-// characters never appear, and that chip can only be our own paste: this runs
-// while writing to a composer we just found non-empty, mid-delivery.
+// the truncated one. A chip is accepted ONLY once staged already vouched for
+// the text, where it is the rendering of the paste we know we made rather than
+// evidence about who made it.
 //
 // This asks a narrower question than "did bramble stage something here". A
 // composer holding a DIFFERENT message is still one that must not be pasted
 // into: tmux paste-buffer appends, so pasting over it would submit both as a
 // single prompt.
-func composerHoldsThisDelivery(provider, composer, text string) bool {
+func composerHoldsThisDelivery(provider, composer, staged, text string) bool {
 	body := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(composer), claudePromptGlyph))
 	if body == "" {
 		return false
-	}
-	if containsAny(body, pasteEvidenceProbes[provider].chipMarkers) {
-		return true
 	}
 	first, _, _ := strings.Cut(text, "\n")
 	first = strings.TrimSpace(first)
 	if first == "" {
 		return false
+	}
+	// Whether this courier remembers staging this exact text decides how much
+	// the pane is allowed to prove.
+	ours := staged != "" && staged == text
+	if !ours {
+		// No record. Only an EXACT match of the delivery's first line counts:
+		// a composer showing precisely the message bramble is about to write is
+		// a previous attempt of this very delivery that a restart forgot, and
+		// holding it would mean re-pasting a message already sitting there.
+		//
+		// Nothing weaker may vouch for it. A "[Pasted text #N]" chip is what
+		// claude renders for ANY paste, so accepting one meant a user who
+		// pasted a block and had not yet hit Enter got that block submitted for
+		// them — the harm section 2 exists to prevent — while the delivery was
+		// dropped as delivered. A one-sided prefix match had the same effect in
+		// miniature: a short typed line that happens to begin the message.
+		return body == first
+	}
+	// This courier pasted this text and did not submit it, so anything in the
+	// composer that is consistent with that paste is that paste. A chip counts
+	// here because it is the rendering of a paste already known to be ours, not
+	// evidence about who made it; and a prefix match in either direction covers
+	// a capture truncated at the pane width against a composer that wraps.
+	if containsAny(body, pasteEvidenceProbes[provider].chipMarkers) {
+		return true
 	}
 	return strings.HasPrefix(first, body) || strings.HasPrefix(body, first)
 }
@@ -378,6 +419,33 @@ func (c *Courier) noteDraftHold(to SessionID, draft string) (expired bool) {
 		return false
 	}
 	return c.now().Sub(held.firstSeen) >= composerHoldGrace
+}
+
+// noteStaged records that this courier pasted text into a recipient's composer
+// but has not submitted it, so a later attempt can tell its own staged text
+// from a human's draft. See composerHoldsThisDelivery for why nothing readable
+// from the pane can answer that question.
+func (c *Courier) noteStaged(to SessionID, text string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.staged[to] = text
+}
+
+// stagedText reports what this courier last pasted to a recipient without
+// submitting it, or "" if nothing is outstanding.
+func (c *Courier) stagedText(to SessionID) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.staged[to]
+}
+
+// clearStaged forgets a recipient's unsubmitted paste. Called once the text is
+// submitted, and on every path that stops trying to deliver it, so a stale
+// record can never vouch for a composer a human has since typed into.
+func (c *Courier) clearStaged(to SessionID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.staged, to)
 }
 
 // clearDraftHold forgets a recipient's hold, so the grace period applies to a
@@ -543,6 +611,27 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 			return err
 		}
 		provider := providerForSession(info)
+		// Never write into a pane whose CLI says it is mid-turn.
+		//
+		// Drain gates on info.Status, which is bramble's bookkeeping, and that
+		// can say idle while the TUI is still running: codex's notify hook
+		// fires ahead of its prompt being ready, which is the very case
+		// correctsPrematureIdle exists for — but the correction needs the
+		// monitor to have polled that pane, and a delivery does not wait for
+		// it. Pasting anyway put the message into a live turn, where codex's
+		// TUI discards it; verification then failed, the delivery re-queued,
+		// and the pair repeated every retryDelay for as long as the turn ran.
+		// That is the "paste did not reach ...'s prompt" warning seen in
+		// production, once per retry per stuck session.
+		//
+		// Only a POSITIVE working verdict holds. An unknown pane — a provider
+		// with no probe, a capture that failed, chrome that has not painted —
+		// delivers as before: refusing to deliver into every unreadable pane
+		// would strand mail, which is the failure class this PR exists to
+		// close.
+		if working, known := c.paneSaysWorking(info.ID, provider); known && working {
+			return errPaneBusy
+		}
 		// Never write into a composer someone is typing in. A paste appends to
 		// their draft and the Enter below submits the pair as one prompt, so a
 		// half-written sentence goes out wearing this message. Holding the
@@ -551,7 +640,7 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 		alreadyStaged := false
 		if composerText, draft, known := c.composerHasDraft(info.ID, provider); known && draft {
 			switch {
-			case composerHoldsThisDelivery(provider, composerText, text):
+			case composerHoldsThisDelivery(provider, composerText, c.stagedText(info.ID), text):
 				// This very message is already staged in the composer — a
 				// previous attempt pasted it and then failed before pressing
 				// Enter. Do NOT paste again: tmux paste-buffer appends, so a
@@ -583,8 +672,16 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 		c.clearDraftHold(info.ID)
 		if !alreadyStaged {
 			if err := c.panes.Paste(ctx, target, text); err != nil {
+				// Nothing was staged, so no record must survive to vouch for
+				// whatever is in the composer on the next attempt.
+				c.clearStaged(info.ID)
 				return err
 			}
+			// The text is in the composer now. Record it BEFORE anything that
+			// can fail below, because every one of those paths returns while
+			// the paste is still sitting there — and the next attempt has no
+			// other way to know it put it there.
+			c.noteStaged(info.ID, text)
 		}
 		// Confirm the text actually reached the prompt before pressing Enter.
 		//
@@ -614,23 +711,52 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 		// the probe looks for a fixed-length prefix and a wrapped or truncated
 		// composer may show less than that. Re-verifying would only produce a
 		// worse answer, and acting on it would append a second copy.
-		if !alreadyStaged && pasteVerifyRequired(provider) && !c.pasteLanded(ctx, info.ID, provider, text) {
-			if err := c.panes.Paste(ctx, target, text); err != nil {
-				return err
-			}
-			if !c.pasteLanded(ctx, info.ID, provider, text) {
-				// Returning an error keeps the delivery queued for the next
-				// idle transition rather than dropping it.
-				return fmt.Errorf("paste did not reach session %s's prompt", info.ID)
+		if !alreadyStaged && pasteVerifyRequired(provider) {
+			landed, readable := c.pasteVerdict(ctx, info.ID, provider, text)
+			switch {
+			case landed:
+				// Confirmed in the composer; nothing to do.
+			case !readable:
+				// The pane never became legible, so there is no evidence the
+				// paste failed — only an absence of evidence that it worked.
+				// Proceed to Enter on tmux's word that paste-buffer succeeded,
+				// exactly as every non-required provider does. Re-pasting here
+				// is what appended a second copy on each of an unbounded run of
+				// retries while submitting none of them; the message would sit
+				// in the composer growing by two copies every retryDelay and
+				// the operator would see nothing but a repeating warning.
+				slog.Debug("paste could not be verified because the pane was unreadable; submitting anyway",
+					"session", info.ID, "provider", provider)
+			default:
+				// A readable pane that does not show the paste is a real
+				// negative: the TUI dropped it, which codex does when a paste
+				// arrives while it is finalizing a turn. One retry, then give
+				// up for now.
+				if err := c.panes.Paste(ctx, target, text); err != nil {
+					c.clearStaged(info.ID)
+					return err
+				}
+				c.noteStaged(info.ID, text)
+				if landed, readable := c.pasteVerdict(ctx, info.ID, provider, text); !landed && readable {
+					// Returning an error keeps the delivery queued for the next
+					// idle transition rather than dropping it.
+					return fmt.Errorf("paste did not reach session %s's prompt", info.ID)
+				}
 			}
 		}
 		if !submit {
 			// Staged in the pane for someone to review; no turn has started.
+			// The record stays: this text is genuinely sitting in the composer
+			// unsubmitted, which is exactly what it is for.
 			return nil
 		}
 		if err := c.panes.SendEnter(ctx, target); err != nil {
 			return err
 		}
+		// Submitted: the composer is empty again, so the record must go. Left
+		// behind it would vouch for whatever the user types next, which is the
+		// failure this record exists to prevent.
+		c.clearStaged(info.ID)
 		// There is deliberately no read-back check that the Enter was taken.
 		// The signal is not separable: an agent CLI echoes the submitted prompt
 		// into its transcript directly above the composer, so a pane scrape
@@ -658,6 +784,28 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 // stays queued and rides the next idle transition — but it must be an error so
 // the queue keeps it and arms a retry.
 var errComposerBusy = errors.New("composer holds an unsubmitted draft")
+
+// errPaneBusy is returned when the recipient's own CLI shows a turn still in
+// flight, whatever bramble's bookkeeping says. Like errComposerBusy this is not
+// a delivery failure — the message stays queued and rides the next idle
+// transition — but it must be an error so the queue keeps it and arms a retry.
+var errPaneBusy = errors.New("pane shows a turn still in flight")
+
+// paneSaysWorking asks the recipient's own pane whether a turn is running.
+//
+// known is false whenever no answer is available: the provider has no pane
+// probe, the capture failed, or the chrome was not recognizable. Callers must
+// treat that as "deliver", not as "busy" — see the call site in write.
+func (c *Courier) paneSaysWorking(id SessionID, provider string) (working, known bool) {
+	if !providerHasIdleProbe(provider) {
+		return false, false
+	}
+	lines, err := c.target.CapturePaneText(id, pasteVerifyLines)
+	if err != nil {
+		return false, false
+	}
+	return paneShowsWorking(provider, lines)
+}
 
 // providerForSession resolves which agent CLI backs a session, so the courier
 // can ask provider-specific questions about its pane.
@@ -710,7 +858,8 @@ const (
 	pasteVerifyAttemptsBestEffort = 4
 )
 
-// pasteLanded reports whether the paste is visible in the session's pane.
+// pasteVerdict reports whether the paste is visible in the session's pane, and
+// whether the pane could be read at all.
 //
 // It looks for a prefix of the first line rather than the whole message: a TUI
 // re-renders a long prompt with its own wrapping and decoration, so only a
@@ -721,10 +870,19 @@ const (
 // The attempt budget depends on whether this provider's verdict is load
 // bearing: a required check gets the full budget, a best-effort one only long
 // enough for a chip to paint.
-func (c *Courier) pasteLanded(ctx context.Context, id SessionID, provider, text string) bool {
+//
+// readable is false when every capture came back without evidence bramble knows
+// how to interpret — the pane could not be captured, or this provider's
+// composer could not be located in it. That is silence, not a negative, and the
+// two must not be conflated: a caller that re-pastes on silence appends a
+// second copy of the message on every attempt and never submits any of them,
+// which is the loop this change set out to remove. Only a readable pane that
+// does NOT show the paste is a real negative.
+func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text string) (landed, readable bool) {
+	var obscured bool
 	probe := pasteProbe(text)
 	if probe == "" {
-		return true // nothing distinctive to look for; do not block delivery
+		return true, true // nothing distinctive to look for; do not block delivery
 	}
 	attempts := pasteVerifyAttemptsBestEffort
 	if pasteVerifyRequired(provider) {
@@ -736,7 +894,7 @@ func (c *Courier) pasteLanded(ctx context.Context, id SessionID, provider, text 
 		if i > 0 {
 			select {
 			case <-ctx.Done():
-				return false
+				return false, readable
 			case <-time.After(pasteVerifyInterval):
 			}
 		}
@@ -745,10 +903,17 @@ func (c *Courier) pasteLanded(ctx context.Context, id SessionID, provider, text 
 			continue
 		}
 		if pasteConfirmed(provider, lines, probe) {
-			return true
+			return true, true
 		}
+		// Track WHY this capture did not confirm. Only one shape is silence:
+		// the CLI's chrome is on screen but its composer could not be located,
+		// so there is no evidence either way. Everything else — an empty pane,
+		// a composer that is legible and simply does not hold the text — is a
+		// real negative, and the last capture is the one that decides.
+		obscured = pasteEvidenceObscured(provider, lines)
+		readable = !obscured
 	}
-	return false
+	return false, readable
 }
 
 // pasteProbe picks the substring to look for in the pane.
@@ -776,6 +941,9 @@ func (c *Courier) discard(to SessionID) {
 		return
 	}
 	delete(c.pending, to)
+	// The queue is gone, so nothing will ever finish a paste left in this
+	// recipient's composer; the record must not outlive the intent to submit.
+	delete(c.staged, to)
 	err := c.persistLocked(to)
 	c.mu.Unlock()
 	if err != nil {
@@ -967,6 +1135,15 @@ func logDeliveryWarn(msg string, to SessionID, err error) {
 func logWriteFailure(failMsg string, to SessionID, err error) {
 	if errors.Is(err, errComposerBusy) {
 		logDeliveryWarn("holding delivery: recipient has an unsubmitted draft", to, err)
+		return
+	}
+	if errors.Is(err, errPaneBusy) {
+		// Debug, not warn. A recipient that is simply still working is the
+		// ordinary case for a long turn, and it recurs every retryDelay for as
+		// long as the turn lasts; at warn level a single busy session fills the
+		// log with a line every 30s that reads like a fault and is not one.
+		slog.Debug("holding delivery: recipient's pane shows a turn in flight",
+			"session", to, "error", err)
 		return
 	}
 	logDeliveryWarn(failMsg, to, err)

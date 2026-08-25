@@ -664,7 +664,7 @@ func TestWrappedComposerStillReadsAsADraft(t *testing.T) {
 	// A human draft long enough to wrap. Live window 6 of the 2026-08-25 survey
 	// showed the same shape holding one of bramble's own staged deliveries;
 	// that text is deliberately NOT treated as a draft (see
-	// TestBrambleOwnStagedTextIsNotADraft), so the wrapping itself is what this
+	// TestBrambleOwnStagedDeliveryIsOverwritten), so the wrapping itself is what this
 	// case pins.
 	pane := []string{
 		"● Bash(git status)",
@@ -866,4 +866,76 @@ func TestClaudeAcceptsAPasteChip(t *testing.T) {
 		claudePaneComposer("❯ ", "❯ a report from a subagent", "● I read it."),
 		"a report from a subagent"),
 		"transcript history must not confirm a paste that never arrived")
+}
+
+// TestTallComposerIsHeldNotDelivered: a composer taller than the walk's bound
+// used to report unfound, and both consumers of unfound then failed in the
+// unsafe direction. This pins the draft half: an ordinary long draft — a
+// wrapped delivery or a long human line — must hold, not deliver.
+//
+// The bound was 6, which a 500-character wrapped message clears routinely.
+func TestTallComposerIsHeldNotDelivered(t *testing.T) {
+	t.Parallel()
+
+	pane := []string{"────────────────────────────────────────────"}
+	for i := 0; i < 12; i++ {
+		pane = append(pane, "and the draft continues onto another line")
+	}
+	pane = append([]string{pane[0]}, pane[1:]...)
+	// Put the glyph on the first composer line, as claude draws it.
+	pane[1] = "❯ the beginning of a draft that wraps well past six lines"
+	pane = append(pane,
+		"────────────────────────────────────────────",
+		"  ~/wt/branch  main  Opus 4.6  ctx:43%  tokens:20k",
+		"  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+	)
+
+	draft, known := composerDraft(ProviderClaude, pane)
+	require.True(t, known, "unknown means deliver, straight into the draft")
+	assert.True(t, draft, "a composer taller than six lines is still a draft")
+}
+
+// TestObscuredPasteEvidenceIsNotANegative pins the distinction that ends the
+// re-paste loop: a capture showing claude's chrome but no locatable composer
+// says NOTHING about whether the paste arrived, while an empty or unpainted
+// pane is a real negative.
+//
+// Conflating them re-pasted on silence, appending a second copy of the message
+// every retry and submitting none of them.
+func TestObscuredPasteEvidenceIsNotANegative(t *testing.T) {
+	t.Parallel()
+
+	// Chrome on screen, composer region unbounded above: obscured.
+	obscured := []string{
+		"a composer line with no rule above it",
+		"────────────────────────────────────────────",
+		"  ~/wt/branch  main  Opus 4.6  ctx:43%  tokens:20k",
+	}
+	assert.True(t, pasteEvidenceObscured(ProviderClaude, obscured),
+		"chrome present but composer unfound is silence, not a negative")
+
+	// Nothing painted at all: a real negative, or a dropped paste would be
+	// submitted on an empty prompt.
+	assert.False(t, pasteEvidenceObscured(ProviderClaude, nil),
+		"an unpainted pane is exactly what a dropped paste looks like")
+	assert.False(t, pasteEvidenceObscured(ProviderClaude, []string{"nothing here"}),
+		"a pane with no claude chrome is a negative")
+
+	// A locatable composer is readable, so its verdict is real either way.
+	assert.False(t, pasteEvidenceObscured(ProviderClaude, claudePaneComposer("❯ ", "✻ Worked for 12s")),
+		"a located composer yields a real verdict")
+
+	// Providers whose composer bramble does not read never reach this path.
+	assert.False(t, pasteEvidenceObscured(ProviderCursor, nil), "cursor's evidence is never obscured")
+}
+
+// TestComposerBoundFollowsTheCapture: the walk's bound must be sized against
+// the capture it runs over, not against a guess at composer height. At 6 it
+// manufactured the unfound case for ordinary panes.
+func TestComposerBoundFollowsTheCapture(t *testing.T) {
+	t.Parallel()
+	assert.Greater(t, claudeComposerMaxLines, paneIdleTailLines,
+		"the walk must reach further than the tail scan it replaced")
+	assert.Less(t, claudeComposerMaxLines, pasteVerifyLines,
+		"but never past the capture, or it walks into transcript")
 }
