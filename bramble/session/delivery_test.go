@@ -137,6 +137,17 @@ func (f *fakeTarget) captures() int {
 	return f.captureCount
 }
 
+// setPane REPLACES every session's pane buffer, for tests that need the pane to
+// stop saying what it said before — appendPane only ever adds, so an earlier
+// working marker would still be found in the tail.
+func (f *fakeTarget) setPane(text string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id := range f.sessions {
+		f.captured[id] = strings.Split(text, "\n")
+	}
+}
+
 func (f *fakeTarget) appendPane(text string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -2353,14 +2364,38 @@ func TestUnreadableComposerCostsNoPaneCapture(t *testing.T) {
 	// so neither of those checks may reach tmux.
 	require.False(t, composerReadable(ProviderCursor), "precondition")
 	require.False(t, pasteVerifyRequired(ProviderCursor), "precondition")
-	// One capture, and only one: the pane's own working verdict, which cursor
-	// does have a probe for and which is the ONLY thing standing between a
-	// delivery and a live cursor turn — cursor reports no turn ends at all, so
-	// info.Status can say idle for a session that is running. Every other check
-	// must still cost nothing here.
+	// One capture total, however many questions are asked of it. Cursor does
+	// have an idle probe — the only thing standing between a delivery and a
+	// live cursor turn, since cursor reports no turn ends at all and
+	// info.Status can say idle for a session that is running — so the pane is
+	// read once and every reader shares that frame. Two captures would both
+	// cost a second round-trip and let the readers disagree about the pane.
 	require.True(t, providerHasIdleProbe(ProviderCursor), "precondition")
 	assert.Equal(t, 1, target.captures(),
-		"exactly the working check captures; a provider whose composer and paste verdict are both discarded pays for neither")
+		"the pane is captured once and shared; the discarded checks add nothing")
+}
+
+// TestNothingReadablePaysNoPaneCapture: a provider with neither an idle probe
+// nor a readable composer has no question worth asking of its pane, so it must
+// not pay a tmux round-trip for two verdicts that are both discarded.
+func TestNothingReadablePaysNoPaneCapture(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", "", "some-unknown-model")
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	require.False(t, providerHasIdleProbe(""), "precondition")
+	require.False(t, composerReadable(""), "precondition")
+	assert.Zero(t, target.captures(),
+		"no pane capture may be made when nothing can read the pane")
+	assert.Contains(t, panes.recorded(), "enter(@7)", "and the delivery still goes out")
 }
 
 // TestStagedDeliveryIsSubmittedNotRePasted: tmux paste-buffer APPENDS into the
@@ -2585,4 +2620,126 @@ func TestUnknownPaneStillDelivers(t *testing.T) {
 
 	assert.Contains(t, panes.recorded(), "enter(@7)", "an unreadable pane must not wedge the queue")
 	assert.Empty(t, c.Pending("s1"))
+}
+
+// TestStagedRecordDoesNotVouchForAChangedComposer: the staged record proves
+// bramble PASTED the text, never that the composer still HOLDS it. A composer
+// is editable between a failed attempt and its retry, so a user who clears it
+// and pastes their own block inside the retry window must not have Enter
+// pressed on their paste.
+//
+// A chip was the case that made this concrete: it is the rendering of *a*
+// paste, so accepting one on the strength of the record alone submitted
+// whatever the user had put there and dropped the delivery as delivered.
+func TestStagedRecordDoesNotVouchForAChangedComposer(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+	text := "a report from a subagent"
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	// An earlier attempt pasted the text and could not submit it.
+	c.noteStaged("s1", text)
+	// The user has since replaced the composer contents with their own paste.
+	target.appendPane(claudeComposerPane("[Pasted text #7 +90 lines]"))
+
+	_, err = c.Send(context.Background(), "", "s1", text, true)
+	require.NoError(t, err)
+
+	assert.NotContains(t, panes.recorded(), "enter(@7)",
+		"the record must not authorize submitting text the composer no longer holds")
+	assert.Len(t, c.Pending("s1"), 1, "and the delivery stays queued")
+}
+
+// TestPaneHoldIsBoundedByElapsedTime: the working verdict is one frame's, and a
+// frame can be wrong in a way that never corrects itself. claudeLineVerdict
+// reports work for a `●` tool line with no sparkle below it — what an
+// interrupted turn leaves on screen — and spinnerRe matches any line opening
+// "* " or "· ", so echoed content can read as a spinner. A pane that is static
+// because the session is idle never changes its mind.
+//
+// Unbounded, that is the "parent's mail never drains" failure this PR exists to
+// close, re-entered through a different door. Bounded, it costs latency.
+func TestPaneHoldIsBoundedByElapsedTime(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderCodex, "gpt-5.6-terra")
+	// A pane stuck reporting work, which never changes because nothing is
+	// running to change it.
+	target.appendPane(strings.Join([]string{
+		"◦ Working (28s • esc to interrupt)",
+		"",
+		"› Ask Codex to do anything",
+	}, "\n"))
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+	require.Len(t, c.Pending("s1"), 1, "precondition: the first verdict holds the delivery")
+	require.Zero(t, panes.pasteCount(), "precondition: nothing was written")
+
+	// Still inside the grace period: still held.
+	now = now.Add(paneHoldGrace - time.Second)
+	c.Drain(context.Background(), "s1")
+	assert.Len(t, c.Pending("s1"), 1, "a hold inside the grace period stands")
+
+	// Past it: the verdict has been unchanged too long to be a real turn.
+	now = now.Add(2 * time.Second)
+	c.Drain(context.Background(), "s1")
+	assert.Empty(t, c.Pending("s1"),
+		"a pane stuck on working must not strand mail for the life of the process")
+}
+
+// TestPaneHoldResetsWhenTheTurnEnds: the grace period covers one uninterrupted
+// run of working verdicts, not the session's lifetime. A turn that ends and a
+// later one that starts must each get the full budget, or a busy session would
+// accumulate its way to the bound and deliver into a live turn.
+func TestPaneHoldResetsWhenTheTurnEnds(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderCodex, "gpt-5.6-terra")
+	working := "◦ Working (28s • esc to interrupt)\n\n› Ask Codex to do anything"
+	target.appendPane(working)
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+	require.Len(t, c.Pending("s1"), 1, "precondition: held")
+
+	// The turn ends, the delivery goes out, and a NEW turn starts.
+	now = now.Add(paneHoldGrace - time.Second)
+	target.setPane("› Ask Codex to do anything")
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	c.Drain(context.Background(), "s1")
+	require.Empty(t, c.Pending("s1"), "precondition: an idle pane delivers")
+
+	target.setPane(working)
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	_, err = c.Send(context.Background(), "", "s1", "a second report", true)
+	require.NoError(t, err)
+	require.Len(t, c.Pending("s1"), 1, "precondition: the new turn holds")
+
+	// Only a second past the FIRST hold's start. If the clock had not been
+	// reset by the intervening idle pane, this would deliver into a live turn.
+	now = now.Add(2 * time.Second)
+	c.Drain(context.Background(), "s1")
+	assert.Len(t, c.Pending("s1"), 1,
+		"each uninterrupted run of working verdicts gets the full grace period")
 }
