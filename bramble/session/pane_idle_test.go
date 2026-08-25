@@ -368,23 +368,31 @@ func TestTrackerRearmsForEveryTurn(t *testing.T) {
 	assert.True(t, tr.observe(cursorPane(false)), "the second turn was never seen to end")
 }
 
-// claudePane renders claude-code's footer as it really appears, taken from a
-// live capture: the content region, the input separator, the composer, the
-// status separator, the info line, and the permissions line.
+// claudePane renders claude-code's pane as it really appears, measured against
+// 19 live panes on 2026-08-25:
 //
-// The composer is always drawn, because claude always draws it — it sits
-// between the two separators whether or not a turn is running. An earlier
-// version of this helper put state directly above the status separator with no
-// composer and no input separator at all, a layout tmux_test.go's fixtures show
-// does not occur, and that omission is exactly what hid the bug
-// TestWorkingClaudePaneIsNeverReadAsIdle now pins: every "working" case here
-// was being judged against a pane shape claude never produces.
+//	<transcript>
+//	<state>            <- the line that decides idle vs working
+//	────────────────   <- content boundary
+//	❯ <composer>
+//	────────────────   <- status separator
+//	<info line>
+//	<permissions line>
 //
-// state picks what sits in the content region above the input separator, which
-// is what distinguishes idle from working. Empty state means an empty content
-// region.
+// Both rules are plain runs of ─. The "─ ▪▪▪ ─" mode marker that an earlier
+// version of this helper emitted appeared in ZERO of those panes; requiring it
+// made the judge bail on every real session, so it is not written here.
+//
+// The composer is always drawn, because claude always draws it, whether or not
+// a turn is running — that is the whole reason the composer cannot be used to
+// judge idleness.
+//
+// state is the nearest content line. It is never empty in production:
+// CaptureTmuxPane drops blank lines and a session that has run a turn always
+// has a transcript, so a pane whose content region is empty is not a state the
+// probe can encounter. Tests that want "idle" pass a completion line.
 func claudePane(state string, transcript ...string) []string {
-	return claudePaneComposer("❯ ", state, transcript...)
+	return claudePaneComposer("❯ ", state, transcript...)
 }
 
 // claudePaneComposer is claudePane with the composer line spelled out, for the
@@ -395,7 +403,7 @@ func claudePaneComposer(composer, state string, transcript ...string) []string {
 		lines = append(lines, state)
 	}
 	return append(lines,
-		"───────── ▪▪▪ ─",
+		"────────────────────────────────────────────",
 		composer,
 		"────────────────────────────────────────────",
 		"  ~/wt/branch  main  Opus 4.6  ctx:43%  tokens:20k",
@@ -420,9 +428,11 @@ func TestClaudePaneJudge(t *testing.T) {
 		// Positive idle markers. The composer is present in every one of these
 		// — it is present in the working cases too, which is the point: the
 		// composer says nothing about whether a turn is running.
-		{"empty composer, empty content region", claudePane(""), false, true},
-		{"composer with a draft", claudePaneComposer("❯ half a thought", ""), false, true},
 		{"turn just finished", claudePane("✻ Worked for 36m 36s"), false, true},
+		{"completion with a non-ASCII verb", claudePane("✻ Sautéed for 6m 16s"), false, true},
+		{"completion with a trailing clause", claudePane("✻ Baked for 3m 48s · 1 shell still running"), false, true},
+		{"a draft in the composer is not a turn in flight", claudePaneComposer("❯ half a thought", "✻ Worked for 12s"), false, true},
+		{"a completion pushed up by a recap is still found", claudePane("recap tail (disable recaps in /config)", "✻ Cooked for 2m 44s", "※ recap: you asked me to…"), false, true},
 
 		// Positive working markers.
 		{"spinner", claudePane("* Frosting… (2m 30s)"), true, true},
@@ -462,17 +472,17 @@ func TestClaudeAmbiguousFrameResetsTheStreak(t *testing.T) {
 
 	// One short of firing...
 	for i := 0; i < need-1; i++ {
-		require.False(t, tr.observe(claudePane("")), "observation %d", i+1)
+		require.False(t, tr.observe(claudePane("✻ Worked for 36m 36s")), "observation %d", i+1)
 	}
 	// ...then a frame of plain agent output, which says nothing.
 	require.False(t, tr.observe(claudePane("still working on it")))
 
 	// The count restarted, so the very next idle frame must not fire.
-	assert.False(t, tr.observe(claudePane("")), "the streak restarted")
+	assert.False(t, tr.observe(claudePane("✻ Worked for 36m 36s")), "the streak restarted")
 	for i := 0; i < need-2; i++ {
-		assert.False(t, tr.observe(claudePane("")))
+		assert.False(t, tr.observe(claudePane("✻ Worked for 36m 36s")))
 	}
-	assert.True(t, tr.observe(claudePane("")), "a full fresh streak fires")
+	assert.True(t, tr.observe(claudePane("✻ Worked for 36m 36s")), "a full fresh streak fires")
 }
 
 // TestClaudeNeedsAFullStreakToGoIdle: a single idle-looking frame is not
@@ -484,9 +494,9 @@ func TestClaudeNeedsAFullStreakToGoIdle(t *testing.T) {
 	need := tr.confirmationsNeeded()
 
 	for i := 0; i < need-1; i++ {
-		assert.False(t, tr.observe(claudePane("")), "observation %d of %d", i+1, need)
+		assert.False(t, tr.observe(claudePane("✻ Worked for 36m 36s")), "observation %d of %d", i+1, need)
 	}
-	assert.True(t, tr.observe(claudePane("")), "the %dth consecutive idle frame fires", need)
+	assert.True(t, tr.observe(claudePane("✻ Worked for 36m 36s")), "the %dth consecutive idle frame fires", need)
 }
 
 // TestClaudeWorkingFrameIsNeverIdle: the direct statement of the bug this probe
@@ -588,4 +598,80 @@ func TestPaneIdleAndWorkingStreaksAreIndependent(t *testing.T) {
 	}
 	assert.True(t, tr.observeWorking(codexPane(true)),
 		"a premature idle must still be correctable after a pane-driven idle")
+}
+
+// TestIdleClaudeSessionIsActuallyReachable is the inverse of
+// TestWorkingClaudePaneIsNeverReadAsIdle, and the reason deliverable 3(b)
+// exists: a claude window whose Stop hook can no longer reach bramble is
+// rescued only if the probe can reach an *idle* verdict on a real pane.
+//
+// An earlier judge demanded a positive marker on the topmost content line. For
+// any session that has done work — the only kind that can be stranded — that
+// line is the tail of its own last answer, so every real pane came back
+// ambiguous, observe() reset the streak forever, and the fallback never fired
+// while its tests read as if it worked.
+//
+// The layouts below are taken verbatim from live panes captured 2026-08-25.
+func TestIdleClaudeSessionIsActuallyReachable(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		lines []string
+	}{
+		{"answer tail above the completion line", claudePane(
+			"✻ Cogitated for 1m 27s",
+			"but if you ever see a dangling ~/.agents/skills on a new box, that means the",
+			"Committed as 5aeae0f. I did not push — you'd asked to push last turn for that",
+		)},
+		{"completion pushed up by a recap block", claudePane(
+			"estimate's weakest input. (disable recaps in /config)",
+			"✻ Cooked for 2m 44s",
+			"※ recap: You asked me to cost the per-tenant-org pattern on code.storage",
+		)},
+		{"non-ASCII verb", claudePane(
+			"✻ Sautéed for 6m 10s",
+			"services/python/{api-gateway-service,tenant-user-agent}",
+			"apps).",
+		)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			working, known := claudePaneJudge(tc.lines)
+			require.True(t, known, "a real idle claude pane must produce a verdict")
+			assert.False(t, working, "a finished turn is not work in flight")
+
+			// And the tracker must actually reach the idle decision.
+			tr := &paneIdleTracker{provider: ProviderClaude}
+			need := tr.confirmationsNeeded()
+			for i := 1; i < need; i++ {
+				require.False(t, tr.observe(tc.lines), "frame %d", i)
+			}
+			assert.True(t, tr.observe(tc.lines),
+				"%d agreeing frames must mark a stranded session idle", need)
+		})
+	}
+}
+
+// TestWrappedComposerStillReadsAsADraft: a queued delivery is long, so the
+// composer wraps onto a second line. Taking the nearest line above the status
+// separator reads that continuation as the composer, fails the `❯` check, and
+// reports unknown — which means deliver, pasting straight into the draft.
+// Captured live: window 6 of the 2026-08-25 survey held exactly this.
+func TestWrappedComposerStillReadsAsADraft(t *testing.T) {
+	t.Parallel()
+
+	pane := []string{
+		"● Bash(git status)",
+		"────────────────────────────────────────────",
+		"❯ [bramble] subagent forge-tenant-isolation-planner-0da3be25 (planner, opus) is",
+		"result: /home/ming/.bramble/research/forge-tenant-isolation-planner-0da3be25.md",
+		"────────────────────────────────────────────",
+		"  ~/wt/branch  main  Opus 4.6  ctx:43%  tokens:20k",
+		"  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+	}
+
+	draft, known := composerDraft(ProviderClaude, pane)
+	require.True(t, known, "a wrapped composer is still a readable composer")
+	assert.True(t, draft, "a wrapped draft must hold the delivery, not invite one")
 }

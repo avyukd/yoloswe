@@ -1,11 +1,15 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/bazelment/yoloswe/bramble/session"
 )
@@ -92,10 +96,19 @@ func TestSocketPathsPreferRuntimeDir(t *testing.T) {
 	}
 }
 
-// With no runtime dir configured, fall back to the temp dir rather than
-// producing a path relative to the cwd.
-func TestSocketPathsFallBackToTempDir(t *testing.T) {
+// TestSocketPathsFallBackUnderTempDir: with no XDG_RUNTIME_DIR the sockets
+// live in a private per-user directory *under* os.TempDir(), not in os.TempDir()
+// itself.
+//
+// This test used to assert the opposite — that the socket's parent WAS
+// os.TempDir(). That is the shared, world-writable directory, and since the
+// socket name is stable it is also predictable, so any local user could bind it
+// first and either receive traffic from windows holding the frozen path or push
+// every bramble onto a pid-scoped fallback. The privacy now comes from the
+// directory; see TestSocketDirIsPrivateWithoutXDGRuntimeDir.
+func TestSocketPathsFallBackUnderTempDir(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("TMPDIR", t.TempDir())
 
 	for name, got := range map[string]string{
 		"ipc":     ipcSocketPath(),
@@ -104,8 +117,12 @@ func TestSocketPathsFallBackToTempDir(t *testing.T) {
 		if !filepath.IsAbs(got) {
 			t.Errorf("%s socket path %q is not absolute", name, got)
 		}
-		if filepath.Dir(got) != os.TempDir() {
-			t.Errorf("%s socket %q did not fall back to %q", name, got, os.TempDir())
+		dir := filepath.Dir(got)
+		if dir == os.TempDir() {
+			t.Errorf("%s socket %q sits directly in the shared temp dir", name, got)
+		}
+		if filepath.Dir(dir) != os.TempDir() {
+			t.Errorf("%s socket %q is not under %q", name, got, os.TempDir())
 		}
 	}
 }
@@ -187,4 +204,50 @@ func TestStartIPCServerBindsThePublishedPath(t *testing.T) {
 	if _, err := os.Stat(published); err != nil {
 		t.Errorf("nothing listening at the published path %q: %v", published, err)
 	}
+}
+
+// TestSocketDirIsPrivateWithoutXDGRuntimeDir pins the property the stable
+// socket name depends on for its safety.
+//
+// The name is stable, so it is predictable by construction. In a shared /tmp
+// that is enough for any local user to pre-bind it and receive the IPC and
+// control traffic of tmux windows that have the path frozen in their
+// environment, or to force every bramble on the host onto a pid-scoped fallback
+// — which silently restores the stranding bug the stable path exists to fix.
+// Putting the uid in the filename prevents an accidental collision but not a
+// deliberate one; only a directory this user alone can traverse does that.
+func TestSocketDirIsPrivateWithoutXDGRuntimeDir(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("TMPDIR", t.TempDir())
+
+	dir := socketDir()
+	require.NotEqual(t, os.TempDir(), dir,
+		"the fallback must not be the shared temp dir itself")
+
+	info, err := os.Stat(dir)
+	require.NoError(t, err, "the private socket directory must exist")
+	require.True(t, info.IsDir())
+	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm(),
+		"a group- or world-accessible directory is not private")
+	assert.True(t, ownedByCurrentUser(info), "the directory must be owned by this user")
+
+	// Both sockets land inside it, so neither is directly reachable.
+	assert.Equal(t, dir, filepath.Dir(ipcSocketPath()))
+	assert.Equal(t, dir, filepath.Dir(controlSocketPath()))
+}
+
+// TestSocketDirRefusesADirectoryItDoesNotOwn: MkdirAll leaves an existing
+// directory's mode alone, so a squatter who pre-creates the name with open
+// permissions would otherwise be trusted silently.
+func TestSocketDirRefusesAWorldWritableDirectory(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("TMPDIR", tmp)
+
+	squat := filepath.Join(tmp, fmt.Sprintf("bramble-%d", os.Getuid()))
+	require.NoError(t, os.MkdirAll(squat, 0o777))
+	require.NoError(t, os.Chmod(squat, 0o777))
+
+	assert.Equal(t, os.TempDir(), socketDir(),
+		"a directory with open permissions must be refused, not used")
 }

@@ -513,11 +513,51 @@ func detectRepoFromPath(cwd, wtRoot string) (string, error) {
 // socketDir is where this process's Unix domain sockets live. It prefers
 // $XDG_RUNTIME_DIR (user-private, tmpfs) over /tmp to avoid symlink/TOCTOU
 // risks in world-writable directories.
+//
+// When XDG_RUNTIME_DIR is unset — a host without systemd — the fallback is a
+// 0700 per-user subdirectory of os.TempDir() rather than os.TempDir() itself.
+// The directory, not the filename, is what makes the path private: the socket
+// name is stable and therefore predictable by construction, so in a shared /tmp
+// any local user could pre-bind it and receive IPC and control traffic from
+// tmux windows that have that path frozen in their environment, or force every
+// bramble on the host onto its pid-scoped fallback simply by listening first.
+// A directory only its owner can traverse removes that reach.
+//
+// A directory that exists but is not a private directory owned by this user is
+// refused rather than used, so a pre-created 0777 squat cannot be inherited.
+// Callers fall back to os.TempDir() only when the private directory cannot be
+// established at all, which keeps bramble usable on an exotic host while
+// leaving the warning in the log.
 func socketDir() string {
 	if runDir := os.Getenv("XDG_RUNTIME_DIR"); runDir != "" {
 		return runDir
 	}
-	return os.TempDir()
+	dir := filepath.Join(os.TempDir(), fmt.Sprintf("bramble-%d", os.Getuid()))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		slog.Warn("could not create a private socket directory; falling back to the shared temp dir",
+			"dir", dir, "error", err)
+		return os.TempDir()
+	}
+	// MkdirAll leaves an existing directory's mode and owner alone, so verify
+	// rather than assume: a directory somebody else created, or one that is
+	// group/world accessible, is not private and must not be trusted.
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 || !ownedByCurrentUser(info) {
+		slog.Warn("socket directory is not private to this user; falling back to the shared temp dir",
+			"dir", dir)
+		return os.TempDir()
+	}
+	return dir
+}
+
+// ownedByCurrentUser reports whether a stat result belongs to the running uid.
+// A directory in a world-writable parent is only private if we own it.
+func ownedByCurrentUser(info os.FileInfo) bool {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false // unknown platform: do not claim privacy we cannot verify
+	}
+	return int(st.Uid) == os.Getuid()
 }
 
 // The stable names are what a tmux window's frozen BRAMBLE_SOCK keeps pointing

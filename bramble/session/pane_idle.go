@@ -100,11 +100,18 @@ var paneIdleProbes = map[string]paneIdleProbe{
 	},
 }
 
-// claudeCompletionPastRe matches claude's finished-turn line, which is always a
-// past-tense verb followed by "for <duration>" ("✻ Worked for 36m 36s", "✢
-// Baked for 2m"). It exists to separate that from the sparkle spinner, which
-// shares the same glyph class but is a gerund with a trailing ellipsis.
-var claudeCompletionPastRe = regexp.MustCompile(`^[✻✢✽✹]\s+\w+ for\s`)
+// claudeCompletionPastRe matches claude's finished-turn line: a sparkle glyph,
+// a verb, and " for <duration>" ("✻ Baked for 3m 48s", "✻ Sautéed for 6m 16s",
+// "✻ Crunched for 46s · 1 shell still running").
+//
+// The verb is matched as "any run of non-space characters", NOT as \w. Go's \w
+// is ASCII-only, and claude's verb list is not: "Sautéed" failed to match, so
+// three live idle sessions in the 2026-08-25 survey came back ambiguous and
+// would never have drained their mail. Enumerating verbs has the same defect
+// one level up — the list is claude's to change — so what is matched is the
+// structural part: the " for <duration>" suffix, which is what actually
+// distinguishes a finished turn from the "Baking…" gerund.
+var claudeCompletionPastRe = regexp.MustCompile(`^[✻✢✽✹]\s+\S+ for\s+\d`)
 
 // isClaudeSeparator matches either of claude's two horizontal rules.
 //
@@ -118,22 +125,37 @@ func isClaudeSeparator(trimmed string) bool {
 		(strings.HasPrefix(trimmed, "─") && strings.Contains(trimmed, "▪"))
 }
 
-// claudeComposerIdx locates claude-code's live composer line: the first
-// non-empty line above the status separator, which in claude's layout is always
-// the `❯` composer. It returns the composer index and the index of the input
-// separator (`─ ▪▪▪ ─`) that divides the composer chrome from the agent content
-// above it; either is -1 when not found.
+// claudeComposerIdx locates claude-code's live composer and the boundary of the
+// content region above it.
 //
-// Anchoring matters more than it looks. The composer glyph is not unique in a
-// capture — claude renders every *submitted* prompt with the same `❯` (see the
-// transcript fixture at tmux_test.go:714) — so any scan that simply takes the
-// lowest `❯` can latch onto scrollback and report a permanent draft. The
-// composer is defined by its position between the two separators, so that is
-// how it is found.
-func claudeComposerIdx(lines []string) (composerIdx, inputSepIdx int) {
+// The layout, measured against 14 live claude panes on 2026-08-25, is:
+//
+//	<agent content>
+//	────────────────  <- content boundary
+//	❯ <composer>
+//	────────────────  <- status separator
+//	<cwd/branch/model status line>
+//	<permissions line>
+//
+// Both rules are plain box-drawing runs. An earlier version of this function
+// looked for a "─ ▪▪▪ ─" mode marker on the upper rule, taken from a fixture in
+// tmux_test.go; that marker appeared in ZERO of the 14 live panes, so requiring
+// it made the judge bail on every real session. The composer is therefore
+// identified by position — the first non-empty line above the status separator
+// — and the content boundary is the next rule above it, if any.
+//
+// Position, not glyph, is what makes this safe: claude renders every submitted
+// transcript prompt with the same `❯`, so scanning for the lowest match can
+// latch onto scrollback (window 26 of that survey had two `❯` lines, one of
+// them a submitted `/clear`).
+//
+// contentEndIdx is -1 when no rule sits above the composer, which happens when
+// a multi-line composer absorbs it. Callers must treat that as "content region
+// unknown" rather than "no content".
+func claudeComposerIdx(lines []string) (composerIdx, contentEndIdx int) {
 	statusSepIdx := -1
 	for i := len(lines) - 1; i >= 0; i-- {
-		if separatorRe.MatchString(strings.TrimSpace(lines[i])) {
+		if isClaudeSeparator(strings.TrimSpace(lines[i])) {
 			statusSepIdx = i
 			break
 		}
@@ -141,6 +163,13 @@ func claudeComposerIdx(lines []string) (composerIdx, inputSepIdx int) {
 	if statusSepIdx < 0 {
 		return -1, -1
 	}
+	// Walk up from the status separator to the rule above it. Everything
+	// between the two rules is the composer, which may wrap onto several lines
+	// — a long queued delivery does exactly that — so the composer line is the
+	// FIRST of them, not the last. Taking the nearest line instead reads a
+	// wrapped continuation as the composer, fails the `❯` prefix check, and
+	// reports "unknown", which means deliver: a paste straight into the user's
+	// draft, the harm this is here to prevent.
 	composerIdx = -1
 	for i := statusSepIdx - 1; i >= 0; i-- {
 		trimmed := strings.TrimSpace(lines[i])
@@ -148,29 +177,29 @@ func claudeComposerIdx(lines []string) (composerIdx, inputSepIdx int) {
 			continue
 		}
 		if isClaudeSeparator(trimmed) {
-			// A separator directly under the status separator means claude has
-			// not drawn a composer; there is nothing to report.
-			return -1, i
+			if composerIdx < 0 {
+				// Two rules with nothing between them: no composer drawn.
+				return -1, i
+			}
+			break
 		}
 		composerIdx = i
-		break
 	}
 	if composerIdx < 0 {
 		return -1, -1
 	}
-	// The input separator, if present, is the next separator above the composer.
-	inputSepIdx = -1
-	for i := composerIdx - 1; i >= 0 && i >= composerIdx-3; i-- {
+	contentEndIdx = -1
+	for i := composerIdx - 1; i >= 0; i-- {
 		trimmed := strings.TrimSpace(lines[i])
 		if trimmed == "" {
 			continue
 		}
 		if isClaudeSeparator(trimmed) {
-			inputSepIdx = i
+			contentEndIdx = i
 		}
 		break
 	}
-	return composerIdx, inputSepIdx
+	return composerIdx, contentEndIdx
 }
 
 // claudePaneJudge reads claude-code's pane to decide whether a turn is in
@@ -179,73 +208,94 @@ func claudeComposerIdx(lines []string) (composerIdx, inputSepIdx int) {
 // It deliberately does NOT use ParseClaudeStatusBar's IsIdle. That parser scans
 // up from the status separator and stops at the first `❯` it meets — which is
 // the composer, and the composer is on screen whether or not a turn is running.
-// The repo's own fixture pins the consequence: tmux_test.go:739-761 is a pane
-// with `✢ Fluttering… (4m 16s)` in flight whose expected parse is IsIdle:true.
-// Judging from that would call a working claude session idle on essentially
-// every frame and release its queued mail into a live turn — the precise harm
-// this table exists to prevent.
+// The repo's own fixture pins the consequence: tmux_test.go's "working with
+// completion indicator" case has `✢ Fluttering… (4m 16s)` in flight and parses
+// IsIdle:true. Judging claude that way calls a working session idle on
+// essentially every frame and releases its queued mail into a live turn.
 //
-// So the content region *above* the input separator is what gets judged, where
-// the spinner and tool lines actually live:
+// What actually separates the two states was measured across 19 live claude
+// panes on 2026-08-25: claude's *sparkle line*, and specifically its tense.
 //
-//   - a spinner or a `●` tool line means working;
-//   - a completion indicator (`✻ Worked for …`) means the turn just ended;
-//   - an empty content region under a drawn composer means idle;
-//   - anything else — agent output with no marker — is ambiguous.
+//	working   ✽ Baking… (1m 55s · ↓ 8.1k tokens)      gerund + ellipsis
+//	          · Brewing… (25s · ↓ 1.5k tokens)
+//	idle      ✻ Cogitated for 1m 27s                  past tense + "for <dur>"
+//	          ✻ Baked for 3m 48s · 1 shell still running
 //
-// Ambiguity reports known=false, and observe() resets the streak on it. That is
-// load-bearing: a capture taken mid-turn frequently shows neither spinner nor
-// prompt, because the spinner is sub-second and was never caught once in 400+
-// samples of live monitoring (.claude/memory/tmux-capture-learnings.md, caveat
-// 3). "No spinner" is the normal appearance of a working session, not idleness.
+// Everything else in the content region — prose, a `⎿` tip, a `※ recap`, a
+// table — appears in both states and says nothing. That is why this reads the
+// nearest *sparkle* line rather than the nearest line: an earlier version
+// demanded a marker on the topmost content line, and since an idle session's
+// last line is usually the tail of its own answer, every real idle pane came
+// back ambiguous and the fallback for a stranded window never fired.
+//
+// A `●` tool line still counts as work, but only when no sparkle line sits
+// below it: a finished turn leaves its tool output on screen above the
+// completion line.
+//
+// Ambiguity — no sparkle line at all within the bounded tail — reports
+// known=false, and observe() resets the streak on it. That is load-bearing: the
+// spinner is sub-second and was never caught once in 400+ samples of live
+// monitoring (.claude/memory/tmux-capture-learnings.md, caveat 3), so "no
+// marker" must never be read as idleness on its own.
 func claudePaneJudge(lines []string) (working, known bool) {
-	composerIdx, inputSepIdx := claudeComposerIdx(lines)
+	composerIdx, contentEndIdx := claudeComposerIdx(lines)
 	if composerIdx < 0 {
 		return false, false // no composer: not claude's prompt, or still booting
 	}
-	if inputSepIdx < 0 {
-		// Composer found but no input separator above it, so the content region
-		// cannot be delimited and the spinner would be indistinguishable from
-		// transcript text. Refuse to guess.
+	if contentEndIdx < 0 {
+		// No rule above the composer: a multi-line composer absorbed it, so the
+		// content region cannot be delimited and a transcript line would be
+		// indistinguishable from live chrome. Refuse to guess.
 		return false, false
 	}
 
-	// Scan the content region above the input separator, nearest line first.
-	for i := inputSepIdx - 1; i >= 0; i-- {
+	// Walk a bounded tail of the content region upward and take the verdict of
+	// the first line that carries one.
+	seen := 0
+	for i := contentEndIdx - 1; i >= 0 && seen < claudePaneContentTailLines; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
 		}
-		switch {
-		case spinnerRe.MatchString(line):
-			return true, true
-		case strings.HasPrefix(line, "●"):
-			return true, true
-		case completionRe.MatchString(line):
-			// completionRe's glyph class is shared by two opposite states:
-			// "✻ Worked for 36m 36s" is a finished turn, but "✢ Fluttering…
-			// (4m 16s)" is claude's sparkle *spinner*, still running — the very
-			// line tmux_test.go's working fixture carries. The gerund's
-			// trailing ellipsis is what separates them.
-			if strings.Contains(line, "…") {
-				return true, true
-			}
-			if claudeCompletionPastRe.MatchString(line) {
-				// "Worked for …" — the turn is over; the prompt lands on the
-				// next repaint.
-				return false, true
-			}
-			// Same glyph, neither shape. Never call this idle.
-			return false, false
+		seen++
+		if working, known := claudeLineVerdict(line); known {
+			return working, true
 		}
-		// Agent output with no positive marker: the spinner may simply not be
-		// in this frame. Ambiguous, never idle.
-		return false, false
 	}
 
-	// Nothing above the input separator at all: a drawn composer over an empty
-	// content region, which is a session waiting for input.
-	return false, true
+	// Nothing decisive in the tail. Never guess idle here.
+	return false, false
+}
+
+// claudePaneContentTailLines bounds how far up the content region is read.
+// Deep enough that a sparkle line pushed up by a recap or a tip is still found
+// — the widest gap measured live was two lines — shallow enough that a sparkle
+// line quoted in the transcript is out of reach.
+const claudePaneContentTailLines = 4
+
+// claudeLineVerdict reports what one content line says about the turn, and
+// whether it says anything at all.
+func claudeLineVerdict(line string) (working, known bool) {
+	if spinnerRe.MatchString(line) {
+		return true, true
+	}
+	if completionRe.MatchString(line) {
+		// Same glyph class, opposite meanings — the tense decides.
+		if claudeCompletionPastRe.MatchString(line) {
+			return false, true // "✻ Baked for 3m 48s": the turn is over
+		}
+		if strings.Contains(line, "…") {
+			return true, true // "✽ Baking… (1m 55s)": still running
+		}
+		return false, false // neither shape: say nothing
+	}
+	if strings.HasPrefix(line, "●") {
+		// A tool line means work only when nothing below it has already
+		// reported the turn finished; the caller reaches this first only when
+		// that is the case.
+		return true, true
+	}
+	return false, false
 }
 
 // paneIdleConfirmations is how many consecutive polls must agree before a
