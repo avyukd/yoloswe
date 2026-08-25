@@ -369,15 +369,34 @@ func TestTrackerRearmsForEveryTurn(t *testing.T) {
 }
 
 // claudePane renders claude-code's footer as it really appears, taken from a
-// live capture: an input separator, the composer, the status separator, the
-// info line, and the permissions line. state picks what sits above the
-// separator, which is the only thing that distinguishes idle from working.
+// live capture: the content region, the input separator, the composer, the
+// status separator, the info line, and the permissions line.
+//
+// The composer is always drawn, because claude always draws it — it sits
+// between the two separators whether or not a turn is running. An earlier
+// version of this helper put state directly above the status separator with no
+// composer and no input separator at all, a layout tmux_test.go's fixtures show
+// does not occur, and that omission is exactly what hid the bug
+// TestWorkingClaudePaneIsNeverReadAsIdle now pins: every "working" case here
+// was being judged against a pane shape claude never produces.
+//
+// state picks what sits in the content region above the input separator, which
+// is what distinguishes idle from working. Empty state means an empty content
+// region.
 func claudePane(state string, transcript ...string) []string {
+	return claudePaneComposer("❯ ", state, transcript...)
+}
+
+// claudePaneComposer is claudePane with the composer line spelled out, for the
+// cases that turn on what the composer itself holds.
+func claudePaneComposer(composer, state string, transcript ...string) []string {
 	lines := append([]string{}, transcript...)
 	if state != "" {
 		lines = append(lines, state)
 	}
 	return append(lines,
+		"───────── ▪▪▪ ─",
+		composer,
 		"────────────────────────────────────────────",
 		"  ~/wt/branch  main  Opus 4.6  ctx:43%  tokens:20k",
 		"  ⏵⏵ bypass permissions on (shift+tab to cycle)",
@@ -398,9 +417,11 @@ func TestClaudePaneJudge(t *testing.T) {
 		working bool
 		known   bool
 	}{
-		// Positive idle markers.
-		{"empty composer", claudePane("❯ "), false, true},
-		{"composer with a draft", claudePane("❯ half a thought"), false, true},
+		// Positive idle markers. The composer is present in every one of these
+		// — it is present in the working cases too, which is the point: the
+		// composer says nothing about whether a turn is running.
+		{"empty composer, empty content region", claudePane(""), false, true},
+		{"composer with a draft", claudePaneComposer("❯ half a thought", ""), false, true},
 		{"turn just finished", claudePane("✻ Worked for 36m 36s"), false, true},
 
 		// Positive working markers.
@@ -441,17 +462,17 @@ func TestClaudeAmbiguousFrameResetsTheStreak(t *testing.T) {
 
 	// One short of firing...
 	for i := 0; i < need-1; i++ {
-		require.False(t, tr.observe(claudePane("❯ ")), "observation %d", i+1)
+		require.False(t, tr.observe(claudePane("")), "observation %d", i+1)
 	}
 	// ...then a frame of plain agent output, which says nothing.
 	require.False(t, tr.observe(claudePane("still working on it")))
 
 	// The count restarted, so the very next idle frame must not fire.
-	assert.False(t, tr.observe(claudePane("❯ ")), "the streak restarted")
+	assert.False(t, tr.observe(claudePane("")), "the streak restarted")
 	for i := 0; i < need-2; i++ {
-		assert.False(t, tr.observe(claudePane("❯ ")))
+		assert.False(t, tr.observe(claudePane("")))
 	}
-	assert.True(t, tr.observe(claudePane("❯ ")), "a full fresh streak fires")
+	assert.True(t, tr.observe(claudePane("")), "a full fresh streak fires")
 }
 
 // TestClaudeNeedsAFullStreakToGoIdle: a single idle-looking frame is not
@@ -463,9 +484,9 @@ func TestClaudeNeedsAFullStreakToGoIdle(t *testing.T) {
 	need := tr.confirmationsNeeded()
 
 	for i := 0; i < need-1; i++ {
-		assert.False(t, tr.observe(claudePane("❯ ")), "observation %d of %d", i+1, need)
+		assert.False(t, tr.observe(claudePane("")), "observation %d of %d", i+1, need)
 	}
-	assert.True(t, tr.observe(claudePane("❯ ")), "the %dth consecutive idle frame fires", need)
+	assert.True(t, tr.observe(claudePane("")), "the %dth consecutive idle frame fires", need)
 }
 
 // TestClaudeWorkingFrameIsNeverIdle: the direct statement of the bug this probe
@@ -478,4 +499,93 @@ func TestClaudeWorkingFrameIsNeverIdle(t *testing.T) {
 		require.True(t, known, "%q", working)
 		assert.False(t, idle, "a running turn must never read as idle: %q", working)
 	}
+}
+
+// TestWorkingClaudePaneIsNeverReadAsIdle is the regression this whole judge
+// exists for, built from the repo's own fixture rather than a synthesized one:
+// bramble/session/tmux_test.go:739-761 pins a pane with `✢ Fluttering… (4m 16s)`
+// in flight whose ParseClaudeStatusBar result is IsIdle:true, because that
+// parser stops at the first `❯` above the status separator and the composer is
+// always on screen.
+//
+// Judging claude from that would call a working session idle on essentially
+// every frame: five agreeing polls is ~10s, after which the parent is told the
+// turn finished and Drain releases queued mail straight into it.
+func TestWorkingClaudePaneIsNeverReadAsIdle(t *testing.T) {
+	t.Parallel()
+
+	// Verbatim from tmux_test.go's "working with completion indicator" case.
+	live := []string{
+		"● Bash(pytest tests/)",
+		"  ⎿  Running…",
+		"✢ Fluttering… (4m 16s)",
+		"",
+		"───────── ▪▪▪ ─",
+		"❯ ",
+		"───────────────────────────────────────",
+		"  ~/project  main  Opus 4.6  ctx:19%  tokens:67k",
+		"  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+		"",
+	}
+
+	require.True(t, ParseClaudeStatusBar(live).IsIdle,
+		"precondition: the status-bar parser still reads this working pane as idle")
+
+	working, known := claudePaneJudge(live)
+	assert.True(t, known, "a pane with a tool line in flight is readable")
+	assert.True(t, working, "a working claude pane must never be judged idle")
+
+	// And the tracker must never fire idle on it, however many frames agree.
+	tr := &paneIdleTracker{provider: ProviderClaude}
+	for i := 0; i < 3*tr.confirmationsNeeded(); i++ {
+		require.False(t, tr.observe(live), "frame %d released mail into a live turn", i+1)
+	}
+}
+
+// TestStaleTranscriptPromptIsNotADraft: claude renders submitted prompts with
+// the same `❯` glyph as the composer. A bottom-up scan for the lowest glyph
+// latches onto one of those whenever the live composer is not the lowest match,
+// and then reports a draft that never clears — holding every delivery on a 30s
+// retry forever.
+func TestStaleTranscriptPromptIsNotADraft(t *testing.T) {
+	t.Parallel()
+
+	// A dialog occupying the bottom rows, so the live (empty) composer is no
+	// longer the lowest `❯` in the capture — a submitted transcript prompt
+	// re-drawn below it is. An unanchored bottom-up scan takes that one.
+	pane := append(claudePaneComposer("❯ ", ""),
+		"❯ an earlier prompt the user already sent",
+		"  [press esc to dismiss]",
+	)
+
+	draft, known := composerDraft(ProviderClaude, pane)
+	require.True(t, known, "the composer is readable")
+	assert.False(t, draft,
+		"an empty composer is not a draft just because a redrawn transcript prompt sits below it")
+}
+
+// TestPaneIdleAndWorkingStreaksAreIndependent: observe() fires by equality and
+// does not reset on firing, so a shared counter left sitting at the target
+// makes observeWorking's equality permanently false. Codex — the only
+// correctsPrematureIdle provider — would then stay wedged idle for the rest of
+// the turn, which is the wedge the correction exists to undo.
+func TestPaneIdleAndWorkingStreaksAreIndependent(t *testing.T) {
+	t.Parallel()
+
+	tr := &paneIdleTracker{provider: ProviderCodex}
+	need := tr.confirmationsNeeded()
+
+	// Drive a pane-observed idle to firing point.
+	for i := 1; i < need; i++ {
+		require.False(t, tr.observe(codexPane(false)), "idle frame %d", i)
+	}
+	require.True(t, tr.observe(codexPane(false)), "the idle streak fires")
+
+	// The session is now idle. Working frames must still be able to resurrect
+	// it — this is exactly the state the shared counter made unreachable.
+	for i := 1; i < need; i++ {
+		require.False(t, tr.observeWorking(codexPane(true)), "working frame %d", i)
+	}
+	assert.True(t, tr.observeWorking(codexPane(true)),
+		"a premature idle must still be correctable after a pane-driven idle")
 }

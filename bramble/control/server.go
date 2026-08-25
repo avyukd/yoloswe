@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/bazelment/yoloswe/bramble/session"
@@ -40,7 +41,6 @@ func NewUnixServer(socketPath string, disp *Dispatcher) *UnixServer {
 // SocketPath returns the listening socket path.
 func (s *UnixServer) SocketPath() string { return s.socketPath }
 
-// Start removes any stale socket and begins accepting connections.
 // ErrSocketInUse reports that another live process already serves the socket
 // path, so this server must not unlink it. Mirrors ipc.ErrSocketInUse — the two
 // sockets are published together and have to make the same choice, but control
@@ -64,21 +64,41 @@ func socketInUse(path string) bool {
 // A stale socket file is removed and rebound, but one that still answers is
 // left alone: the path is stable across restarts, and unlinking a live peer's
 // socket would strand every session that has it frozen in its environment.
+//
+// Bind first, then adjudicate — mirrors ipc.Server.Start, and for the same
+// reason: probing liveness and then unlinking leaves a window where two
+// processes both see the path free and the second removes the first's live
+// socket. Letting the kernel refuse the bind closes that window.
 func (s *UnixServer) Start() error {
-	if socketInUse(s.socketPath) {
-		return fmt.Errorf("%w: %s", ErrSocketInUse, s.socketPath)
-	}
-	if err := os.Remove(s.socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("control: remove stale socket: %w", err)
-	}
 	ln, err := net.Listen("unix", s.socketPath)
 	if err != nil {
-		return fmt.Errorf("control: listen %s: %w", s.socketPath, err)
+		if !isAddrInUse(err) {
+			return fmt.Errorf("control: listen %s: %w", s.socketPath, err)
+		}
+		if socketInUse(s.socketPath) {
+			return fmt.Errorf("%w: %s", ErrSocketInUse, s.socketPath)
+		}
+		if rmErr := os.Remove(s.socketPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			return fmt.Errorf("control: remove stale socket: %w", rmErr)
+		}
+		ln, err = net.Listen("unix", s.socketPath)
+		if err != nil {
+			if isAddrInUse(err) {
+				return fmt.Errorf("%w: %s", ErrSocketInUse, s.socketPath)
+			}
+			return fmt.Errorf("control: listen %s: %w", s.socketPath, err)
+		}
 	}
 	s.ln = ln
 	s.wg.Add(1)
 	go s.acceptLoop()
 	return nil
+}
+
+// isAddrInUse reports whether a listen failed because the path is already
+// taken. Mirrors ipc's helper; control does not import ipc.
+func isAddrInUse(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE) || errors.Is(err, os.ErrExist)
 }
 
 func (s *UnixServer) acceptLoop() {

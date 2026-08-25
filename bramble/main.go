@@ -520,24 +520,38 @@ func socketDir() string {
 	return os.TempDir()
 }
 
-// ipcSocketPath and controlSocketPath derive each server's socket path from the
-// pid alone, so a path is knowable before its server exists. runTUI depends on
-// that: it must publish the IPC path to the manager before the IPC server binds,
-// because that server starts serving session-creating requests immediately.
+// The stable names are what a tmux window's frozen BRAMBLE_SOCK keeps pointing
+// at across a restart of the TUI. The pid-scoped names are the fallback for a
+// second bramble started while the first still holds the stable path.
+//
+// The uid is part of the name, not just the directory. socketDir() only
+// isolates per user when XDG_RUNTIME_DIR is set; its fallback is os.TempDir(),
+// which on a host without systemd is the shared /tmp. Without the uid, two
+// users on such a host contend for one name: the loser takes the pid-scoped
+// fallback, which silently restores the stranding bug this change fixes, and
+// any local user can force every bramble on the box onto that fallback just by
+// binding the name first.
+const (
+	ipcSockBase     = "bramble"
+	controlSockBase = "bramble-control"
+)
+
+// userSockName qualifies a socket base name with the uid, keeping the path
+// stable across restarts while restoring the per-user guarantee the pid-scoped
+// naming used to provide by construction.
+func userSockName(base string) string {
+	return fmt.Sprintf("%s-%d.sock", base, os.Getuid())
+}
+
+// ipcSocketPath and controlSocketPath return the path each server should try
+// first: a stable, per-user name rather than a pid-scoped one. A path is
+// knowable before its server exists, which runTUI depends on — it must publish
+// the IPC path to the manager before the IPC server binds, because that server
+// starts serving session-creating requests immediately.
 //
 // Each is called exactly once per process, into a local that is then both
 // published and handed to the server, so the advertised path and the bound path
 // cannot diverge even though socketDir() re-reads the environment.
-// The stable names are what a tmux window's frozen BRAMBLE_SOCK keeps pointing
-// at across a restart of the TUI. The pid-scoped names are the fallback for a
-// second bramble started while the first still holds the stable path.
-const (
-	ipcSockName     = "bramble.sock"
-	controlSockName = "bramble-control.sock"
-)
-
-// ipcSocketPath and controlSocketPath return the path each server should try
-// first: a stable, per-user name rather than a pid-scoped one.
 //
 // Stable because the address is baked into every session's environment at
 // window creation and can never be updated afterwards — tmux set-environment
@@ -550,11 +564,11 @@ const (
 // syscall.Exec keeps the pid, so the in-place restart never had this problem.
 // A crash, a kill -9, or a fresh launch in another terminal did.
 func ipcSocketPath() string {
-	return filepath.Join(socketDir(), ipcSockName)
+	return filepath.Join(socketDir(), userSockName(ipcSockBase))
 }
 
 func controlSocketPath() string {
-	return filepath.Join(socketDir(), controlSockName)
+	return filepath.Join(socketDir(), userSockName(controlSockBase))
 }
 
 // pidScopedSocketPath is where a server falls back when the stable path is
@@ -594,7 +608,7 @@ func bindIPCServer(registry *session.SessionRegistry, wtRoot, repoName string) (
 	if srv := startIPCServer(registry, sockPath, wtRoot, repoName); srv != nil {
 		return srv, sockPath
 	}
-	fallback := pidScopedSocketPath(ipcSockName)
+	fallback := pidScopedSocketPath(userSockName(ipcSockBase))
 	slog.Warn("stable IPC socket is served by another bramble; falling back",
 		"stable", sockPath, "fallback", fallback)
 	if srv := startIPCServer(registry, fallback, wtRoot, repoName); srv != nil {
@@ -727,7 +741,7 @@ func startControlServer(registry *session.SessionRegistry, courier *session.Cour
 	srv := control.NewUnixServer(sockPath, dispatcher)
 	err := srv.Start()
 	if errors.Is(err, control.ErrSocketInUse) {
-		fallback := pidScopedSocketPath(controlSockName)
+		fallback := pidScopedSocketPath(userSockName(controlSockBase))
 		slog.Warn("stable control socket is served by another bramble; falling back",
 			"stable", sockPath, "fallback", fallback)
 		srv = control.NewUnixServer(fallback, dispatcher)

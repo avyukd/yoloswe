@@ -55,8 +55,8 @@ func TestSocketPathDerivation(t *testing.T) {
 // from the other socket's fallback, or two live brambles would fight over one
 // address — the collision the pid used to prevent by construction.
 func TestPidScopedFallbackIsDistinct(t *testing.T) {
-	ipcFallback := pidScopedSocketPath(ipcSockName)
-	controlFallback := pidScopedSocketPath(controlSockName)
+	ipcFallback := pidScopedSocketPath(userSockName(ipcSockBase))
+	controlFallback := pidScopedSocketPath(userSockName(controlSockBase))
 
 	if ipcFallback == ipcSocketPath() || controlFallback == controlSocketPath() {
 		t.Errorf("fallback must differ from the stable path: ipc=%q control=%q", ipcFallback, controlFallback)

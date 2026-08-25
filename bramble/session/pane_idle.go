@@ -1,6 +1,9 @@
 package session
 
-import "strings"
+import (
+	"regexp"
+	"strings"
+)
 
 // paneIdleProbe tells, from a tmux pane's text, whether an agent CLI is waiting
 // for input.
@@ -97,31 +100,152 @@ var paneIdleProbes = map[string]paneIdleProbe{
 	},
 }
 
-// claudePaneJudge reads claude-code's pane through the parser that already
-// backs the status line, rather than a second set of markers that could drift
-// away from it.
+// claudeCompletionPastRe matches claude's finished-turn line, which is always a
+// past-tense verb followed by "for <duration>" ("✻ Worked for 36m 36s", "✢
+// Baked for 2m"). It exists to separate that from the sparkle spinner, which
+// shares the same glyph class but is a gerund with a trailing ellipsis.
+var claudeCompletionPastRe = regexp.MustCompile(`^[✻✢✽✹]\s+\w+ for\s`)
+
+// isClaudeSeparator matches either of claude's two horizontal rules.
 //
-// The critical case is the third one. A capture taken mid-turn frequently shows
-// neither a spinner nor a prompt — just agent output — because the spinner is
-// sub-second and was never caught once in 400+ samples of live monitoring (see
-// .claude/memory/tmux-capture-learnings.md, caveat 3). Read as idle, that would
-// release queued mail into a running turn, which is exactly what this whole
-// table exists to prevent. So ambiguity reports known=false, and observe()
-// resets the streak on it.
-func claudePaneJudge(lines []string) (working, known bool) {
-	ps := ParseClaudeStatusBar(lines)
-	if ps == nil {
-		return false, false // no separator: not claude's prompt, or still booting
+// separatorRe alone is not enough: it requires ten unbroken box-drawing
+// characters, and the *input* separator carries the `▪▪▪` mode indicator that
+// breaks the run ("───────── ▪▪▪ ─"). Matching only the status separator is
+// how the input separator went unfound, which left the content region
+// undelimited.
+func isClaudeSeparator(trimmed string) bool {
+	return separatorRe.MatchString(trimmed) ||
+		(strings.HasPrefix(trimmed, "─") && strings.Contains(trimmed, "▪"))
+}
+
+// claudeComposerIdx locates claude-code's live composer line: the first
+// non-empty line above the status separator, which in claude's layout is always
+// the `❯` composer. It returns the composer index and the index of the input
+// separator (`─ ▪▪▪ ─`) that divides the composer chrome from the agent content
+// above it; either is -1 when not found.
+//
+// Anchoring matters more than it looks. The composer glyph is not unique in a
+// capture — claude renders every *submitted* prompt with the same `❯` (see the
+// transcript fixture at tmux_test.go:714) — so any scan that simply takes the
+// lowest `❯` can latch onto scrollback and report a permanent draft. The
+// composer is defined by its position between the two separators, so that is
+// how it is found.
+func claudeComposerIdx(lines []string) (composerIdx, inputSepIdx int) {
+	statusSepIdx := -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		if separatorRe.MatchString(strings.TrimSpace(lines[i])) {
+			statusSepIdx = i
+			break
+		}
 	}
-	switch {
-	case ps.IsWorking:
-		return true, true
-	case ps.IsIdle:
-		return false, true
-	default:
-		// Agent output above the separator, and no positive marker either way.
+	if statusSepIdx < 0 {
+		return -1, -1
+	}
+	composerIdx = -1
+	for i := statusSepIdx - 1; i >= 0; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed == "" {
+			continue
+		}
+		if isClaudeSeparator(trimmed) {
+			// A separator directly under the status separator means claude has
+			// not drawn a composer; there is nothing to report.
+			return -1, i
+		}
+		composerIdx = i
+		break
+	}
+	if composerIdx < 0 {
+		return -1, -1
+	}
+	// The input separator, if present, is the next separator above the composer.
+	inputSepIdx = -1
+	for i := composerIdx - 1; i >= 0 && i >= composerIdx-3; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed == "" {
+			continue
+		}
+		if isClaudeSeparator(trimmed) {
+			inputSepIdx = i
+		}
+		break
+	}
+	return composerIdx, inputSepIdx
+}
+
+// claudePaneJudge reads claude-code's pane to decide whether a turn is in
+// flight.
+//
+// It deliberately does NOT use ParseClaudeStatusBar's IsIdle. That parser scans
+// up from the status separator and stops at the first `❯` it meets — which is
+// the composer, and the composer is on screen whether or not a turn is running.
+// The repo's own fixture pins the consequence: tmux_test.go:739-761 is a pane
+// with `✢ Fluttering… (4m 16s)` in flight whose expected parse is IsIdle:true.
+// Judging from that would call a working claude session idle on essentially
+// every frame and release its queued mail into a live turn — the precise harm
+// this table exists to prevent.
+//
+// So the content region *above* the input separator is what gets judged, where
+// the spinner and tool lines actually live:
+//
+//   - a spinner or a `●` tool line means working;
+//   - a completion indicator (`✻ Worked for …`) means the turn just ended;
+//   - an empty content region under a drawn composer means idle;
+//   - anything else — agent output with no marker — is ambiguous.
+//
+// Ambiguity reports known=false, and observe() resets the streak on it. That is
+// load-bearing: a capture taken mid-turn frequently shows neither spinner nor
+// prompt, because the spinner is sub-second and was never caught once in 400+
+// samples of live monitoring (.claude/memory/tmux-capture-learnings.md, caveat
+// 3). "No spinner" is the normal appearance of a working session, not idleness.
+func claudePaneJudge(lines []string) (working, known bool) {
+	composerIdx, inputSepIdx := claudeComposerIdx(lines)
+	if composerIdx < 0 {
+		return false, false // no composer: not claude's prompt, or still booting
+	}
+	if inputSepIdx < 0 {
+		// Composer found but no input separator above it, so the content region
+		// cannot be delimited and the spinner would be indistinguishable from
+		// transcript text. Refuse to guess.
 		return false, false
 	}
+
+	// Scan the content region above the input separator, nearest line first.
+	for i := inputSepIdx - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		switch {
+		case spinnerRe.MatchString(line):
+			return true, true
+		case strings.HasPrefix(line, "●"):
+			return true, true
+		case completionRe.MatchString(line):
+			// completionRe's glyph class is shared by two opposite states:
+			// "✻ Worked for 36m 36s" is a finished turn, but "✢ Fluttering…
+			// (4m 16s)" is claude's sparkle *spinner*, still running — the very
+			// line tmux_test.go's working fixture carries. The gerund's
+			// trailing ellipsis is what separates them.
+			if strings.Contains(line, "…") {
+				return true, true
+			}
+			if claudeCompletionPastRe.MatchString(line) {
+				// "Worked for …" — the turn is over; the prompt lands on the
+				// next repaint.
+				return false, true
+			}
+			// Same glyph, neither shape. Never call this idle.
+			return false, false
+		}
+		// Agent output with no positive marker: the spinner may simply not be
+		// in this frame. Ambiguous, never idle.
+		return false, false
+	}
+
+	// Nothing above the input separator at all: a drawn composer over an empty
+	// content region, which is a session waiting for input.
+	return false, true
 }
 
 // paneIdleConfirmations is how many consecutive polls must agree before a
@@ -237,8 +361,18 @@ func containsAny(haystack string, needles []string) bool {
 // paneIdleTracker turns a stream of pane judgements into one idle transition.
 type paneIdleTracker struct {
 	provider string
-	streak   int
-	// epoch is the session turn the current streak was observed during, so
+	// idleStreak and workingStreak count the two directions separately.
+	//
+	// One shared counter cannot serve both. observe() fires by equality
+	// (streak == confirmationsNeeded) and does not reset on firing, so after a
+	// pane-driven idle the counter sits exactly at the target; every later
+	// working frame then increments past it and observeWorking's equality can
+	// never be true again. Codex — the only correctsPrematureIdle provider —
+	// would stay wedged idle for the rest of the turn, which is the very wedge
+	// the correction exists to undo.
+	idleStreak    int
+	workingStreak int
+	// epoch is the session turn the current streaks were observed during, so
 	// observations cannot be carried across a turn boundary. See forTurn.
 	epoch uint64
 }
@@ -276,7 +410,8 @@ func (p *paneIdleTracker) forTurn(epoch uint64) {
 		return
 	}
 	p.epoch = epoch
-	p.streak = 0
+	p.idleStreak = 0
+	p.workingStreak = 0
 }
 
 // observe feeds one capture in and reports whether the session should now be
@@ -288,11 +423,11 @@ func (p *paneIdleTracker) observe(lines []string) bool {
 	}
 	idle, known := paneShowsIdle(p.provider, lines)
 	if !known || !idle {
-		p.streak = 0
+		p.idleStreak = 0
 		return false
 	}
-	p.streak++
-	return p.streak == p.confirmationsNeeded()
+	p.idleStreak++
+	return p.idleStreak == p.confirmationsNeeded()
 }
 
 // confirmationsNeeded is how many consecutive idle observations this provider
@@ -316,18 +451,19 @@ func (p *paneIdleTracker) observeWorking(lines []string) bool {
 	}
 	working, known := paneShowsWorking(p.provider, lines)
 	if !known || !working {
-		p.streak = 0
+		p.workingStreak = 0
 		return false
 	}
-	p.streak++
-	return p.streak == p.confirmationsNeeded()
+	p.workingStreak++
+	return p.workingStreak == p.confirmationsNeeded()
 }
 
-// reset forgets the current streak, so a session that went idle and was then
-// given more work must be observed idle afresh.
+// reset forgets both streaks, so a session that went idle and was then given
+// more work must be observed afresh in either direction.
 func (p *paneIdleTracker) reset() {
 	if p != nil {
-		p.streak = 0
+		p.idleStreak = 0
+		p.workingStreak = 0
 	}
 }
 
@@ -397,6 +533,12 @@ type pasteEvidence struct {
 	required bool
 }
 
+// Only an entry with required:true is consulted in production: the courier
+// checks pasteVerifyRequired before it probes, so a non-required provider's
+// markers are never read. Cursor's entry is kept anyway — it records the fact
+// that made this table necessary (cursor renders a chip, so scanning for the
+// pasted characters can never succeed), and it is what pasteConfirmed is tested
+// against. If cursor ever needs required:true, the markers are already right.
 var pasteEvidenceProbes = map[string]pasteEvidence{
 	ProviderCursor: {chipMarkers: []string{"[Pasted text"}},
 	ProviderCodex:  {required: true},
@@ -428,42 +570,54 @@ func pasteConfirmed(provider string, lines []string, probe string) bool {
 // claudePromptGlyph is the composer prompt in claude-code's TUI, U+276F.
 const claudePromptGlyph = "❯"
 
-// composerDraft reports whether the user has typed something into the composer
-// that has not been submitted yet.
+// composerDraft reports whether claude's composer holds text the user has
+// typed but not yet submitted.
 //
-// Delivering into a non-empty composer appends to whatever the human was
-// writing and then presses Enter, submitting their half-finished sentence
-// wearing someone else's text. The idle probe cannot catch this: a composer
-// holding a draft is still a composer, so the session reads as maximally idle
-// at exactly the moment it is least safe to write to.
+// The composer is located by position (claudeComposerIdx) whenever the pane
+// shows claude's full chrome. An unanchored bottom-up scan cannot be used as
+// the primary rule: claude renders every submitted transcript prompt with the
+// same glyph, so the lowest match is not the composer whenever a repaint, a
+// dialog over the bottom rows, or copy mode puts something below it — and the
+// scan then reports a draft that never clears, wedging the queue on a 30s
+// retry forever.
 //
-// known is false for a provider whose composer cannot be read, and callers must
-// treat that as "no draft" — refusing to deliver into every pane we cannot
-// parse would strand mail rather than protect it.
-//
-// Only claude is judged today. cursor and codex render *placeholder* text in an
-// empty composer ("Add a follow-up", "Ask Codex to do anything") which
-// disappears as soon as the user types, so a typed draft is indistinguishable
-// from a CLI that has not finished booting. Reading those needs a positive
-// anchor on the composer glyph, validated against a live capture first.
+// When the chrome is not parseable (a partial capture with no status
+// separator), the search falls back to the bounded pane tail rather than to a
+// whole-capture scan or to "unknown". Reporting unknown here means "deliver",
+// and delivering into a draft is the harm this function exists to prevent; the
+// tail bound is what keeps a stale transcript prompt out of reach.
 func composerDraft(provider string, lines []string) (draft, known bool) {
 	if provider != ProviderClaude {
 		return false, false
 	}
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if !strings.HasPrefix(line, claudePromptGlyph) {
-			continue
-		}
-		// The glyph is separated from the text by a non-breaking space
-		// (U+00A0), not an ordinary one -- see the fixtures in
-		// TestEmptyClaudeComposerIsNotADraft. The TrimSpace above is what
-		// handles it: it is Unicode-aware, so an empty composer is already bare
-		// by the time the prefix comes off. Trimming again here would be
-		// redundant, but an ASCII-only cutset anywhere in this path would leave
-		// " " behind and read every empty composer as a draft, holding back
-		// all mail on the host.
-		return strings.TrimPrefix(line, claudePromptGlyph) != "", true
+	if composerIdx, _ := claudeComposerIdx(lines); composerIdx >= 0 {
+		return judgeComposerLine(lines[composerIdx])
 	}
-	return false, false
+	// No parseable chrome: judge the lowest composer-looking line within the
+	// tail bound, and nothing above it.
+	draft, known = false, false
+	forEachPaneTailLine(lines, func(line string) bool {
+		if !strings.HasPrefix(strings.TrimSpace(line), claudePromptGlyph) {
+			return false
+		}
+		draft, known = judgeComposerLine(line)
+		return true
+	})
+	return draft, known
+}
+
+// judgeComposerLine reports whether one composer line holds a draft.
+//
+// The glyph is separated from the text by a non-breaking space (U+00A0), not an
+// ordinary one -- see the fixtures in TestEmptyClaudeComposerIsNotADraft.
+// TrimSpace is what handles it: it is Unicode-aware, so an empty composer is
+// already bare by the time the prefix comes off. An ASCII-only cutset anywhere
+// in this path would leave "\u00a0" behind and read every empty composer as a
+// draft, holding back all mail on the host.
+func judgeComposerLine(line string) (draft, known bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, claudePromptGlyph) {
+		return false, false
+	}
+	return strings.TrimSpace(strings.TrimPrefix(trimmed, claudePromptGlyph)) != "", true
 }

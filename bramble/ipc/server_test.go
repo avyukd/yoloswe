@@ -250,3 +250,85 @@ func TestSocketPathSurvivesRestart(t *testing.T) {
 
 	require.NoError(t, client.Ping(), "the address a live session holds still works")
 }
+
+// TestConcurrentStartNeverUnlinksALiveSocket pins the invariant the stable
+// socket path depends on: exactly one server binds, and the loser must never
+// remove the winner's socket.
+//
+// Checking liveness and then unlinking is not atomic — both processes can
+// observe the path as free, one binds, and the other then removes the live
+// socket out from under it. Every session holding that path in its frozen tmux
+// environment is stranded at that moment, which is the failure the stable path
+// was introduced to fix.
+func TestConcurrentStartNeverUnlinksALiveSocket(t *testing.T) {
+	t.Parallel()
+	sockPath := filepath.Join(t.TempDir(), "contended.sock")
+
+	const racers = 8
+	start := make(chan struct{})
+	results := make(chan error, racers)
+	servers := make([]*Server, racers)
+
+	for i := range servers {
+		srv := NewServer(sockPath)
+		srv.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+			return "pong", nil
+		})
+		servers[i] = srv
+		go func() {
+			<-start // release them together so the binds actually contend
+			results <- srv.Start()
+		}()
+	}
+	close(start)
+
+	var won int
+	for i := 0; i < racers; i++ {
+		err := <-results
+		if err == nil {
+			won++
+			continue
+		}
+		require.ErrorIs(t, err, ErrSocketInUse,
+			"a loser must report the path as taken, not fail some other way")
+	}
+	require.Equal(t, 1, won, "exactly one server may hold the socket")
+
+	for _, srv := range servers {
+		defer srv.Close()
+	}
+
+	// The decisive assertion: the winner is still reachable. If any loser had
+	// unlinked and rebound, this either fails or reaches a different listener.
+	require.NoError(t, NewClient(sockPath).Ping(),
+		"the live socket must still be served after the contention")
+}
+
+// TestStaleSocketFileIsReclaimed is the other half: a socket file left behind by
+// a killed process has no listener, so it must be removed and rebound rather
+// than treated as live. Without this a crash would make the stable path
+// permanently unusable.
+func TestStaleSocketFileIsReclaimed(t *testing.T) {
+	t.Parallel()
+	sockPath := filepath.Join(t.TempDir(), "stale.sock")
+
+	// Leave a bound socket file with no listener behind it, the way a killed
+	// process does. Go's UnixListener unlinks on Close, so a normal
+	// Listen/Close cannot reproduce it — SetUnlinkOnClose(false) is what makes
+	// the file outlive its listener.
+	ln, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	ln.(*net.UnixListener).SetUnlinkOnClose(false)
+	require.NoError(t, ln.Close())
+	_, err = os.Stat(sockPath)
+	require.NoError(t, err, "precondition: a socket file is left on disk")
+
+	srv := NewServer(sockPath)
+	srv.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+		return "pong", nil
+	})
+	require.NoError(t, srv.Start(), "a stale socket file must be reclaimed")
+	defer srv.Close()
+
+	require.NoError(t, NewClient(sockPath).Ping())
+}

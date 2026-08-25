@@ -233,7 +233,7 @@ func (c *Courier) deliver(ctx context.Context, from, to SessionID, text string, 
 			if err == nil {
 				return false, nil
 			}
-			logDeliveryWarn("failed to write delivery, queueing it instead", to, err)
+			logWriteFailure("failed to write delivery, queueing it instead", to, err)
 			writeFailed = true
 		}
 	}
@@ -393,11 +393,7 @@ func (c *Courier) Drain(ctx context.Context, to SessionID) {
 		// sentence — but it looks exactly like one in the log, and a queue that
 		// stops draining because somebody left a half-typed line is otherwise
 		// very hard to explain.
-		if errors.Is(err, errComposerBusy) {
-			logDeliveryWarn("holding delivery: recipient has an unsubmitted draft", to, err)
-		} else {
-			logDeliveryWarn("failed to write queued delivery", to, err)
-		}
+		logWriteFailure("failed to write queued delivery", to, err)
 		c.retryLater(ctx, to)
 		return
 	}
@@ -476,7 +472,14 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 		// — an empty scrape is silence, not a negative. Re-pasting on silence
 		// is what put the message in the composer twice and then never
 		// submitted it.
-		if !c.pasteLanded(ctx, info.ID, provider, text) && pasteVerifyRequired(provider) {
+		//
+		// pasteVerifyRequired is checked FIRST so no work is done for a
+		// provider whose verdict is discarded. The other order still ran the
+		// probe for everyone — up to pasteVerifyAttemptsBestEffort sleeps plus
+		// a CapturePaneText round-trip per attempt, on every delivery — and
+		// then threw the answer away, while widening the very window between
+		// the draft check and SendEnter that this change set out to close.
+		if pasteVerifyRequired(provider) && !c.pasteLanded(ctx, info.ID, provider, text) {
 			if err := c.panes.Paste(ctx, target, text); err != nil {
 				return err
 			}
@@ -807,6 +810,23 @@ const maxDeliveryAge = 7 * 24 * time.Hour
 // to — so they surface here instead of vanishing.
 func logDeliveryWarn(msg string, to SessionID, err error) {
 	log.Printf("WARNING: %s for session %s: %v", msg, to, err)
+}
+
+// logWriteFailure reports a failed delivery write, distinguishing a composer
+// hold from a real failure.
+//
+// Both write sites go through here on purpose. A hold is not a failure — the
+// recipient is simply mid sentence — but it is indistinguishable from one in
+// the log, and a queue that stops draining because somebody left a half-typed
+// line is otherwise very hard to explain. deliver() handles the common case (a
+// subagent report arriving at an already-idle parent), so classifying only in
+// Drain left the first and most likely hold reported as a failure.
+func logWriteFailure(failMsg string, to SessionID, err error) {
+	if errors.Is(err, errComposerBusy) {
+		logDeliveryWarn("holding delivery: recipient has an unsubmitted draft", to, err)
+		return
+	}
+	logDeliveryWarn(failMsg, to, err)
 }
 
 // parentSessionID reads the session's parent under the lock. The field is set

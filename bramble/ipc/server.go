@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -80,18 +81,36 @@ func socketInUse(path string) bool {
 // blindly would steal every running session's callback address from whichever
 // bramble is still serving them, and those sessions have that path frozen in
 // their tmux window environment with no way to learn a new one.
+//
+// The bind is attempted BEFORE any unlink, so the check and the claim cannot
+// race. A liveness probe followed by os.Remove has a window in which two
+// brambles both see the path free, one binds, and the other then unlinks the
+// live socket out from under it — stranding exactly the sessions this stability
+// was added to protect. Binding first makes the kernel the arbiter: only one
+// listener can hold a path, and EADDRINUSE means somebody already does.
 func (s *Server) Start() error {
-	if socketInUse(s.socketPath) {
-		return fmt.Errorf("%w: %s", ErrSocketInUse, s.socketPath)
-	}
-	// Nothing answered, so any file here is stale.
-	if err := os.Remove(s.socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("failed to remove stale socket %s: %w", s.socketPath, err)
-	}
-
 	ln, err := net.Listen("unix", s.socketPath)
 	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %w", s.socketPath, err)
+		if !isAddrInUse(err) {
+			return fmt.Errorf("failed to listen on %s: %w", s.socketPath, err)
+		}
+		// A file is in the way. Only its owner can say whether it is live.
+		if socketInUse(s.socketPath) {
+			return fmt.Errorf("%w: %s", ErrSocketInUse, s.socketPath)
+		}
+		// Nothing answered, so the file is stale: reclaim it and retry once.
+		if rmErr := os.Remove(s.socketPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			return fmt.Errorf("failed to remove stale socket %s: %w", s.socketPath, rmErr)
+		}
+		ln, err = net.Listen("unix", s.socketPath)
+		if err != nil {
+			// Lost the retry to another process that bound between the unlink
+			// and here. It is live by construction, so do not touch it.
+			if isAddrInUse(err) {
+				return fmt.Errorf("%w: %s", ErrSocketInUse, s.socketPath)
+			}
+			return fmt.Errorf("failed to listen on %s: %w", s.socketPath, err)
+		}
 	}
 	s.listener = ln
 
@@ -99,6 +118,12 @@ func (s *Server) Start() error {
 	go s.acceptLoop()
 
 	return nil
+}
+
+// isAddrInUse reports whether a listen failed because the path is already
+// taken, which for a Unix socket is any existing file at that path.
+func isAddrInUse(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE) || errors.Is(err, os.ErrExist)
 }
 
 // Close shuts down the server, closes the listener, waits for in-flight connections, and removes the socket file.
