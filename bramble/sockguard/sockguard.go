@@ -35,12 +35,29 @@ const liveness = 250 * time.Millisecond
 // refuses with ECONNREFUSED. Sending a request would additionally require the
 // peer to speak a particular protocol, which is a stronger claim than needed
 // and would hang on a peer that accepts but never replies.
+//
+// Only two answers mean the path is free, and they are named positively rather
+// than by excluding the failures anyone thought of: the peer REFUSED the
+// connection, or there is no file to connect to. Every other error is one this
+// function could not classify — a dial that timed out against a saturated
+// listener backlog, EMFILE from fd exhaustion, EINTR — and an unclassified
+// error is not evidence of absence. It is reported as in use.
+//
+// Failing closed here costs a fallback to a pid-scoped path; failing open costs
+// the live peer its address. reclaimStale unlinks on this verdict, so a false
+// "free" strands every window whose tmux environment froze the stable path,
+// which is exactly the failure this package was extracted to prevent. This
+// check runs on every start that finds a file present — net.Listen fails with
+// EADDRINUSE whether or not a peer is alive — so it is not a rare path.
 func InUse(path string) bool {
 	conn, err := net.DialTimeout("unix", path, liveness)
-	if err != nil {
+	if err == nil {
+		conn.Close()
+		return true
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, os.ErrNotExist) {
 		return false
 	}
-	conn.Close()
 	return true
 }
 
@@ -93,8 +110,10 @@ func reclaimStale(path string) (net.Listener, error) {
 	if InUse(path) {
 		return nil, fmt.Errorf("%w: %s", ErrInUse, path)
 	}
-	// Nothing answered and no other reclaimer can be running, so the file is
-	// stale.
+	// The path refused the connection (or vanished) and no other reclaimer can
+	// be running, so the file is stale. InUse answers false only for those two,
+	// so an error it could not classify has already returned ErrInUse above
+	// rather than reaching this unlink.
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("failed to remove stale socket %s: %w", path, err)
 	}

@@ -1,6 +1,7 @@
 package sockguard
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -162,13 +164,12 @@ func TestListenRefusesALiveSocket(t *testing.T) {
 // spin on a shared gate file, so they enter check-unlink-bind together instead
 // of in spawn order.
 //
-// Measured both directions rather than assumed: 15/15 green with the lock in
-// place, 2/10 red with the flock call removed. So it is a real detector of the
-// regression but a probabilistic one — it will not catch every reintroduction in
-// a single run, while it never fails spuriously with the lock present. An
-// earlier in-process version caught nothing at all: goroutines share an open
-// file description, so they never contend for the flock the way two brambles
-// do.
+// Measured both directions rather than assumed: per race, 15/15 green with the
+// lock in place, 2/10 red with the flock call removed. One race is therefore a
+// real detector but a weak one, so the test runs raceRounds of them, which
+// raises detection to a measured 4/5 — see there. An earlier
+// in-process version caught nothing at all: goroutines share an open file
+// description, so they never contend for the flock the way two brambles do.
 //
 // The winner holds the socket until the parent reports every child settled,
 // rather than for a fixed span. A timed hold was flaky in the one direction
@@ -179,7 +180,29 @@ func TestConcurrentReclaimYieldsExactlyOneWinner(t *testing.T) {
 	if os.Getenv(raceChildEnv) != "" {
 		return // this process is a child; see TestMain
 	}
+	for round := 0; round < raceRounds; round++ {
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) {
+			raceOnce(t)
+		})
+	}
+}
 
+// raceRounds is how many independent races one run performs.
+//
+// One race is a real detector of the missing lock but a weak one — measured
+// 2/10 red with the flock call removed — so a single round left a green gate
+// mostly silent about the one regression it exists to catch. Independent rounds
+// compound, and a round that never fails spuriously stays green however many
+// times it is repeated.
+//
+// Measured at this count, both directions: 4/5 runs red with the flock call
+// removed, 8/8 green with it in place. Still not a proof, but a gate that
+// usually fires rather than usually does not. A deterministic barrier would
+// need a test hook wired between the InUse check and the unlink in production
+// code; repetition buys most of the signal for none of that.
+const raceRounds = 12
+
+func raceOnce(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "s.sock")
 	require.NoError(t, os.WriteFile(path, nil, 0o600)) // a stale file to race for
@@ -266,4 +289,30 @@ func TestInUseDistinguishesLiveFromStale(t *testing.T) {
 	assert.True(t, InUse(livePath), "a socket that accepts has a live process behind it")
 
 	assert.False(t, InUse(filepath.Join(dir, "absent.sock")), "an absent path is not in use")
+}
+
+// TestInUseFailsClosedOnAnUnclassifiableError pins the direction InUse errs in
+// when it cannot tell live from stale.
+//
+// The two safe answers are named positively — refused, or no such file — and
+// everything else must read as in use, because the caller of a false "free" is
+// reclaimStale, which unlinks. A dial that fails for a reason nobody enumerated
+// (a timeout against a saturated backlog, EMFILE, EINTR) would otherwise steal
+// the address of a process still serving it.
+//
+// The error is injected rather than described: a path longer than sun_path
+// fails the dial with EINVAL, which is neither ECONNREFUSED nor ErrNotExist and
+// so exercises exactly the branch a real ambiguous failure takes.
+func TestInUseFailsClosedOnAnUnclassifiableError(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	// sun_path is 108 bytes on Linux; anything past it cannot be dialed at all.
+	tooLong := filepath.Join(dir, strings.Repeat("n", 200)+".sock")
+	_, err := net.DialTimeout("unix", tooLong, 250*time.Millisecond)
+	require.Error(t, err, "the injected path must fail the dial for this test to mean anything")
+	require.False(t, errors.Is(err, syscall.ECONNREFUSED), "must not be a refusal")
+	require.False(t, errors.Is(err, os.ErrNotExist), "must not be an absent path")
+
+	assert.True(t, InUse(tooLong), "an error InUse cannot classify must read as in use, never as free")
 }

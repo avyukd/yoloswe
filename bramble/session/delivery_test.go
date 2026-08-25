@@ -531,6 +531,12 @@ func TestSendToUnknownSessionErrors(t *testing.T) {
 
 // TestDrainDiscardsQueueForTerminalSession stops the on-disk queue leaking when
 // a recipient dies with mail still waiting.
+//
+// It asserts on EVERY per-recipient map, not just the queue. discard is the
+// only lifecycle cleanup point the courier has, so a map it forgets is a map
+// that never empties: one entry per session that ever held a delivery, kept for
+// the process lifetime, and inherited by any session ID reused after a terminal
+// transition.
 func TestDrainDiscardsQueueForTerminalSession(t *testing.T) {
 	t.Parallel()
 	c, target, _ := newTestCourier(t)
@@ -538,10 +544,34 @@ func TestDrainDiscardsQueueForTerminalSession(t *testing.T) {
 	_, err := c.Send(context.Background(), "", "s1", "hello", true)
 	require.NoError(t, err)
 
+	// Populate the state a held delivery leaves behind, so the assertions below
+	// are about release and not about maps that were empty all along.
+	c.noteStaged("s1", "hello")
+	c.noteDraftHold("s1", "a half-typed line")
+	require.True(t, c.noteBlockedReport("s1", "a half-typed line"))
+	c.notePaneHold("s1", []string{"some pane content"})
+	c.mu.Lock()
+	for name, populated := range map[string]bool{
+		"staged":          len(c.staged) == 1,
+		"heldForDraft":    len(c.heldForDraft) == 1,
+		"reportedBlocked": len(c.reportedBlocked) == 1,
+		"heldForPane":     len(c.heldForPane) == 1,
+	} {
+		require.True(t, populated, "%s must hold an entry before discard for this test to prove anything", name)
+	}
+	c.mu.Unlock()
+
 	target.set("s1", StatusFailed, RunnerTypeTmux)
 	c.Drain(context.Background(), "s1")
 
 	assert.Empty(t, c.Pending("s1"))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	assert.Empty(t, c.pending, "pending")
+	assert.Empty(t, c.staged, "staged")
+	assert.Empty(t, c.heldForDraft, "heldForDraft")
+	assert.Empty(t, c.reportedBlocked, "reportedBlocked")
+	assert.Empty(t, c.heldForPane, "heldForPane")
 }
 
 // TestQueueSurvivesReload is why the queue is on disk: a bramble restart must
@@ -1912,11 +1942,20 @@ func TestConcurrentDrainAndSendKeepsQueueConsistent(t *testing.T) {
 		"the persisted queue disagrees with the live one")
 }
 
-// TestCursorChipCountsAsPasteLanded: cursor-agent collapses a bracketed paste
-// into a "[Pasted text #N]" chip and never echoes the characters, so looking
-// for the text itself can never succeed. Before this was provider-aware every
-// cursor delivery pasted twice and then refused to submit.
-func TestCursorChipCountsAsPasteLanded(t *testing.T) {
+// TestCursorDeliveryPastesOnceAndSubmits: cursor-agent collapses a bracketed
+// paste into a "[Pasted text #N]" chip and never echoes the characters, so
+// looking for the text itself can never succeed. Before this was provider-aware
+// every cursor delivery pasted twice and then refused to submit.
+//
+// What fixes cursor is that it is not verified at all — Courier.write checks
+// pasteVerifyRequired before it probes, and cursor's entry is required:false —
+// NOT that a chip is accepted as proof. Measured: deleting cursor's chipMarkers
+// leaves the end-to-end half of this test green and fails only the direct
+// pasteConfirmed asserts below, which exercise a branch production never
+// reaches for cursor. Those asserts are kept as the pin on the table entry
+// itself, which is inert until cursor becomes required:true; the regression
+// signal for the shipped cursor fix is TestUnverifiablePasteStillSubmits.
+func TestCursorDeliveryPastesOnceAndSubmits(t *testing.T) {
 	t.Parallel()
 	target := newFakeTarget()
 	target.set("s1", StatusIdle, RunnerTypeTmux)
@@ -1942,10 +1981,12 @@ func TestCursorChipCountsAsPasteLanded(t *testing.T) {
 	assert.Equal(t, []SessionID{"s1"}, target.markedRunning)
 	assert.Empty(t, c.Pending("s1"), "a delivered message must leave the queue")
 
-	// The chip is what makes this a *confirmed* delivery rather than one that
-	// merely proceeded because cursor is not verified strictly. Without the
-	// marker the courier would spend the whole verify budget scraping for text
-	// that is never echoed, so assert the recognition directly.
+	// Below this line the subject changes: the delivery above succeeded because
+	// cursor is not verified, and these two asserts pin the table entry rather
+	// than the delivery. They are the only thing that would notice cursor's
+	// chipMarkers being dropped, and they matter for the day cursor becomes
+	// required:true — at which point scanning for the pasted characters could
+	// never succeed and only the chip would confirm.
 	assert.True(t, pasteConfirmed(ProviderCursor,
 		[]string{"[Pasted text #1 +12 lines]"}, "the report body"),
 		"a chip stands in for the pasted text")

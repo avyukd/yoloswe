@@ -356,6 +356,14 @@ func (c *Courier) Pending(to SessionID) []Delivery {
 // into: tmux paste-buffer appends, so pasting over it would submit both as a
 // single prompt.
 func composerHoldsThisDelivery(provider, composer, staged, text string) bool {
+	// Claude-only by construction, and it says so rather than leaving the
+	// provider argument to look like a branch that was planned and never
+	// landed: the body strips claudePromptGlyph and compares against a composer
+	// this package can only locate for claude. A caller passing anything else
+	// would be reading a line it has no way to have found.
+	if !composerReadable(provider) {
+		return false
+	}
 	body := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(composer), claudePromptGlyph))
 	if body == "" {
 		return false
@@ -1194,8 +1202,17 @@ func (c *Courier) discard(to SessionID) {
 	delete(c.pending, to)
 	// The queue is gone, so nothing will ever finish a paste left in this
 	// recipient's composer; the record must not outlive the intent to submit.
+	//
+	// Every per-recipient map is released here, not just the ones this delivery
+	// happened to populate. discard is the ONLY lifecycle cleanup point —
+	// Drain and Watch both funnel into it — so an entry left behind lives for
+	// the process lifetime, and a session ID reused after a terminal transition
+	// would inherit the old one's hold clock or suppressed block report.
+	// TestDrainDiscardsQueueForTerminalSession asserts all four are empty.
 	delete(c.staged, to)
 	delete(c.heldForPane, to)
+	delete(c.heldForDraft, to)
+	delete(c.reportedBlocked, to)
 	err := c.persistLocked(to)
 	c.mu.Unlock()
 	if err != nil {

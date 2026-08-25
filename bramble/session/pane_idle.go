@@ -674,20 +674,6 @@ func pasteVerifyRequired(provider string) bool {
 	return pasteEvidenceProbes[provider].required
 }
 
-// pasteConfirmed reports whether a captured pane shows the paste arrived,
-// either by echoing the text or by rendering a chip in its place.
-//
-// Where the composer can be located, ONLY the composer is read. A capture is 40
-// lines deep and an agent echoes every submitted prompt into its transcript, so
-// a scan of the whole pane is confirmed by a previous delivery of the same text
-// — and for a provider whose verdict actually gates Enter (claude, codex) that
-// means pressing Enter on an empty composer: the message is lost and
-// MarkRunning wedges the session on a turn that never started, which is the
-// failure this check exists to prevent.
-//
-// Where it cannot be located, the whole capture is scanned as before. That is
-// the weaker test, but for a CLI whose chrome bramble cannot read it is the
-// only one available, and those providers are not required:true.
 // pasteEvidenceObscured reports the one shape in which a capture says nothing
 // about a paste rather than denying it: this provider's chrome is on screen —
 // so the pane is painted and the CLI is up — yet the composer could not be
@@ -707,6 +693,20 @@ func pasteEvidenceObscured(provider string, lines []string) bool {
 	return searchedForComposer(lines)
 }
 
+// pasteConfirmed reports whether a captured pane shows the paste arrived,
+// either by echoing the text or by rendering a chip in its place.
+//
+// Where the composer can be located, ONLY the composer is read. A capture is 40
+// lines deep and an agent echoes every submitted prompt into its transcript, so
+// a scan of the whole pane is confirmed by a previous delivery of the same text
+// — and for a provider whose verdict actually gates Enter (claude, codex) that
+// means pressing Enter on an empty composer: the message is lost and
+// MarkRunning wedges the session on a turn that never started, which is the
+// failure this check exists to prevent.
+//
+// Where it cannot be located, the whole capture is scanned as before. That is
+// the weaker test, but for a CLI whose chrome bramble cannot read it is the
+// only one available, and those providers are not required:true.
 func pasteConfirmed(provider string, lines []string, probe string) bool {
 	if probe == "" {
 		return true // nothing distinctive to look for

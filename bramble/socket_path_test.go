@@ -199,9 +199,9 @@ func TestStartIPCServerBindsThePublishedPath(t *testing.T) {
 	published := ipcSocketPath()
 	registry := session.NewSessionRegistry()
 
-	srv := startIPCServer(registry, published, dir, "repo")
-	if srv == nil {
-		t.Fatal("startIPCServer returned nil; expected a bound server")
+	srv, err := startIPCServer(registry, published, dir, "repo")
+	if err != nil {
+		t.Fatalf("startIPCServer failed to bind %q: %v", published, err)
 	}
 	defer srv.Close()
 

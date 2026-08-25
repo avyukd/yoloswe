@@ -724,8 +724,20 @@ func bindIPCServer(registry *session.SessionRegistry, wtRoot, repoName string) (
 		// No private directory: stableOrPidScoped has already said so, loudly.
 		return nil, ""
 	}
-	if srv := startIPCServer(registry, sockPath, wtRoot, repoName); srv != nil {
+	srv, err := startIPCServer(registry, sockPath, wtRoot, repoName)
+	if err == nil {
 		return srv, sockPath
+	}
+	// The fallback is for ONE cause — another live bramble holds the stable
+	// path — and the error class is what says so. Falling back on any failure
+	// would take the collision path for a cause the collision path does not
+	// fix (a missing directory, a permission error), and would diverge from
+	// startControlServer, which branches on its own ErrSocketInUse. These two
+	// paths are published together; a window with one live address and one dead
+	// one is the drift sockguard was extracted to stop.
+	if !errors.Is(err, ipc.ErrSocketInUse) {
+		slog.Warn("IPC server failed to bind", "path", sockPath, "err", err)
+		return nil, ""
 	}
 	fallback := pidScopedSocketPath(userSockName(ipcSockBase))
 	if fallback == "" {
@@ -733,10 +745,12 @@ func bindIPCServer(registry *session.SessionRegistry, wtRoot, repoName string) (
 	}
 	slog.Warn("stable IPC socket is served by another bramble; falling back",
 		"stable", sockPath, "fallback", fallback)
-	if srv := startIPCServer(registry, fallback, wtRoot, repoName); srv != nil {
-		return srv, fallback
+	srv, err = startIPCServer(registry, fallback, wtRoot, repoName)
+	if err != nil {
+		slog.Warn("IPC server failed to bind", "path", fallback, "err", err)
+		return nil, ""
 	}
-	return nil, ""
+	return srv, fallback
 }
 
 // startIPCServer binds the IPC server to sockPath but does NOT begin accepting.
@@ -744,7 +758,7 @@ func bindIPCServer(registry *session.SessionRegistry, wtRoot, repoName string) (
 // session-creating request can be handled before every session knows the
 // address to call back on. Taking the path as a parameter rather than
 // recomputing it is what guarantees the advertised and bound paths agree.
-func startIPCServer(registry *session.SessionRegistry, sockPath, wtRoot, repoName string) *ipc.Server {
+func startIPCServer(registry *session.SessionRegistry, sockPath, wtRoot, repoName string) (*ipc.Server, error) {
 	srv := ipc.NewServer(sockPath)
 
 	srv.Handle(ipc.RequestPing, func(_ context.Context, _ *ipc.Request) (any, error) {
@@ -832,11 +846,13 @@ func startIPCServer(registry *session.SessionRegistry, sockPath, wtRoot, repoNam
 		return "ok", nil
 	})
 
+	// The error is returned rather than logged and swallowed: the caller's
+	// fallback is only correct for ErrSocketInUse, and it cannot tell without
+	// this.
 	if err := srv.Bind(); err != nil {
-		slog.Warn("IPC server failed to bind", "err", err)
-		return nil
+		return nil, err
 	}
-	return srv
+	return srv, nil
 }
 
 // newDispatcher builds a control dispatcher, enabling queued delivery when a

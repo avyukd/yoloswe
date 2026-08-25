@@ -634,8 +634,11 @@ func TestSubagentWorktreeIsReusedNotDuplicated(t *testing.T) {
 // succeeds by the text rather than by the chip. Printing a decorative chip on
 // top would only look like coverage.
 //
-// The chip logic is pinned where it can be isolated, on captured pane text:
-// TestCursorChipCountsAsPasteLanded and TestUnverifiablePasteStillSubmits in
+// The chip logic is pinned where it can be isolated, on captured pane text, by
+// the pasteConfirmed asserts in TestCursorDeliveryPastesOnceAndSubmits — a
+// branch production does not reach while cursor is required:false. What
+// actually keeps cursor deliverable is that it is not verified at all, which
+// TestUnverifiablePasteStillSubmits is the regression test for. Both live in
 // bramble/session. What this adds is the part those cannot reach — that a real
 // cursor session, driven through tmux, takes exactly one paste and one Enter.
 func TestCursorDeliveryIsPastedOnceAndSubmitted(t *testing.T) {
