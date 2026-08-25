@@ -2037,3 +2037,69 @@ func TestComposerDraftUnknownForUnreadableProviders(t *testing.T) {
 		assert.False(t, known, "provider %q composer is not judged", provider)
 	}
 }
+
+// TestDraftHoldIsBounded: a composer is cleared only by a keypress, so a draft
+// left by someone who has walked away holds every later delivery to that
+// session behind it. Round 2 added the hold with no exit condition; this pins
+// the bound.
+//
+// The trade is deliberate and one-directional: holding forever means the parent
+// never receives its subagent's report, which is the failure class this PR
+// exists to close, while delivering late risks landing beside typed text once.
+func TestDraftHoldIsBounded(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	// A draft nobody ever clears.
+	target.appendPane("❯ a half-typed line whose author has gone home")
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+	require.Len(t, c.Pending("s1"), 1, "the first attempt holds")
+	require.Zero(t, panes.pasteCount(), "nothing is pasted while the hold stands")
+
+	// Every retry sees the same unchanged draft.
+	for i := 0; i < maxComposerHolds; i++ {
+		c.Drain(context.Background(), "s1")
+	}
+
+	assert.NotZero(t, panes.pasteCount(),
+		"after %d holds the delivery must go out rather than wait forever", maxComposerHolds)
+	assert.Empty(t, c.Pending("s1"), "the queue must not stay wedged")
+}
+
+// TestDraftHoldStreakResetsWhenTheComposerClears: the bound counts one
+// uninterrupted run of holds, not a session's lifetime. Otherwise a user who
+// drafts briefly a few times over a long session would eventually exhaust the
+// budget and be typed over for a draft that was never stuck.
+func TestDraftHoldStreakResetsWhenTheComposerClears(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.appendPane("❯ typing")
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "first", true)
+	require.NoError(t, err)
+	require.Len(t, c.Pending("s1"), 1)
+
+	// The user finishes the line; the delivery lands normally.
+	target.appendPane("❯ ")
+	c.Drain(context.Background(), "s1")
+	require.Empty(t, c.Pending("s1"), "the delivery went out on a clear composer")
+
+	// A fresh draft must get the full budget again, not the remainder.
+	target.appendPane("❯ typing again")
+	_, err = c.Send(context.Background(), "", "s1", "second", true)
+	require.NoError(t, err)
+	assert.Len(t, c.Pending("s1"), 1, "a new draft is held, not delivered over")
+}

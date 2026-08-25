@@ -118,7 +118,12 @@ type Courier struct { //nolint:govet // fieldalignment: grouping by role reads b
 	// retryArmed records that a failed delivery has a retry scheduled. Only
 	// read by tests, which would otherwise have to wait out retryDelay.
 	retryArmed bool
-	seq        uint64
+	// heldForDraft counts consecutive composer holds per recipient, so a hold
+	// cannot last forever. Nothing but a keypress clears a composer, so a
+	// half-typed line left by someone who has walked away would otherwise
+	// block every later delivery to that session for the life of the process.
+	heldForDraft map[SessionID]int
+	seq          uint64
 }
 
 // CourierConfig holds the filesystem locations used by a Courier.
@@ -145,13 +150,14 @@ func NewCourier(target DeliveryTarget, panes PaneWriter, config CourierConfig) (
 		return nil, fmt.Errorf("failed to create result dir %s: %w", resultDir, err)
 	}
 	c := &Courier{
-		target:    target,
-		panes:     panes,
-		dir:       deliveryDir,
-		resultDir: resultDir,
-		pending:   make(map[SessionID][]Delivery),
-		reported:  make(map[SessionID]map[SessionStatus]bool),
-		writing:   make(map[SessionID]bool),
+		target:       target,
+		panes:        panes,
+		dir:          deliveryDir,
+		resultDir:    resultDir,
+		pending:      make(map[SessionID][]Delivery),
+		heldForDraft: make(map[SessionID]int),
+		reported:     make(map[SessionID]map[SessionStatus]bool),
+		writing:      make(map[SessionID]bool),
 	}
 	if err := c.load(); err != nil {
 		return nil, err
@@ -288,6 +294,29 @@ func (c *Courier) Pending(to SessionID) []Delivery {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]Delivery(nil), c.pending[to]...)
+}
+
+// maxComposerHolds bounds how many consecutive retries a composer draft may
+// hold a delivery for. Six retries at retryDelay is about five minutes, long
+// enough to cover someone finishing a sentence and short enough that a queue is
+// never wedged for the life of the process.
+const maxComposerHolds = 6
+
+// noteDraftHold records one more consecutive hold for a recipient and returns
+// the running count.
+func (c *Courier) noteDraftHold(to SessionID) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.heldForDraft[to]++
+	return c.heldForDraft[to]
+}
+
+// clearDraftHold forgets a recipient's hold streak, so the bound applies to a
+// single uninterrupted run of holds rather than to the session's lifetime.
+func (c *Courier) clearDraftHold(to SessionID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.heldForDraft, to)
 }
 
 // retryDelay is how long a failed delivery waits before it is tried again.
@@ -451,8 +480,20 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 		// delivery is safe: the error keeps it queued and arms a retry, and the
 		// next transition delivers it once the line is clear.
 		if draft, known := c.composerHasDraft(info.ID, provider); known && draft {
-			return errComposerBusy
+			if c.noteDraftHold(info.ID) <= maxComposerHolds {
+				return errComposerBusy
+			}
+			// The hold has outlived its usefulness. A composer is cleared only
+			// by a keypress, so a draft still sitting there after
+			// maxComposerHolds retries (~5 minutes) belongs to someone who is
+			// not at the keyboard, and holding longer trades a small risk of
+			// interleaving against never delivering at all. Say so plainly:
+			// this is the one case where the message can land beside typed
+			// text.
+			logDeliveryWarn("composer still holds a draft after repeated retries; delivering anyway",
+				info.ID, errComposerBusy)
 		}
+		c.clearDraftHold(info.ID)
 		if err := c.panes.Paste(ctx, target, text); err != nil {
 			return err
 		}

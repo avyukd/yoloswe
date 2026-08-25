@@ -661,11 +661,16 @@ func TestIdleClaudeSessionIsActuallyReachable(t *testing.T) {
 func TestWrappedComposerStillReadsAsADraft(t *testing.T) {
 	t.Parallel()
 
+	// A human draft long enough to wrap. Live window 6 of the 2026-08-25 survey
+	// showed the same shape holding one of bramble's own staged deliveries;
+	// that text is deliberately NOT treated as a draft (see
+	// TestBrambleOwnStagedTextIsNotADraft), so the wrapping itself is what this
+	// case pins.
 	pane := []string{
 		"● Bash(git status)",
 		"────────────────────────────────────────────",
-		"❯ [bramble] subagent forge-tenant-isolation-planner-0da3be25 (planner, opus) is",
-		"result: /home/ming/.bramble/research/forge-tenant-isolation-planner-0da3be25.md",
+		"❯ file the dev deprovisioning bug and then check whether the staging",
+		"tenant still has the old role binding attached to it",
 		"────────────────────────────────────────────",
 		"  ~/wt/branch  main  Opus 4.6  ctx:43%  tokens:20k",
 		"  ⏵⏵ bypass permissions on (shift+tab to cycle)",
@@ -674,4 +679,71 @@ func TestWrappedComposerStillReadsAsADraft(t *testing.T) {
 	draft, known := composerDraft(ProviderClaude, pane)
 	require.True(t, known, "a wrapped composer is still a readable composer")
 	assert.True(t, draft, "a wrapped draft must hold the delivery, not invite one")
+}
+
+// TestOversizedComposerIsHeldNotDelivered: claude runs on the alternate screen,
+// where capture-pane returns only the visible rows however deep -S goes, so a
+// composer taller than the window leaves no rule above it in the capture.
+//
+// The composer walk used to run to the top of the capture in that case and
+// call arbitrary transcript the composer. Two ways that hurts, both pinned
+// here: a line without the glyph reported "unknown", which means deliver —
+// straight into the oversized draft — and a submitted transcript prompt, which
+// claude draws with the same glyph, reported a draft that never cleared.
+func TestOversizedComposerIsHeldNotDelivered(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a draft wrapping past the top of the capture is held", func(t *testing.T) {
+		t.Parallel()
+		// The composer's first line is still visible at the very top of the
+		// capture, but the rule above it has scrolled off.
+		pane := []string{
+			"❯ the beginning of a very long draft that fills the window",
+			"and the rest of my long draft continues here",
+			"more of the draft, still no rule above it",
+			"────────────────────────────────────────────",
+			"  ~/wt/branch  main  Opus 4.6  ctx:43%  tokens:20k",
+			"  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+		}
+		draft, known := composerDraft(ProviderClaude, pane)
+		require.True(t, known, "an unreadable composer must not report unknown — that means deliver")
+		assert.True(t, draft, "an oversized draft must hold the delivery")
+	})
+
+	t.Run("a stale prompt with no rule above it does not wedge the queue", func(t *testing.T) {
+		t.Parallel()
+		pane := []string{
+			"❯ an earlier submitted prompt",
+			"● some tool output",
+			"❯ ",
+			"────────────────────────────────────────────",
+			"  ~/wt/branch  main  Opus 4.6  ctx:43%  tokens:20k",
+			"  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+		}
+		draft, known := composerDraft(ProviderClaude, pane)
+		require.True(t, known)
+		assert.False(t, draft, "the live composer is empty; a transcript prompt must not hold mail forever")
+	})
+}
+
+// TestBrambleOwnStagedTextIsNotADraft: a composer holding bramble's own message
+// is not a human mid-sentence. Nothing but a keypress clears a composer, so
+// holding for it waits for someone who is not coming, and every later delivery
+// to that session queues behind it forever — the failure class this PR closes.
+// Overwriting our own text is safe: it is already recorded in the queue.
+func TestBrambleOwnStagedTextIsNotADraft(t *testing.T) {
+	t.Parallel()
+
+	staged := claudePaneComposer(
+		"❯ "+subagentReportPrefix+" subagent forge-planner-0da3be25 (planner, opus) is idle",
+		"✻ Worked for 12s")
+	draft, known := composerDraft(ProviderClaude, staged)
+	require.True(t, known)
+	assert.False(t, draft, "bramble's own staged report must not hold the queue")
+
+	// A human draft in the same position still holds.
+	human := claudePaneComposer("❯ file the dev deprovisioning bug", "✻ Worked for 12s")
+	draft, known = composerDraft(ProviderClaude, human)
+	require.True(t, known)
+	assert.True(t, draft, "a real draft must still be protected")
 }

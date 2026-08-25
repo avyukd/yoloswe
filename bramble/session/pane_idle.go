@@ -171,7 +171,9 @@ func claudeComposerIdx(lines []string) (composerIdx, contentEndIdx int) {
 	// reports "unknown", which means deliver: a paste straight into the user's
 	// draft, the harm this is here to prevent.
 	composerIdx = -1
-	for i := statusSepIdx - 1; i >= 0; i-- {
+	seen := 0
+	sawUpperRule := false
+	for i := statusSepIdx - 1; i >= 0 && seen < claudeComposerMaxLines; i-- {
 		trimmed := strings.TrimSpace(lines[i])
 		if trimmed == "" {
 			continue
@@ -181,11 +183,27 @@ func claudeComposerIdx(lines []string) (composerIdx, contentEndIdx int) {
 				// Two rules with nothing between them: no composer drawn.
 				return -1, i
 			}
+			sawUpperRule = true
 			break
 		}
+		seen++
 		composerIdx = i
 	}
 	if composerIdx < 0 {
+		return -1, -1
+	}
+	if !sawUpperRule {
+		// The walk ran out of lines without meeting the rule above the
+		// composer, so the region is not bounded above and composerIdx is just
+		// the topmost line reached — arbitrary transcript, not a located
+		// composer. Claude Code runs on the alternate screen, where
+		// capture-pane returns only the visible rows however deep -S goes, so a
+		// composer taller than the window genuinely produces this.
+		//
+		// Report it unfound. Trusting it either delivers into an oversized
+		// draft (the line lacks the glyph, so judgeComposerLine says "unknown",
+		// which means deliver) or latches onto a submitted transcript prompt
+		// and reports a draft that never clears.
 		return -1, -1
 	}
 	contentEndIdx = -1
@@ -266,6 +284,11 @@ func claudePaneJudge(lines []string) (working, known bool) {
 	// Nothing decisive in the tail. Never guess idle here.
 	return false, false
 }
+
+// claudeComposerMaxLines bounds the composer walk. A composer wraps over a few
+// lines at most before claude scrolls it; without a bound, a capture with no
+// upper rule walks to the top and calls arbitrary transcript the composer.
+const claudeComposerMaxLines = 6
 
 // claudePaneContentTailLines bounds how far up the content region is read.
 // Deep enough that a sparkle line pushed up by a recap or a tip is still found
@@ -641,7 +664,14 @@ func composerDraft(provider string, lines []string) (draft, known bool) {
 		return false, false
 	}
 	if composerIdx, _ := claudeComposerIdx(lines); composerIdx >= 0 {
-		return judgeComposerLine(lines[composerIdx])
+		draft, known := judgeComposerLine(lines[composerIdx])
+		if !known {
+			// The composer region was located but its first line does not carry
+			// the glyph. Something is in there that this parser cannot read, and
+			// "unknown" means deliver — so the safe verdict is to hold.
+			return true, true
+		}
+		return draft, known
 	}
 	// No parseable chrome: judge the lowest composer-looking line within the
 	// tail bound, and nothing above it.
@@ -669,5 +699,17 @@ func judgeComposerLine(line string) (draft, known bool) {
 	if !strings.HasPrefix(trimmed, claudePromptGlyph) {
 		return false, false
 	}
-	return strings.TrimSpace(strings.TrimPrefix(trimmed, claudePromptGlyph)) != "", true
+	body := strings.TrimSpace(strings.TrimPrefix(trimmed, claudePromptGlyph))
+	if body == "" {
+		return false, true
+	}
+	if strings.HasPrefix(body, subagentReportPrefix) {
+		// Bramble's own staged text, not a human draft. Holding for it would
+		// wait for a person who is not coming: nothing clears the composer but
+		// a keypress, so every later delivery to this session would be held
+		// behind it forever on a 30s retry. Overwriting our own message is
+		// safe — it is already recorded in the queue.
+		return false, true
+	}
+	return true, true
 }

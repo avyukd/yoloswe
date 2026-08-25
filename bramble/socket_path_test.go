@@ -251,3 +251,36 @@ func TestSocketDirRefusesAWorldWritableDirectory(t *testing.T) {
 	assert.Equal(t, os.TempDir(), socketDir(),
 		"a directory with open permissions must be refused, not used")
 }
+
+// TestStableNameIsNotUsedInAnUnprivateDirectory: a stable socket name is
+// predictable by construction, so publishing one in a shared directory lets any
+// local user bind it first and receive the IPC and control traffic of windows
+// that have the path frozen in their environment.
+//
+// When the private directory cannot be established, the earlier code still
+// published the stable name into the shared temp dir — the exact exposure the
+// privacy work was meant to remove. It must degrade to a pid-scoped name
+// instead: that costs restart survival on such a host, which is a liveness
+// cost, not a confidentiality one.
+func TestStableNameIsNotUsedInAnUnprivateDirectory(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("TMPDIR", tmp)
+
+	// A squatted directory with open permissions: private-directory setup fails.
+	squat := filepath.Join(tmp, fmt.Sprintf("bramble-%d", os.Getuid()))
+	require.NoError(t, os.MkdirAll(squat, 0o777))
+	require.NoError(t, os.Chmod(squat, 0o777))
+
+	_, private := socketDirPrivate()
+	require.False(t, private, "precondition: the directory must be judged unprivate")
+
+	pid := strconv.Itoa(os.Getpid())
+	for name, got := range map[string]string{
+		"ipc":     ipcSocketPath(),
+		"control": controlSocketPath(),
+	} {
+		assert.Contains(t, filepath.Base(got), pid,
+			"%s socket %q must be pid-scoped when no private directory is available", name, got)
+	}
+}

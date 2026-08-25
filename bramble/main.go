@@ -529,25 +529,34 @@ func detectRepoFromPath(cwd, wtRoot string) (string, error) {
 // established at all, which keeps bramble usable on an exotic host while
 // leaving the warning in the log.
 func socketDir() string {
+	dir, _ := socketDirPrivate()
+	return dir
+}
+
+// socketDirPrivate returns the socket directory and whether it is private to
+// this user. Callers that would publish a *stable* name must consult private:
+// a stable name is predictable by construction, and a predictable name in a
+// shared directory can be pre-bound by any local user.
+func socketDirPrivate() (dir string, private bool) {
 	if runDir := os.Getenv("XDG_RUNTIME_DIR"); runDir != "" {
-		return runDir
+		return runDir, true
 	}
-	dir := filepath.Join(os.TempDir(), fmt.Sprintf("bramble-%d", os.Getuid()))
+	dir = filepath.Join(os.TempDir(), fmt.Sprintf("bramble-%d", os.Getuid()))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		slog.Warn("could not create a private socket directory; falling back to the shared temp dir",
+		slog.Warn("could not create a private socket directory; sockets will use pid-scoped names",
 			"dir", dir, "error", err)
-		return os.TempDir()
+		return os.TempDir(), false
 	}
 	// MkdirAll leaves an existing directory's mode and owner alone, so verify
 	// rather than assume: a directory somebody else created, or one that is
 	// group/world accessible, is not private and must not be trusted.
 	info, err := os.Stat(dir)
 	if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 || !ownedByCurrentUser(info) {
-		slog.Warn("socket directory is not private to this user; falling back to the shared temp dir",
+		slog.Warn("socket directory is not private to this user; sockets will use pid-scoped names",
 			"dir", dir)
-		return os.TempDir()
+		return os.TempDir(), false
 	}
-	return dir
+	return dir, true
 }
 
 // ownedByCurrentUser reports whether a stat result belongs to the running uid.
@@ -604,11 +613,30 @@ func userSockName(base string) string {
 // syscall.Exec keeps the pid, so the in-place restart never had this problem.
 // A crash, a kill -9, or a fresh launch in another terminal did.
 func ipcSocketPath() string {
-	return filepath.Join(socketDir(), userSockName(ipcSockBase))
+	return stableOrPidScoped(ipcSockBase)
 }
 
 func controlSocketPath() string {
-	return filepath.Join(socketDir(), userSockName(controlSockBase))
+	return stableOrPidScoped(controlSockBase)
+}
+
+// stableOrPidScoped returns the stable per-user socket path when the directory
+// holding it is private, and a pid-scoped path when it is not.
+//
+// Stability is only safe in a private directory. The stable name is fixed and
+// therefore predictable, so in a shared /tmp any local user could bind it first
+// and receive the IPC and control traffic of tmux windows that have the path
+// frozen in their environment. Degrading to a pid-scoped name gives up the
+// restart-survival this PR adds — a window started under the old pid is
+// stranded — but that is a liveness cost on a host that cannot offer a private
+// runtime directory, not a confidentiality one, and the warning from
+// socketDirPrivate says which happened.
+func stableOrPidScoped(base string) string {
+	dir, private := socketDirPrivate()
+	if !private {
+		return filepath.Join(dir, fmt.Sprintf("%s-%d.sock", base, os.Getpid()))
+	}
+	return filepath.Join(dir, userSockName(base))
 }
 
 // pidScopedSocketPath is where a server falls back when the stable path is
@@ -1495,6 +1523,14 @@ the recipient should read as part of its own work.`,
 			// subagent reporting to its parent replaces bramble's generated
 			// report instead of arriving alongside it.
 			from = os.Getenv(session.SessionIDEnvVar)
+		}
+		if queue && !submit {
+			// --queue promises the text "is held until the recipient goes idle
+			// and is then delivered". Staging it into the composer without
+			// pressing Enter delivers nothing, and the text then sits there
+			// looking exactly like a human draft, holding every later delivery
+			// to that session behind it. Submitting is what --queue means.
+			submit = true
 		}
 
 		typ := control.TypeSessionSendInput
