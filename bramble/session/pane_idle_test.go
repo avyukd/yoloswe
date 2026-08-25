@@ -1,6 +1,7 @@
 package session
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -866,6 +867,27 @@ func TestClaudeAcceptsAPasteChip(t *testing.T) {
 		claudePaneComposer("❯ ", "❯ a report from a subagent", "● I read it."),
 		"a report from a subagent"),
 		"transcript history must not confirm a paste that never arrived")
+
+	// A composer too narrow to show the whole probe still confirms. The capture
+	// stops at the pane width and the composer wraps, so a delivery that DID
+	// arrive can show fewer than pasteProbeLen bytes of itself.
+	// composerHoldsThisDelivery already compares prefix-wise for this reason;
+	// requiring full containment here made a narrow pane a real negative, and
+	// because the composer was located the caller reads that as readable and
+	// re-pastes — appending a second copy, which is the loop this check exists
+	// to end.
+	long := strings.Repeat("x", pasteProbeLen*2)
+	require.Greater(t, len(pasteProbe(long)), 8, "precondition: the probe must be longer than the truncation below")
+	assert.True(t, pasteConfirmed(ProviderClaude,
+		claudePaneComposer("❯ "+pasteProbe(long)[:8], "✻ Worked for 12s"), long),
+		"a composer showing a truncation of the paste confirms it; the pane is simply narrow")
+
+	// But a truncation is only evidence in ONE direction. A composer holding
+	// something that merely happens to sit under the probe's length, and is not
+	// a prefix of it, is somebody else's line and confirms nothing.
+	assert.False(t, pasteConfirmed(ProviderClaude,
+		claudePaneComposer("❯ zzzz", "✻ Worked for 12s"), long),
+		"an unrelated short line is not a truncation of our paste")
 }
 
 // TestTallComposerIsHeldNotDelivered: a composer taller than the walk's bound

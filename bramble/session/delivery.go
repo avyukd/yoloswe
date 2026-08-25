@@ -569,10 +569,19 @@ func (c *Courier) clearStaged(to SessionID) {
 
 // clearDraftHold forgets a recipient's hold, so the grace period applies to a
 // single uninterrupted draft rather than to the session's lifetime.
+//
+// The block report goes with it. noteBlockedReport promises "once per distinct
+// blocking text", and that is a claim about one standing block: a session
+// blocked by T, unblocked, delivered, and later blocked by T again is a NEW
+// standing condition and must be reported again. Keyed on the text alone and
+// never released, the promise silently became "once per session per text for
+// the life of the process". Releasing both here is what makes the record's
+// lifetime the block's rather than the process's.
 func (c *Courier) clearDraftHold(to SessionID) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.heldForDraft, to)
+	delete(c.reportedBlocked, to)
 }
 
 // retryDelay is how long a failed delivery waits before it is tried again.
@@ -897,8 +906,8 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 		//
 		// pasteVerifyRequired is checked FIRST so no work is done for a
 		// provider whose verdict is discarded. The other order still ran the
-		// probe for everyone — up to pasteVerifyAttemptsBestEffort sleeps plus
-		// a CapturePaneText round-trip per attempt, on every delivery — and
+		// probe for everyone — several sleeps plus a CapturePaneText
+		// round-trip per attempt, on every delivery — and
 		// then threw the answer away, while widening the very window between
 		// the draft check and SendEnter that this change set out to close.
 		// alreadyStaged means the composer was READ and found to hold this very
@@ -1074,11 +1083,6 @@ const (
 	pasteVerifyInterval = 150 * time.Millisecond
 	pasteVerifyLines    = 40
 	pasteProbeLen       = 24
-	// pasteVerifyAttemptsBestEffort bounds the wait for a provider that does
-	// not require confirmation. The verdict there does not gate anything — the
-	// message is sent either way — so this is only long enough for a chip to
-	// render, not the full budget codex needs.
-	pasteVerifyAttemptsBestEffort = 4
 )
 
 // pasteIsReadableAsText reports whether the pane renders this delivery as the
@@ -1143,11 +1147,13 @@ func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text
 	if probe == "" {
 		return true, true // nothing distinctive to look for; do not block delivery
 	}
-	attempts := pasteVerifyAttemptsBestEffort
-	if pasteVerifyRequired(provider) {
-		attempts = pasteVerifyAttempts
-	}
-	for i := 0; i < attempts; i++ {
+	// One budget, because there is only one caller shape. write probes inside
+	// `if !alreadyStaged && pasteVerifyRequired(provider)`, so a provider whose
+	// verdict is discarded never reaches here at all — it is not given a
+	// shortened probe, it is given none. A second, best-effort budget lived
+	// here for a caller that does not exist and read as though cursor still
+	// paid a probe per delivery.
+	for i := 0; i < pasteVerifyAttempts; i++ {
 		// Wait before every attempt but the first: a paste needs a frame to
 		// show up, and sleeping *after* the last one only delays the verdict.
 		if i > 0 {
@@ -1195,24 +1201,33 @@ func pasteProbe(text string) string {
 // never written.
 func (c *Courier) discard(to SessionID) {
 	c.mu.Lock()
-	if _, queued := c.pending[to]; !queued {
-		c.mu.Unlock()
-		return
-	}
-	delete(c.pending, to)
-	// The queue is gone, so nothing will ever finish a paste left in this
-	// recipient's composer; the record must not outlive the intent to submit.
+	// Release every per-recipient record BEFORE asking about the queue.
 	//
-	// Every per-recipient map is released here, not just the ones this delivery
-	// happened to populate. discard is the ONLY lifecycle cleanup point —
-	// Drain and Watch both funnel into it — so an entry left behind lives for
-	// the process lifetime, and a session ID reused after a terminal transition
-	// would inherit the old one's hold clock or suppressed block report.
-	// TestDrainDiscardsQueueForTerminalSession asserts all four are empty.
+	// A queue is the wrong proxy for "this session still has state here". Each
+	// record is released where its own condition ends — staged when the paste
+	// is submitted or dropped, the holds when the composer or pane clears — and
+	// this is the backstop for a session that goes terminal before any of those
+	// happen. Gating it on pending made the backstop miss exactly the ordinary
+	// case: Drain removes pending itself when the last message lands
+	// (delivery.go, "if remaining := c.pending[to]; len(remaining) <= 1"), so a
+	// recipient whose mail all delivered and then died reached this with no
+	// queue and kept its records for the life of the process.
+	//
+	// delete on an absent key is a no-op, so the unconditional release costs a
+	// map lookup for the many sessions that never had a delivery.
 	delete(c.staged, to)
 	delete(c.heldForPane, to)
 	delete(c.heldForDraft, to)
 	delete(c.reportedBlocked, to)
+	if _, queued := c.pending[to]; !queued {
+		// No queue, so nothing on disk to unlink — persistLocked would remove a
+		// path that was never written.
+		c.mu.Unlock()
+		return
+	}
+	// The queue is gone, so nothing will ever finish a paste left in this
+	// recipient's composer; the record must not outlive the intent to submit.
+	delete(c.pending, to)
 	err := c.persistLocked(to)
 	c.mu.Unlock()
 	if err != nil {

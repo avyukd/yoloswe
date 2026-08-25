@@ -566,12 +566,33 @@ func TestDrainDiscardsQueueForTerminalSession(t *testing.T) {
 
 	assert.Empty(t, c.Pending("s1"))
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	assert.Empty(t, c.pending, "pending")
 	assert.Empty(t, c.staged, "staged")
 	assert.Empty(t, c.heldForDraft, "heldForDraft")
 	assert.Empty(t, c.reportedBlocked, "reportedBlocked")
 	assert.Empty(t, c.heldForPane, "heldForPane")
+	c.mu.Unlock()
+
+	// And again with NO queue, which is the ordinary case: Drain removes
+	// pending itself once the last message lands, so a recipient whose mail all
+	// delivered and then went terminal reaches discard with nothing queued.
+	// Gating the release on a queue made the cleanup miss exactly that session.
+	c.noteStaged("s1", "hello")
+	c.noteDraftHold("s1", "a half-typed line")
+	require.True(t, c.noteBlockedReport("s1", "a half-typed line"))
+	c.notePaneHold("s1", []string{"some pane content"})
+	c.mu.Lock()
+	require.Empty(t, c.pending, "this half of the test is only meaningful with no queue")
+	c.mu.Unlock()
+
+	c.discard("s1")
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	assert.Empty(t, c.staged, "staged, with no queue to gate on")
+	assert.Empty(t, c.heldForDraft, "heldForDraft, with no queue to gate on")
+	assert.Empty(t, c.reportedBlocked, "reportedBlocked, with no queue to gate on")
+	assert.Empty(t, c.heldForPane, "heldForPane, with no queue to gate on")
 }
 
 // TestQueueSurvivesReload is why the queue is on disk: a bramble restart must
@@ -2987,7 +3008,10 @@ func TestAnUnownedChipIsNeitherPastedOverNorSubmitted(t *testing.T) {
 // condition is one report.
 func TestOneStandingBlockIsReportedOnce(t *testing.T) {
 	t.Parallel()
-	c := &Courier{reportedBlocked: map[SessionID]string{}}
+	c := &Courier{
+		reportedBlocked: map[SessionID]string{},
+		heldForDraft:    map[SessionID]draftHold{},
+	}
 
 	assert.True(t, c.noteBlockedReport("s1", "❯ a half-typed line"), "the first block is reported")
 	for i := 0; i < 20; i++ {
@@ -2996,6 +3020,19 @@ func TestOneStandingBlockIsReportedOnce(t *testing.T) {
 	}
 	assert.True(t, c.noteBlockedReport("s1", "❯ a different half-typed line"),
 		"a new blocking draft is a new situation and is reported")
+
+	// A block that ENDED and came back is a new standing condition, not the
+	// same one repeating. The record is released where the block ends —
+	// clearDraftHold, on the path that goes on to paste — so without that
+	// release "once per block" silently means "once per session per text for
+	// the life of the process", and the second standing block goes unreported.
+	//
+	// clearDraftHold is called directly because that IS the end-of-block
+	// signal: write calls it on the path that proceeds to paste, once the
+	// composer no longer holds a draft.
+	c.clearDraftHold("s1")
+	assert.True(t, c.noteBlockedReport("s1", "❯ a different half-typed line"),
+		"a block that cleared and returned is a new standing condition and is reported again")
 }
 
 // TestAChipBesideTypedTextIsStillAHumanDraft: a chip with text beside it is

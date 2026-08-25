@@ -717,7 +717,7 @@ func pasteConfirmed(provider string, lines []string, probe string) bool {
 	}
 	if composerReadable(provider) {
 		if composerIdx, _ := claudeComposerIdx(lines); composerIdx >= 0 {
-			return confirms(lines[composerIdx])
+			return confirmsComposer(lines[composerIdx], probe, chips)
 		}
 		// The composer could not be located, so there is nothing to read. Do
 		// not fall back to the whole-pane scan here: this provider's verdict
@@ -736,6 +736,37 @@ func pasteConfirmed(provider string, lines []string, probe string) bool {
 		}
 	}
 	return false
+}
+
+// confirmsComposer is confirms for a LOCATED composer line, where the probe may
+// legitimately be cut short.
+//
+// A pane capture stops at the pane width and a composer wraps, so the composer
+// can show fewer than pasteProbeLen bytes of a message that did arrive.
+// composerHoldsThisDelivery already knows this — it compares prefix-wise for
+// exactly this reason — and requiring full containment here contradicted it:
+// a composer narrow enough that the glyph plus the probe does not fit scored a
+// real negative, and because the composer WAS located pasteEvidenceObscured
+// reports readable, so pasteVerdict took the re-paste arm and appended a second
+// copy. That is the section-1 symptom, re-entered through the check meant to
+// end it.
+//
+// One direction only, like composerHoldsThisDelivery: the composer may be a
+// truncation of the probe, so a probe that begins with the composer's body is
+// consistent with our paste. The mirror — a composer that merely starts with
+// the probe and continues — is not tested here because Contains already covers
+// the untruncated case.
+func confirmsComposer(line, probe string, chips []string) bool {
+	if strings.Contains(line, probe) || containsAny(line, chips) {
+		return true
+	}
+	body := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), claudePromptGlyph))
+	// An empty composer confirms nothing: that is what a dropped paste looks
+	// like, and every string has the empty prefix.
+	if body == "" {
+		return false
+	}
+	return strings.HasPrefix(probe, body)
 }
 
 // claudePromptGlyph is the composer prompt in claude-code's TUI, U+276F.
