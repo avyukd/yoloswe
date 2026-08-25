@@ -32,6 +32,7 @@ type fakeTarget struct { //nolint:govet // fieldalignment: readability over pack
 	// makes the courier's event handling slow enough to test what happens to the
 	// events arriving behind it.
 	captureDelay  time.Duration
+	captureCount  int
 	markedRunning []SessionID
 }
 
@@ -111,6 +112,7 @@ func (f *fakeTarget) ResolveTmuxTarget(id SessionID) (string, error) {
 
 func (f *fakeTarget) CapturePaneText(id SessionID, _ int) ([]string, error) {
 	f.mu.Lock()
+	f.captureCount++
 	delay := f.captureDelay
 	err := f.captureErr
 	lines := f.captured[id]
@@ -129,6 +131,12 @@ func (f *fakeTarget) CapturePaneText(id SessionID, _ int) ([]string, error) {
 // appendPane mirrors text into every session's pane buffer. The courier only
 // ever reads back the pane it just wrote to, so a shared buffer is enough and
 // keeps the fake from needing to know which session a paste targeted.
+func (f *fakeTarget) captures() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.captureCount
+}
+
 func (f *fakeTarget) appendPane(text string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -2246,4 +2254,84 @@ func TestOwnDeliveryOverwriteIsNotLoggedAsAGraceExpiry(t *testing.T) {
 		"precondition: bramble's own staged text must not hold its own queue")
 	assert.NotContains(t, logs.String(), "past the grace period",
 		"overwriting bramble's own text must not claim a human draft was typed over")
+}
+
+// TestClaudePasteIsVerified: claude's composer echoes a pasted message
+// verbatim — measured across 13 live panes, none of which rendered a
+// "[Pasted text …]" chip — so paste evidence is readable for it and must be
+// required.
+//
+// This is the same composer composerDraftText reads: the draft protection in
+// this change rests on claude's composer being legible, so declining to check
+// it would be the two tables contradicting each other. A paste claude's TUI
+// dropped would otherwise go unnoticed, because deliver() writes directly
+// rather than queueing — the message is lost and MarkRunning wedges the session
+// on a turn that never started.
+func TestClaudePasteIsVerified(t *testing.T) {
+	t.Parallel()
+
+	require.True(t, pasteVerifyRequired(ProviderClaude),
+		"claude's composer is readable, so its paste must be confirmed before Enter")
+
+	t.Run("an echoed paste is submitted once", func(t *testing.T) {
+		t.Parallel()
+		target := newFakeTarget()
+		target.set("s1", StatusIdle, RunnerTypeTmux)
+		target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+		panes := echoPanes(target) // claude echoes, as the live panes show
+		c, err := NewCourier(target, panes, testCourierConfig(t))
+		require.NoError(t, err)
+
+		_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+		require.NoError(t, err)
+
+		assert.Equal(t, 1, panes.pasteCount(), "a confirmed paste is never repeated")
+		assert.Contains(t, panes.recorded(), "enter(@7)", "and is submitted")
+		assert.Empty(t, c.Pending("s1"))
+	})
+
+	t.Run("a paste that never lands is queued, not submitted", func(t *testing.T) {
+		t.Parallel()
+		target := newFakeTarget()
+		target.set("s1", StatusIdle, RunnerTypeTmux)
+		target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+		panes := &fakePanes{} // the pane never shows the text: the TUI dropped it
+		c, err := NewCourier(target, panes, testCourierConfig(t))
+		require.NoError(t, err)
+
+		_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+		require.NoError(t, err)
+
+		assert.NotContains(t, panes.recorded(), "enter(@7)",
+			"never press Enter on a paste that did not arrive — that starts a turn with no prompt")
+		assert.Len(t, c.Pending("s1"), 1, "the delivery stays queued for the next transition")
+	})
+}
+
+// TestUnreadableComposerCostsNoPaneCapture: composerDraftText returns unknown
+// for every provider but claude, so capturing the pane first made each codex,
+// cursor and unresolved-model delivery pay a tmux round-trip for an answer that
+// is thrown away — the same waste the pasteVerifyRequired ordering avoids, and
+// it widens the same paste-to-Enter window.
+func TestUnreadableComposerCostsNoPaneCapture(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderCursor, "cursor-composer-2")
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	// Cursor's composer cannot be read and its paste evidence is not required,
+	// so neither check should reach tmux.
+	require.False(t, composerReadable(ProviderCursor), "precondition")
+	require.False(t, pasteVerifyRequired(ProviderCursor), "precondition")
+	assert.Zero(t, target.captures(),
+		"no pane capture may be made for a provider whose verdict is discarded")
 }

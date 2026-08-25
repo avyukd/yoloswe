@@ -268,12 +268,30 @@ func claudePaneJudge(lines []string) (working, known bool) {
 	}
 
 	// Walk a bounded tail of the content region upward and take the verdict of
-	// the first line that carries one.
+	// the first line that carries one — but stop at a submitted prompt.
+	//
+	// Claude echoes every submitted prompt into the transcript with the same
+	// `❯` glyph (see claudeComposerIdx's doc), so such a line is the boundary
+	// of the current turn: everything above it belongs to a previous one. A
+	// completion line persists and is pushed up by later output, so without
+	// this stop the seconds right after bramble writes a delivery read the
+	// PREVIOUS turn's "✻ Worked for …" as this turn's verdict. The spinner is
+	// usually absent from any given frame (caveat 3), forTurn resets the streak
+	// at exactly that boundary, and five confirmations is ~10s — comfortably
+	// inside the window before the new turn has produced four content lines.
+	// The result would be SetSessionIdle on a live turn, which releases queued
+	// mail into it and reports a spurious idle to the parent: precisely the two
+	// harms this probe exists to prevent.
 	seen := 0
 	for i := contentEndIdx - 1; i >= 0 && seen < claudePaneContentTailLines; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
+		}
+		if strings.HasPrefix(line, claudePromptGlyph) {
+			// This turn's own submitted prompt. Nothing above it can speak for
+			// the turn now running, and this turn has produced no verdict yet.
+			return false, false
 		}
 		seen++
 		if working, known := claudeLineVerdict(line); known {
@@ -615,6 +633,20 @@ type pasteEvidence struct {
 var pasteEvidenceProbes = map[string]pasteEvidence{
 	ProviderCursor: {chipMarkers: []string{"[Pasted text"}},
 	ProviderCodex:  {required: true},
+	// Claude echoes a pasted message into its composer verbatim — measured
+	// across 13 live panes on 2026-08-25, every one showed the text itself and
+	// not one showed a "[Pasted text …]" chip, including a pane holding a real
+	// bramble delivery. So pasteConfirmed's prefix scan works here, and the
+	// false-negative risk that makes verification unsafe for an unreadable CLI
+	// does not apply.
+	//
+	// It has to be required, because this is the same composer composerDraftText
+	// reads: the rest of this change rests on claude's composer being legible,
+	// so declining to check it would mean a paste claude's TUI dropped goes
+	// unnoticed — deliver() writes directly rather than queueing, so the
+	// message is lost and MarkRunning wedges the session on a turn that never
+	// started.
+	ProviderClaude: {required: true},
 }
 
 // pasteVerifyRequired reports whether a paste must be confirmed before Enter.
@@ -642,6 +674,19 @@ func pasteConfirmed(provider string, lines []string, probe string) bool {
 
 // claudePromptGlyph is the composer prompt in claude-code's TUI, U+276F.
 const claudePromptGlyph = "❯"
+
+// composerReadable reports whether bramble can read this provider's composer.
+//
+// Only claude: its `❯` is a real prompt glyph followed by U+00A0, so an empty
+// composer is distinguishable from one holding a draft. Cursor and codex render
+// placeholder text that disappears once the user types, which makes a draft
+// indistinguishable from a CLI still booting.
+//
+// Kept beside the probe tables because it answers the same question they do,
+// and callers use it to skip work rather than to interpret a capture.
+func composerReadable(provider string) bool {
+	return provider == ProviderClaude
+}
 
 // composerDraft reports whether claude's composer holds text the user has
 // typed but not yet submitted.

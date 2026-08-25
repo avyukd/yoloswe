@@ -24,6 +24,9 @@ type Server struct {
 	cancel     context.CancelFunc
 	socketPath string
 	wg         sync.WaitGroup
+	// bound records that this server actually acquired the socket, so Close
+	// unlinks only a path this process owns. See Close.
+	bound bool
 }
 
 // NewServer creates a new IPC server but does not start listening.
@@ -82,42 +85,70 @@ func socketInUse(path string) bool {
 // bramble is still serving them, and those sessions have that path frozen in
 // their tmux window environment with no way to learn a new one.
 //
-// The bind is attempted BEFORE any unlink, so the check and the claim cannot
-// race. A liveness probe followed by os.Remove has a window in which two
-// brambles both see the path free, one binds, and the other then unlinks the
-// live socket out from under it — stranding exactly the sessions this stability
-// was added to protect. Binding first makes the kernel the arbiter: only one
-// listener can hold a path, and EADDRINUSE means somebody already does.
+// The bind is attempted BEFORE any unlink, so the common case never touches a
+// file it does not own, and the reclaim of a stale file is serialized by a lock
+// file. Both are needed. Binding first makes the kernel the arbiter for a live
+// socket, but it cannot order the stale path: two processes can both fail the
+// bind, both find nothing listening, and then one unlinks and binds while the
+// other unlinks that now-live socket and binds over it — stranding the first,
+// which keeps serving a path that no longer refers to it.
 func (s *Server) Start() error {
 	ln, err := net.Listen("unix", s.socketPath)
 	if err != nil {
 		if !isAddrInUse(err) {
 			return fmt.Errorf("failed to listen on %s: %w", s.socketPath, err)
 		}
-		// A file is in the way. Only its owner can say whether it is live.
-		if socketInUse(s.socketPath) {
-			return fmt.Errorf("%w: %s", ErrSocketInUse, s.socketPath)
-		}
-		// Nothing answered, so the file is stale: reclaim it and retry once.
-		if rmErr := os.Remove(s.socketPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-			return fmt.Errorf("failed to remove stale socket %s: %w", s.socketPath, rmErr)
-		}
-		ln, err = net.Listen("unix", s.socketPath)
+		ln, err = reclaimStaleSocket(s.socketPath)
 		if err != nil {
-			// Lost the retry to another process that bound between the unlink
-			// and here. It is live by construction, so do not touch it.
-			if isAddrInUse(err) {
-				return fmt.Errorf("%w: %s", ErrSocketInUse, s.socketPath)
-			}
-			return fmt.Errorf("failed to listen on %s: %w", s.socketPath, err)
+			return err
 		}
 	}
 	s.listener = ln
+	s.bound = true
 
 	s.wg.Add(1)
 	go s.acceptLoop()
 
 	return nil
+}
+
+// reclaimStaleSocket takes the path if nothing is listening on it, holding a
+// lock file across the whole check-unlink-bind sequence so two processes cannot
+// both decide the same file is stale.
+//
+// The lock is advisory (flock) and its file is never removed: unlinking a lock
+// is what reintroduces the race it prevents, since two processes can then hold
+// locks on different inodes for the same name. One empty file per socket path
+// is a small price.
+func reclaimStaleSocket(socketPath string) (net.Listener, error) {
+	lock, err := os.OpenFile(socketPath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open socket lock for %s: %w", socketPath, err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return nil, fmt.Errorf("failed to lock socket %s: %w", socketPath, err)
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+
+	// Re-test under the lock. Another process may have reclaimed and bound the
+	// path while this one waited, in which case it is live and must be left be.
+	if socketInUse(socketPath) {
+		return nil, fmt.Errorf("%w: %s", ErrSocketInUse, socketPath)
+	}
+	// Nothing answered and no other reclaimer can be running, so the file is
+	// stale.
+	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("failed to remove stale socket %s: %w", socketPath, err)
+	}
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		if isAddrInUse(err) {
+			return nil, fmt.Errorf("%w: %s", ErrSocketInUse, socketPath)
+		}
+		return nil, fmt.Errorf("failed to listen on %s: %w", socketPath, err)
+	}
+	return ln, nil
 }
 
 // isAddrInUse reports whether a listen failed because the path is already
@@ -127,6 +158,15 @@ func isAddrInUse(err error) bool {
 }
 
 // Close shuts down the server, closes the listener, waits for in-flight connections, and removes the socket file.
+// Close shuts down the server, waits for in-flight connections, and removes the
+// socket file — but only if this server is the one that bound it.
+//
+// The ownership rule Start establishes has to hold here too: a server whose
+// Start returned ErrSocketInUse never owned the path, and unlinking it would
+// delete a live peer's socket, stranding every window that has that address
+// frozen in its environment. `srv := New(path); defer srv.Close()` before a
+// Start that may lose is the natural Go shape, so this must be safe by
+// construction rather than by caller discipline.
 func (s *Server) Close() error {
 	s.cancel()
 	var err error
@@ -134,7 +174,9 @@ func (s *Server) Close() error {
 		err = s.listener.Close()
 	}
 	s.wg.Wait()
-	os.Remove(s.socketPath)
+	if s.bound {
+		os.Remove(s.socketPath)
+	}
 	return err
 }
 

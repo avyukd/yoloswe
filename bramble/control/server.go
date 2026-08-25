@@ -30,6 +30,9 @@ type UnixServer struct {
 	cancel     context.CancelFunc
 	socketPath string
 	wg         sync.WaitGroup
+	// bound records that this server actually acquired the socket, so Close
+	// unlinks only a path this process owns. See Close.
+	bound bool
 }
 
 // NewUnixServer creates a control server bound to socketPath (not yet started).
@@ -65,34 +68,58 @@ func socketInUse(path string) bool {
 // left alone: the path is stable across restarts, and unlinking a live peer's
 // socket would strand every session that has it frozen in its environment.
 //
-// Bind first, then adjudicate — mirrors ipc.Server.Start, and for the same
-// reason: probing liveness and then unlinking leaves a window where two
-// processes both see the path free and the second removes the first's live
-// socket. Letting the kernel refuse the bind closes that window.
+// Bind first, then adjudicate, and serialize the stale reclaim under a lock —
+// mirrors ipc.Server.Start, and for the same reasons. Binding first lets the
+// kernel arbitrate a live socket; the lock is what stops two processes from
+// both judging the same file stale and the second unlinking the first's
+// now-live socket.
 func (s *UnixServer) Start() error {
 	ln, err := net.Listen("unix", s.socketPath)
 	if err != nil {
 		if !isAddrInUse(err) {
 			return fmt.Errorf("control: listen %s: %w", s.socketPath, err)
 		}
-		if socketInUse(s.socketPath) {
-			return fmt.Errorf("%w: %s", ErrSocketInUse, s.socketPath)
-		}
-		if rmErr := os.Remove(s.socketPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-			return fmt.Errorf("control: remove stale socket: %w", rmErr)
-		}
-		ln, err = net.Listen("unix", s.socketPath)
+		ln, err = reclaimStaleSocket(s.socketPath)
 		if err != nil {
-			if isAddrInUse(err) {
-				return fmt.Errorf("%w: %s", ErrSocketInUse, s.socketPath)
-			}
-			return fmt.Errorf("control: listen %s: %w", s.socketPath, err)
+			return err
 		}
 	}
 	s.ln = ln
+	s.bound = true
 	s.wg.Add(1)
 	go s.acceptLoop()
 	return nil
+}
+
+// reclaimStaleSocket takes the path if nothing is listening on it, holding a
+// lock file across the check-unlink-bind sequence. Mirrors ipc's helper; the
+// lock file is never removed, because unlinking a lock reintroduces the race it
+// exists to prevent.
+func reclaimStaleSocket(socketPath string) (net.Listener, error) {
+	lock, err := os.OpenFile(socketPath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("control: open socket lock %s: %w", socketPath, err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return nil, fmt.Errorf("control: lock socket %s: %w", socketPath, err)
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+
+	if socketInUse(socketPath) {
+		return nil, fmt.Errorf("%w: %s", ErrSocketInUse, socketPath)
+	}
+	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("control: remove stale socket: %w", err)
+	}
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		if isAddrInUse(err) {
+			return nil, fmt.Errorf("%w: %s", ErrSocketInUse, socketPath)
+		}
+		return nil, fmt.Errorf("control: listen %s: %w", socketPath, err)
+	}
+	return ln, nil
 }
 
 // isAddrInUse reports whether a listen failed because the path is already
@@ -122,6 +149,9 @@ func (s *UnixServer) acceptLoop() {
 
 // Close stops the server, closes the listener, waits for in-flight connections,
 // and removes the socket file.
+// Close stops the server and removes the socket file, but only if this server
+// bound it. Mirrors ipc.Server.Close: a server whose Start lost to a live peer
+// never owned the path, and unlinking it would strand that peer's sessions.
 func (s *UnixServer) Close() error {
 	s.cancel()
 	var err error
@@ -129,6 +159,8 @@ func (s *UnixServer) Close() error {
 		err = s.ln.Close()
 	}
 	s.wg.Wait()
-	os.Remove(s.socketPath)
+	if s.bound {
+		os.Remove(s.socketPath)
+	}
 	return err
 }

@@ -2129,11 +2129,12 @@ func (m *Manager) runSession(session *Session, prompt string) {
 		m.tryUpdateSessionStatus(session, StatusPending, StatusRunning)
 		startTime := time.Now()
 
-		// Pane probes cover hookless backends (cursor) and premature-idle
-		// correction for codex, whose notify hook can fire before the pane
-		// shows idle. nil for claude, which reports turn ends reliably. Built
-		// from the stored model and backend so the re-adopt path — which never
-		// sees a resolved agent model — gets the same tracker.
+		// Pane probes cover a hookless backend (cursor), premature-idle
+		// correction for codex — whose notify hook can fire before the pane
+		// shows idle — and, for claude, the fallback for a window whose Stop
+		// hook can no longer reach bramble. Only codex corrects a premature
+		// idle. Built from the stored model and backend so the re-adopt path —
+		// which never sees a resolved agent model — gets the same tracker.
 		idleTracker := m.newPaneIdleTrackerForModel(session.Model, session.Backend)
 
 		// Periodically check if tmux window still exists

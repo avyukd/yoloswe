@@ -659,6 +659,14 @@ func providerForSession(info SessionInfo) string {
 // composerHasDraft reports whether the recipient is mid-sentence in its
 // composer. known is false when this provider's composer cannot be read.
 func (c *Courier) composerHasDraft(id SessionID, provider string) (text string, draft, known bool) {
+	// Check readability before capturing, not after. composerDraftText returns
+	// unknown for every provider but claude, so capturing first made each codex,
+	// cursor and unresolved-model delivery pay a tmux round-trip for an answer
+	// that is discarded — the same waste the pasteVerifyRequired ordering above
+	// exists to avoid, widening the same paste-to-Enter window.
+	if !composerReadable(provider) {
+		return "", false, false
+	}
 	lines, err := c.target.CapturePaneText(id, pasteVerifyLines)
 	if err != nil {
 		return "", false, false

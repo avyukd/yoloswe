@@ -332,3 +332,82 @@ func TestStaleSocketFileIsReclaimed(t *testing.T) {
 
 	require.NoError(t, NewClient(sockPath).Ping())
 }
+
+// TestConcurrentStaleReclaimNeverStrandsTheWinner: binding first settles a
+// contest over a LIVE socket, but not over a stale one. Two processes can both
+// fail the bind, both find nothing listening, and then one unlinks and binds
+// while the other unlinks that now-live socket and binds over it. The first
+// keeps serving a path that no longer refers to it, so every window holding
+// that address in its frozen environment is stranded — the failure the stable
+// path was introduced to fix.
+func TestConcurrentStaleReclaimNeverStrandsTheWinner(t *testing.T) {
+	t.Parallel()
+	sockPath := filepath.Join(t.TempDir(), "stale-contended.sock")
+
+	// Leave a socket file with no listener behind it, as a killed process does.
+	seed, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	seed.(*net.UnixListener).SetUnlinkOnClose(false)
+	require.NoError(t, seed.Close())
+
+	const racers = 8
+	start := make(chan struct{})
+	results := make(chan error, racers)
+	servers := make([]*Server, racers)
+	for i := range servers {
+		srv := NewServer(sockPath)
+		srv.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+			return "pong", nil
+		})
+		servers[i] = srv
+		go func() {
+			<-start
+			results <- srv.Start()
+		}()
+	}
+	close(start)
+
+	var won int
+	for i := 0; i < racers; i++ {
+		if err := <-results; err == nil {
+			won++
+		} else {
+			require.ErrorIs(t, err, ErrSocketInUse,
+				"a loser must report the path as taken, not fail some other way")
+		}
+	}
+	require.Equal(t, 1, won, "exactly one server may reclaim a stale socket")
+	for _, srv := range servers {
+		defer srv.Close()
+	}
+
+	// The decisive assertion: whoever won is still the one reachable at the
+	// path. If a loser had unlinked and rebound, this reaches a listener with
+	// no handlers registered and the ping fails.
+	require.NoError(t, NewClient(sockPath).Ping(),
+		"the winner must still own the path after the contention")
+}
+
+// TestCloseDoesNotUnlinkASocketItDoesNotOwn: the ownership rule Start
+// establishes has to hold in Close too. `srv := New(path); defer srv.Close()`
+// before a Start that may lose is the natural Go shape, and a loser removing
+// the winner's socket strands exactly the sessions the stable path protects.
+func TestCloseDoesNotUnlinkASocketItDoesNotOwn(t *testing.T) {
+	t.Parallel()
+	sockPath := filepath.Join(t.TempDir(), "owned.sock")
+
+	winner := NewServer(sockPath)
+	winner.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+		return "pong", nil
+	})
+	require.NoError(t, winner.Start())
+	defer winner.Close()
+
+	loser := NewServer(sockPath)
+	require.ErrorIs(t, loser.Start(), ErrSocketInUse, "precondition: the loser never binds")
+	require.NoError(t, loser.Close(), "closing an unbound server must be harmless")
+
+	_, err := os.Stat(sockPath)
+	require.NoError(t, err, "the winner's socket file must survive the loser's Close")
+	require.NoError(t, NewClient(sockPath).Ping(), "and must still be served")
+}

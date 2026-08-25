@@ -775,3 +775,60 @@ func TestLocatedButUnreadableComposerHolds(t *testing.T) {
 	require.True(t, known, "an unreadable composer must not report unknown — that means deliver")
 	assert.True(t, draft, "hold when something unparseable occupies the composer")
 }
+
+// TestStaleCompletionLineIsNotThisTurnsVerdict: a completion line persists in
+// claude's transcript and is pushed up by later output, so in the seconds right
+// after bramble writes a delivery the content region holds this turn's echoed
+// prompt with the PREVIOUS turn's "✻ Worked for …" just above it.
+//
+// Reading that as the current verdict marks a live turn idle: Drain then
+// releases the next queued delivery into it and the parent is told the child
+// finished — the two harms this probe exists to prevent. The spinner is usually
+// absent from any given frame (caveat 3) and forTurn resets the streak at
+// exactly this boundary, so all five confirmations (~10s) fit inside the window.
+//
+// A submitted prompt is the boundary: claude echoes every one with the same
+// glyph, so nothing above it speaks for the turn now running.
+func TestStaleCompletionLineIsNotThisTurnsVerdict(t *testing.T) {
+	t.Parallel()
+
+	justSubmitted := []string{
+		"  Worktree is ready for your next task.",
+		"✻ Worked for 36m 36s",                                    // the PREVIOUS turn's completion
+		"❯ " + subagentReportPrefix + " subagent child-1 is idle", // THIS turn's prompt
+		"────────────────────────────────────────────",
+		"❯ ",
+		"────────────────────────────────────────────",
+		"  ~/wt/branch  main  Opus 4.6  ctx:43%  tokens:20k",
+		"  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+	}
+
+	working, known := claudePaneJudge(justSubmitted)
+	assert.False(t, known,
+		"a turn that has produced no output yet has no verdict; the line above its prompt is a previous turn's")
+	assert.False(t, working)
+
+	// And the tracker must never reach an idle decision on it, however many
+	// frames agree.
+	tr := &paneIdleTracker{provider: ProviderClaude}
+	for i := 0; i < 3*tr.confirmationsNeeded(); i++ {
+		require.False(t, tr.observe(justSubmitted),
+			"frame %d released queued mail into a live turn", i+1)
+	}
+
+	// Once the turn genuinely ends, its own completion line sits below the
+	// prompt and the verdict is reachable again.
+	finished := []string{
+		"❯ " + subagentReportPrefix + " subagent child-1 is idle",
+		"● Read(delivery.go)",
+		"✻ Worked for 12s",
+		"────────────────────────────────────────────",
+		"❯ ",
+		"────────────────────────────────────────────",
+		"  ~/wt/branch  main  Opus 4.6  ctx:43%  tokens:20k",
+		"  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+	}
+	working, known = claudePaneJudge(finished)
+	require.True(t, known, "a completed turn below its own prompt is readable")
+	assert.False(t, working, "and reads as idle")
+}

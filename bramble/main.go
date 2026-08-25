@@ -1571,14 +1571,11 @@ the recipient should read as part of its own work.`,
 			// report instead of arriving alongside it.
 			from = os.Getenv(session.SessionIDEnvVar)
 		}
-		if queue && !submit {
-			// --queue promises the text "is held until the recipient goes idle
-			// and is then delivered". Staging it into the composer without
-			// pressing Enter delivers nothing, and the text then sits there
-			// looking exactly like a human draft, holding every later delivery
-			// to that session behind it. Submitting is what --queue means.
-			submit = true
-		}
+		// Note: --queue always submits, but that is enforced in
+		// Dispatcher.sendInput rather than here, so it covers every producer —
+		// the hub forwards control.SendInputReq from remote agents, which never
+		// pass through these flags. The flag is left alone so the request on
+		// the wire still says what the caller asked for.
 
 		typ := control.TypeSessionSendInput
 		if sessionID == "" {

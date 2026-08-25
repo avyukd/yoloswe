@@ -356,3 +356,34 @@ func TestSendInputQueueSurfacesCourierError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cannot receive messages")
 }
+
+// TestSendInputQueueAlwaysSubmits: a queued delivery is submitted whatever the
+// caller asked for.
+//
+// Staging text into a composer without pressing Enter delivers nothing, and the
+// text then masquerades as a human draft: it carries no "[bramble]" marker, so
+// the courier cannot recognise it as its own, and the next delivery is held for
+// the full grace period and then pasted on top — submitting the message twice
+// in one prompt.
+//
+// The rule lives here rather than only in the CLI flag handler because every
+// producer reaches the courier through this dispatcher; the hub forwards
+// SendInputReq from remote agents, which never pass through cobra's flags.
+func TestSendInputQueueAlwaysSubmits(t *testing.T) {
+	t.Parallel()
+	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+	d, _ := newDispatcher(reg)
+	courier := &fakeCourier{queued: true}
+	d.SetCourier(courier)
+
+	resp := d.Handle(context.Background(), req(t, TypeSessionSendInput,
+		SendInputReq{SessionID: "s1", From: "s0", Text: "hello", Submit: false, Queue: true}))
+
+	var result SendInputResult
+	require.NoError(t, resp.DecodeResponse(&result))
+	require.True(t, result.OK)
+
+	require.Len(t, courier.sends, 1)
+	assert.True(t, courier.sends[0].submit,
+		"a queued delivery must be submitted even when the request says otherwise")
+}
