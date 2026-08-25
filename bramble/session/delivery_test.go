@@ -2129,11 +2129,14 @@ func TestDraftHoldIsBoundedByElapsedTime(t *testing.T) {
 	// is no keystroke bramble may send to clear the line first, because
 	// clearing a composer destroys the draft to deliver a report.
 	//
-	// So an unchanged HUMAN draft holds, the operator is told which session is
-	// blocked, and the queue's own maxDeliveryAge is the backstop rather than
-	// this branch. A composer holding only a stale paste chip is the separate,
-	// decidable case that does release — see
-	// TestAStaleChipIsSubmittedRatherThanPastedOverOrHeldForever.
+	// So an unchanged composer holds, whatever is in it, and the operator is
+	// told once which session is blocked and by what. Nothing retires it
+	// automatically: maxDeliveryAge prunes only at process start and DELETES
+	// rather than delivers, so it is not a backstop for a running bramble —
+	// saying it was, as an earlier version of this comment did, was worse than
+	// saying nothing. A paste chip is not the exception it once was here; see
+	// TestAnUnownedChipIsNeitherPastedOverNorSubmitted for why the pane cannot
+	// answer whose paste it is.
 	now = now.Add(composerHoldGrace + time.Second)
 	c.Drain(context.Background(), "s1")
 
@@ -2896,23 +2899,25 @@ func TestAChippedPasteLeavesNoStagedRecord(t *testing.T) {
 		"a record no later comparison could use must not survive the attempt that made it")
 }
 
-// TestAStaleChipIsRedeliveredRatherThanHeldForever is the other half of the
-// grace-period decision, and the case that made it necessary.
+// TestAnUnownedChipIsNeitherPastedOverNorSubmitted: a "[Pasted text #N]" chip is
+// what claude renders for ANY paste, so it cannot tell bramble's own unsent
+// paste from a block the user pasted and has not submitted.
 //
-// When claude collapses a delivery to "[Pasted text #N]" and the Enter then
-// fails, the composer holds a chip that no text comparison can match — so every
-// retry reads it as an unidentified draft. But a chip is not a human draft:
-// nobody is at the keyboard to clear it, so holding is holding forever, and the
-// old behaviour of pasting after the grace period appended the message to a
-// chip that already represented it, submitting it twice in one prompt.
+// An earlier version of this branch submitted it, reasoning that "the only
+// paste in play here is one of ours". That is the chip-as-provenance reasoning
+// already removed from composerHoldsThisDelivery, and it is doubly unavailable
+// here: a chipped paste deliberately leaves no staged record (see
+// TestAChippedPasteLeavesNoStagedRecord), so by construction bramble has no way
+// to know whose chip it is. Pressing Enter on it would submit the user's paste
+// and drop this delivery as though it had been sent.
 //
-// A composer holding ONLY a chip is therefore SUBMITTED — not pasted into, and
-// not held forever. Anything else holds.
-func TestAStaleChipIsSubmittedRatherThanPastedOverOrHeldForever(t *testing.T) {
+// Neither pasted over nor submitted: held, and reported.
+func TestAnUnownedChipIsNeitherPastedOverNorSubmitted(t *testing.T) {
 	t.Parallel()
 	target := newFakeTarget()
 	target.set("s1", StatusIdle, RunnerTypeTmux)
 	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	// A chip this courier has never pasted anything to account for.
 	target.setPane(claudeComposerPane("[Pasted text #1 +80 lines]"))
 
 	panes := &fakePanes{}
@@ -2928,16 +2933,34 @@ func TestAStaleChipIsSubmittedRatherThanPastedOverOrHeldForever(t *testing.T) {
 	now = now.Add(composerHoldGrace + time.Second)
 	c.Drain(context.Background(), "s1")
 
-	assert.Zero(t, panes.pasteCount(),
-		"pasting would append this message to a chip that already represents it, submitting it twice")
-	assert.Contains(t, panes.recorded(), "enter(@7)",
-		"the text is already in the composer; it only ever needed its Enter")
-	assert.Empty(t, c.Pending("s1"), "and the delivery leaves the queue")
+	assert.Zero(t, panes.pasteCount(), "pasting would append to whatever the chip represents")
+	assert.NotContains(t, panes.recorded(), "enter(@7)",
+		"submitting would send a paste bramble cannot show is its own")
+	assert.Len(t, c.Pending("s1"), 1, "the delivery stays queued rather than being dropped as sent")
 }
 
-// TestAChipBesideTypedTextIsStillAHumanDraft: "only a chip" is what makes the
-// release decidable. A chip with text next to it says a paste happened AND
-// somebody has been typing, which is a composer with an author — hold it.
+// TestOneStandingBlockIsReportedOnce: the grace branch is reached on every
+// retry for as long as the composer holds the same thing, so warning there
+// unconditionally is one line every retryDelay for the life of the block — the
+// log-flood shape errPaneBusy is logged at Debug to avoid. One standing
+// condition is one report.
+func TestOneStandingBlockIsReportedOnce(t *testing.T) {
+	t.Parallel()
+	c := &Courier{reportedBlocked: map[SessionID]string{}}
+
+	assert.True(t, c.noteBlockedReport("s1", "❯ a half-typed line"), "the first block is reported")
+	for i := 0; i < 20; i++ {
+		assert.False(t, c.noteBlockedReport("s1", "❯ a half-typed line"),
+			"the same block must not be reported again on every retry")
+	}
+	assert.True(t, c.noteBlockedReport("s1", "❯ a different half-typed line"),
+		"a new blocking draft is a new situation and is reported")
+}
+
+// TestAChipBesideTypedTextIsStillAHumanDraft: a chip with text beside it is
+// unambiguously a person's composer — a paste happened AND somebody typed. It
+// holds for the same reason a bare chip does, and this pins the clearer case so
+// no future attempt to read provenance off a chip can start from the easy end.
 func TestAChipBesideTypedTextIsStillAHumanDraft(t *testing.T) {
 	t.Parallel()
 	target := newFakeTarget()

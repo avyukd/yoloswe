@@ -138,6 +138,10 @@ type Courier struct { //nolint:govet // fieldalignment: grouping by role reads b
 	// bounded on a STATIC pane only, which is what separates a stuck verdict
 	// from a long turn. See notePaneHold.
 	heldForPane map[SessionID]paneHold
+	// reportedBlocked remembers, per recipient, the composer text an operator
+	// has already been warned about, so one standing block is reported once
+	// rather than on every retry. See noteBlockedReport.
+	reportedBlocked map[SessionID]string
 	// now is the clock, injectable so a test can assert the elapsed-time
 	// property rather than a call count.
 	now func() time.Time
@@ -168,17 +172,18 @@ func NewCourier(target DeliveryTarget, panes PaneWriter, config CourierConfig) (
 		return nil, fmt.Errorf("failed to create result dir %s: %w", resultDir, err)
 	}
 	c := &Courier{
-		target:       target,
-		panes:        panes,
-		dir:          deliveryDir,
-		resultDir:    resultDir,
-		pending:      make(map[SessionID][]Delivery),
-		heldForDraft: make(map[SessionID]draftHold),
-		staged:       make(map[SessionID]string),
-		heldForPane:  make(map[SessionID]paneHold),
-		now:          time.Now,
-		reported:     make(map[SessionID]map[SessionStatus]bool),
-		writing:      make(map[SessionID]bool),
+		target:          target,
+		panes:           panes,
+		dir:             deliveryDir,
+		resultDir:       resultDir,
+		pending:         make(map[SessionID][]Delivery),
+		heldForDraft:    make(map[SessionID]draftHold),
+		staged:          make(map[SessionID]string),
+		heldForPane:     make(map[SessionID]paneHold),
+		reportedBlocked: make(map[SessionID]string),
+		now:             time.Now,
+		reported:        make(map[SessionID]map[SessionStatus]bool),
+		writing:         make(map[SessionID]bool),
 	}
 	if err := c.load(); err != nil {
 		return nil, err
@@ -388,27 +393,23 @@ func composerHoldsThisDelivery(provider, composer, staged, text string) bool {
 	return body == first
 }
 
-// isBareChip reports whether a composer holds a paste chip and nothing else.
+// noteBlockedReport reports whether this blocked composer is worth telling an
+// operator about, which is once per distinct blocking text.
 //
-// "Nothing else" is what makes it decidable. A chip beside typed text says a
-// paste happened AND somebody has been typing, which is a human's composer; a
-// chip alone is the residue of a paste with nobody behind it. Only the second
-// may be pasted over, and only after the grace period has already shown that
-// nothing is going to clear it.
-func isBareChip(provider, composer string) bool {
-	body := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(composer), claudePromptGlyph))
-	for _, chip := range pasteEvidenceProbes[provider].chipMarkers {
-		if !strings.HasPrefix(body, chip) {
-			continue
-		}
-		// The chip must run to the end of the composer: "[Pasted text #3 +45
-		// lines]" and no more. Anything past the closing bracket is content the
-		// chip does not account for.
-		if end := strings.IndexByte(body, ']'); end == len(body)-1 {
-			return true
-		}
+// The grace-period branch is reached on every retry for as long as the composer
+// holds the same thing, so an unconditional warning there is one line every
+// retryDelay for the life of the block — the log-flood shape errPaneBusy is
+// deliberately logged at Debug to avoid. Keyed on the text so a NEW blocking
+// draft is reported again: that is a different situation, not the same one
+// repeating.
+func (c *Courier) noteBlockedReport(to SessionID, composer string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.reportedBlocked[to] == composer {
+		return false
 	}
-	return false
+	c.reportedBlocked[to] = composer
+	return true
 }
 
 // composerHoldGrace is how long one unchanged draft may hold a delivery.
@@ -817,54 +818,37 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 				// earlier version of this branch reached it after a five-minute
 				// delay while logging that a human's line had been typed over.
 				//
-				// So the grace period no longer buys a paste. It buys a
-				// WARNING: the delivery stays queued and keeps retrying, and an
-				// operator is told which session is blocked and by what, which
-				// is the actionable half of what this branch was for. Nothing
-				// here can clear the composer safely — the only way is a
-				// keystroke into somebody's pane, which would destroy a draft
-				// to deliver a report — so a composer that never clears is a
-				// situation to surface, not to overwrite.
-				// Two very different things reach this branch, and only one of
-				// them may be pasted over.
+				// The grace period no longer buys a paste, and does not buy a
+				// submit either. Both were attempts to decide from the pane
+				// whose text this is, and the pane cannot answer: tmux
+				// paste-buffer APPENDS, so pasting submits this message joined
+				// to a half-written sentence, and a "[Pasted text #N]" chip is
+				// what claude renders for ANY paste, so submitting one presses
+				// Enter on whatever a user pasted and drops this delivery as
+				// though it had been sent. That second reading was tried here
+				// and removed: it is the same chip-as-provenance reasoning
+				// removed from composerHoldsThisDelivery, and by then this file
+				// had already destroyed the one thing that could tell the cases
+				// apart, since a chipped paste deliberately leaves no record.
 				//
-				// A composer holding ONLY a paste chip is not a human draft at
-				// all: it is the residue of a paste, and the only paste in play
-				// here is one of ours that failed to submit. Nobody is going to
-				// clear it — a chip has no author at the keyboard — so holding
-				// is holding forever, and pasting appends this message to a
-				// chip that already represents it: the same message twice in
-				// one prompt, which is the double-paste symptom section 1
-				// exists to remove.
+				// So what the grace period buys is a REPORT, once. The
+				// delivery stays queued and keeps retrying, and an operator is
+				// told which session is blocked and by what — but only the
+				// first time, because this branch is reached on every retry for
+				// as long as the composer sits there and a warning every
+				// retryDelay reads like a recurring fault rather than one
+				// standing condition. That is the same reasoning errPaneBusy is
+				// logged at Debug for, a few lines below.
 				//
-				// Anything else is text a person may still come back to. tmux
-				// paste-buffer APPENDS, so pasting there submits a half-written
-				// sentence wearing this delivery, and no keystroke that could
-				// clear it first is bramble's to send: clearing a composer
-				// destroys a draft to deliver a report. Keep holding and say
-				// which session is blocked; the queue's own maxDeliveryAge is
-				// the backstop, not this branch.
-				if isBareChip(provider, composerText) {
-					// SUBMIT it, do not paste again. The chip is a paste that
-					// was never sent, and the only paste in play here is one of
-					// ours — this branch is reached after composerHoldGrace has
-					// already shown nobody is clearing it. Pasting would append
-					// this message to a chip that already represents it and
-					// submit both as one prompt, which is the double-paste
-					// symptom section 1 exists to remove; an earlier version of
-					// this branch did exactly that, five minutes late and while
-					// logging that a human's line had been typed over.
-					//
-					// Submitting is the action that makes the queue's own
-					// intent true — the text is in the composer, it just never
-					// got its Enter.
-					logDeliveryWarn("composer holds only a stale paste chip past the grace period; submitting it",
+				// Say plainly that nothing will retire this on its own. The
+				// queue's maxDeliveryAge only prunes at process start and
+				// DELETES rather than delivers, so it is not a backstop for a
+				// running bramble — an earlier version of this comment claimed
+				// it was, which was worse than saying nothing.
+				if c.noteBlockedReport(info.ID, composerText) {
+					logDeliveryWarn("composer has held unchanged text past the grace period; delivery stays queued until the composer clears",
 						info.ID, errComposerBusy)
-					alreadyStaged = true
-					break
 				}
-				logDeliveryWarn("composer has held an unchanged human draft past the grace period; delivery still queued",
-					info.ID, errComposerBusy)
 				return errComposerBusy
 			}
 		}
