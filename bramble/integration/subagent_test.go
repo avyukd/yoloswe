@@ -142,7 +142,7 @@ func TestQueuedDeliveryWaitsForIdle(t *testing.T) {
 
 	if result.Queued {
 		// The interesting case: held back rather than typed into a live turn.
-		assert.Equal(t, 1, h.deliveryQueueLen(), "a queued delivery should be persisted")
+		assert.Equal(t, 1, h.queuedFor(target), "a queued delivery should be persisted")
 		h.awaitPane(target, "STUB-REPLY QUEUED-BEHIND", "the queued message never landed")
 	} else {
 		// The session had already gone idle, so it was written immediately —
@@ -416,7 +416,7 @@ func TestLiveQueuedDeliveryWaitsForALiveTurn(t *testing.T) {
 			require.NoErrorf(t, err, "could not queue for the %s subagent", backend.provider)
 			require.Truef(t, result.Queued,
 				"a message sent to a %s subagent mid-turn should have been held, not written", backend.provider)
-			assert.Equal(t, 1, h.deliveryQueueLen(), "the held message should be persisted")
+			assert.Equal(t, 1, h.queuedFor(child), "the held message should be persisted")
 
 			// While the turn runs: the session must stay running, and nothing
 			// may be typed into it.
@@ -429,7 +429,11 @@ func TestLiveQueuedDeliveryWaitsForALiveTurn(t *testing.T) {
 			// The turn ends, and only then does the message land.
 			h.awaitPaneClearingDialogs(child, "LONG-DONE", "the subagent never finished its long turn")
 			h.awaitPaneClearingDialogs(child, "QUEUED-MID-TURN", "the held message never landed after the turn ended")
-			require.Eventually(t, func() bool { return h.deliveryQueueLen() == 0 },
+			// The child's queue, not the whole spool: the parent is a live
+			// session that receives its own subagent report when the child
+			// finishes, and whether that report has been consumed yet is a race
+			// this test says nothing about.
+			require.Eventually(t, func() bool { return h.queuedFor(child) == 0 },
 				settleTimeout, pollInterval, "the queue should drain once delivered")
 		})
 	}

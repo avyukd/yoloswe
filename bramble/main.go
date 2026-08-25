@@ -331,17 +331,22 @@ func runTUI(cmd *cobra.Command, args []string) error {
 		os.Setenv(control.SockEnvVar, controlSockPath)
 	}
 
-	// The IPC server has not started yet, so its path is the one it is about to
-	// bind. Publish it up front; clear it below if the bind fails.
+	// Which path the IPC server gets cannot be decided without trying to bind:
+	// the stable name is preferred, but if another bramble is still serving it
+	// this process must take a pid-scoped one instead of stealing it. So bind
+	// first, publish whatever was actually bound, and only then start
+	// accepting.
 	//
-	// Which path that is cannot be decided without trying to bind: the stable
-	// name is preferred, but if another bramble is still serving it this
-	// process must take a pid-scoped one instead of stealing it. Bind first,
-	// then publish whatever was actually bound.
+	// That last step is the ordering publishSockPaths documents as its
+	// precondition. It is reachable now that the path is stable: a tmux window
+	// left by a previous bramble has this address frozen in its environment and
+	// can fire into it the moment it binds, and a session created before the
+	// publish would carry an empty address for its whole life.
 	ipcServer, ipcSockPath := bindIPCServer(registry, wtRoot, repoName)
 	publishSockPaths(sessionManager, &sharedManagerConfig, ipcSockPath, controlSockPath)
-
 	if ipcServer != nil {
+		// Published above, so it is safe to take requests now.
+		ipcServer.Serve()
 		defer ipcServer.Close()
 		os.Setenv(ipc.SockEnvVar, ipcSockPath)
 	} else {
@@ -725,9 +730,11 @@ func bindIPCServer(registry *session.SessionRegistry, wtRoot, repoName string) (
 	return nil, ""
 }
 
-// startIPCServer binds the IPC server to sockPath, which the caller has already
-// published to the session manager. Taking the path as a parameter rather than
-// recomputing it is what guarantees the two agree.
+// startIPCServer binds the IPC server to sockPath but does NOT begin accepting.
+// The caller publishes the bound path and then calls Serve, so no
+// session-creating request can be handled before every session knows the
+// address to call back on. Taking the path as a parameter rather than
+// recomputing it is what guarantees the advertised and bound paths agree.
 func startIPCServer(registry *session.SessionRegistry, sockPath, wtRoot, repoName string) *ipc.Server {
 	srv := ipc.NewServer(sockPath)
 
@@ -816,8 +823,8 @@ func startIPCServer(registry *session.SessionRegistry, sockPath, wtRoot, repoNam
 		return "ok", nil
 	})
 
-	if err := srv.Start(); err != nil {
-		slog.Warn("IPC server failed to start", "err", err)
+	if err := srv.Bind(); err != nil {
+		slog.Warn("IPC server failed to bind", "err", err)
 		return nil
 	}
 	return srv

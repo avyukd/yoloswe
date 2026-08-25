@@ -302,34 +302,31 @@ func (c *Courier) Pending(to SessionID) []Delivery {
 	return append([]Delivery(nil), c.pending[to]...)
 }
 
-// draftIsOurOwnDelivery reports whether the text sitting in a recipient's
-// composer is a message bramble itself staged there.
+// composerHoldsThisDelivery reports whether the text sitting in a recipient's
+// composer is the very message about to be written there.
 //
-// Matched against what is actually queued for this recipient, not against the
-// "[bramble]" prefix: the prefix is user-controllable, so a person who types it
-// into their own draft would otherwise have that draft delivered over. A pane
-// capture truncates at the pane width, so the comparison is a prefix test
-// against the delivery's own first line, which is the most the pane can show.
-func (c *Courier) draftIsOurOwnDelivery(to SessionID, draft string) bool {
-	body := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(draft), claudePromptGlyph))
+// Matched against the message itself rather than the "[bramble]" prefix: the
+// prefix is user-controllable, so a person who types it into their own draft
+// must still be protected. A pane capture truncates at the pane width, so the
+// comparison is a prefix test against the message's first line — the most the
+// pane can show.
+//
+// Note this asks a narrower question than "did bramble stage something here".
+// A composer holding a DIFFERENT bramble message is still a composer that must
+// not be pasted into: tmux paste-buffer appends, so pasting over it would
+// submit both messages as one prompt.
+func composerHoldsThisDelivery(composer, text string) bool {
+	body := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(composer), claudePromptGlyph))
 	if body == "" || !strings.HasPrefix(body, subagentReportPrefix) {
 		return false
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, d := range c.pending[to] {
-		first, _, _ := strings.Cut(d.Text, "\n")
-		first = strings.TrimSpace(first)
-		if first == "" {
-			continue
-		}
-		// The pane shows at most one wrapped line of it; either side may be the
-		// truncated one depending on where the terminal cut.
-		if strings.HasPrefix(first, body) || strings.HasPrefix(body, first) {
-			return true
-		}
+	first, _, _ := strings.Cut(text, "\n")
+	first = strings.TrimSpace(first)
+	if first == "" {
+		return false
 	}
-	return false
+	// Either side may be the truncated one, depending on where the pane cut.
+	return strings.HasPrefix(first, body) || strings.HasPrefix(body, first)
 }
 
 // composerHoldGrace is how long one unchanged draft may hold a delivery.
@@ -540,18 +537,24 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 		// half-written sentence goes out wearing this message. Holding the
 		// delivery is safe: the error keeps it queued and arms a retry, and the
 		// next transition delivers it once the line is clear.
+		alreadyStaged := false
 		if composerText, draft, known := c.composerHasDraft(info.ID, provider); known && draft {
 			switch {
-			case c.draftIsOurOwnDelivery(info.ID, composerText):
-				// Bramble's own staged text, not a human draft. Holding for it
-				// would wait for a person who is not coming — nothing clears a
-				// composer but a keypress — so every later delivery to this
-				// session would queue behind it forever. Overwriting our own
-				// message is safe: it is still in the queue. No draft was held
-				// and no grace period elapsed, so this must not borrow the
-				// warning below, which would tell an operator a human's line
-				// was typed over.
-				slog.Debug("overwriting bramble's own unsubmitted delivery", "session", info.ID)
+			case composerHoldsThisDelivery(composerText, text):
+				// This very message is already staged in the composer — a
+				// previous attempt pasted it and then failed before pressing
+				// Enter. Do NOT paste again: tmux paste-buffer appends, so a
+				// second copy would be submitted alongside the first as one
+				// prompt, which is the double-paste symptom this change set out
+				// to remove. The text is already where it needs to be, so skip
+				// straight to submitting it.
+				//
+				// No draft was held and no grace period elapsed, so this must
+				// not borrow the warning below, which would tell an operator a
+				// human's line was typed over.
+				slog.Debug("delivery is already staged in the composer; submitting without re-pasting",
+					"session", info.ID)
+				alreadyStaged = true
 			case !c.noteDraftHold(info.ID, composerText):
 				return errComposerBusy
 			default:
@@ -567,8 +570,10 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 			}
 		}
 		c.clearDraftHold(info.ID)
-		if err := c.panes.Paste(ctx, target, text); err != nil {
-			return err
+		if !alreadyStaged {
+			if err := c.panes.Paste(ctx, target, text); err != nil {
+				return err
+			}
 		}
 		// Confirm the text actually reached the prompt before pressing Enter.
 		//

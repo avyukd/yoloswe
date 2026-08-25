@@ -93,6 +93,27 @@ func socketInUse(path string) bool {
 // other unlinks that now-live socket and binds over it — stranding the first,
 // which keeps serving a path that no longer refers to it.
 func (s *Server) Start() error {
+	if err := s.Bind(); err != nil {
+		return err
+	}
+	s.Serve()
+	return nil
+}
+
+// Bind acquires the socket without accepting anything yet.
+//
+// Splitting bind from serve is what lets a caller publish the address it
+// actually bound BEFORE any request can be handled. That ordering is
+// load-bearing here: this server creates sessions, a session snapshots the
+// socket paths at creation and keeps them for life, and the path is stable
+// across restarts — so a tmux window left by a previous bramble can fire into
+// it the instant it binds. A session built in that window before the path was
+// published would carry an empty address and stay mute forever, which is the
+// failure deliverable 3 exists to close.
+//
+// Call Serve once the path has been published. Start does both, for callers
+// with nothing to publish.
+func (s *Server) Bind() error {
 	ln, err := net.Listen("unix", s.socketPath)
 	if err != nil {
 		if !isAddrInUse(err) {
@@ -105,11 +126,16 @@ func (s *Server) Start() error {
 	}
 	s.listener = ln
 	s.bound = true
+	return nil
+}
 
+// Serve starts accepting on an already-bound listener. No-op if Bind failed.
+func (s *Server) Serve() {
+	if s.listener == nil {
+		return
+	}
 	s.wg.Add(1)
 	go s.acceptLoop()
-
-	return nil
 }
 
 // reclaimStaleSocket takes the path if nothing is listening on it, holding a

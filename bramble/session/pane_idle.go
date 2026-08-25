@@ -646,7 +646,16 @@ var pasteEvidenceProbes = map[string]pasteEvidence{
 	// unnoticed — deliver() writes directly rather than queueing, so the
 	// message is lost and MarkRunning wedges the session on a turn that never
 	// started.
-	ProviderClaude: {required: true},
+	//
+	// The chip marker is carried anyway. The measurement above is of the
+	// deliveries seen, not of every delivery possible: formatSubagentReport
+	// emits two or three lines once ErrorMsg or a result path is set, and a
+	// large enough paste collapses to a chip in claude too. Accepting a chip
+	// cannot produce a false positive that matters — a chip in the pane means
+	// the paste reached the composer, which is exactly what is being asked —
+	// while a false NEGATIVE here re-pastes and re-queues, which is the loop
+	// section 1 of this PR exists to remove.
+	ProviderClaude: {required: true, chipMarkers: []string{"[Pasted text"}},
 }
 
 // pasteVerifyRequired reports whether a paste must be confirmed before Enter.

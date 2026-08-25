@@ -26,6 +26,7 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -108,9 +109,17 @@ func newHarness(t *testing.T, stubAgent bool) *harness {
 	if stubAgent {
 		h.home = filepath.Join(root, "home")
 	}
-	for _, dir := range []string{h.home, wtRoot, runtimeDir} {
+	for _, dir := range []string{h.home, wtRoot} {
 		require.NoError(t, os.MkdirAll(dir, 0o755))
 	}
+	// 0700, and chmod'd explicitly because MkdirAll applies the umask: bramble
+	// verifies XDG_RUNTIME_DIR is a private directory owned by this user before
+	// it will publish a stable socket name there, exactly as a real
+	// /run/user/$UID is. A 0755 dir is rejected, bramble falls back to the
+	// shared temp dir, and awaitSockets then waits out its whole timeout for
+	// sockets that were never put where it is looking.
+	require.NoError(t, os.MkdirAll(runtimeDir, 0o700))
+	require.NoError(t, os.Chmod(runtimeDir, 0o700))
 
 	h.worktreePath = seedRepo(t, wtRoot)
 
@@ -436,10 +445,31 @@ func (h *harness) tmux(args ...string) (string, error) {
 
 // deliveryQueueLen counts the queue files bramble is holding. The queue lives
 // under the harness's private HOME, so this only ever sees this test's mail.
+//
+// Counts RECIPIENTS, not messages: the courier persists one file per recipient,
+// holding that recipient's whole queue. A test that means "my message is held"
+// should use queuedFor instead — a parent waiting on its own subagent report is
+// a second recipient, and whether that report has landed yet is a race.
 func (h *harness) deliveryQueueLen() int {
 	h.t.Helper()
 	files, _ := filepath.Glob(filepath.Join(h.home, ".bramble", "deliveries", "*.json"))
 	return len(files)
+}
+
+// queuedFor reports how many messages are held for one session.
+func (h *harness) queuedFor(id session.SessionID) int {
+	h.t.Helper()
+	data, err := os.ReadFile(filepath.Join(h.home, ".bramble", "deliveries", string(id)+".json"))
+	if err != nil {
+		return 0 // no file means nothing queued for this recipient
+	}
+	var queue []struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(data, &queue); err != nil {
+		h.t.Fatalf("delivery queue for %s is not readable: %v", id, err)
+	}
+	return len(queue)
 }
 
 // startupDialog is a prompt an agent CLI puts in front of its own prompt, which

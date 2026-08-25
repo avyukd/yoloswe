@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -410,4 +411,45 @@ func TestCloseDoesNotUnlinkASocketItDoesNotOwn(t *testing.T) {
 	_, err := os.Stat(sockPath)
 	require.NoError(t, err, "the winner's socket file must survive the loser's Close")
 	require.NoError(t, NewClient(sockPath).Ping(), "and must still be served")
+}
+
+// TestBindDoesNotAcceptUntilServe: a caller that must publish its address
+// before handling requests needs bind and accept to be separable.
+//
+// This server creates sessions, a session snapshots the socket paths at
+// creation and keeps them for life, and the path is now stable across restarts
+// — so a tmux window left by a previous bramble can fire into it the instant it
+// binds. A session built from that request before the path was published would
+// carry an empty address and stay mute forever, which is the failure
+// deliverable 3 exists to close.
+func TestBindDoesNotAcceptUntilServe(t *testing.T) {
+	t.Parallel()
+	sockPath := filepath.Join(t.TempDir(), "deferred.sock")
+
+	srv := NewServer(sockPath)
+	srv.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+		return "pong", nil
+	})
+	require.NoError(t, srv.Bind())
+	defer srv.Close()
+
+	// Bound: the path exists and a dial is accepted by the kernel's backlog...
+	_, err := os.Stat(sockPath)
+	require.NoError(t, err, "Bind must acquire the socket")
+
+	// ...but nothing is handling requests yet, so a full round-trip must not
+	// complete. This is the window in which the caller publishes.
+	client := NewClient(sockPath)
+	done := make(chan error, 1)
+	go func() { done <- client.Ping() }()
+	select {
+	case err := <-done:
+		t.Fatalf("a request completed before Serve: %v", err)
+	case <-time.After(150 * time.Millisecond):
+		// Correct: no handler has run.
+	}
+
+	// Once serving, the same path answers.
+	srv.Serve()
+	require.NoError(t, NewClient(sockPath).Ping(), "Serve must start handling")
 }

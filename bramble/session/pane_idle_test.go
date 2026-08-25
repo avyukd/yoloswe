@@ -832,3 +832,25 @@ func TestStaleCompletionLineIsNotThisTurnsVerdict(t *testing.T) {
 	require.True(t, known, "a completed turn below its own prompt is readable")
 	assert.False(t, working, "and reads as idle")
 }
+
+// TestClaudeAcceptsAPasteChip: claude is required:true, so a paste it cannot
+// confirm is re-pasted and then re-queued — the loop section 1 of this PR
+// exists to remove. The live measurement behind required:true covered the
+// deliveries seen, not every delivery possible: a subagent report grows to two
+// or three lines once an error or a result path is set, and a large enough
+// paste collapses to a chip.
+//
+// Accepting a chip cannot produce a false positive that matters: a chip in the
+// pane means the paste reached the composer, which is exactly what is asked.
+func TestClaudeAcceptsAPasteChip(t *testing.T) {
+	t.Parallel()
+
+	require.True(t, pasteVerifyRequired(ProviderClaude), "precondition")
+
+	chipPane := []string{"❯ [Pasted text #1 +42 lines]"}
+	assert.True(t, pasteConfirmed(ProviderClaude, chipPane, "a report from a subagent"),
+		"a collapsed paste is still a paste that arrived")
+
+	// And an empty pane is still not confirmation.
+	assert.False(t, pasteConfirmed(ProviderClaude, []string{"❯ "}, "a report from a subagent"))
+}

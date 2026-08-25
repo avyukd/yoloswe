@@ -2250,8 +2250,13 @@ func TestOwnDeliveryOverwriteIsNotLoggedAsAGraceExpiry(t *testing.T) {
 	target.set("s1", StatusIdle, RunnerTypeTmux)
 	c.Drain(context.Background(), "s1")
 
-	require.NotZero(t, panes.pasteCount(),
-		"precondition: bramble's own staged text must not hold its own queue")
+	// The delivery goes out without a second paste — the text is already in the
+	// composer, and tmux paste-buffer appends (see
+	// TestStagedDeliveryIsSubmittedNotRePasted). What matters here is that it
+	// was not held.
+	require.Contains(t, panes.recorded(), "enter(@7)",
+		"precondition: bramble's own staged text must be submitted, not held")
+	require.Empty(t, c.Pending("s1"), "precondition: and must leave the queue")
 	assert.NotContains(t, logs.String(), "past the grace period",
 		"overwriting bramble's own text must not claim a human draft was typed over")
 }
@@ -2334,4 +2339,61 @@ func TestUnreadableComposerCostsNoPaneCapture(t *testing.T) {
 	require.False(t, pasteVerifyRequired(ProviderCursor), "precondition")
 	assert.Zero(t, target.captures(),
 		"no pane capture may be made for a provider whose verdict is discarded")
+}
+
+// TestStagedDeliveryIsSubmittedNotRePasted: tmux paste-buffer APPENDS into the
+// composer — PaneWriter.Paste is set-buffer + paste-buffer with no clearing
+// step. So when an earlier attempt already pasted this message and then failed
+// before pressing Enter, pasting again would leave two copies and submit both
+// as one prompt: the double-paste symptom this change set out to remove,
+// re-created on the failure path.
+//
+// The state is reachable through failure paths this PR itself creates — a
+// SendEnter error requeues with the text still staged, and claude's now-required
+// paste verification requeues after a re-paste.
+func TestStagedDeliveryIsSubmittedNotRePasted(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+	staged := subagentReportPrefix + " subagent child-1 (planner, opus) is idle"
+	// The message is already in the composer from a previous attempt.
+	target.appendPane("❯ " + staged)
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", staged, true)
+	require.NoError(t, err)
+
+	assert.Zero(t, panes.pasteCount(),
+		"the message is already staged; pasting again would submit it twice in one prompt")
+	assert.Contains(t, panes.recorded(), "enter(@7)", "it must still be submitted")
+	assert.Empty(t, c.Pending("s1"), "and leave the queue")
+}
+
+// TestADifferentStagedMessageStillHolds: a composer holding a DIFFERENT bramble
+// message is still a composer that must not be pasted into — appending would
+// submit both messages as a single prompt. Only the message about to be written
+// may skip the paste.
+func TestADifferentStagedMessageStillHolds(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.appendPane("❯ " + subagentReportPrefix + " subagent OTHER-child is idle")
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1",
+		subagentReportPrefix+" subagent child-1 is idle", true)
+	require.NoError(t, err)
+
+	assert.Zero(t, panes.pasteCount(),
+		"a different staged message must not be appended to")
+	assert.Len(t, c.Pending("s1"), 1, "the delivery is held for the next transition")
 }
