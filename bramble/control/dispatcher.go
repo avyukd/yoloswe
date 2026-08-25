@@ -193,18 +193,20 @@ func (d *Dispatcher) sendInput(ctx context.Context, req *Msg, sessionScoped bool
 		if d.courier == nil {
 			return SendInputResult{}, fmt.Errorf("queued delivery is not available on this bramble")
 		}
-		// A queued delivery is always submitted, whatever the caller asked for.
-		// Staging text into a composer without pressing Enter delivers nothing
-		// and then masquerades as a human draft — it carries no "[bramble]"
-		// marker, so draftIsOurOwnDelivery cannot recognise it, and the next
-		// delivery is held for the full grace period and then pasted on top,
-		// submitting the message twice in one prompt.
+		// A queued delivery must be submitted, and saying otherwise is refused
+		// rather than silently ignored: Submit is a documented field, and a
+		// caller that asked to stage text deserves to learn that this endpoint
+		// cannot do that, not to be told OK and get a submitted message.
 		//
-		// Enforced here rather than only in the CLI flag handler because every
-		// producer reaches the courier through this dispatcher: the hub
-		// forwards arbitrary control.SendInputReq from remote agents, and those
-		// never pass through cobra's flags.
-		queued, err := d.courier.Send(ctx, session.SessionID(r.From), session.SessionID(r.SessionID), r.Text, true)
+		// Staging into a composer without pressing Enter delivers nothing, and
+		// the text then sits there looking like a human draft — it holds every
+		// later delivery to that session behind it for the full grace period
+		// and is then pasted on top.
+		if !r.Submit {
+			return SendInputResult{}, fmt.Errorf(
+				"queue requires submit: text staged without Enter is never delivered and blocks the queue behind it")
+		}
+		queued, err := d.courier.Send(ctx, session.SessionID(r.From), session.SessionID(r.SessionID), r.Text, r.Submit)
 		if err != nil {
 			return SendInputResult{}, err
 		}

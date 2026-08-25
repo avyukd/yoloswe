@@ -350,26 +350,28 @@ func TestSendInputQueueSurfacesCourierError(t *testing.T) {
 	d.SetCourier(&fakeCourier{sendErr: fmt.Errorf("session s1 is completed and cannot receive messages")})
 
 	resp := d.Handle(context.Background(), req(t, TypeSessionSendInput,
-		SendInputReq{SessionID: "s1", Text: "hello", Queue: true}))
+		// Submit is set because Queue requires it; this test is about the
+		// courier's error reaching the caller, not the flag combination.
+		SendInputReq{SessionID: "s1", Text: "hello", Submit: true, Queue: true}))
 
 	err := resp.DecodeResponse(nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cannot receive messages")
 }
 
-// TestSendInputQueueAlwaysSubmits: a queued delivery is submitted whatever the
-// caller asked for.
+// TestSendInputQueueRequiresSubmit: a queued delivery must be submitted, and
+// asking otherwise is refused rather than silently ignored.
 //
-// Staging text into a composer without pressing Enter delivers nothing, and the
-// text then masquerades as a human draft: it carries no "[bramble]" marker, so
-// the courier cannot recognise it as its own, and the next delivery is held for
-// the full grace period and then pasted on top — submitting the message twice
-// in one prompt.
+// Submit is a documented wire field, so quietly overriding it would tell a
+// caller OK and then do something else. And staging text into a composer
+// without Enter delivers nothing: it sits there looking like a human draft,
+// holding every later delivery to that session behind it for the full grace
+// period before being pasted on top.
 //
-// The rule lives here rather than only in the CLI flag handler because every
-// producer reaches the courier through this dispatcher; the hub forwards
-// SendInputReq from remote agents, which never pass through cobra's flags.
-func TestSendInputQueueAlwaysSubmits(t *testing.T) {
+// Enforced here rather than only in the CLI because every producer reaches the
+// courier through this dispatcher; the hub forwards SendInputReq from remote
+// agents, which never pass through cobra's flags.
+func TestSendInputQueueRequiresSubmit(t *testing.T) {
 	t.Parallel()
 	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
 	d, _ := newDispatcher(reg)
@@ -380,10 +382,8 @@ func TestSendInputQueueAlwaysSubmits(t *testing.T) {
 		SendInputReq{SessionID: "s1", From: "s0", Text: "hello", Submit: false, Queue: true}))
 
 	var result SendInputResult
-	require.NoError(t, resp.DecodeResponse(&result))
-	require.True(t, result.OK)
-
-	require.Len(t, courier.sends, 1)
-	assert.True(t, courier.sends[0].submit,
-		"a queued delivery must be submitted even when the request says otherwise")
+	err := resp.DecodeResponse(&result)
+	require.Error(t, err, "the combination must be refused, not quietly submitted")
+	assert.Contains(t, err.Error(), "submit")
+	assert.Empty(t, courier.sends, "nothing may be queued for a request that cannot be honoured")
 }

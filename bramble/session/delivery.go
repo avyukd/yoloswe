@@ -305,27 +305,38 @@ func (c *Courier) Pending(to SessionID) []Delivery {
 // composerHoldsThisDelivery reports whether the text sitting in a recipient's
 // composer is the very message about to be written there.
 //
-// Matched against the message itself rather than the "[bramble]" prefix: the
-// prefix is user-controllable, so a person who types it into their own draft
-// must still be protected. A pane capture truncates at the pane width, so the
-// comparison is a prefix test against the message's first line — the most the
-// pane can show.
+// Matched against the message itself, never against the "[bramble]" prefix. Two
+// reasons, pulling in opposite directions and both satisfied by comparing the
+// text: the prefix is user-controllable, so a person who types it must still be
+// protected; and a plain queued message ("hello" from the CLI) carries no
+// prefix at all, so requiring one left it looking like a human draft and got it
+// pasted a second time.
 //
-// Note this asks a narrower question than "did bramble stage something here".
-// A composer holding a DIFFERENT bramble message is still a composer that must
-// not be pasted into: tmux paste-buffer appends, so pasting over it would
-// submit both messages as one prompt.
-func composerHoldsThisDelivery(composer, text string) bool {
+// A pane capture truncates at the pane width and a composer wraps, so only the
+// first line is compared, prefix-wise in both directions — either side may be
+// the truncated one.
+//
+// A chip counts too. When a CLI collapses a paste to "[Pasted text #N]" the
+// characters never appear, and that chip can only be our own paste: this runs
+// while writing to a composer we just found non-empty, mid-delivery.
+//
+// This asks a narrower question than "did bramble stage something here". A
+// composer holding a DIFFERENT message is still one that must not be pasted
+// into: tmux paste-buffer appends, so pasting over it would submit both as a
+// single prompt.
+func composerHoldsThisDelivery(provider, composer, text string) bool {
 	body := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(composer), claudePromptGlyph))
-	if body == "" || !strings.HasPrefix(body, subagentReportPrefix) {
+	if body == "" {
 		return false
+	}
+	if containsAny(body, pasteEvidenceProbes[provider].chipMarkers) {
+		return true
 	}
 	first, _, _ := strings.Cut(text, "\n")
 	first = strings.TrimSpace(first)
 	if first == "" {
 		return false
 	}
-	// Either side may be the truncated one, depending on where the pane cut.
 	return strings.HasPrefix(first, body) || strings.HasPrefix(body, first)
 }
 
@@ -540,7 +551,7 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 		alreadyStaged := false
 		if composerText, draft, known := c.composerHasDraft(info.ID, provider); known && draft {
 			switch {
-			case composerHoldsThisDelivery(composerText, text):
+			case composerHoldsThisDelivery(provider, composerText, text):
 				// This very message is already staged in the composer — a
 				// previous attempt pasted it and then failed before pressing
 				// Enter. Do NOT paste again: tmux paste-buffer appends, so a
@@ -598,7 +609,12 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 		// a CapturePaneText round-trip per attempt, on every delivery — and
 		// then threw the answer away, while widening the very window between
 		// the draft check and SendEnter that this change set out to close.
-		if pasteVerifyRequired(provider) && !c.pasteLanded(ctx, info.ID, provider, text) {
+		// alreadyStaged means the composer was READ and found to hold this very
+		// message, which is a stronger confirmation than the probe can give:
+		// the probe looks for a fixed-length prefix and a wrapped or truncated
+		// composer may show less than that. Re-verifying would only produce a
+		// worse answer, and acting on it would append a second copy.
+		if !alreadyStaged && pasteVerifyRequired(provider) && !c.pasteLanded(ctx, info.ID, provider, text) {
 			if err := c.panes.Paste(ctx, target, text); err != nil {
 				return err
 			}

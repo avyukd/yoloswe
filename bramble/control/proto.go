@@ -80,9 +80,13 @@ type SendInputReq struct {
 	// From is the sender's session ID, when the sender is itself a session.
 	// A subagent messaging its own parent this way replaces the completion
 	// report bramble would otherwise generate for it.
-	From   string `json:"from,omitempty"`
-	Text   string `json:"text"`
-	Submit bool   `json:"submit"`
+	From string `json:"from,omitempty"`
+	Text string `json:"text"`
+	// Submit presses Enter after the paste. Required when Queue is set — text
+	// staged into a composer without Enter is never delivered, and it then
+	// looks like a human draft to every later delivery, holding them behind it.
+	// Queue with Submit false is refused rather than quietly submitted.
+	Submit bool `json:"submit"`
 	// Queue holds the text back until the recipient is idle instead of typing
 	// it into a live turn, where it would land in the recipient's next prompt
 	// stripped of its context. Requires SessionID: a raw pane target has no

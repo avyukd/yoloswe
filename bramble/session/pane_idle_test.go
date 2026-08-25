@@ -847,10 +847,23 @@ func TestClaudeAcceptsAPasteChip(t *testing.T) {
 
 	require.True(t, pasteVerifyRequired(ProviderClaude), "precondition")
 
-	chipPane := []string{"❯ [Pasted text #1 +42 lines]"}
-	assert.True(t, pasteConfirmed(ProviderClaude, chipPane, "a report from a subagent"),
+	// A real pane: pasteConfirmed reads the composer, so the chrome has to be
+	// there for the composer to be located.
+	assert.True(t, pasteConfirmed(ProviderClaude,
+		claudePaneComposer("❯ [Pasted text #1 +42 lines]", "✻ Worked for 12s"),
+		"a report from a subagent"),
 		"a collapsed paste is still a paste that arrived")
 
-	// And an empty pane is still not confirmation.
-	assert.False(t, pasteConfirmed(ProviderClaude, []string{"❯ "}, "a report from a subagent"))
+	// An empty composer is not confirmation.
+	assert.False(t, pasteConfirmed(ProviderClaude,
+		claudePaneComposer("❯ ", "✻ Worked for 12s"), "a report from a subagent"))
+
+	// Nor is the same text sitting in the transcript above an empty composer:
+	// an agent echoes every submitted prompt, so a previous delivery would
+	// otherwise confirm a paste that was dropped, and Enter would submit an
+	// empty composer.
+	assert.False(t, pasteConfirmed(ProviderClaude,
+		claudePaneComposer("❯ ", "❯ a report from a subagent", "● I read it."),
+		"a report from a subagent"),
+		"transcript history must not confirm a paste that never arrived")
 }

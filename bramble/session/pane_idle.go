@@ -665,16 +665,37 @@ func pasteVerifyRequired(provider string) bool {
 
 // pasteConfirmed reports whether a captured pane shows the paste arrived,
 // either by echoing the text or by rendering a chip in its place.
+//
+// Where the composer can be located, ONLY the composer is read. A capture is 40
+// lines deep and an agent echoes every submitted prompt into its transcript, so
+// a scan of the whole pane is confirmed by a previous delivery of the same text
+// — and for a provider whose verdict actually gates Enter (claude, codex) that
+// means pressing Enter on an empty composer: the message is lost and
+// MarkRunning wedges the session on a turn that never started, which is the
+// failure this check exists to prevent.
+//
+// Where it cannot be located, the whole capture is scanned as before. That is
+// the weaker test, but for a CLI whose chrome bramble cannot read it is the
+// only one available, and those providers are not required:true.
 func pasteConfirmed(provider string, lines []string, probe string) bool {
 	if probe == "" {
 		return true // nothing distinctive to look for
 	}
 	chips := pasteEvidenceProbes[provider].chipMarkers
-	for _, line := range lines {
-		if strings.Contains(line, probe) {
-			return true
+	confirms := func(line string) bool {
+		return strings.Contains(line, probe) || containsAny(line, chips)
+	}
+	if composerReadable(provider) {
+		if composerIdx, _ := claudeComposerIdx(lines); composerIdx >= 0 {
+			return confirms(lines[composerIdx])
 		}
-		if len(chips) > 0 && containsAny(line, chips) {
+		// The composer could not be located, so there is nothing to read. Do
+		// not fall back to the whole-pane scan here: this provider's verdict
+		// gates Enter, and a transcript match would submit an empty composer.
+		return false
+	}
+	for _, line := range lines {
+		if confirms(line) {
 			return true
 		}
 	}

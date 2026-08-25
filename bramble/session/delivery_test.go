@@ -230,15 +230,31 @@ func (p *fakePanes) recorded() []string {
 
 // echoPanes builds a pane writer whose pastes show up in target's pane, so the
 // courier's paste verification sees what it just wrote.
+// echoPanes stands in for a CLI that echoes a pasted message into its composer.
+//
+// The echo is written as a real claude pane: the composer line between two
+// rules, with the status lines below. That shape is load-bearing now that
+// pasteConfirmed reads only the composer — a bare line with no chrome cannot be
+// located, and a fake that emits one would exercise a pane claude never
+// produces (measured: 10/10 live panes are locatable at capture depth).
 func echoPanes(target *fakeTarget) *fakePanes {
 	p := &fakePanes{}
-	p.echo = func(text string) { target.appendPane(text) }
-	// Submitting scrolls the composer contents up into the transcript. The
-	// courier decides that by looking at the pane's tail, so stand in for the
-	// fresh empty composer with enough lines to push the submitted text out of
-	// it.
-	p.onSubmit = func() { target.appendPane("> ") }
+	p.echo = func(text string) { target.appendPane(claudeComposerPane(text)) }
+	// Submitting scrolls the composer contents up into the transcript, leaving
+	// a fresh empty composer behind.
+	p.onSubmit = func() { target.appendPane(claudeComposerPane("")) }
 	return p
+}
+
+// claudeComposerPane renders a composer holding body as claude draws it.
+func claudeComposerPane(body string) string {
+	return strings.Join([]string{
+		"────────────────────────────────────────────",
+		"❯ " + body,
+		"────────────────────────────────────────────",
+		"  ~/wt/branch  main  Opus 4.6  ctx:43%  tokens:20k",
+		"  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+	}, "\n")
 }
 
 // testCourierResultDir names a result dir inside this test's temp dir without
@@ -2396,4 +2412,62 @@ func TestADifferentStagedMessageStillHolds(t *testing.T) {
 	assert.Zero(t, panes.pasteCount(),
 		"a different staged message must not be appended to")
 	assert.Len(t, c.Pending("s1"), 1, "the delivery is held for the next transition")
+}
+
+// TestStagedDeliveryIsNotAppendedByPasteVerification: the alreadyStaged guard
+// has to cover BOTH pastes. Round 7 guarded the first one, but the
+// paste-verification block thirty lines below pasted unconditionally — and
+// claude is now required:true, so whenever the probe cannot see the text the
+// code performed exactly the append the guard exists to prevent, submitting
+// <staged copy><second copy> as one prompt.
+//
+// The two predicates disagree most cleanly when the pane shows less of the
+// message than pasteProbeLen: composerHoldsThisDelivery matches on a prefix in
+// either direction, while the probe wants a fixed 24 characters.
+func TestStagedDeliveryIsNotAppendedByPasteVerification(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+	// A short prefix of the message, as a narrow pane would show it.
+	target.appendPane(claudeComposerPane(subagentReportPrefix + " sub"))
+
+	panes := &fakePanes{} // no echo: the pane keeps showing only that prefix
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	full := subagentReportPrefix + " subagent child-1 (planner, opus) is idle"
+	_, err = c.Send(context.Background(), "", "s1", full, true)
+	require.NoError(t, err)
+
+	assert.Zero(t, panes.pasteCount(),
+		"verification must not append a second copy of a message already staged")
+}
+
+// TestPlainQueuedMessageIsNotDuplicated: a queued CLI message carries no
+// "[bramble]" prefix, so requiring one classified it as a human draft — the
+// retry after a failed SendEnter then pasted it again and submitted a
+// duplicate. Ownership is decided by matching the queued text, not a prefix.
+func TestPlainQueuedMessageIsNotDuplicated(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.appendPane(claudeComposerPane("hello"))
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "hello", true)
+	require.NoError(t, err)
+
+	assert.Zero(t, panes.pasteCount(),
+		"a plain queued message already in the composer must not be pasted again")
+	// Both halves matter: requiring the "[bramble]" prefix also leaves
+	// pasteCount at zero, but by classifying the message as a HUMAN draft and
+	// holding it — so the queue never drains. Assert it was actually delivered.
+	assert.Contains(t, panes.recorded(), "enter(@7)", "it must be submitted, not held")
+	assert.Empty(t, c.Pending("s1"), "and must leave the queue")
 }

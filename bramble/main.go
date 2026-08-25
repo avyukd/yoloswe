@@ -1578,11 +1578,15 @@ the recipient should read as part of its own work.`,
 			// report instead of arriving alongside it.
 			from = os.Getenv(session.SessionIDEnvVar)
 		}
-		// Note: --queue always submits, but that is enforced in
-		// Dispatcher.sendInput rather than here, so it covers every producer —
-		// the hub forwards control.SendInputReq from remote agents, which never
-		// pass through these flags. The flag is left alone so the request on
-		// the wire still says what the caller asked for.
+		// --queue requires --submit: staging text into a composer without Enter
+		// delivers nothing and blocks every later delivery to that session
+		// behind it. The dispatcher refuses the combination for every producer
+		// (the hub forwards SendInputReq from remote agents, which never see
+		// these flags); this turns that refusal into a usable CLI message
+		// instead of a round-trip error.
+		if queue && !submit {
+			return fmt.Errorf("--queue requires --submit: text staged without Enter is never delivered")
+		}
 
 		typ := control.TypeSessionSendInput
 		if sessionID == "" {
