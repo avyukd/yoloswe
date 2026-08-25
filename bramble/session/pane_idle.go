@@ -704,9 +704,13 @@ func pasteEvidenceObscured(provider string, lines []string) bool {
 // MarkRunning wedges the session on a turn that never started, which is the
 // failure this check exists to prevent.
 //
-// Where it cannot be located, the whole capture is scanned as before. That is
-// the weaker test, but for a CLI whose chrome bramble cannot read it is the
-// only one available, and those providers are not required:true.
+// Where it cannot be located, the pane TAIL is scanned instead. That is the
+// weaker test, but for a CLI whose chrome bramble cannot read it is the only
+// one available — and codex, which is required:true, is exactly such a CLI, so
+// the fallback must be sound rather than merely unreached. Bounding it to the
+// tail is what makes it sound: the transcript above holds every prompt the
+// agent has ever echoed, and letting those confirm a paste means submitting an
+// empty composer on the strength of a delivery that already happened.
 func pasteConfirmed(provider string, lines []string, probe string) bool {
 	if probe == "" {
 		return true // nothing distinctive to look for
@@ -730,12 +734,31 @@ func pasteConfirmed(provider string, lines []string, probe string) bool {
 		// negative is what re-pasted a message on every retry forever.
 		return false
 	}
-	for _, line := range lines {
+	// No composer to scope to, so the pane TAIL is the strongest evidence
+	// available — never the whole capture.
+	//
+	// A capture is 40 lines deep and an agent echoes every submitted prompt
+	// into its transcript, so scanning all of it lets history confirm the
+	// present. That is not theoretical for codex, the other required:true
+	// provider and the one that never has a readable composer: pasteProbe takes
+	// 24 bytes of the first line, a subagent report opens with a 19-byte
+	// constant prefix, and the 5 bytes left over are the worktree name every
+	// sibling shares — so once one report has been submitted and echoed, the
+	// next report's dropped paste is confirmed off that echo, Enter lands on an
+	// empty composer, and the parent wedges at running with the report lost.
+	// That is precisely the failure required:true exists to catch.
+	//
+	// paneIdleTailLines is the same bound the idle probe uses for the same
+	// reason: what is near the bottom is now, what is above it is history.
+	confirmed := false
+	forEachPaneTailLine(lines, func(line string) bool {
 		if confirms(line) {
+			confirmed = true
 			return true
 		}
-	}
-	return false
+		return false
+	})
+	return confirmed
 }
 
 // confirmsComposer is confirms for a LOCATED composer line, where the probe may

@@ -890,6 +890,48 @@ func TestClaudeAcceptsAPasteChip(t *testing.T) {
 		"an unrelated short line is not a truncation of our paste")
 }
 
+// TestCodexTranscriptDoesNotConfirmAPaste is the codex half of the rule the
+// claude case already pins: what is on screen near the composer is now, what is
+// scrolled above it is history.
+//
+// codex is required:true and never composer-readable, so it always takes
+// pasteConfirmed's fallback — the branch whose own doc says confirming a
+// required:true provider off the transcript means "pressing Enter on an empty
+// composer: the message is lost and MarkRunning wedges the session on a turn
+// that never started".
+//
+// The collision is not hypothetical. pasteProbe takes pasteProbeLen bytes of
+// the first line; a subagent report opens with a 19-byte constant prefix and
+// the remaining bytes are the worktree name every sibling shares, so two
+// different reports to one parent produce the SAME probe. Once report #1 is
+// submitted and echoed, report #2's dropped paste would be confirmed off that
+// echo — exactly the drop required:true exists to catch.
+func TestCodexTranscriptDoesNotConfirmAPaste(t *testing.T) {
+	t.Parallel()
+
+	require.True(t, pasteVerifyRequired(ProviderCodex), "precondition: codex's verdict gates Enter")
+	require.False(t, composerReadable(ProviderCodex), "precondition: codex always takes the fallback")
+
+	report := "[bramble] subagent wt-builder-a1b2c3d4 (builder) is completed"
+	probe := pasteProbe(report)
+
+	// A deep pane: the previous delivery is echoed far above the composer, with
+	// enough intervening rows to put it out of the tail's reach — which is what
+	// a real transcript looks like after the agent has answered it.
+	deep := []string{"  › " + report, "  • I read the report and acted on it."}
+	for i := 0; i < 20; i++ {
+		deep = append(deep, "  • still working through it")
+	}
+	assert.False(t, pasteConfirmed(ProviderCodex, codexPane(false, deep...), probe),
+		"a delivery echoed into the transcript must not confirm the NEXT one, which may have been dropped")
+
+	// The paste that actually just arrived sits at the bottom, where the tail
+	// reaches it. Bounding the scan must not cost the real confirmation.
+	assert.True(t, pasteConfirmed(ProviderCodex,
+		codexPane(false, "  • an earlier turn", "  › "+report), probe),
+		"a paste sitting at the bottom of the pane is what the check is for")
+}
+
 // TestTallComposerIsHeldNotDelivered: a composer taller than the walk's bound
 // used to report unfound, and both consumers of unfound then failed in the
 // unsafe direction. This pins the draft half: an ordinary long draft — a

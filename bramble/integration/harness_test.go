@@ -232,22 +232,33 @@ func (h *harness) restart() {
 // Discovered by globbing the private runtime dir, which can only ever hold this
 // bramble.
 //
-// The pattern is "bramble*.sock", not "bramble-*.sock": the IPC socket is
-// plain "bramble.sock" now that the names are stable, and a hyphen in the glob
-// silently matches only the control socket — leaving the harness waiting out
-// its whole timeout for an IPC path that was bound all along. The glob still
-// has to span both spellings, because a bramble that finds the stable path
-// already served falls back to a pid-scoped name.
+// The glob has to span two spellings, not one. userSockName formats
+// "<base>-<uid>.sock", so the stable IPC socket is "bramble-<uid>.sock" — and a
+// bramble that finds that path already served falls back to a pid-scoped
+// "bramble-<uid>-<pid>.sock". Both are names this harness may meet, which is
+// why the glob is "bramble*.sock" and not "bramble-<uid>.sock".
+//
+// The ping at the end is what settles which one is live, so the loop must not
+// overwrite a candidate it has already accepted: the pid-scoped name sorts
+// BEFORE the stable one, so a last-match-wins loop in a directory holding both
+// would hand the ping whichever came last rather than letting it choose. Taking
+// the first match and letting the ping reject it leaves the retry to
+// require.Eventually, which is where this function's waiting already lives.
 func (h *harness) awaitSockets(runtimeDir string) {
 	h.t.Helper()
 	require.Eventually(h.t, func() bool {
 		socks, _ := filepath.Glob(filepath.Join(runtimeDir, "bramble*.sock"))
+		h.ipcSock, h.controlSock = "", ""
 		for _, s := range socks {
 			if strings.Contains(filepath.Base(s), "control") {
-				h.controlSock = s
+				if h.controlSock == "" {
+					h.controlSock = s
+				}
 				continue
 			}
-			h.ipcSock = s
+			if h.ipcSock == "" {
+				h.ipcSock = s
+			}
 		}
 		if h.ipcSock == "" || h.controlSock == "" {
 			return false
