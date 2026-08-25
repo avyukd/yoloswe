@@ -1182,6 +1182,31 @@ func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text
 }
 
 // pasteProbe picks the substring to look for in the pane.
+//
+// The TAIL of the first line, not its head, because the head is what two
+// different deliveries SHARE. A subagent report opens with a 19-byte constant
+// prefix ("[bramble] subagent ") followed by a session ID that begins with the
+// worktree name every sibling shares — see formatSubagentReport and
+// generateSessionID — so a head-anchored probe of pasteProbeLen bytes came out
+// identical for every report sent to one parent.
+//
+// That mattered because a confirmed probe is read as "this paste arrived". With
+// identical probes, a report already echoed into the agent's transcript
+// confirmed the NEXT one even when that paste had been dropped, so Enter landed
+// on an empty composer, the message was lost, and MarkRunning wedged the parent
+// on a turn that never started. Measured: with the head anchor, report #2's
+// probe was found verbatim in report #1's echo four rows up.
+//
+// The tail is better but not a guarantee, and this is not the whole fix — see
+// TestCodexPaneVerdictIsBoundedByWhatBrambleCanSee for the part that is not
+// closed. Two reports differing only in bytes that fall outside the window
+// still collide; what makes that survivable is that the window now spans the
+// varying region for the shapes measured, rather than sitting entirely inside
+// the constant one.
+//
+// Still ONE line and still a bounded slice of it: a TUI re-renders a long
+// prompt with its own wrapping and decoration, so only a short run of
+// characters survives verbatim.
 func pasteProbe(text string) string {
 	first := text
 	if i := strings.IndexByte(first, '\n'); i >= 0 {
@@ -1189,7 +1214,7 @@ func pasteProbe(text string) string {
 	}
 	first = strings.TrimSpace(first)
 	if len(first) > pasteProbeLen {
-		first = first[:pasteProbeLen]
+		first = first[len(first)-pasteProbeLen:]
 	}
 	return first
 }

@@ -246,8 +246,29 @@ func (h *harness) restart() {
 // path sat one entry later. So the candidates are pinged in order and the first
 // that answers wins.
 //
-// The single-candidate case, which is every ordinary run, still costs exactly
-// one ping: the same one this function ended with before.
+// The control socket is chosen the same way, for the same reason — a stale
+// pid-scoped control socket sorts first just as a stale IPC one does, and this
+// harness would otherwise record it and fail every later control request
+// against a bramble that was up all along.
+//
+// The single-candidate case, which is every ordinary run, costs one ping and
+// one connect.
+// controlAnswers reports whether a live control server is behind path.
+//
+// Connecting IS the test, exactly as sockguard.InUse argues: a Unix socket that
+// accepts has a listener behind it, while a file left by a dead process
+// refuses. Sending a request would additionally require the peer to speak the
+// protocol — a stronger claim than "is anyone there", and one that would hang
+// on a peer that accepts but never replies.
+func controlAnswers(path string) bool {
+	conn, err := control.DialUnix(path)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
 func (h *harness) awaitSockets(runtimeDir string) {
 	h.t.Helper()
 	require.Eventually(h.t, func() bool {
@@ -255,7 +276,7 @@ func (h *harness) awaitSockets(runtimeDir string) {
 		h.ipcSock, h.controlSock = "", ""
 		for _, s := range socks {
 			if strings.Contains(filepath.Base(s), "control") {
-				if h.controlSock == "" {
+				if h.controlSock == "" && controlAnswers(s) {
 					h.controlSock = s
 				}
 				continue

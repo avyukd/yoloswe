@@ -915,17 +915,23 @@ func TestCodexTranscriptDoesNotConfirmAPaste(t *testing.T) {
 	report := "[bramble] subagent wt-builder-a1b2c3d4 (builder) is completed"
 	probe := pasteProbe(report)
 
-	// A full-depth capture: the previous delivery is echoed at the TOP, with the
-	// agent's answer filling the rows between it and the composer. That is what
-	// a real transcript looks like once the agent has replied, and the capture
-	// is pasteVerifyLines deep, so the fixture has to be too — a shallow
-	// stand-in would sit inside any bound and prove nothing.
-	deep := []string{"  › " + report, "  • I read the report and acted on it."}
+	// A SHORT reply, which is the case that matters and the one an earlier
+	// version of this test missed by padding the transcript until it fell
+	// outside the scan bound. The echo sits a couple of rows up, well inside
+	// any depth, so depth cannot be what saves this — only a probe that tells
+	// the two reports apart.
+	other := "[bramble] subagent wt-builder-b2b2b2b2 (builder) is completed"
+	shortReply := codexPane(false, "  › "+other, "  • Noted, waiting on the others.")
+	assert.False(t, pasteConfirmed(ProviderCodex, shortReply, probe),
+		"a DIFFERENT delivery echoed two rows up must not confirm this one, which may have been dropped")
+
+	// The same pane, deep: still not confirmed, for the same reason.
+	deep := []string{"  › " + other, "  • I read the report and acted on it."}
 	for len(deep) < pasteVerifyLines {
 		deep = append(deep, "  • still working through it")
 	}
 	assert.False(t, pasteConfirmed(ProviderCodex, codexPane(false, deep...), probe),
-		"a delivery echoed into the transcript must not confirm the NEXT one, which may have been dropped")
+		"and neither does the same echo far above the composer")
 
 	// A delivery that WRAPS must still confirm. The composer holds the message
 	// and grows upward, so the probe-bearing first line sits as many rows up as
@@ -942,6 +948,41 @@ func TestCodexTranscriptDoesNotConfirmAPaste(t *testing.T) {
 	assert.True(t, pasteConfirmed(ProviderCodex,
 		codexPane(false, "  • an earlier turn", "  › "+report), probe),
 		"a paste sitting at the bottom of the pane is what the check is for")
+}
+
+// TestCodexPaneVerdictIsBoundedByWhatBrambleCanSee pins the limit of the codex
+// paste check, so it reads as a known gap rather than as coverage.
+//
+// For a provider whose composer cannot be isolated from its transcript, a
+// SINGLE capture cannot distinguish bramble's paste from an identical earlier
+// one. pasteProbe now makes ordinary deliveries distinguishable, which is what
+// closes the realistic case above — but two first lines that agree across the
+// whole probe window are still indistinguishable, and no scan depth changes
+// that: the colliding echo can sit at any depth.
+//
+// Closing it needs evidence a single capture does not carry — the pane before
+// the paste compared with the pane after — which is a change to the delivery
+// path rather than to this predicate, and a real tradeoff for codex: pay a
+// second CapturePaneText on every delivery, or accept one of the two errors.
+// Recorded here rather than guessed at, after two rounds in which a chosen
+// depth reopened whichever side it was not chosen for.
+func TestCodexPaneVerdictIsBoundedByWhatBrambleCanSee(t *testing.T) {
+	t.Parallel()
+
+	require.False(t, composerReadable(ProviderCodex),
+		"the whole gap follows from this: no composer boundary, so no way to attribute pane text to our paste")
+
+	// Two deliveries whose first lines agree over the probe window. The echoed
+	// one confirms the dropped one, and this test says so out loud.
+	same := "[bramble] subagent wt-builder-9a9a9a9a (builder) is completed"
+	pane := codexPane(false, "  › "+same, "  • Noted.")
+	assert.True(t, pasteConfirmed(ProviderCodex, pane, pasteProbe(same)),
+		"KNOWN GAP: an echo of a delivery with the same probe confirms a paste that may have been dropped")
+
+	// The reason it is not closed by reading less of the pane: the echo is two
+	// rows up, inside any bound that can still reach a wrapped composer.
+	assert.Less(t, 2, pasteConfirmTailLines,
+		"a depth that excluded this echo would also exclude an ordinary wrapped composer")
 }
 
 // TestTallComposerIsHeldNotDelivered: a composer taller than the walk's bound

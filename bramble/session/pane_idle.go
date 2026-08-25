@@ -716,6 +716,23 @@ func pasteEvidenceObscured(provider string, lines []string) bool {
 // pane is what keeps it sound in the other: see pasteConfirmTailLines, since a
 // bound too tight turns an ordinary wrapped delivery into a false negative and
 // re-pastes it forever.
+//
+// The depth is NOT what separates those two cases, and it cannot be. Both
+// scale with things this code cannot see — a composer grows with the message,
+// an echo's depth shrinks with a short reply — so any constant fails one of
+// them; two rounds of this change picked a number and each reopened the other
+// side. What actually separates them is the PROBE, which now tells two
+// deliveries apart (see pasteProbe). The bound only keeps the scan from
+// wandering arbitrarily far up a capture.
+//
+// A residual remains, deliberately unfixed here: two deliveries whose first
+// lines agree over the whole probe window still collide, and for a provider
+// with no composer boundary there is no single capture that can distinguish
+// bramble's paste from an identical earlier one. Closing that needs evidence
+// this function does not have — a capture from before the paste compared with
+// one after — which is a delivery-path design change rather than a fix. See
+// TestCodexPaneVerdictIsBoundedByWhatBrambleCanSee, which pins the residual so
+// it reads as known rather than as covered.
 func pasteConfirmed(provider string, lines []string, probe string) bool {
 	if probe == "" {
 		return true // nothing distinctive to look for
