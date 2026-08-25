@@ -637,28 +637,28 @@ func controlSocketPath() string {
 	return stableOrPidScoped(controlSockBase)
 }
 
-// stableOrPidScoped returns the stable per-user socket path when the directory
-// holding it is private, and a pid-scoped path when it is not.
+// stableOrPidScoped returns the socket path to publish, or "" when there is no
+// safe place to put one.
 //
-// Stability is only safe in a private directory. The stable name is fixed and
-// therefore predictable, so in a shared /tmp any local user could bind it first
-// and receive the IPC and control traffic of tmux windows that have the path
-// frozen in their environment. Degrading to a pid-scoped name gives up the
-// restart-survival this PR adds — a window started under the old pid is
-// stranded — but that is a liveness cost on a host that cannot offer a private
-// runtime directory, not a confidentiality one, and the warning from
-// socketDirPrivate says which happened.
+// A socket path is only safe inside a directory this user alone can traverse.
+// Without one, every candidate is exposed: the stable name is fixed and so
+// predictable outright, and a pid-scoped name is barely better, since a pid is
+// observable and an abandoned path can be pre-bound by another local user
+// before bramble restarts — they would then receive callbacks from tmux windows
+// that still point there. Unpredictability was never the protection; the
+// directory is.
+//
+// So this fails closed. The caller runs without that socket, which costs
+// subagent callbacks and remote control — a degraded bramble, but not one
+// quietly serving its IPC over a path anybody can take. startIPCServer already
+// tolerates a nil server, so this is a path the program is built to survive.
 func stableOrPidScoped(base string) string {
 	dir, private := socketDirPrivate()
 	if !private {
-		// A pid is observable, so a pid-scoped name in a shared directory is
-		// only marginally less predictable than a stable one — after a crash
-		// another local process can bind the old path before bramble restarts
-		// and receive callbacks from windows that still point at it. The
-		// unpredictability is a mitigation, not the protection; the protection
-		// is the directory, and there isn't one here. Both facts go in the log
-		// once, at the point the decision is made.
-		return filepath.Join(dir, fmt.Sprintf("%s-%d.sock", base, os.Getpid()))
+		slog.Error("refusing to publish a socket outside a private directory; "+
+			"subagent callbacks and remote control are disabled for this session",
+			"dir", dir, "socket", base)
+		return ""
 	}
 	return filepath.Join(dir, userSockName(base))
 }
@@ -670,8 +670,17 @@ func stableOrPidScoped(base string) string {
 // must never happen is a second bramble unlinking a socket the first is still
 // serving, which would strand every one of its windows.
 func pidScopedSocketPath(name string) string {
+	// Same rule as stableOrPidScoped: no private directory, no socket. This is
+	// the collision fallback, so it only runs when a stable path was already
+	// published — but it derives its own path, and deriving it from bare
+	// socketDir() would have put it in the shared temp dir after the stable
+	// path had correctly refused to go there.
+	dir, private := socketDirPrivate()
+	if !private {
+		return ""
+	}
 	base := strings.TrimSuffix(name, ".sock")
-	return filepath.Join(socketDir(), fmt.Sprintf("%s-%d.sock", base, os.Getpid()))
+	return filepath.Join(dir, fmt.Sprintf("%s-%d.sock", base, os.Getpid()))
 }
 
 // publishSockPaths makes both socket paths visible to every session the manager
@@ -697,10 +706,17 @@ func publishSockPaths(m *session.Manager, shared *session.ManagerConfig, ipcSock
 // that is really listening rather than the one it hoped for.
 func bindIPCServer(registry *session.SessionRegistry, wtRoot, repoName string) (*ipc.Server, string) {
 	sockPath := ipcSocketPath()
+	if sockPath == "" {
+		// No private directory: stableOrPidScoped has already said so, loudly.
+		return nil, ""
+	}
 	if srv := startIPCServer(registry, sockPath, wtRoot, repoName); srv != nil {
 		return srv, sockPath
 	}
 	fallback := pidScopedSocketPath(userSockName(ipcSockBase))
+	if fallback == "" {
+		return nil, ""
+	}
 	slog.Warn("stable IPC socket is served by another bramble; falling back",
 		"stable", sockPath, "fallback", fallback)
 	if srv := startIPCServer(registry, fallback, wtRoot, repoName); srv != nil {
@@ -830,10 +846,17 @@ func newDispatcher(registry *session.SessionRegistry, courier *session.Courier) 
 func startControlServer(registry *session.SessionRegistry, courier *session.Courier) *control.UnixServer {
 	dispatcher := newDispatcher(registry, courier)
 	sockPath := controlSocketPath()
+	if sockPath == "" {
+		// No private directory: stableOrPidScoped has already said so, loudly.
+		return nil
+	}
 	srv := control.NewUnixServer(sockPath, dispatcher)
 	err := srv.Start()
 	if errors.Is(err, control.ErrSocketInUse) {
 		fallback := pidScopedSocketPath(userSockName(controlSockBase))
+		if fallback == "" {
+			return nil
+		}
 		slog.Warn("stable control socket is served by another bramble; falling back",
 			"stable", sockPath, "fallback", fallback)
 		srv = control.NewUnixServer(fallback, dispatcher)

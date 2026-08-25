@@ -1,10 +1,12 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -2203,4 +2205,45 @@ func TestBrambleOwnStagedDeliveryIsOverwritten(t *testing.T) {
 			"a user draft must be protected even when it wears bramble's prefix")
 		assert.Len(t, c.Pending("s1"), 1, "the delivery stays queued")
 	})
+}
+
+// TestOwnDeliveryOverwriteIsNotLoggedAsAGraceExpiry: the grace-period warning
+// says a human's unchanged draft was typed over after composerHoldGrace. When
+// bramble overwrites its own staged text, none of that happened — no draft was
+// held and no grace elapsed — so borrowing that line tells an operator the
+// opposite of the truth, inverting the distinct diagnostic this PR added.
+func TestOwnDeliveryOverwriteIsNotLoggedAsAGraceExpiry(t *testing.T) {
+	// Not parallel: it captures the shared standard logger.
+	var logs bytes.Buffer
+	oldOut, oldFlags := log.Writer(), log.Flags()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(oldOut); log.SetFlags(oldFlags) })
+
+	target := newFakeTarget()
+	// Busy, so the first Send only queues: the delivery must still be pending
+	// when the staged text is already sitting in the composer, which is the
+	// state the own-delivery branch exists for.
+	target.set("s1", StatusRunning, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	staged := subagentReportPrefix + " subagent child-1 (planner, opus) is idle"
+	queued, err := c.Send(context.Background(), "", "s1", staged, true)
+	require.NoError(t, err)
+	require.True(t, queued, "precondition: the delivery is queued, not written")
+
+	// The same text is in the composer — a --queue send that never pressed
+	// Enter — and the session is now idle, so the drain attempts a write.
+	target.appendPane("❯ " + staged)
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	c.Drain(context.Background(), "s1")
+
+	require.NotZero(t, panes.pasteCount(),
+		"precondition: bramble's own staged text must not hold its own queue")
+	assert.NotContains(t, logs.String(), "past the grace period",
+		"overwriting bramble's own text must not claim a human draft was typed over")
 }

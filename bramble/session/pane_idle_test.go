@@ -743,3 +743,35 @@ func TestComposerLayerDoesNotJudgeOwnership(t *testing.T) {
 		assert.True(t, draft, "any non-empty composer is a draft at this layer: %q", body)
 	}
 }
+
+// TestLocatedButUnreadableComposerHolds: the composer region is bounded by two
+// rules — so it IS located — but its first line does not carry the glyph, which
+// happens when claude decorates the composer or a repaint lands mid-frame.
+//
+// Something is in there that this parser cannot read, and "unknown" means
+// deliver. The safe verdict is to hold. This case is only reachable when the
+// upper rule is present: with no rule the composer is reported unfound and the
+// bounded tail fallback runs instead, which is what
+// TestOversizedComposerIsHeldNotDelivered covers.
+func TestLocatedButUnreadableComposerHolds(t *testing.T) {
+	t.Parallel()
+
+	pane := []string{
+		"✻ Worked for 12s",
+		"────────────────────────────────────────────",
+		"⏎ some decorated composer shape we do not parse",
+		"────────────────────────────────────────────",
+		"  ~/wt/branch  main  Opus 4.6  ctx:43%  tokens:20k",
+		"  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+	}
+
+	// Precondition: the composer really is located, so this is the branch under
+	// test and not the tail fallback.
+	composerIdx, contentEnd := claudeComposerIdx(pane)
+	require.GreaterOrEqual(t, composerIdx, 0, "the composer region must be located")
+	require.GreaterOrEqual(t, contentEnd, 0, "bounded above by a rule")
+
+	draft, known := composerDraft(ProviderClaude, pane)
+	require.True(t, known, "an unreadable composer must not report unknown — that means deliver")
+	assert.True(t, draft, "hold when something unparseable occupies the composer")
+}

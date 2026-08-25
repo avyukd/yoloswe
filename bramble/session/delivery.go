@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -539,25 +540,31 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 		// half-written sentence goes out wearing this message. Holding the
 		// delivery is safe: the error keeps it queued and arms a retry, and the
 		// next transition delivers it once the line is clear.
-		if text, draft, known := c.composerHasDraft(info.ID, provider); known && draft {
-			if c.draftIsOurOwnDelivery(info.ID, text) {
+		if composerText, draft, known := c.composerHasDraft(info.ID, provider); known && draft {
+			switch {
+			case c.draftIsOurOwnDelivery(info.ID, composerText):
 				// Bramble's own staged text, not a human draft. Holding for it
 				// would wait for a person who is not coming — nothing clears a
 				// composer but a keypress — so every later delivery to this
 				// session would queue behind it forever. Overwriting our own
-				// message is safe: it is still in the queue.
-				c.clearDraftHold(info.ID)
-			} else if !c.noteDraftHold(info.ID, text) {
+				// message is safe: it is still in the queue. No draft was held
+				// and no grace period elapsed, so this must not borrow the
+				// warning below, which would tell an operator a human's line
+				// was typed over.
+				slog.Debug("overwriting bramble's own unsubmitted delivery", "session", info.ID)
+			case !c.noteDraftHold(info.ID, composerText):
 				return errComposerBusy
+			default:
+				// The same draft has now held this delivery for
+				// composerHoldGrace without changing, so nobody is at the
+				// keyboard: a composer is cleared only by a keypress. Holding
+				// longer trades a small risk of landing beside typed text
+				// against never delivering at all, which is the failure class
+				// this PR exists to close. Say so plainly — this is the one
+				// path where a message can join a draft.
+				logDeliveryWarn("composer has held an unchanged draft past the grace period; delivering anyway",
+					info.ID, errComposerBusy)
 			}
-			// The same draft has now held this delivery for composerHoldGrace
-			// without changing, so nobody is at the keyboard: a composer is
-			// cleared only by a keypress. Holding longer trades a small risk of
-			// landing beside typed text against never delivering at all, which
-			// is the failure class this PR exists to close. Say so plainly —
-			// this is the one path where a message can join a draft.
-			logDeliveryWarn("composer has held an unchanged draft past the grace period; delivering anyway",
-				info.ID, errComposerBusy)
 		}
 		c.clearDraftHold(info.ID)
 		if err := c.panes.Paste(ctx, target, text); err != nil {

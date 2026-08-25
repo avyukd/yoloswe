@@ -113,6 +113,9 @@ func TestSocketPathsPreferRuntimeDir(t *testing.T) {
 func TestSocketPathsFallBackUnderTempDir(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	t.Setenv("TMPDIR", t.TempDir())
+	// The fallback directory is created 0700 by socketDirPrivate, so paths are
+	// published normally here; the refusal case is
+	// TestNoSocketIsPublishedWithoutAPrivateDirectory.
 
 	for name, got := range map[string]string{
 		"ipc":     ipcSocketPath(),
@@ -256,17 +259,17 @@ func TestSocketDirRefusesAWorldWritableDirectory(t *testing.T) {
 		"a directory with open permissions must be refused, not used")
 }
 
-// TestStableNameIsNotUsedInAnUnprivateDirectory: a stable socket name is
-// predictable by construction, so publishing one in a shared directory lets any
-// local user bind it first and receive the IPC and control traffic of windows
-// that have the path frozen in their environment.
+// TestNoSocketIsPublishedWithoutAPrivateDirectory: a socket path is only safe
+// inside a directory this user alone can traverse.
 //
-// When the private directory cannot be established, the earlier code still
-// published the stable name into the shared temp dir — the exact exposure the
-// privacy work was meant to remove. It must degrade to a pid-scoped name
-// instead: that costs restart survival on such a host, which is a liveness
-// cost, not a confidentiality one.
-func TestStableNameIsNotUsedInAnUnprivateDirectory(t *testing.T) {
+// Without one, every candidate is exposed. The stable name is fixed and so
+// predictable outright; a pid-scoped name is barely better, since a pid is
+// observable and an abandoned path can be pre-bound by another local user
+// before bramble restarts, who would then receive callbacks from tmux windows
+// that still point there. So both derivations refuse, and the session runs
+// without IPC and control rather than serving them over a path anybody can
+// take.
+func TestNoSocketIsPublishedWithoutAPrivateDirectory(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	t.Setenv("TMPDIR", tmp)
@@ -279,14 +282,10 @@ func TestStableNameIsNotUsedInAnUnprivateDirectory(t *testing.T) {
 	_, private := socketDirPrivate()
 	require.False(t, private, "precondition: the directory must be judged unprivate")
 
-	pid := strconv.Itoa(os.Getpid())
-	for name, got := range map[string]string{
-		"ipc":     ipcSocketPath(),
-		"control": controlSocketPath(),
-	} {
-		assert.Contains(t, filepath.Base(got), pid,
-			"%s socket %q must be pid-scoped when no private directory is available", name, got)
-	}
+	assert.Empty(t, ipcSocketPath(), "no IPC socket may be published")
+	assert.Empty(t, controlSocketPath(), "no control socket may be published")
+	assert.Empty(t, pidScopedSocketPath(userSockName(ipcSockBase)),
+		"the collision fallback derives its own path and must refuse too")
 }
 
 // TestUnprivateRuntimeDirIsNotTrusted: XDG_RUNTIME_DIR is an environment

@@ -646,43 +646,13 @@ const claudePromptGlyph = "❯"
 // composerDraft reports whether claude's composer holds text the user has
 // typed but not yet submitted.
 //
-// The composer is located by position (claudeComposerIdx) whenever the pane
-// shows claude's full chrome. An unanchored bottom-up scan cannot be used as
-// the primary rule: claude renders every submitted transcript prompt with the
-// same glyph, so the lowest match is not the composer whenever a repaint, a
-// dialog over the bottom rows, or copy mode puts something below it — and the
-// scan then reports a draft that never clears, wedging the queue on a 30s
-// retry forever.
-//
-// When the chrome is not parseable (a partial capture with no status
-// separator), the search falls back to the bounded pane tail rather than to a
-// whole-capture scan or to "unknown". Reporting unknown here means "deliver",
-// and delivering into a draft is the harm this function exists to prevent; the
-// tail bound is what keeps a stale transcript prompt out of reach.
+// A thin wrapper over composerDraftText, which is what production calls. It
+// exists so the draft-detection tests read as the question they are asking; the
+// body lives in one place because both copies carried the same non-obvious
+// safety rules (the located-but-unreadable composer that reports a hold, and
+// the bounded tail fallback), and two copies of a safety rule is one too many.
 func composerDraft(provider string, lines []string) (draft, known bool) {
-	if provider != ProviderClaude {
-		return false, false
-	}
-	if composerIdx, _ := claudeComposerIdx(lines); composerIdx >= 0 {
-		draft, known := judgeComposerLine(lines[composerIdx])
-		if !known {
-			// The composer region was located but its first line does not carry
-			// the glyph. Something is in there that this parser cannot read, and
-			// "unknown" means deliver — so the safe verdict is to hold.
-			return true, true
-		}
-		return draft, known
-	}
-	// No parseable chrome: judge the lowest composer-looking line within the
-	// tail bound, and nothing above it.
-	draft, known = false, false
-	forEachPaneTailLine(lines, func(line string) bool {
-		if !strings.HasPrefix(strings.TrimSpace(line), claudePromptGlyph) {
-			return false
-		}
-		draft, known = judgeComposerLine(line)
-		return true
-	})
+	_, draft, known = composerDraftText(provider, lines)
 	return draft, known
 }
 
