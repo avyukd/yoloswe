@@ -118,12 +118,16 @@ type Courier struct { //nolint:govet // fieldalignment: grouping by role reads b
 	// retryArmed records that a failed delivery has a retry scheduled. Only
 	// read by tests, which would otherwise have to wait out retryDelay.
 	retryArmed bool
-	// heldForDraft counts consecutive composer holds per recipient, so a hold
-	// cannot last forever. Nothing but a keypress clears a composer, so a
-	// half-typed line left by someone who has walked away would otherwise
-	// block every later delivery to that session for the life of the process.
-	heldForDraft map[SessionID]int
-	seq          uint64
+	// heldForDraft records, per recipient, the draft currently holding a
+	// delivery and when that exact text was first seen. Nothing but a keypress
+	// clears a composer, so a half-typed line left by someone who has walked
+	// away would otherwise block every later delivery to that session for the
+	// life of the process.
+	heldForDraft map[SessionID]draftHold
+	// now is the clock, injectable so a test can assert the elapsed-time
+	// property rather than a call count.
+	now func() time.Time
+	seq uint64
 }
 
 // CourierConfig holds the filesystem locations used by a Courier.
@@ -155,7 +159,8 @@ func NewCourier(target DeliveryTarget, panes PaneWriter, config CourierConfig) (
 		dir:          deliveryDir,
 		resultDir:    resultDir,
 		pending:      make(map[SessionID][]Delivery),
-		heldForDraft: make(map[SessionID]int),
+		heldForDraft: make(map[SessionID]draftHold),
+		now:          time.Now,
 		reported:     make(map[SessionID]map[SessionStatus]bool),
 		writing:      make(map[SessionID]bool),
 	}
@@ -296,23 +301,78 @@ func (c *Courier) Pending(to SessionID) []Delivery {
 	return append([]Delivery(nil), c.pending[to]...)
 }
 
-// maxComposerHolds bounds how many consecutive retries a composer draft may
-// hold a delivery for. Six retries at retryDelay is about five minutes, long
-// enough to cover someone finishing a sentence and short enough that a queue is
-// never wedged for the life of the process.
-const maxComposerHolds = 6
-
-// noteDraftHold records one more consecutive hold for a recipient and returns
-// the running count.
-func (c *Courier) noteDraftHold(to SessionID) int {
+// draftIsOurOwnDelivery reports whether the text sitting in a recipient's
+// composer is a message bramble itself staged there.
+//
+// Matched against what is actually queued for this recipient, not against the
+// "[bramble]" prefix: the prefix is user-controllable, so a person who types it
+// into their own draft would otherwise have that draft delivered over. A pane
+// capture truncates at the pane width, so the comparison is a prefix test
+// against the delivery's own first line, which is the most the pane can show.
+func (c *Courier) draftIsOurOwnDelivery(to SessionID, draft string) bool {
+	body := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(draft), claudePromptGlyph))
+	if body == "" || !strings.HasPrefix(body, subagentReportPrefix) {
+		return false
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.heldForDraft[to]++
-	return c.heldForDraft[to]
+	for _, d := range c.pending[to] {
+		first, _, _ := strings.Cut(d.Text, "\n")
+		first = strings.TrimSpace(first)
+		if first == "" {
+			continue
+		}
+		// The pane shows at most one wrapped line of it; either side may be the
+		// truncated one depending on where the terminal cut.
+		if strings.HasPrefix(first, body) || strings.HasPrefix(body, first) {
+			return true
+		}
+	}
+	return false
 }
 
-// clearDraftHold forgets a recipient's hold streak, so the bound applies to a
-// single uninterrupted run of holds rather than to the session's lifetime.
+// composerHoldGrace is how long one unchanged draft may hold a delivery.
+//
+// Wall clock, not a retry count. Drain has four callers — the retry timer, every
+// idle transition, every DrainIdle sweep, and a direct send — so counting calls
+// measures how often bramble happened to look at the pane, not how long the
+// draft has been sitting there. A busy session would exhaust a call budget in
+// seconds.
+const composerHoldGrace = 5 * time.Minute
+
+// draftHold is one recipient's current composer hold.
+type draftHold struct {
+	// firstSeen is when this exact text was first observed.
+	firstSeen time.Time
+	// text is the draft that is holding the delivery. When the composer's
+	// content changes the hold restarts, because a changing draft means
+	// somebody is at the keyboard — and a drafter who is present should be
+	// waited for indefinitely, not raced.
+	text string
+}
+
+// noteDraftHold records that draft is holding a delivery to this recipient and
+// reports whether the hold has now outlived composerHoldGrace.
+//
+// Returns false — keep holding — whenever the draft differs from the one
+// recorded, so an actively edited composer resets the clock on every keystroke.
+// That matters more than it looks: a draft long enough to wrap has continuation
+// lines that ContentLines does not treat as chrome, so each keystroke flips
+// contentChanged and revives the session, which is exactly when a call-counting
+// bound would have fired.
+func (c *Courier) noteDraftHold(to SessionID, draft string) (expired bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	held, ok := c.heldForDraft[to]
+	if !ok || held.text != draft {
+		c.heldForDraft[to] = draftHold{text: draft, firstSeen: c.now()}
+		return false
+	}
+	return c.now().Sub(held.firstSeen) >= composerHoldGrace
+}
+
+// clearDraftHold forgets a recipient's hold, so the grace period applies to a
+// single uninterrupted draft rather than to the session's lifetime.
 func (c *Courier) clearDraftHold(to SessionID) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -479,18 +539,24 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 		// half-written sentence goes out wearing this message. Holding the
 		// delivery is safe: the error keeps it queued and arms a retry, and the
 		// next transition delivers it once the line is clear.
-		if draft, known := c.composerHasDraft(info.ID, provider); known && draft {
-			if c.noteDraftHold(info.ID) <= maxComposerHolds {
+		if text, draft, known := c.composerHasDraft(info.ID, provider); known && draft {
+			if c.draftIsOurOwnDelivery(info.ID, text) {
+				// Bramble's own staged text, not a human draft. Holding for it
+				// would wait for a person who is not coming — nothing clears a
+				// composer but a keypress — so every later delivery to this
+				// session would queue behind it forever. Overwriting our own
+				// message is safe: it is still in the queue.
+				c.clearDraftHold(info.ID)
+			} else if !c.noteDraftHold(info.ID, text) {
 				return errComposerBusy
 			}
-			// The hold has outlived its usefulness. A composer is cleared only
-			// by a keypress, so a draft still sitting there after
-			// maxComposerHolds retries (~5 minutes) belongs to someone who is
-			// not at the keyboard, and holding longer trades a small risk of
-			// interleaving against never delivering at all. Say so plainly:
-			// this is the one case where the message can land beside typed
-			// text.
-			logDeliveryWarn("composer still holds a draft after repeated retries; delivering anyway",
+			// The same draft has now held this delivery for composerHoldGrace
+			// without changing, so nobody is at the keyboard: a composer is
+			// cleared only by a keypress. Holding longer trades a small risk of
+			// landing beside typed text against never delivering at all, which
+			// is the failure class this PR exists to close. Say so plainly —
+			// this is the one path where a message can join a draft.
+			logDeliveryWarn("composer has held an unchanged draft past the grace period; delivering anyway",
 				info.ID, errComposerBusy)
 		}
 		c.clearDraftHold(info.ID)
@@ -585,12 +651,12 @@ func providerForSession(info SessionInfo) string {
 
 // composerHasDraft reports whether the recipient is mid-sentence in its
 // composer. known is false when this provider's composer cannot be read.
-func (c *Courier) composerHasDraft(id SessionID, provider string) (draft, known bool) {
+func (c *Courier) composerHasDraft(id SessionID, provider string) (text string, draft, known bool) {
 	lines, err := c.target.CapturePaneText(id, pasteVerifyLines)
 	if err != nil {
-		return false, false
+		return "", false, false
 	}
-	return composerDraft(provider, lines)
+	return composerDraftText(provider, lines)
 }
 
 // pasteVerify bounds how long a paste is given to show up in the pane before

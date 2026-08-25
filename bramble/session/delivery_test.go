@@ -2038,46 +2038,94 @@ func TestComposerDraftUnknownForUnreadableProviders(t *testing.T) {
 	}
 }
 
-// TestDraftHoldIsBounded: a composer is cleared only by a keypress, so a draft
-// left by someone who has walked away holds every later delivery to that
-// session behind it. Round 2 added the hold with no exit condition; this pins
-// the bound.
+// TestDraftHoldIsBoundedByElapsedTime: a composer is cleared only by a
+// keypress, so a draft left by someone who has walked away holds every later
+// delivery to that session behind it. Round 2 added the hold with no exit;
+// round 3 bounded it by counting write attempts, which measured how often
+// bramble happened to look at the pane rather than how long the draft had sat
+// there — Drain has four callers and only one is the retry timer.
 //
-// The trade is deliberate and one-directional: holding forever means the parent
-// never receives its subagent's report, which is the failure class this PR
-// exists to close, while delivering late risks landing beside typed text once.
-func TestDraftHoldIsBounded(t *testing.T) {
+// The property is elapsed time on an UNCHANGED draft, so that is what is
+// asserted here, with an injected clock. An attempt-count assertion would pass
+// with the grace period removed entirely.
+func TestDraftHoldIsBoundedByElapsedTime(t *testing.T) {
 	t.Parallel()
 	target := newFakeTarget()
 	target.set("s1", StatusIdle, RunnerTypeTmux)
 	target.setBackend("s1", ProviderClaude, "claude-opus-5")
-	// A draft nobody ever clears.
 	target.appendPane("❯ a half-typed line whose author has gone home")
 
 	panes := echoPanes(target)
 	c, err := NewCourier(target, panes, testCourierConfig(t))
 	require.NoError(t, err)
 
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
 	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
 	require.NoError(t, err)
 	require.Len(t, c.Pending("s1"), 1, "the first attempt holds")
 	require.Zero(t, panes.pasteCount(), "nothing is pasted while the hold stands")
 
-	// Every retry sees the same unchanged draft.
-	for i := 0; i < maxComposerHolds; i++ {
+	// Any number of attempts inside the grace period must keep holding: the
+	// bound is time, not attempts.
+	for i := 0; i < 50; i++ {
 		c.Drain(context.Background(), "s1")
 	}
+	require.Zero(t, panes.pasteCount(), "50 attempts inside the grace period must not release")
+	require.Len(t, c.Pending("s1"), 1)
+
+	// Past the grace period, the same unchanged draft releases.
+	now = now.Add(composerHoldGrace + time.Second)
+	c.Drain(context.Background(), "s1")
 
 	assert.NotZero(t, panes.pasteCount(),
-		"after %d holds the delivery must go out rather than wait forever", maxComposerHolds)
+		"an unchanged draft held past %s must release rather than wait forever", composerHoldGrace)
 	assert.Empty(t, c.Pending("s1"), "the queue must not stay wedged")
 }
 
-// TestDraftHoldStreakResetsWhenTheComposerClears: the bound counts one
-// uninterrupted run of holds, not a session's lifetime. Otherwise a user who
-// drafts briefly a few times over a long session would eventually exhaust the
-// budget and be typed over for a draft that was never stuck.
-func TestDraftHoldStreakResetsWhenTheComposerClears(t *testing.T) {
+// TestActivelyEditedDraftHoldsIndefinitely: a changing draft means somebody is
+// at the keyboard, and a drafter who is present should be waited for, not
+// raced. This is the case a call-counting bound got wrong — a wrapped draft's
+// continuation lines are not chrome, so every keystroke flips contentChanged,
+// revives the session, and would have burned one attempt from the budget.
+func TestActivelyEditedDraftHoldsIndefinitely(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.appendPane("❯ file the")
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+	require.Len(t, c.Pending("s1"), 1)
+
+	// Someone keeps typing, well past the grace period in total.
+	for _, draft := range []string{
+		"❯ file the dev",
+		"❯ file the dev deprovisioning",
+		"❯ file the dev deprovisioning bug",
+	} {
+		now = now.Add(composerHoldGrace)
+		target.appendPane(draft)
+		c.Drain(context.Background(), "s1")
+	}
+
+	assert.Zero(t, panes.pasteCount(),
+		"a draft being actively edited must never be delivered over")
+	assert.Len(t, c.Pending("s1"), 1, "the delivery stays queued while the user types")
+}
+
+// TestDraftHoldResetsWhenTheComposerClears: the grace applies to a single
+// uninterrupted draft, not to a session's lifetime.
+func TestDraftHoldResetsWhenTheComposerClears(t *testing.T) {
 	t.Parallel()
 	target := newFakeTarget()
 	target.set("s1", StatusIdle, RunnerTypeTmux)
@@ -2097,9 +2145,62 @@ func TestDraftHoldStreakResetsWhenTheComposerClears(t *testing.T) {
 	c.Drain(context.Background(), "s1")
 	require.Empty(t, c.Pending("s1"), "the delivery went out on a clear composer")
 
-	// A fresh draft must get the full budget again, not the remainder.
+	// A fresh draft is held again, with the full grace period.
 	target.appendPane("❯ typing again")
 	_, err = c.Send(context.Background(), "", "s1", "second", true)
 	require.NoError(t, err)
 	assert.Len(t, c.Pending("s1"), 1, "a new draft is held, not delivered over")
+}
+
+// TestBrambleOwnStagedDeliveryIsOverwritten: a composer holding a message
+// bramble itself staged is not a human draft. Nothing but a keypress clears a
+// composer, so holding for it waits for someone who is not coming and every
+// later delivery queues behind it forever.
+//
+// Ownership is decided by matching what is actually queued for the recipient,
+// not by the "[bramble]" prefix — a user can type that themselves, and their
+// draft must still be protected.
+func TestBrambleOwnStagedDeliveryIsOverwritten(t *testing.T) {
+	t.Parallel()
+
+	t.Run("our own staged delivery does not hold the queue", func(t *testing.T) {
+		t.Parallel()
+		target := newFakeTarget()
+		target.set("s1", StatusIdle, RunnerTypeTmux)
+		target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+		panes := echoPanes(target)
+		c, err := NewCourier(target, panes, testCourierConfig(t))
+		require.NoError(t, err)
+
+		staged := subagentReportPrefix + " subagent child-1 (planner, opus) is idle"
+		// The message is queued and its text is sitting in the composer, as it
+		// would be after a --queue send that never pressed Enter.
+		_, err = c.Send(context.Background(), "", "s1", staged, true)
+		require.NoError(t, err)
+		target.appendPane("❯ " + staged)
+		c.Drain(context.Background(), "s1")
+
+		assert.Empty(t, c.Pending("s1"), "bramble's own staged text must not wedge its queue")
+	})
+
+	t.Run("a user draft wearing the prefix is still protected", func(t *testing.T) {
+		t.Parallel()
+		target := newFakeTarget()
+		target.set("s1", StatusIdle, RunnerTypeTmux)
+		target.setBackend("s1", ProviderClaude, "claude-opus-5")
+		// Someone typed the prefix themselves; nothing matching it is queued.
+		target.appendPane("❯ " + subagentReportPrefix + " I was about to ask about")
+
+		panes := echoPanes(target)
+		c, err := NewCourier(target, panes, testCourierConfig(t))
+		require.NoError(t, err)
+
+		_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+		require.NoError(t, err)
+
+		assert.Zero(t, panes.pasteCount(),
+			"a user draft must be protected even when it wears bramble's prefix")
+		assert.Len(t, c.Pending("s1"), 1, "the delivery stays queued")
+	})
 }

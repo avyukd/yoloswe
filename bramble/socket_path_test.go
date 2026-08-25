@@ -84,6 +84,10 @@ func TestPidScopedFallbackIsDistinct(t *testing.T) {
 // rather than a world-writable directory where a symlink could be swapped in.
 func TestSocketPathsPreferRuntimeDir(t *testing.T) {
 	dir := t.TempDir()
+	// A real XDG_RUNTIME_DIR (/run/user/$UID) is 0700; t.TempDir() is 0775, and
+	// socketDirPrivate now verifies the directory rather than trusting the
+	// variable, so the fixture has to match reality.
+	require.NoError(t, os.Chmod(dir, 0o700))
 	t.Setenv("XDG_RUNTIME_DIR", dir)
 
 	for name, got := range map[string]string{
@@ -283,4 +287,21 @@ func TestStableNameIsNotUsedInAnUnprivateDirectory(t *testing.T) {
 		assert.Contains(t, filepath.Base(got), pid,
 			"%s socket %q must be pid-scoped when no private directory is available", name, got)
 	}
+}
+
+// TestUnprivateRuntimeDirIsNotTrusted: XDG_RUNTIME_DIR is an environment
+// variable, so it can be inherited from another user's session or point
+// somewhere world-writable. Trusting it would publish a stable, predictable
+// socket name into a directory anyone can write to — the exposure the private
+// directory exists to close.
+func TestUnprivateRuntimeDirIsNotTrusted(t *testing.T) {
+	shared := t.TempDir()
+	require.NoError(t, os.Chmod(shared, 0o777))
+	t.Setenv("XDG_RUNTIME_DIR", shared)
+	t.Setenv("TMPDIR", t.TempDir())
+
+	dir, private := socketDirPrivate()
+	assert.NotEqual(t, shared, dir, "a world-writable runtime dir must not be used")
+	assert.True(t, private, "the private fallback directory should still be available")
+	assert.True(t, isPrivateDir(dir))
 }

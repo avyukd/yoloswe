@@ -686,6 +686,32 @@ func composerDraft(provider string, lines []string) (draft, known bool) {
 	return draft, known
 }
 
+// composerDraftText is composerDraft plus the draft's text, for callers that
+// must tell one draft from another — a hold restarts when the text changes,
+// since a changing draft means somebody is still typing.
+func composerDraftText(provider string, lines []string) (text string, draft, known bool) {
+	if provider != ProviderClaude {
+		return "", false, false
+	}
+	if composerIdx, _ := claudeComposerIdx(lines); composerIdx >= 0 {
+		line := strings.TrimSpace(lines[composerIdx])
+		draft, known = judgeComposerLine(line)
+		if !known {
+			return line, true, true
+		}
+		return line, draft, known
+	}
+	forEachPaneTailLine(lines, func(line string) bool {
+		if !strings.HasPrefix(strings.TrimSpace(line), claudePromptGlyph) {
+			return false
+		}
+		text = strings.TrimSpace(line)
+		draft, known = judgeComposerLine(line)
+		return true
+	})
+	return text, draft, known
+}
+
 // judgeComposerLine reports whether one composer line holds a draft.
 //
 // The glyph is separated from the text by a non-breaking space (U+00A0), not an
@@ -703,13 +729,10 @@ func judgeComposerLine(line string) (draft, known bool) {
 	if body == "" {
 		return false, true
 	}
-	if strings.HasPrefix(body, subagentReportPrefix) {
-		// Bramble's own staged text, not a human draft. Holding for it would
-		// wait for a person who is not coming: nothing clears the composer but
-		// a keypress, so every later delivery to this session would be held
-		// behind it forever on a 30s retry. Overwriting our own message is
-		// safe — it is already recorded in the queue.
-		return false, true
-	}
+	// Whether the text is bramble's own staged delivery is deliberately NOT
+	// decided here. The prefix alone is user-controllable — anyone can type
+	// "[bramble] ..." into their composer — so only the courier, which knows
+	// what it actually queued for this recipient, can tell its own message from
+	// a draft that merely looks like one. See Courier.draftIsOurOwnDelivery.
 	return true, true
 }

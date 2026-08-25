@@ -538,8 +538,15 @@ func socketDir() string {
 // a stable name is predictable by construction, and a predictable name in a
 // shared directory can be pre-bound by any local user.
 func socketDirPrivate() (dir string, private bool) {
+	// XDG_RUNTIME_DIR is the right answer when it is real, but it is an
+	// environment variable — it can be inherited from another user's session or
+	// simply point somewhere world-writable — so it is verified, not trusted.
 	if runDir := os.Getenv("XDG_RUNTIME_DIR"); runDir != "" {
-		return runDir, true
+		if isPrivateDir(runDir) {
+			return runDir, true
+		}
+		slog.Warn("XDG_RUNTIME_DIR is not a private directory owned by this user; ignoring it",
+			"dir", runDir)
 	}
 	dir = filepath.Join(os.TempDir(), fmt.Sprintf("bramble-%d", os.Getuid()))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -550,13 +557,23 @@ func socketDirPrivate() (dir string, private bool) {
 	// MkdirAll leaves an existing directory's mode and owner alone, so verify
 	// rather than assume: a directory somebody else created, or one that is
 	// group/world accessible, is not private and must not be trusted.
-	info, err := os.Stat(dir)
-	if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 || !ownedByCurrentUser(info) {
+	if !isPrivateDir(dir) {
 		slog.Warn("socket directory is not private to this user; sockets will use pid-scoped names",
 			"dir", dir)
 		return os.TempDir(), false
 	}
 	return dir, true
+}
+
+// isPrivateDir reports whether path is a directory this user alone can
+// traverse. Both halves matter: 0700 owned by somebody else is not private to
+// us, and a directory we own with looser bits is not private at all.
+func isPrivateDir(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	return info.Mode().Perm() == 0o700 && ownedByCurrentUser(info)
 }
 
 // ownedByCurrentUser reports whether a stat result belongs to the running uid.
@@ -634,6 +651,13 @@ func controlSocketPath() string {
 func stableOrPidScoped(base string) string {
 	dir, private := socketDirPrivate()
 	if !private {
+		// A pid is observable, so a pid-scoped name in a shared directory is
+		// only marginally less predictable than a stable one — after a crash
+		// another local process can bind the old path before bramble restarts
+		// and receive callbacks from windows that still point at it. The
+		// unpredictability is a mitigation, not the protection; the protection
+		// is the directory, and there isn't one here. Both facts go in the log
+		// once, at the point the decision is made.
 		return filepath.Join(dir, fmt.Sprintf("%s-%d.sock", base, os.Getpid()))
 	}
 	return filepath.Join(dir, userSockName(base))

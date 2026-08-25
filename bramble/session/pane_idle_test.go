@@ -726,24 +726,20 @@ func TestOversizedComposerIsHeldNotDelivered(t *testing.T) {
 	})
 }
 
-// TestBrambleOwnStagedTextIsNotADraft: a composer holding bramble's own message
-// is not a human mid-sentence. Nothing but a keypress clears a composer, so
-// holding for it waits for someone who is not coming, and every later delivery
-// to that session queues behind it forever — the failure class this PR closes.
-// Overwriting our own text is safe: it is already recorded in the queue.
-func TestBrambleOwnStagedTextIsNotADraft(t *testing.T) {
+// TestComposerLayerDoesNotJudgeOwnership: whether staged text belongs to
+// bramble is not decidable from the pane. The "[bramble]" prefix is
+// user-controllable, so this layer reports any non-empty composer as a draft
+// and leaves ownership to the courier, which knows what it queued.
+// See TestBrambleOwnStagedDeliveryIsOverwritten.
+func TestComposerLayerDoesNotJudgeOwnership(t *testing.T) {
 	t.Parallel()
 
-	staged := claudePaneComposer(
-		"❯ "+subagentReportPrefix+" subagent forge-planner-0da3be25 (planner, opus) is idle",
-		"✻ Worked for 12s")
-	draft, known := composerDraft(ProviderClaude, staged)
-	require.True(t, known)
-	assert.False(t, draft, "bramble's own staged report must not hold the queue")
-
-	// A human draft in the same position still holds.
-	human := claudePaneComposer("❯ file the dev deprovisioning bug", "✻ Worked for 12s")
-	draft, known = composerDraft(ProviderClaude, human)
-	require.True(t, known)
-	assert.True(t, draft, "a real draft must still be protected")
+	for _, body := range []string{
+		subagentReportPrefix + " subagent forge-planner-0da3be25 (planner, opus) is idle",
+		"file the dev deprovisioning bug",
+	} {
+		draft, known := composerDraft(ProviderClaude, claudePaneComposer("❯ "+body, "✻ Worked for 12s"))
+		require.True(t, known)
+		assert.True(t, draft, "any non-empty composer is a draft at this layer: %q", body)
+	}
 }
