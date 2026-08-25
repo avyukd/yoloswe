@@ -192,6 +192,9 @@ type fakePanes struct { //nolint:govet // fieldalignment: readability over packi
 	// onSubmit, when set, stands in for a TUI accepting Enter: the composer
 	// clears and the text moves up into the transcript.
 	onSubmit func()
+	// enterErr, when set, stands in for a tmux send-keys that failed: the text
+	// is in the composer and no turn was started.
+	enterErr error
 }
 
 func (p *fakePanes) Paste(_ context.Context, target, text string) error {
@@ -210,8 +213,12 @@ func (p *fakePanes) Paste(_ context.Context, target, text string) error {
 func (p *fakePanes) SendEnter(_ context.Context, target string) error {
 	p.mu.Lock()
 	onSubmit := p.onSubmit
+	enterErr := p.enterErr
 	p.writes = append(p.writes, "enter("+target+")")
 	p.mu.Unlock()
+	if enterErr != nil {
+		return enterErr
+	}
 	if onSubmit != nil {
 		onSubmit()
 	}
@@ -2742,4 +2749,135 @@ func TestPaneHoldResetsWhenTheTurnEnds(t *testing.T) {
 	c.Drain(context.Background(), "s1")
 	assert.Len(t, c.Pending("s1"), 1,
 		"each uninterrupted run of working verdicts gets the full grace period")
+}
+
+// TestALongRunningTurnIsNeverReleasedByTheGrace: the pane hold's bound is on
+// STALENESS, not on turn length. A real turn repaints — its elapsed timer moves
+// every second — so however long it runs it keeps restarting the clock and is
+// never released. Only a pane that has stopped changing expires, which is the
+// shape of a false positive rather than of a long turn.
+//
+// Without that distinction the grace period would eventually deliver into a
+// live turn, which is the harm the gate exists to prevent.
+func TestALongRunningTurnIsNeverReleasedByTheGrace(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderCodex, "gpt-5.6-terra")
+	working := func(elapsed int) string {
+		return fmt.Sprintf("◦ Working (%ds • esc to interrupt)\n\n› Ask Codex to do anything", elapsed)
+	}
+	target.setPane(working(1))
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+	require.Len(t, c.Pending("s1"), 1, "precondition: the turn holds the delivery")
+
+	// Run far past the grace period, repainting as a real turn does.
+	for i := 0; i < 10; i++ {
+		now = now.Add(paneHoldGrace / 2)
+		target.setPane(working(i + 2))
+		target.set("s1", StatusIdle, RunnerTypeTmux)
+		c.Drain(context.Background(), "s1")
+	}
+
+	assert.Len(t, c.Pending("s1"), 1,
+		"a turn that keeps repainting is still working, however long it runs")
+	assert.Zero(t, panes.pasteCount(), "and nothing may be written into it")
+}
+
+// TestTextTypedOntoOurStagedLineIsNotSubmitted: the record widens an exact
+// match to a prefix match in ONE direction only. A composer showing less than
+// we pasted is a capture truncated at the pane width, which is consistent with
+// our paste and nothing else. A composer showing our line AND MORE is our text
+// with something typed onto the end of it — submitting that sends the user's
+// edit while the delivery is dropped as delivered.
+func TestTextTypedOntoOurStagedLineIsNotSubmitted(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+	text := "a report from a subagent"
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	// An earlier attempt pasted the text and could not submit it; the user has
+	// since typed onto the end of the line.
+	c.noteStaged("s1", text)
+	target.setPane(claudeComposerPane(text + " and my own question"))
+
+	_, err = c.Send(context.Background(), "", "s1", text, true)
+	require.NoError(t, err)
+
+	assert.NotContains(t, panes.recorded(), "enter(@7)",
+		"our line with the user's text appended is their draft, not our staged delivery")
+	assert.Len(t, c.Pending("s1"), 1, "the delivery stays queued")
+}
+
+// TestTruncatedCaptureOfOurStagedLineStillCounts is the direction that IS safe,
+// pinned so the fix above cannot be tightened into never matching at all: a
+// capture stops at the pane width, so a composer showing a prefix of what we
+// pasted is that paste seen through a narrow pane.
+func TestTruncatedCaptureOfOurStagedLineStillCounts(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+	text := "a report from a subagent that runs past the width of this pane"
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	c.noteStaged("s1", text)
+	target.setPane(claudeComposerPane("a report from a subagent that runs"))
+
+	_, err = c.Send(context.Background(), "", "s1", text, true)
+	require.NoError(t, err)
+
+	assert.Zero(t, panes.pasteCount(),
+		"the text is already staged; pasting again would submit it twice in one prompt")
+	assert.Contains(t, panes.recorded(), "enter(@7)", "it must still be submitted")
+	assert.Empty(t, c.Pending("s1"))
+}
+
+// TestAChippedPasteLeavesNoStagedRecord: the staged record is only worth
+// keeping if a retry could RECOGNIZE the text in the composer, and a chipped
+// paste can never be matched by any text comparison — claude collapses a large
+// enough paste to "[Pasted text #N]", and a chip is what ANY paste looks like.
+//
+// Kept anyway, such a record would vouch for whatever the chip turned out to
+// be. Dropped, the retry reads an unidentified draft and holds, which costs
+// composerHoldGrace instead of pasting the message on top of its own chip and
+// submitting both in one prompt — the double-paste symptom section 1 removes.
+func TestAChippedPasteLeavesNoStagedRecord(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+	text := "a report from a subagent"
+	panes := &fakePanes{}
+	// The CLI chips the paste rather than echoing it, and Enter then fails.
+	panes.echo = func(string) { target.setPane(claudeComposerPane("[Pasted text #1 +80 lines]")) }
+	panes.enterErr = errors.New("send-keys failed")
+
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", text, true)
+	require.NoError(t, err, "Send queues; the write failure surfaces as a retained queue")
+	require.Contains(t, panes.recorded(), "enter(@7)", "precondition: Enter was attempted")
+	require.Len(t, c.Pending("s1"), 1, "precondition: the failed Enter left the delivery queued")
+
+	assert.Empty(t, c.stagedText("s1"),
+		"a record no later comparison could use must not survive the attempt that made it")
 }

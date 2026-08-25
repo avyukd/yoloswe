@@ -132,11 +132,12 @@ type Courier struct { //nolint:govet // fieldalignment: grouping by role reads b
 	// the same whoever produced them. Cleared as soon as the text is submitted
 	// or the delivery stops being ours to finish.
 	staged map[SessionID]string
-	// heldForPane records when a recipient's pane first read as working
-	// without interruption. The verdict is a single frame's, and a frame can be
-	// wrong in a way that never corrects itself on a static pane, so the hold
-	// is bounded in wall clock exactly as the draft hold is.
-	heldForPane map[SessionID]time.Time
+	// heldForPane records when a recipient's pane first read as working with
+	// this exact content. The verdict is a single frame's, and a frame can be
+	// wrong in a way that never corrects itself, so the hold is bounded — but
+	// bounded on a STATIC pane only, which is what separates a stuck verdict
+	// from a long turn. See notePaneHold.
+	heldForPane map[SessionID]paneHold
 	// now is the clock, injectable so a test can assert the elapsed-time
 	// property rather than a call count.
 	now func() time.Time
@@ -174,7 +175,7 @@ func NewCourier(target DeliveryTarget, panes PaneWriter, config CourierConfig) (
 		pending:      make(map[SessionID][]Delivery),
 		heldForDraft: make(map[SessionID]draftHold),
 		staged:       make(map[SessionID]string),
-		heldForPane:  make(map[SessionID]time.Time),
+		heldForPane:  make(map[SessionID]paneHold),
 		now:          time.Now,
 		reported:     make(map[SessionID]map[SessionStatus]bool),
 		writing:      make(map[SessionID]bool),
@@ -367,12 +368,17 @@ func composerHoldsThisDelivery(provider, composer, staged, text string) bool {
 	// their own block inside the retry window, and have Enter pressed on it
 	// while the delivery was dropped as delivered.
 	//
-	// So the text is what decides, in both directions to survive a capture
-	// truncated at the pane width against a composer that wraps. The record
-	// only widens an EXACT match to a prefix match, because only a courier that
-	// knows it pasted this text may read a partial line as the whole of it.
+	// So the text is what decides, and only ONE direction of prefix match is
+	// safe. body may be a TRUNCATION of what we pasted — a capture stops at the
+	// pane width and a composer wraps — so a body that begins our first line is
+	// consistent with our paste and nothing else. The mirror is not: a body
+	// that begins WITH our line and continues is our text with something typed
+	// onto the end of it, and submitting that sends the user's edit while the
+	// delivery is dropped as delivered. Only the record permits even this much,
+	// because only a courier that knows it pasted the text may read a partial
+	// line as the whole of it.
 	if staged != "" && staged == text {
-		return strings.HasPrefix(first, body) || strings.HasPrefix(body, first)
+		return strings.HasPrefix(first, body)
 	}
 	// No record — a restart forgot it, or this composer is somebody else's.
 	// Only an exact match of the delivery's first line counts: a composer
@@ -422,13 +428,30 @@ func (c *Courier) noteDraftHold(to SessionID, draft string) (expired bool) {
 	return c.now().Sub(held.firstSeen) >= composerHoldGrace
 }
 
-// paneHoldGrace is how long an uninterrupted "working" pane verdict may hold a
+// paneHold is one recipient's current working-verdict hold.
+type paneHold struct {
+	// firstSeen is when the pane was first seen working with this content.
+	firstSeen time.Time
+	// fingerprint is that content. A hold restarts whenever it changes,
+	// because a pane that is repainting belongs to a turn that is running.
+	fingerprint string
+}
+
+// paneHoldGrace is how long a working verdict on an UNCHANGING pane may hold a
 // delivery.
 //
-// Longer than composerHoldGrace, and deliberately so: a human draft is cleared
-// by a keystroke that may never come, while a real turn ends on its own. This
-// only has to outlast the longest turn worth waiting out, so that what it
-// actually catches is a verdict stuck on a pane that has stopped changing.
+// The bound is on staleness, not on turn length: a real turn repaints — its
+// elapsed timer moves every second — so it restarts this clock continuously and
+// is never released by it, however long it runs. What expires is a verdict on a
+// pane that has stopped changing, which is the shape of a false positive:
+// claudeLineVerdict reports work for a bare tool line left by an interrupted
+// turn, and spinnerRe matches any line opening "* " or "· ". Those panes are
+// static precisely because nothing is running, and holding on one forever is
+// the "parent's mail never drains" failure this PR exists to close.
+//
+// Longer than composerHoldGrace: a human draft is cleared by a keystroke that
+// may never come, while a genuinely working pane clears this by simply
+// continuing to work.
 const paneHoldGrace = 15 * time.Minute
 
 // notePaneHold records that a working verdict is holding a delivery to this
@@ -437,15 +460,26 @@ const paneHoldGrace = 15 * time.Minute
 // Wall clock, not a frame count, for the same reason the draft hold uses it:
 // Drain has four callers, so counting attempts measures how often bramble
 // happened to look rather than how long the pane has been saying this.
-func (c *Courier) notePaneHold(to SessionID) (expired bool) {
+func (c *Courier) notePaneHold(to SessionID, pane []string) (expired bool) {
+	fingerprint := paneFingerprint(pane)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	first, ok := c.heldForPane[to]
-	if !ok {
-		c.heldForPane[to] = c.now()
+	held, ok := c.heldForPane[to]
+	if !ok || held.fingerprint != fingerprint {
+		// First hold, or the pane has moved since the last one. A running turn
+		// repaints constantly — the elapsed timer alone changes every second —
+		// so any change is proof the verdict is live and the clock restarts.
+		c.heldForPane[to] = paneHold{fingerprint: fingerprint, firstSeen: c.now()}
 		return false
 	}
-	return c.now().Sub(first) >= paneHoldGrace
+	return c.now().Sub(held.firstSeen) >= paneHoldGrace
+}
+
+// paneFingerprint reduces a capture to what distinguishes one frame from the
+// next. The whole capture, joined: a running turn changes SOMETHING every
+// frame, and this only has to notice that it did.
+func paneFingerprint(lines []string) string {
+	return strings.Join(lines, "\n")
 }
 
 // clearPaneHold forgets a recipient's pane hold, so the grace period covers one
@@ -687,19 +721,21 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 			// Keeping a staged record across it would let it vouch for a
 			// composer that has changed since — see clearStaged.
 			c.clearStaged(info.ID)
-			if !c.notePaneHold(info.ID) {
+			if !c.notePaneHold(info.ID, paneLines) {
 				return errPaneBusy
 			}
-			// The pane has read "working" without interruption for longer than
-			// any real turn this gate is meant to protect, so the verdict is
-			// almost certainly wrong rather than the turn eternal. It can be:
+			// The pane has read "working" and not repainted at all for longer
+			// than paneHoldGrace, so this is a stuck verdict rather than a long
+			// turn — a running turn moves its own timer every second. It can
+			// be stuck:
 			// claudeLineVerdict reports work for a `●` tool line with no
 			// sparkle below it, which is what an interrupted turn leaves on
 			// screen, and spinnerRe matches any line opening "* " or "· ", so
-			// ordinary echoed content can read as a spinner. A pane that is
-			// static because the session is idle never changes its mind, and
-			// holding on it forever is the "parent's mail never drains" failure
-			// this PR exists to close, re-entered through a different door.
+			// ordinary echoed content can read as a spinner. Such a pane is
+			// static because the session is idle, so it never changes its mind,
+			// and holding on it forever is the "parent's mail never drains"
+			// failure this PR exists to close, re-entered through a different
+			// door.
 			//
 			// Deliver anyway and say so. This is the same trade the composer
 			// hold makes: a bounded risk of writing at a bad moment against an
@@ -762,6 +798,10 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 			// can fail below, because every one of those paths returns while
 			// the paste is still sitting there — and the next attempt has no
 			// other way to know it put it there.
+			//
+			// The record is provisional at this point: it is discarded again
+			// below if the pane turns out not to show the text as text. See
+			// the chipped-paste case there.
 			c.noteStaged(info.ID, text)
 		}
 		// Confirm the text actually reached the prompt before pressing Enter.
@@ -825,13 +865,41 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 				}
 			}
 		}
+		// Only the paths that LEAVE the record behind need to ask this, and the
+		// submit path below clears it unconditionally — so a delivery that is
+		// about to press Enter pays nothing here.
+		if !submit && !alreadyStaged && !c.pasteIsReadableAsText(ctx, info.ID, provider, text) {
+			// The paste landed — tmux said so, and for a required provider the
+			// check above agreed — but the pane does not render it as text.
+			// claude collapses a large enough paste to "[Pasted text #N]", and
+			// a chip is what ANY paste looks like, so a record kept here could
+			// never be matched against the composer on a retry and would only
+			// vouch for whatever a chip turned out to be.
+			//
+			// Drop it. The retry then reads the composer as an unidentified
+			// draft and HOLDS, which costs this delivery composerHoldGrace in
+			// the rare case that the paste was ours; the alternative — keeping
+			// a record no comparison can use — is a message pasted on top of
+			// its own chip and submitted twice in one prompt.
+			c.clearStaged(info.ID)
+		}
 		if !submit {
 			// Staged in the pane for someone to review; no turn has started.
-			// The record stays: this text is genuinely sitting in the composer
-			// unsubmitted, which is exactly what it is for.
+			// The record stays where it survived the check above: that text is
+			// genuinely sitting in the composer unsubmitted, which is exactly
+			// what it is for.
 			return nil
 		}
 		if err := c.panes.SendEnter(ctx, target); err != nil {
+			// The text is in the composer and unsubmitted, which is the one
+			// case the record exists for — but only if a retry could ever
+			// recognize it. A chipped paste cannot be matched against the
+			// composer by any text comparison, so a record kept for one would
+			// vouch for whatever the chip turns out to be; drop it and let the
+			// retry hold on an unidentified draft instead.
+			if !alreadyStaged && !c.pasteIsReadableAsText(ctx, info.ID, provider, text) {
+				c.clearStaged(info.ID)
+			}
 			return err
 		}
 		// Submitted: the composer is empty again, so the record must go. Left
@@ -902,8 +970,9 @@ func providerForSession(info SessionInfo) string {
 	return agentModel.Provider
 }
 
-// composerHasDraft reports whether the recipient is mid-sentence in its
-// composer. known is false when this provider's composer cannot be read.
+// capturePaneFor reads the recipient's pane once, for every check that has a
+// question to ask of it. known-ness is each reader's own business; this only
+// decides whether the capture is worth making at all.
 func (c *Courier) capturePaneFor(id SessionID, provider string) []string {
 	// Check what can be read before capturing, not after. Neither check has an
 	// answer for a provider with no idle probe and an unreadable composer, so
@@ -937,6 +1006,42 @@ const (
 	// render, not the full budget codex needs.
 	pasteVerifyAttemptsBestEffort = 4
 )
+
+// pasteIsReadableAsText reports whether the pane renders this delivery as the
+// characters themselves rather than as a paste chip.
+//
+// Distinct from pasteVerdict, which asks only whether the paste ARRIVED and
+// accepts a chip as evidence that it did. This asks whether a later attempt
+// could ever RECOGNIZE the text in the composer, which only the characters can
+// answer — and the answer decides whether the staged record is worth keeping.
+//
+// One capture, not a budget: by the time this runs the paste has already been
+// confirmed (or the provider does not require confirmation), so this is a
+// question about rendering, not about arrival, and a second wait would buy
+// nothing but latency in the paste-to-Enter window.
+func (c *Courier) pasteIsReadableAsText(ctx context.Context, id SessionID, provider, text string) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	probe := pasteProbe(text)
+	if probe == "" {
+		return false // nothing distinctive to look for later either
+	}
+	lines, err := c.target.CapturePaneText(id, pasteVerifyLines)
+	if err != nil {
+		return false
+	}
+	if composerReadable(provider) {
+		composerIdx, _ := claudeComposerIdx(lines)
+		return composerIdx >= 0 && strings.Contains(lines[composerIdx], probe)
+	}
+	for _, line := range lines {
+		if strings.Contains(line, probe) {
+			return true
+		}
+	}
+	return false
+}
 
 // pasteVerdict reports whether the paste is visible in the session's pane, and
 // whether the pane could be read at all.
