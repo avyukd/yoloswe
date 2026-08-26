@@ -17,9 +17,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The cross-process race test re-executes this test binary as its own child.
-// The child is selected by raceChildEnv before any test runs, so it does the
-// race and exits rather than running the suite.
+// TestConcurrentReclaimYieldsExactlyOneWinner re-executes this test binary as
+// children selected by raceChildEnv.
 const (
 	raceChildEnv  = "SOCKGUARD_RACE_CHILD"
 	raceSockEnv   = "SOCKGUARD_RACE_SOCK"
@@ -35,38 +34,25 @@ func TestMain(m *testing.M) {
 	os.Exit(raceChild())
 }
 
-// childrenSettled reports whether every child has recorded a verdict — won or
-// lost — so no sibling can still be inside its check-unlink-bind window.
-//
-// A condition, not a clock. The parent cannot wg.Wait here: the winner is
-// itself waiting on the signal this produces, so that would deadlock. Each
-// child instead writes a verdict file the moment Listen returns, whichever way
-// it went, and the count of those is exactly "the window is closed".
+// childrenSettled reports whether every child has recorded a verdict, so no
+// sibling can still be inside its check-unlink-bind window. The parent cannot
+// wg.Wait here because the winner is waiting on this signal.
 func childrenSettled(gate string, want int) bool {
 	matches, err := filepath.Glob(gate + ".settled.*")
 	return err == nil && len(matches) >= want
 }
 
-// childrenSpinning reports whether every child has announced it is waiting on
-// the gate.
 func childrenSpinning(gate string, want int) bool {
 	matches, err := filepath.Glob(gate + ".arrived.*")
 	return err == nil && len(matches) >= want
 }
 
-// raceChild contends for one stale socket path and reports whether it won.
-//
-// It waits on a gate file so every sibling reaches the check-unlink-bind
-// sequence at the same moment; without that they arrive in turn and the window
-// the lock protects never opens. The winner then holds the socket until every
-// sibling has settled, so a second reclaimer would have to unlink a LIVE socket
-// to succeed — which is precisely the regression being tested for.
+// raceChild waits on a gate so sibling processes enter check-unlink-bind
+// together. The winner stays live until every sibling has settled, so a second
+// win means another process unlinked a live socket.
 func raceChild() int {
 	path := os.Getenv(raceSockEnv)
 	gate := os.Getenv(raceGateEnv)
-	// Announce arrival, then spin on the gate. The parent waits for every
-	// child to arrive before opening it, so all of them enter the window
-	// together rather than in spawn order.
 	if f, err := os.Create(gate + fmt.Sprintf(".arrived.%d", os.Getpid())); err == nil {
 		f.Close()
 	}
@@ -80,9 +66,6 @@ func raceChild() int {
 		}
 	}
 	ln, err := Listen(path)
-	// Record the verdict before doing anything else with it: the parent
-	// releases the winner only once every child has settled, and a child that
-	// announced nothing would hold the whole test open.
 	if f, ferr := os.Create(gate + fmt.Sprintf(".settled.%d", os.Getpid())); ferr == nil {
 		f.Close()
 	}
@@ -90,13 +73,9 @@ func raceChild() int {
 		return 0
 	}
 	fmt.Println(raceWonMarker)
-	// Hold the socket until the PARENT says every sibling has finished, rather
-	// than for a fixed span. A timed hold makes the test flaky in the one
-	// direction that matters: a sibling descheduled past the window finds a
-	// stale file again and legitimately wins, so two winners are reported with
-	// no bug present. Waiting on the parent removes the race from the test
-	// itself — while any sibling can still be racing, the winner is still live,
-	// so a second win is only ever the defect.
+	// A timed hold lets a delayed sibling find a stale file again and win
+	// legitimately; waiting for the parent keeps the winner's socket live
+	// while any sibling can still be racing.
 	deadline = time.Now().Add(30 * time.Second)
 	for {
 		if _, err := os.Stat(os.Getenv(raceDoneEnv)); err == nil {
@@ -111,15 +90,12 @@ func raceChild() int {
 	return 0
 }
 
-// TestListenReclaimsAStaleSocketFile: a socket file left behind by a killed
-// process has no listener, so it is safe to unlink and rebind. This is the case
-// that makes a stable socket path usable at all — without it a crash would
-// leave bramble unable to bind its own name.
+// TestListenReclaimsAStaleSocketFile pins crash recovery: a socket file left
+// behind by a killed process has no listener, so it is safe to unlink and bind.
 func TestListenReclaimsAStaleSocketFile(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "s.sock")
 
-	// A socket file with nothing behind it, exactly as a SIGKILL leaves one.
 	ln, err := net.Listen("unix", path)
 	require.NoError(t, err)
 	require.NoError(t, ln.Close())
@@ -131,10 +107,9 @@ func TestListenReclaimsAStaleSocketFile(t *testing.T) {
 	t.Cleanup(func() { got.Close() })
 }
 
-// TestListenRefusesALiveSocket: the path is stable across restarts, so
-// unlinking one a live process still serves would steal every running session's
-// callback address — and those sessions have the path frozen in their tmux
-// window environment with no way to learn a new one.
+// TestListenRefusesALiveSocket pins the stable callback address: unlinking a
+// live socket would steal it from sessions that already have the path frozen in
+// their tmux window environment.
 func TestListenRefusesALiveSocket(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "s.sock")
@@ -147,34 +122,17 @@ func TestListenRefusesALiveSocket(t *testing.T) {
 	require.ErrorIs(t, err, ErrInUse, "a live peer's socket is never unlinked")
 }
 
-// TestConcurrentReclaimYieldsExactlyOneWinner pins what the lock file is for,
-// across PROCESSES — which is the only place it can be shown, because flock is
-// held per open file description and two goroutines in one process do not
-// contend for it the way two brambles do.
+// TestConcurrentReclaimYieldsExactlyOneWinner pins what the lock file is for
+// across processes. Goroutines in one process share an open file description,
+// so they do not contend for flock the way two brambles do.
 //
-// Binding first makes the kernel arbitrate a LIVE socket, but it cannot order
-// the stale path: without the lock two processes can both fail the bind, both
-// find nothing listening, and then one unlinks and binds while the other
-// unlinks that now-live socket and binds over it. The loser is left serving a
-// path that no longer refers to it, while every session holding that address
-// talks to the winner.
+// Binding first lets the kernel arbitrate a live socket, but it cannot order a
+// stale path. Without the lock, two processes can both fail the bind, both see
+// no listener, then one can unlink and bind while the other unlinks that now
+// live socket and binds over it.
 //
-// Each child races for the same stale path and announces a win; exactly one
-// may. The window is opened by having every child announce arrival and then
-// spin on a shared gate file, so they enter check-unlink-bind together instead
-// of in spawn order.
-//
-// Measured both directions rather than assumed: per race, 15/15 green with the
-// lock in place, 2/10 red with the flock call removed. One race is therefore a
-// real detector but a weak one, so the test runs raceRounds of them, which
-// raises detection to a measured 4/5 — see there. An earlier
-// in-process version caught nothing at all: goroutines share an open file
-// description, so they never contend for the flock the way two brambles do.
-//
-// The winner holds the socket until the parent reports every child settled,
-// rather than for a fixed span. A timed hold was flaky in the one direction
-// that matters: a sibling descheduled past the window finds a stale file again
-// and legitimately wins, failing the assertion with no bug present.
+// The loser is left serving a path that no longer refers to it, while sessions
+// holding that address talk to the winner.
 func TestConcurrentReclaimYieldsExactlyOneWinner(t *testing.T) {
 	t.Parallel()
 	if os.Getenv(raceChildEnv) != "" {
@@ -187,19 +145,10 @@ func TestConcurrentReclaimYieldsExactlyOneWinner(t *testing.T) {
 	}
 }
 
-// raceRounds is how many independent races one run performs.
-//
-// One race is a real detector of the missing lock but a weak one — measured
-// 2/10 red with the flock call removed — so a single round left a green gate
-// mostly silent about the one regression it exists to catch. Independent rounds
-// compound, and a round that never fails spuriously stays green however many
-// times it is repeated.
-//
-// Measured at this count, both directions: 4/5 runs red with the flock call
-// removed, 8/8 green with it in place. Still not a proof, but a gate that
-// usually fires rather than usually does not. A deterministic barrier would
-// need a test hook wired between the InUse check and the unlink in production
-// code; repetition buys most of the signal for none of that.
+// raceRounds repeats the race enough for the missing-lock detector to fire
+// reliably without adding a production test hook between InUse and unlink.
+// Local mutation runs at this count kept the locked path green while making the
+// missing-lock variant fail often enough to be useful.
 const raceRounds = 12
 
 func raceOnce(t *testing.T) {
@@ -228,32 +177,19 @@ func raceOnce(t *testing.T) {
 			mu.Unlock()
 		}()
 	}
-	// Release every child at once, so they contend rather than queue. The
-	// children are already spinning on the gate by now — they are spawned
-	// above and do nothing until it appears — so opening it puts them all into
-	// the check-unlink-bind window together, which is the only way the window
-	// the lock protects is ever open at all.
+	// Wait for every child to spin on the gate; otherwise they queue and the
+	// check-unlink-bind window never opens.
 	require.Eventually(t, func() bool {
 		return childrenSpinning(gate, racers)
 	}, 10*time.Second, 20*time.Millisecond, "children must reach the gate before it opens")
 	require.NoError(t, os.WriteFile(gate, nil, 0o600))
 
-	// Every loser exits as soon as it loses, so once no child can still be
-	// inside its check-unlink-bind window the winner may release the socket.
-	// Signalling that explicitly is what keeps a second, legitimate win — and
-	// therefore a spurious failure — out of the result.
+	// Release the winner only after every child has recorded a verdict; until
+	// then a delayed loser could still unlink the live socket under test.
 	go func() {
 		defer func() { _ = os.WriteFile(done, nil, 0o600) }()
-		// Wait for the window to close, not for a duration: once every child
-		// has recorded a verdict, none can still be about to unlink.
-		//
-		// Plain polling rather than require.Eventually: testify's require
-		// variants end in t.FailNow, which the testing package documents as
-		// callable only from the goroutine running the test. From here it would
-		// run runtime.Goexit, and a genuine timeout would surface as a confused
-		// partial failure instead of the assertion below. Releasing the winner
-		// on the deadline is the right behaviour anyway — the assertion on the
-		// win count is what reports the result.
+		// require.Eventually cannot fail this helper goroutine correctly; the
+		// win-count assertion below reports the timeout result.
 		deadline := time.Now().Add(30 * time.Second)
 		for !childrenSettled(gate, racers) && time.Now().Before(deadline) {
 			time.Sleep(5 * time.Millisecond)
@@ -271,9 +207,8 @@ func raceOnce(t *testing.T) {
 		"exactly one process may take a stale path; a second unlinks the winner's live socket (got %d of %d)", won, racers)
 }
 
-// TestInUseDistinguishesLiveFromStale: connecting IS the test. A live listener
-// accepts immediately; a stale file refuses with ECONNREFUSED. Requiring a
-// protocol reply instead would hang on a peer that accepts but never answers.
+// TestInUseDistinguishesLiveFromStale pins connect-only liveness: requiring a
+// protocol reply would hang on a peer that accepts but never answers.
 func TestInUseDistinguishesLiveFromStale(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -291,18 +226,14 @@ func TestInUseDistinguishesLiveFromStale(t *testing.T) {
 	assert.False(t, InUse(filepath.Join(dir, "absent.sock")), "an absent path is not in use")
 }
 
-// TestInUseFailsClosedOnAnUnclassifiableError pins the direction InUse errs in
-// when it cannot tell live from stale.
+// TestInUseFailsClosedOnAnUnclassifiableError pins fail-closed behavior:
+// anything besides refusal or absence must read as in use because reclaimStale
+// unlinks paths reported as free.
 //
-// The two safe answers are named positively — refused, or no such file — and
-// everything else must read as in use, because the caller of a false "free" is
-// reclaimStale, which unlinks. A dial that fails for a reason nobody enumerated
-// (a timeout against a saturated backlog, EMFILE, EINTR) would otherwise steal
-// the address of a process still serving it.
-//
-// The error is injected rather than described: a path longer than sun_path
-// fails the dial with EINVAL, which is neither ECONNREFUSED nor ErrNotExist and
-// so exercises exactly the branch a real ambiguous failure takes.
+// A path longer than sun_path injects EINVAL, exercising the same branch as any
+// real ambiguous dial failure.
+// That includes failures such as timeouts against a saturated backlog, EMFILE,
+// or EINTR, where treating the path as free would steal a live process address.
 func TestInUseFailsClosedOnAnUnclassifiableError(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
