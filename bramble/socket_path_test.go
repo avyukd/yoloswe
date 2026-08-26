@@ -14,13 +14,11 @@ import (
 	"github.com/bazelment/yoloswe/bramble/session"
 )
 
-// Covers path derivation only — NOT the startup ordering that depends on it.
-// See TestPublishSockPaths* for the publication behavior and
-// TestStartIPCServerBindsThePublishedPath for the publish/bind equality.
-//
-// The ordering fix in runTUI is only possible because a path is knowable before
-// its server exists: if either helper grew a dependency on a started server, the
-// startup window would silently reopen. That is the property pinned here.
+// TestSocketPathDerivation pins that paths are knowable before their servers
+// start. Publication and bind equality are covered by the TestPublishSockPaths*
+// and TestStartIPCServerBindsThePublishedPath cases.
+// If derivation starts depending on a running server, the startup ordering
+// window silently reopens.
 func TestSocketPathDerivation(t *testing.T) {
 	ipc := ipcSocketPath()
 	control := controlSocketPath()
@@ -32,8 +30,7 @@ func TestSocketPathDerivation(t *testing.T) {
 		t.Errorf("IPC and control servers must not share a socket path, both = %q", ipc)
 	}
 
-	// Deterministic: repeated calls agree, so the value published to the manager
-	// is the same one the server later binds.
+	// Repeated calls must agree with the value later published to the manager.
 	if got := ipcSocketPath(); got != ipc {
 		t.Errorf("ipcSocketPath() not deterministic: %q then %q", ipc, got)
 	}
@@ -41,11 +38,9 @@ func TestSocketPathDerivation(t *testing.T) {
 		t.Errorf("controlSocketPath() not deterministic: %q then %q", control, got)
 	}
 
-	// Neither is pid-scoped. A session's callback address is frozen into its
-	// tmux window at creation and can never be updated, so a path that moved
-	// with the pid stranded every window whenever bramble came back under a new
-	// one. Collision between concurrent brambles is handled at bind time
-	// instead — see pidScopedSocketPath and TestPidScopedFallbackIsDistinct.
+	// Sessions freeze the callback path in tmux, so the stable path must survive
+	// a restart under a new pid. Concurrent collisions are handled at bind time.
+	// A pid-scoped address stranded every existing window after restart.
 	pid := strconv.Itoa(os.Getpid())
 	for _, p := range []string{ipc, control} {
 		if strings.Contains(filepath.Base(p), pid) {
@@ -55,9 +50,9 @@ func TestSocketPathDerivation(t *testing.T) {
 }
 
 // TestPidScopedFallbackIsDistinct covers the path a second bramble takes when
-// the stable one is already served. It must differ from the stable name and
-// from the other socket's fallback, or two live brambles would fight over one
-// address — the collision the pid used to prevent by construction.
+// the stable one is already served. The fallback must stay per-process and
+// per-socket.
+// Otherwise two live brambles fight over the same address.
 func TestPidScopedFallbackIsDistinct(t *testing.T) {
 	ipcFallback := pidScopedSocketPath(ipcSockBase)
 	controlFallback := pidScopedSocketPath(controlSockBase)
@@ -80,13 +75,12 @@ func TestPidScopedFallbackIsDistinct(t *testing.T) {
 	}
 }
 
-// The sockets belong in $XDG_RUNTIME_DIR when it is set: a user-private tmpfs,
-// rather than a world-writable directory where a symlink could be swapped in.
+// TestSocketPathsPreferRuntimeDir pins $XDG_RUNTIME_DIR as the preferred
+// user-private socket root.
+// That avoids world-writable directories where a symlink can be swapped in.
 func TestSocketPathsPreferRuntimeDir(t *testing.T) {
 	dir := t.TempDir()
-	// A real XDG_RUNTIME_DIR (/run/user/$UID) is 0700; t.TempDir() is 0775, and
-	// socketDirPrivate now verifies the directory rather than trusting the
-	// variable, so the fixture has to match reality.
+	// Match real /run/user/$UID permissions; socketDirPrivate verifies them.
 	require.NoError(t, os.Chmod(dir, 0o700))
 	t.Setenv("XDG_RUNTIME_DIR", dir)
 
@@ -100,22 +94,16 @@ func TestSocketPathsPreferRuntimeDir(t *testing.T) {
 	}
 }
 
-// TestSocketPathsFallBackUnderTempDir: with no XDG_RUNTIME_DIR the sockets
-// live in a private per-user directory *under* os.TempDir(), not in os.TempDir()
-// itself.
-//
-// This test used to assert the opposite — that the socket's parent WAS
-// os.TempDir(). That is the shared, world-writable directory, and since the
-// socket name is stable it is also predictable, so any local user could bind it
-// first and either receive traffic from windows holding the frozen path or push
-// every bramble onto a pid-scoped fallback. The privacy now comes from the
-// directory; see TestSocketDirIsPrivateWithoutXDGRuntimeDir.
+// TestSocketPathsFallBackUnderTempDir pins the fallback root: with no
+// XDG_RUNTIME_DIR, sockets live in a private per-user directory under os.TempDir,
+// never directly in the shared temp directory.
+// A stable name directly in shared temp is predictable enough for another local
+// user to pre-bind it or force pid-scoped fallback.
+// The privacy comes from the directory, not from the filename.
 func TestSocketPathsFallBackUnderTempDir(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	t.Setenv("TMPDIR", t.TempDir())
-	// The fallback directory is created 0700 by socketDirPrivate, so paths are
-	// published normally here; the refusal case is
-	// TestNoSocketIsPublishedWithoutAPrivateDirectory.
+	// Refusal without a private directory is covered separately.
 
 	for name, got := range map[string]string{
 		"ipc":     ipcSocketPath(),
@@ -134,10 +122,9 @@ func TestSocketPathsFallBackUnderTempDir(t *testing.T) {
 	}
 }
 
-// publishSockPaths must write BOTH destinations: the live manager (whose
-// sessions read it via newTmuxRunner) and the shared config template that
-// openRepo copies for repos opened later with Alt-R. Updating only one is how a
-// secondary repo's sessions silently lose a socket.
+// TestPublishSockPathsWritesManagerAndSharedConfig pins both publication
+// destinations: live manager and shared config for repos opened later with Alt-R.
+// Updating only one silently drops sockets for secondary repo sessions.
 func TestPublishSockPathsWritesManagerAndSharedConfig(t *testing.T) {
 	t.Parallel()
 
@@ -164,9 +151,8 @@ func TestPublishSockPathsWritesManagerAndSharedConfig(t *testing.T) {
 	}
 }
 
-// When the control server fails to bind, runTUI publishes an empty control path
-// rather than the path nothing is listening on. Clearing must reach the shared
-// config too, or Alt-R sessions would export a dead socket.
+// TestPublishSockPathsClearsBothOnEmpty pins failed-bind cleanup: an empty path
+// must clear the shared config too, or Alt-R sessions export a dead socket.
 func TestPublishSockPathsClearsBothOnEmpty(t *testing.T) {
 	t.Parallel()
 
@@ -182,16 +168,14 @@ func TestPublishSockPathsClearsBothOnEmpty(t *testing.T) {
 	if shared.ControlSockPath != "" {
 		t.Errorf("shared config control path = %q, want empty after a failed control bind", shared.ControlSockPath)
 	}
-	// Clearing one socket must not disturb the other.
 	if got := m.IPCSockPath(); got != "/run/bramble.sock" {
 		t.Errorf("IPC path = %q, want it untouched by a control-socket clear", got)
 	}
 }
 
-// The whole ordering fix rests on the manager advertising the path the IPC
-// server actually binds. startIPCServer takes that path as a parameter rather
-// than recomputing it; this pins that it binds what it was given, so the value
-// published to the manager beforehand cannot be stale.
+// TestStartIPCServerBindsThePublishedPath pins the startup ordering: the
+// manager advertises the same path startIPCServer later binds.
+// startIPCServer takes that path as a parameter rather than recomputing it.
 func TestStartIPCServerBindsThePublishedPath(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", dir)
@@ -213,16 +197,12 @@ func TestStartIPCServerBindsThePublishedPath(t *testing.T) {
 	}
 }
 
-// TestSocketDirIsPrivateWithoutXDGRuntimeDir pins the property the stable
-// socket name depends on for its safety.
-//
-// The name is stable, so it is predictable by construction. In a shared /tmp
-// that is enough for any local user to pre-bind it and receive the IPC and
-// control traffic of tmux windows that have the path frozen in their
-// environment, or to force every bramble on the host onto a pid-scoped fallback
-// — which silently restores the stranding bug the stable path exists to fix.
-// Putting the uid in the filename prevents an accidental collision but not a
-// deliberate one; only a directory this user alone can traverse does that.
+// TestSocketDirIsPrivateWithoutXDGRuntimeDir pins the security property the
+// stable socket name depends on: predictable names are safe only inside a
+// directory this user alone can traverse.
+// A shared directory lets another local user receive frozen-window traffic or
+// push every bramble back to the stranding-prone pid fallback.
+// The uid in the filename avoids accidental collisions, not deliberate ones.
 func TestSocketDirIsPrivateWithoutXDGRuntimeDir(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	t.Setenv("TMPDIR", t.TempDir())
@@ -238,7 +218,7 @@ func TestSocketDirIsPrivateWithoutXDGRuntimeDir(t *testing.T) {
 		"a group- or world-accessible directory is not private")
 	assert.True(t, ownedByCurrentUser(info), "the directory must be owned by this user")
 
-	// Both sockets land inside it, so neither is directly reachable.
+	// Both sockets land inside it.
 	assert.Equal(t, dir, filepath.Dir(ipcSocketPath()))
 	assert.Equal(t, dir, filepath.Dir(controlSocketPath()))
 }
@@ -259,22 +239,19 @@ func TestSocketDirRefusesAWorldWritableDirectory(t *testing.T) {
 		"a directory with open permissions must be refused, not used")
 }
 
-// TestNoSocketIsPublishedWithoutAPrivateDirectory: a socket path is only safe
-// inside a directory this user alone can traverse.
-//
-// Without one, every candidate is exposed. The stable name is fixed and so
-// predictable outright; a pid-scoped name is barely better, since a pid is
-// observable and an abandoned path can be pre-bound by another local user
-// before bramble restarts, who would then receive callbacks from tmux windows
-// that still point there. So both derivations refuse, and the session runs
-// without IPC and control rather than serving them over a path anybody can
-// take.
+// TestNoSocketIsPublishedWithoutAPrivateDirectory pins fail-closed behavior:
+// without a private directory, both stable and pid-scoped socket paths are
+// exposed enough that bramble must publish neither.
+// Pids are observable, and abandoned pid-scoped paths can be pre-bound before a
+// restart by another local user.
+// Running without IPC and control is safer than serving them over a path anyone
+// can take.
 func TestNoSocketIsPublishedWithoutAPrivateDirectory(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	t.Setenv("TMPDIR", tmp)
 
-	// A squatted directory with open permissions: private-directory setup fails.
+	// A squatted directory with open permissions.
 	squat := filepath.Join(tmp, fmt.Sprintf("bramble-%d", os.Getuid()))
 	require.NoError(t, os.MkdirAll(squat, 0o777))
 	require.NoError(t, os.Chmod(squat, 0o777))
@@ -288,11 +265,10 @@ func TestNoSocketIsPublishedWithoutAPrivateDirectory(t *testing.T) {
 		"the collision fallback derives its own path and must refuse too")
 }
 
-// TestUnprivateRuntimeDirIsNotTrusted: XDG_RUNTIME_DIR is an environment
-// variable, so it can be inherited from another user's session or point
-// somewhere world-writable. Trusting it would publish a stable, predictable
-// socket name into a directory anyone can write to — the exposure the private
-// directory exists to close.
+// TestUnprivateRuntimeDirIsNotTrusted pins that XDG_RUNTIME_DIR is still just an
+// environment variable; world-writable values must be rejected.
+// Trusting one would publish stable, predictable sockets into a directory anyone
+// can write to.
 func TestUnprivateRuntimeDirIsNotTrusted(t *testing.T) {
 	shared := t.TempDir()
 	require.NoError(t, os.Chmod(shared, 0o777))
@@ -305,19 +281,17 @@ func TestUnprivateRuntimeDirIsNotTrusted(t *testing.T) {
 	assert.True(t, isPrivateDir(dir))
 }
 
-// TestSymlinkedSocketDirIsNotPrivate: os.Stat resolves symlinks, so judging the
-// socket directory with it judged whatever the link POINTED at. A local user
-// who wins the race to create /tmp/bramble-$UID as a link to any 0700 directory
-// this user owns then has MkdirAll succeed on the link, both privacy checks
-// pass on the target, and bramble publish its stable IPC and control sockets at
-// a path the attacker chose — the symlink/TOCTOU hazard socketDir()'s own doc
-// says the private directory exists to prevent.
+// TestSymlinkedSocketDirIsNotPrivate pins the symlink/TOCTOU hazard: privacy
+// checks must judge the directory entry bramble will use, not a private target
+// chosen through a link.
+// os.Stat follows the link, so target-only checks would bless an attacker-chosen
+// socket location.
+// MkdirAll would succeed on the link before those target checks ran.
 func TestSymlinkedSocketDirIsNotPrivate(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
-	// A directory that is genuinely private by every other measure: 0700 and
-	// owned by this user. Reached through a link it must still be refused.
+	// Private by every other measure; reached through a link it is still refused.
 	target := filepath.Join(root, "attacker-chosen")
 	require.NoError(t, os.Mkdir(target, 0o700))
 	require.True(t, isPrivateDir(target), "the target itself is private; only the link is the problem")
