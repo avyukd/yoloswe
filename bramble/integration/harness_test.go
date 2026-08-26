@@ -44,12 +44,10 @@ import (
 )
 
 const (
-	// repoName is the throwaway repo every test operates on.
 	repoName = "subagentrepo"
-	// settleTimeout bounds waits on an agent CLI reacting. Generous: a real
-	// backend has to answer a prompt inside it.
+	// settleTimeout bounds waits on a real agent CLI reacting.
+	// Real backends have to receive, run, and answer a prompt within it.
 	settleTimeout = 90 * time.Second
-	// pollInterval is how often those waits re-check.
 	pollInterval = 250 * time.Millisecond
 )
 
@@ -62,25 +60,17 @@ type harness struct {
 	controlSock  string
 	home         string
 	stubLog      string
-	// launchCmd, runtimeDir and brambleWindow are kept so the bramble under test
-	// can be restarted in place — see restart.
+	// Kept so restart can bring bramble back up in place.
 	launchCmd  string
 	runtimeDir string
-	// brambleWindow is the tmux window id bramble is running in. Tracked rather
-	// than assumed: a restart brings the replacement up in a new window, so the
-	// launch window is only "@0" until the first restart.
+	// Tracked because restart brings the replacement up in a new window.
 	brambleWindow string
-	// answeredDialogs remembers which dialogs have been answered, so one
-	// appearance collects one answer.
+	// One visible dialog should collect one answer, even across TUI repaints.
 	answeredDialogs map[dialogKey]bool
 }
 
-// newHarness brings up a private tmux server, a throwaway repo, and a bramble
-// running in tmux mode against them, and tears it all down afterwards.
-//
-// stubAgent selects the backend: true installs a scripted stand-in for the
-// `codex` binary so the test is deterministic and needs no credentials; false
-// leaves the real CLIs on PATH for the live-backend cases.
+// newHarness starts isolated tmux, repo, HOME/runtime state, and bramble.
+// stubAgent installs the scripted backend; false leaves real CLIs on PATH.
 func newHarness(t *testing.T, stubAgent bool) *harness {
 	t.Helper()
 	requireTool(t, "tmux")
@@ -112,12 +102,10 @@ func newHarness(t *testing.T, stubAgent bool) *harness {
 	for _, dir := range []string{h.home, wtRoot} {
 		require.NoError(t, os.MkdirAll(dir, 0o755))
 	}
-	// 0700, and chmod'd explicitly because MkdirAll applies the umask: bramble
-	// verifies XDG_RUNTIME_DIR is a private directory owned by this user before
-	// it will publish a stable socket name there, exactly as a real
-	// /run/user/$UID is. A 0755 dir is rejected, bramble falls back to the
-	// shared temp dir, and awaitSockets then waits out its whole timeout for
-	// sockets that were never put where it is looking.
+	// bramble publishes a stable socket only under a private XDG_RUNTIME_DIR;
+	// chmod is explicit because MkdirAll applies the umask.
+	// A 0755 runtime dir falls back to the shared temp dir, leaving awaitSockets
+	// looking in the wrong place.
 	require.NoError(t, os.MkdirAll(runtimeDir, 0o700))
 	require.NoError(t, os.Chmod(runtimeDir, 0o700))
 
@@ -129,15 +117,13 @@ func newHarness(t *testing.T, stubAgent bool) *harness {
 		"XDG_RUNTIME_DIR=" + runtimeDir,
 		"WT_ROOT=" + wtRoot,
 		"TERM=xterm-256color",
-		// The stand-in records what it parsed and what its notify program
-		// returned. Without it a failed notify is invisible: bramble passes
-		// --silent, so the hook swallows its own errors by design.
+		// The stand-in records notify failures that --silent would swallow.
+		// Without it, a failed hook looks like an agent that simply stayed busy.
 		"BRAMBLE_IT_STUB_LOG=" + h.stubLog,
 	}
 	pathDirs := os.Getenv("PATH")
 	if stubAgent {
-		// Prepended, so bramble's provider probe and its tmux windows both
-		// find the stand-in rather than a real codex.
+		// Prepended so provider probes and tmux windows find the stand-in.
 		pathDirs = installStubAgent(t, root) + string(os.PathListSeparator) + pathDirs
 	}
 	env = append(env, "PATH="+pathDirs)
@@ -160,16 +146,13 @@ func newHarness(t *testing.T, stubAgent bool) *harness {
 	h.brambleWindow = strings.TrimSpace(string(out))
 	require.NotEmpty(t, h.brambleWindow, "tmux did not report the window it started bramble in")
 
-	// A window bramble opens inherits PATH from bramble itself (its tmux
-	// client), which is how the stand-in gets found — but not arbitrary
-	// variables. Those have to go on the server. PATH deliberately does not:
-	// tmux special-cases it here and the override is silently dropped, which
-	// is why it rides the shell wrapper above instead.
+	// Session windows inherit PATH from bramble's tmux client, but arbitrary
+	// variables have to be placed on the server. PATH deliberately rides the
+	// shell wrapper above because tmux special-cases and drops it here.
 	_, _ = h.tmux("set-environment", "-g", "BRAMBLE_IT_STUB_LOG", h.stubLog)
 
 	t.Cleanup(func() {
-		// Dump the TUI window on failure: a bramble that refused to start
-		// (unknown repo, no provider) says so there and nowhere else.
+		// Startup failures are visible only in the TUI pane.
 		if t.Failed() {
 			if pane, err := exec.Command("tmux", "-S", h.tmuxSocket,
 				"capture-pane", "-p", "-t", h.brambleWindow).Output(); err == nil {
@@ -186,22 +169,15 @@ func newHarness(t *testing.T, stubAgent bool) *harness {
 	return h
 }
 
-// restart kills the bramble under test and brings a fresh one up on the same
-// tmux server, store and HOME — what a user quitting and reopening bramble
-// does, and the only way to reach the re-adoption path.
-//
-// The session windows are separate windows on this server, so they outlive the
-// restart exactly as they would in real use; the new bramble finds them through
-// ReconcileTmuxSessions.
+// restart brings bramble back on the same tmux server, store, and HOME so
+// existing session windows survive into the re-adoption path.
+// The new bramble must find them through ReconcileTmuxSessions.
 func (h *harness) restart() {
 	h.t.Helper()
 
-	// SIGTERM rather than kill-window. In tmux mode a session is only written
-	// to the store when its manager closes, so a bramble killed outright leaves
-	// nothing to re-adopt and the restart tests nothing. The signal handler
-	// cancels the program, which is the same shutdown a user quitting gets.
-	//
-	// The launch command execs bramble, so the pane's process is bramble itself.
+	// SIGTERM lets session managers close and write the store; kill-window would
+	// leave nothing for the restart to re-adopt.
+	// The launch command execs bramble, so pane_pid is the bramble process.
 	pid, err := h.tmux("display-message", "-p", "-t", h.brambleWindow, "#{pane_pid}")
 	require.NoError(h.t, err, "find the bramble process")
 	require.NotEmpty(h.t, pid)
@@ -212,11 +188,8 @@ func (h *harness) restart() {
 		return ipc.NewClient(h.ipcSock).Ping() != nil
 	}, settleTimeout, pollInterval, "the old bramble kept answering after it was signalled")
 
-	// The socket files are deliberately left in place. They carry a stable
-	// name now, and reclaiming a dead one is exactly what lets a session
-	// started before the restart still reach bramble afterwards — its window
-	// env froze that path and can never learn a new one. Deleting them here
-	// would hide the very behaviour the restart tests depend on.
+	// Leave socket files in place: pre-restart windows froze that path, so
+	// reclaiming the dead stable name is the behavior under test.
 	h.ipcSock, h.controlSock = "", ""
 
 	out, err := exec.Command("tmux", "-S", h.tmuxSocket, "new-window", "-d",
@@ -228,38 +201,10 @@ func (h *harness) restart() {
 	h.awaitSockets(h.runtimeDir)
 }
 
-// awaitSockets waits for bramble to bind both of its sockets and answer a ping.
-// Discovered by globbing the private runtime dir, which can only ever hold this
-// bramble.
-//
-// The glob has to span two spellings, not one. userSockName formats
-// "<base>-<uid>.sock", so the stable IPC socket is "bramble-<uid>.sock" — and a
-// bramble that finds that path already served falls back to a pid-scoped
-// "bramble-<uid>-<pid>.sock". Both are names this harness may meet, which is
-// why the glob is "bramble*.sock" and not "bramble-<uid>.sock".
-//
-// Which IPC candidate to take is settled by the ping, not by glob order, and
-// the loop must therefore be able to reach past a candidate that does not
-// answer. Retrying does not do it: every Eventually iteration globs the same
-// directory and would re-pick the same first name, so a stale pid-scoped socket
-// — which sorts BEFORE the stable one — would be chosen forever while the live
-// path sat one entry later. So the candidates are pinged in order and the first
-// that answers wins.
-//
-// The control socket is chosen the same way, for the same reason — a stale
-// pid-scoped control socket sorts first just as a stale IPC one does, and this
-// harness would otherwise record it and fail every later control request
-// against a bramble that was up all along.
-//
-// The single-candidate case, which is every ordinary run, costs one ping and
-// one connect.
 // controlAnswers reports whether a live control server is behind path.
 //
-// Connecting IS the test, exactly as sockguard.InUse argues: a Unix socket that
-// accepts has a listener behind it, while a file left by a dead process
-// refuses. Sending a request would additionally require the peer to speak the
-// protocol — a stronger claim than "is anyone there", and one that would hang
-// on a peer that accepts but never replies.
+// Connecting is the test: sending a request would require the peer to speak the
+// protocol and could hang on a listener that accepts but never replies.
 func controlAnswers(path string) bool {
 	conn, err := control.DialUnix(path)
 	if err != nil {
@@ -269,6 +214,12 @@ func controlAnswers(path string) bool {
 	return true
 }
 
+// awaitSockets pings candidates instead of trusting glob order. Stable and
+// pid-scoped sockets can both exist, and stale pid-scoped names sort before the
+// live stable name this restart path needs to find.
+// The glob spans both spellings; the first candidate that answers wins.
+// The same rule is used for IPC and control sockets so stale files cannot poison
+// later control requests.
 func (h *harness) awaitSockets(runtimeDir string) {
 	h.t.Helper()
 	require.Eventually(h.t, func() bool {
@@ -291,7 +242,6 @@ func (h *harness) awaitSockets(runtimeDir string) {
 
 // --- talking to the bramble under test ---------------------------------------
 
-// newSession sends a new-session request and returns the decoded result.
 func (h *harness) newSession(reqID string, params ipc.NewSessionParams) ipc.NewSessionResult {
 	h.t.Helper()
 	params.RepoName = repoName
@@ -345,7 +295,6 @@ func (h *harness) spawnOnNewWorktree(sessionType, model, parent, branch, base, p
 	return session.SessionID(result.SessionID), result.WorktreePath
 }
 
-// gitIn runs a read-only git command inside a worktree.
 func (h *harness) gitIn(dir string, args ...string) string {
 	h.t.Helper()
 	cmd := exec.Command("git", args...)
@@ -355,7 +304,6 @@ func (h *harness) gitIn(dir string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// sessions returns every session bramble currently knows about.
 func (h *harness) sessions() []ipc.SessionSummary {
 	h.t.Helper()
 	resp, err := ipc.NewClient(h.ipcSock).Send(&ipc.Request{
@@ -369,7 +317,6 @@ func (h *harness) sessions() []ipc.SessionSummary {
 	return result.Sessions
 }
 
-// status returns one session's status, or "" if bramble has never heard of it.
 func (h *harness) status(id session.SessionID) string {
 	h.t.Helper()
 	for _, s := range h.sessions() {
@@ -380,7 +327,6 @@ func (h *harness) status(id session.SessionID) string {
 	return ""
 }
 
-// awaitStatus waits for a session to reach one of the given statuses.
 func (h *harness) awaitStatus(id session.SessionID, want ...string) {
 	h.t.Helper()
 	require.Eventuallyf(h.t, func() bool {
@@ -417,7 +363,6 @@ func (h *harness) send(from, to session.SessionID, text string, queue bool) (con
 	return result, nil
 }
 
-// pane returns a session's captured pane text as one string.
 func (h *harness) pane(id session.SessionID) string {
 	h.t.Helper()
 	resp, err := ipc.NewClient(h.ipcSock).Send(&ipc.Request{
@@ -433,14 +378,12 @@ func (h *harness) pane(id session.SessionID) string {
 	return strings.Join(result.Lines, "\n")
 }
 
-// awaitPane waits for a session's pane to contain want.
 func (h *harness) awaitPane(id session.SessionID, want, because string) {
 	h.t.Helper()
 	h.awaitPaneCond(id, func() bool { return strings.Contains(h.pane(id), want) },
 		"%s: %q never appeared in %s's pane", because, want, id)
 }
 
-// countInPane reports how many times want appears in a session's pane.
 func (h *harness) countInPane(id session.SessionID, want string) int {
 	h.t.Helper()
 	return strings.Count(h.pane(id), want)
@@ -468,7 +411,6 @@ func (h *harness) tmuxTargetOf(id session.SessionID) string {
 	return ""
 }
 
-// tmux runs a tmux command against the harness's private server.
 func (h *harness) tmux(args ...string) (string, error) {
 	h.t.Helper()
 	full := append([]string{"-S", h.tmuxSocket}, args...)
@@ -476,13 +418,9 @@ func (h *harness) tmux(args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
-// deliveryQueueLen counts the queue files bramble is holding. The queue lives
-// under the harness's private HOME, so this only ever sees this test's mail.
-//
-// Counts RECIPIENTS, not messages: the courier persists one file per recipient,
-// holding that recipient's whole queue. A test that means "my message is held"
-// should use queuedFor instead — a parent waiting on its own subagent report is
-// a second recipient, and whether that report has landed yet is a race.
+// deliveryQueueLen counts recipients, not messages. Tests that mean "my message
+// is held" should use queuedFor because parent reports may be racing too.
+// The courier persists one file per recipient, holding that recipient's queue.
 func (h *harness) deliveryQueueLen() int {
 	h.t.Helper()
 	files, _ := filepath.Glob(filepath.Join(h.home, ".bramble", "deliveries", "*.json"))
@@ -505,32 +443,20 @@ func (h *harness) queuedFor(id session.SessionID) int {
 	return len(queue)
 }
 
-// startupDialog is a prompt an agent CLI puts in front of its own prompt, which
-// a human would otherwise have to click through.
-//
-// These are the reason a "live" test is not simply a matter of spawning a
-// session and waiting: a fresh worktree makes Claude ask whether the folder is
-// trusted, and codex interrupts with model-deprecation and rate-limit choices.
-// Left unanswered the session never reaches its prompt and the test times out
-// looking like a bramble bug.
+// startupDialog is a prompt an agent CLI puts in front of its own prompt.
+// Left unanswered, the live test times out looking like a bramble bug.
+// Fresh worktrees commonly trigger trust, model-deprecation, and rate-limit
+// prompts before the agent can take a turn.
 type startupDialog struct {
 	name string
-	// match must all appear in the pane for this dialog to be recognized.
-	// Specific on purpose — answering the wrong modal picks a menu item.
+	// match is specific on purpose: answering the wrong modal picks a menu item.
 	match []string
-	// keys are sent, in order, to answer it.
 	keys []string
-	// fatal, when set, means this dialog must never appear: seeing it is
-	// itself the failure, so the harness reports it instead of clearing it.
-	// An entry with fatal set sends no keys.
+	// fatal dialogs are reported instead of cleared.
 	fatal string
 }
 
-// startupDialogs is the set answered automatically. Each entry names the choice
-// it takes, because pressing Enter on an unknown menu is how a test silently
-// changes a setting (codex's rate-limit prompt switches model on Enter).
-// dialogKey identifies one dialog on one session, so an answer to a codex
-// trust prompt does not count as an answer to Claude's.
+// dialogKey keeps one session's answered dialog from suppressing another's.
 type dialogKey struct {
 	id   session.SessionID
 	name string
@@ -538,27 +464,17 @@ type dialogKey struct {
 
 var startupDialogs = []startupDialog{
 	{
-		// Claude, on a directory it has not seen before. Option 1, the
-		// default, is "Yes, I trust this folder".
+		// Claude directory trust. Default is "Yes, I trust this folder".
 		name:  "claude folder trust",
 		match: []string{"Is this a project you created or one you trust", "I trust this folder"},
 		keys:  []string{"Enter"},
 	},
 	{
-		// Claude asks before using API-key authentication when its usual
-		// account login is also available. Recognized, never answered.
-		//
-		// In a correct run this modal is unreachable: tmuxRunner.endpointEnv
-		// shadows ANTHROPIC_API_KEY with an empty value precisely so the
-		// interactive CLI never asks. So it appears only when that shadow has
-		// regressed — and answering it is worse than either alternative.
-		// "Yes" is what the shadow exists to prevent: newHarness(t, false)
-		// keeps the developer's real HOME, so it would forward their own
-		// Anthropic credential to the third-party endpoint as x-api-key. "No"
-		// is quieter but no better for a live test: the session would carry on
-		// against ANTHROPIC_BASE_URL with the account login, and the test would
-		// pass while asserting nothing about the endpoint it exists to
-		// exercise. Fail instead, naming the regression.
+		// This modal must fail closed. Answering "Yes" can forward the user's
+		// Anthropic credential to the third-party endpoint; "No" can let the
+		// test pass against the wrong provider.
+		// In a correct run ANTHROPIC_API_KEY is shadowed before the CLI starts, so
+		// seeing the modal means that protection regressed.
 		name:  "claude custom API key",
 		match: []string{"Detected a custom API key in your environment", "Do you want to use this API key"},
 		fatal: "claude prompted for a custom API key: the ANTHROPIC_API_KEY shadow in tmuxRunner.endpointEnv has regressed. " +
@@ -566,36 +482,29 @@ var startupDialogs = []startupDialog{
 			"or run the session against the default provider while the test still passes (No).",
 	},
 	{
-		// Codex, on a directory it has not seen before. Option 1, the default,
-		// is "Yes, continue".
+		// Codex directory trust. Default is "Yes, continue".
 		name:  "codex directory trust",
 		match: []string{"Do you trust the contents of this directory", "Yes, continue"},
 		keys:  []string{"Enter"},
 	},
 	{
-		// Codex, when the requested model is being retired. Option 2 keeps the
-		// model the test asked for; taking the new one silently would make the
-		// run untraceable to the model under test.
+		// Keep the requested model; silently switching makes the run untraceable.
 		name:  "codex model deprecation",
 		match: []string{"will be deprecated soon", "Use existing model"},
 		keys:  []string{"Down", "Enter"},
 	},
 	{
-		// Codex, near a usage limit. Escape dismisses without switching model.
+		// Escape dismisses without switching model.
 		name:  "codex rate-limit switch",
 		match: []string{"Approaching rate limits", "Switch to"},
 		keys:  []string{"Escape"},
 	},
 }
 
-// dialogTailLines is how much of the pane's bottom a dialog is looked for in.
-//
-// Not the whole capture: a dialog's text stays in the scrollback after it is
-// dismissed, so matching the full pane re-recognizes one that is long gone —
-// and each "answer" is a keystroke into whatever has since taken its place.
+// dialogTailLines limits matching to the pane bottom; dismissed dialog text
+// remains in scrollback and would otherwise be answered again.
 const dialogTailLines = 30
 
-// paneTail returns the last few non-empty lines of an already-captured pane.
 func paneTail(pane string) string {
 	lines := strings.Split(pane, "\n")
 	kept := make([]string, 0, dialogTailLines)
@@ -608,15 +517,10 @@ func paneTail(pane string) string {
 	return strings.Join(kept, "\n")
 }
 
-// answerStartupDialogs looks at what is currently on a session's screen and
-// answers any dialog it recognizes. It reports whether it acted.
-//
-// A given dialog is answered once and then not again until it has disappeared
-// from the screen entirely. Keying on the screen's contents instead does not
-// work: a live TUI repaints a spinner and a token count every poll, so no two
-// captures are equal and every poll looks like a new dialog. Without this a run
-// sent Enter twenty-two times into a live session — a dismissed dialog stays in
-// the scrollback just above the prompt that replaced it.
+// answerStartupDialogs answers each recognized dialog once until it disappears.
+// Keying on full screen contents would treat every TUI repaint as a new dialog.
+// Dismissed dialog text remains in scrollback above the prompt, so matching only
+// "have I seen these bytes before" re-sends Enter into the live session.
 func (h *harness) answerStartupDialogs(id session.SessionID, pane string) bool {
 	h.t.Helper()
 	tail := paneTail(pane)
@@ -664,18 +568,11 @@ func (h *harness) answerStartupDialogs(id session.SessionID, pane string) bool {
 	return false
 }
 
-// awaitClearingDialogs polls cond, answering first-run dialogs between polls,
-// and fails with the session's pane attached if it never comes true.
-//
-// Answering as it polls is what separates these waits from require.Eventually:
-// a real CLI on a fresh worktree puts a trust prompt in front of the agent, and
-// a condition that waits for the agent to act can only come true once that
-// prompt is cleared.
-// The pane is captured once per iteration and handed to both cond and the
-// dialog answerer: a capture is an IPC round-trip plus a tmux fork, and taking
-// two per poll for 90 seconds is hundreds of them per wait. The last capture
-// also becomes the failure dump, which is the pane the wait actually gave up
-// on rather than a fresh one taken afterwards.
+// awaitClearingDialogs answers first-run dialogs while polling the condition.
+// It captures once per iteration so the condition, dialog answerer, and failure
+// dump all see the same pane without doubling tmux captures.
+// This is the live-test replacement for require.Eventually when a trust prompt
+// may be blocking the agent from acting.
 func (h *harness) awaitClearingDialogs(id session.SessionID, cond func(pane string) bool, failf string, args ...any) {
 	h.t.Helper()
 	h.awaitClearingDialogsFor(id, settleTimeout, cond, failf, args...)
@@ -696,13 +593,10 @@ func (h *harness) awaitClearingDialogsFor(id session.SessionID, timeout time.Dur
 	h.t.Fatalf(failf+"\n--- pane ---\n%s", append(args, pane)...)
 }
 
-// awaitPaneCond polls cond until it holds, failing with the session's pane as
-// it stands at that moment.
-//
-// Deliberately not require.Eventuallyf with h.pane() among its format
-// arguments: Go evaluates those eagerly, so the pane is captured before the
-// wait even begins — an extra capture on every passing run, and on a failing
-// one it prints the screen from before the wait instead of the one that failed.
+// awaitPaneCond captures the pane only after timeout. Putting h.pane() in
+// require.Eventuallyf arguments captures before the wait begins.
+// On failure, that would print the pre-wait screen instead of the screen that
+// actually timed out.
 func (h *harness) awaitPaneCond(id session.SessionID, cond func() bool, failf string, args ...any) {
 	h.t.Helper()
 	deadline := time.Now().Add(settleTimeout)
@@ -715,8 +609,7 @@ func (h *harness) awaitPaneCond(id session.SessionID, cond func() bool, failf st
 	h.t.Fatalf(failf+"\n--- pane ---\n%s", append(args, h.pane(id))...)
 }
 
-// neverDuring fails if cond ever holds within d, dumping the pane at the moment
-// it did. Same eager-argument reasoning as awaitPaneCond.
+// neverDuring dumps the pane from the moment the forbidden condition appears.
 func (h *harness) neverDuring(id session.SessionID, d time.Duration, cond func() bool, failf string, args ...any) {
 	h.t.Helper()
 	deadline := time.Now().Add(d)
@@ -728,17 +621,14 @@ func (h *harness) neverDuring(id session.SessionID, d time.Duration, cond func()
 	}
 }
 
-// awaitReady waits for a session to reach its prompt, answering first-run
-// dialogs along the way. This is what a live test uses instead of awaitStatus:
-// a real CLI on a fresh worktree may need a click before it ever runs a turn.
+// awaitReady handles first-run dialogs before waiting for idle.
 func (h *harness) awaitReady(id session.SessionID) {
 	h.t.Helper()
 	h.awaitClearingDialogs(id, func(string) bool { return h.status(id) == "idle" },
 		"session %s never reached its prompt", id)
 }
 
-// awaitPaneClearingDialogs waits for text to appear, answering any dialog that
-// blocks the agent on the way.
+// awaitPaneClearingDialogs waits for text while clearing startup dialogs.
 func (h *harness) awaitPaneClearingDialogs(id session.SessionID, want, because string) {
 	h.t.Helper()
 	h.awaitClearingDialogs(id, func(pane string) bool { return strings.Contains(pane, want) },
@@ -750,13 +640,8 @@ func (h *harness) awaitPaneClearingDialogs(id session.SessionID, want, because s
 // enough not to dominate the suite.
 const longTurnSeconds = 20
 
-// longTurnPrompt asks an agent to occupy itself for a bounded, predictable
-// time and then say a known word.
-//
-// It shells out rather than asking for a long answer because generated text is
-// not a reliable clock — a model told to "count slowly" may emit the whole list
-// at once, leaving no live turn to queue behind. A sleep is the same length on
-// every backend. Requires a session type that may run commands (builder).
+// longTurnPrompt shells out because generated text is not a reliable clock; a
+// sleep gives every backend the same live turn to queue behind.
 func longTurnPrompt(done string) string {
 	return fmt.Sprintf(
 		"Run this exact shell command and wait for it to finish: sleep %d. "+
@@ -764,12 +649,8 @@ func longTurnPrompt(done string) string {
 			"Do not read or edit any files.", longTurnSeconds, done)
 }
 
-// awaitWorking waits until a session is demonstrably mid-turn: bramble reports
-// it running and its pane shows it has taken the prompt.
-//
-// Both halves matter. Status alone is true from the moment the session is
-// created, so a test that queued on status alone could be queueing before the
-// CLI had even started — which is a different case, and not the one under test.
+// awaitWorking requires both running status and prompt echo; status alone can
+// be true before the CLI has started the turn under test.
 func (h *harness) awaitWorking(id session.SessionID, promptEcho string) {
 	h.t.Helper()
 	h.awaitClearingDialogs(id, func(pane string) bool {
@@ -777,11 +658,8 @@ func (h *harness) awaitWorking(id session.SessionID, promptEcho string) {
 	}, "session %s never started working", id)
 }
 
-// reportedResultPath pulls the path out of the most recent report in a pane.
-//
-// The report is a pointer, not a payload, so the path is the part a parent
-// actually has to be able to use; asserting only that "result:" appears would
-// pass on a report naming a file that was never written.
+// reportedResultPath returns the newest report path; the path, not just the
+// marker text, proves the parent can read the child output.
 func reportedResultPath(pane string) (string, bool) {
 	matches := resultPathRE.FindAllStringSubmatch(pane, -1)
 	if len(matches) == 0 {
@@ -792,8 +670,7 @@ func reportedResultPath(pane string) (string, bool) {
 
 var resultPathRE = regexp.MustCompile(`result:\s+(\S+)`)
 
-// queuedTextFor returns the raw on-disk queue for a recipient, which is what a
-// restarted bramble would read back.
+// queuedTextFor returns the on-disk queue a restarted bramble would read.
 func (h *harness) queuedTextFor(to session.SessionID) string {
 	h.t.Helper()
 	files, _ := filepath.Glob(filepath.Join(h.home, ".bramble", "deliveries", "*.json"))
