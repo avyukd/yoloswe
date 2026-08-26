@@ -24,6 +24,14 @@ func TestDelegatorScenario_HappyPath(t *testing.T) {
 		AutoNotify:    true,
 		MaxTurns:      15,
 		TurnTimeout:   120 * time.Second,
+		// This test counts tool calls, so it has the same exposure the nudge
+		// exists for: haiku routinely opens in prose, and without a reply the
+		// run ends at turn one having started nothing — both assertions below
+		// then fail on a coin flip rather than on the delegator's behaviour.
+		// The two scenarios that assert the delegator ASKED rather than acted
+		// (NonRetriableError, AmbiguousTask) keep an empty Nudge on purpose.
+		Nudge:     "Use your tools now: call start_session to carry that out.",
+		MaxNudges: 3,
 		Behaviors: map[string][]*session.MockSessionBehavior{
 			"planner": {
 				{States: []session.MockSessionState{
