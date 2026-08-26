@@ -1019,17 +1019,17 @@ func logDeliveryWarn(msg string, to SessionID, err error) {
 	log.Printf("WARNING: %s for session %s: %v", msg, to, err)
 }
 
-// logWriteFailure reports real write failures while classifying composer and
-// pane holds as queued waiting states.
 // isHeld reports whether an error means the delivery was held rather than
 // written: the recipient's pane or composer was busy, so nothing reached it and
-// no turn started. Both callers must agree on this set -- logWriteFailure uses
-// it to pick a log level, and write uses it to decide whether re-arming idle
-// reporting is justified -- so it lives in one place.
+// no turn started. write uses it to decide whether re-arming idle reporting is
+// justified. logWriteFailure tests the same two errors separately because it
+// must tell them apart to pick a log level, not merely recognize a hold.
 func isHeld(err error) bool {
 	return errors.Is(err, errComposerBusy) || errors.Is(err, errPaneBusy)
 }
 
+// logWriteFailure reports real write failures while classifying composer and
+// pane holds as queued waiting states.
 func logWriteFailure(failMsg string, to SessionID, err error) {
 	if errors.Is(err, errComposerBusy) {
 		logDeliveryWarn("holding delivery: recipient has an unsubmitted draft", to, err)
