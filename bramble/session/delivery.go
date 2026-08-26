@@ -300,8 +300,12 @@ func composerHoldsThisDelivery(provider, composer, staged, text string) bool {
 	if body == "" {
 		return false
 	}
-	first, _, _ := strings.Cut(text, "\n")
-	first = strings.TrimSpace(first)
+	// pasteFirstLine, not an inline Cut: this is the same operand confirmsComposer,
+	// composerHoldsForeignText and pasteVerdict all compare against. Deriving it
+	// twice lets the draft check and the verify check disagree about what "our
+	// text" looks like, and that disagreement is what flip-flops a delivery
+	// between alreadyStaged and foreign until the queue wedges.
+	first := pasteFirstLine(text)
 	if first == "" {
 		return false
 	}

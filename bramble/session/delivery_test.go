@@ -3188,3 +3188,68 @@ func TestDroppedPasteIntoAnEmptyComposerIsStillRetried(t *testing.T) {
 	assert.NotContains(t, panes.recorded(), "enter(@7)")
 	assert.Len(t, c.Pending("s1"), 1)
 }
+
+// TestUserTypingBesideAPasteChipIsNotSubmitted is the chip form of the race
+// TestUserTypingDuringPasteVerificationIsNotPastedInto pins for echoed text.
+//
+// Claude collapses a large paste into "[Pasted text #N]", so the echoed-text
+// path never runs for it and the one-way prefix rule never gets a chance to
+// refuse. If a merely-contained chip counts as confirmation, a person typing
+// inside the verification window produces "❯ [Pasted text #1 …] their words",
+// pasteVerdict reports landed, composerHoldsForeignText is never consulted, and
+// Enter submits their line with the delivery riding on it.
+//
+// The rule: a chip proves arrival only when it is the WHOLE composer body.
+// Anything outside its brackets was typed by a person.
+func TestUserTypingBesideAPasteChipIsNotSubmitted(t *testing.T) {
+	t.Parallel()
+	const delivery = "a report from a subagent that ran for a while"
+
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	// Empty when the draft check reads it, so the write path proceeds to paste.
+	target.appendPane(claudeComposerPane(""))
+
+	panes := &fakePanes{}
+	panes.echo = func(string) {
+		// Claude collapsed our paste to a chip, and the human kept typing.
+		target.appendPane(claudeComposerPane("[Pasted text #1 +42 lines] what were we doing with the"))
+	}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", delivery, true)
+	require.NoError(t, err)
+
+	assert.NotContains(t, panes.recorded(), "enter(@7)",
+		"a chip with someone's typing beside it must not be read as proof our paste sits there alone")
+	assert.Len(t, c.Pending("s1"), 1, "the delivery is held, not lost")
+	assert.Empty(t, c.stagedText("s1"),
+		"a composer bramble does not own cannot be its staged record")
+}
+
+// TestAWholeBodyChipStillConfirms keeps the other half adjacent: the chip is
+// exactly what a confirmed claude paste looks like, and tightening the rule
+// above must not turn every large delivery into a re-paste-and-requeue loop.
+func TestAWholeBodyChipStillConfirms(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.appendPane(claudeComposerPane(""))
+
+	panes := &fakePanes{}
+	panes.echo = func(string) {
+		target.appendPane(claudeComposerPane("[Pasted text #1 +42 lines]"))
+	}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent that ran for a while", true)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, panes.pasteCount(), "a chip confirms arrival: never paste a second copy")
+	assert.Contains(t, panes.recorded(), "enter(@7)", "and the delivery is submitted")
+	assert.Empty(t, c.Pending("s1"))
+}

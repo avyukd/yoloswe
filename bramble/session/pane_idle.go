@@ -623,16 +623,52 @@ const pasteConfirmTailLines = pasteVerifyLines - 8
 // visible body must be a prefix of what we sent. Narrow panes then read as
 // confirmation rather than as a dropped paste.
 func confirmsComposer(line, first string, chips []string) bool {
-	if containsAny(line, chips) {
-		return true
-	}
 	body, _ := composerBody(line)
 	// An empty composer confirms nothing: that is what a dropped paste looks
 	// like, and every string has the empty prefix.
 	if body == "" {
 		return false
 	}
+	// A chip proves arrival only when it is the WHOLE body. A chip with text
+	// beside it is a human composer — somebody typed next to the paste — and
+	// this package already treats that shape as a draft everywhere else
+	// (TestAChipBesideTypedTextIsStillAHumanDraft holds it at the draft check).
+	//
+	// Accepting a merely-contained chip here would confirm that pane, so
+	// pasteVerdict would report landed and never consult composerHoldsForeignText,
+	// and write() would press Enter on the person's half-typed line with the
+	// delivery riding on it — the same race the foreign check closes for the
+	// echoed-text form, arriving instead through the chip.
+	if bodyIsOnlyAChip(body, chips) {
+		return true
+	}
 	return strings.HasPrefix(first, body)
+}
+
+// bodyIsOnlyAChip reports whether a composer body is one paste chip and nothing
+// else. Chips render as a self-contained bracketed token ("[Pasted text #1 +42
+// lines]"), so anything outside those brackets was typed by a person.
+func bodyIsOnlyAChip(body string, chips []string) bool {
+	for _, chip := range chips {
+		start := strings.Index(body, chip)
+		if start < 0 {
+			continue
+		}
+		// Nothing may precede the chip, and only its own closing bracket may
+		// follow it. Bracket-matching rather than marker length so a chip whose
+		// contents change ("+42 lines", a filename) still reads as whole.
+		if start != 0 {
+			continue
+		}
+		end := strings.Index(body, "]")
+		if end < 0 {
+			continue // an unterminated chip is a truncated capture, not evidence
+		}
+		if strings.TrimSpace(body[end+1:]) == "" {
+			return true
+		}
+	}
+	return false
 }
 
 // claudePromptGlyph is the composer prompt in claude-code's TUI, U+276F.

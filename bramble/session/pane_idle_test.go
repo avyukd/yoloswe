@@ -859,6 +859,22 @@ func TestClaudeAcceptsAPasteChip(t *testing.T) {
 	// head rule does not, because the visible body starts with the draft.
 	assert.False(t, confirmed("❯ file the dev bug "+long, long),
 		"a composer whose body starts with a user's draft is not our paste, however much of our text trails it")
+
+	// The chip counterpart to the assertion above, and the reason the chip arm
+	// may not short-circuit. Claude collapses our paste to a chip, so the
+	// echoed-text rule above never runs for it; a person typing inside the same
+	// verification window leaves the chip with their words beside it. Accepting
+	// that as confirmation reports landed, which means composerHoldsForeignText
+	// is never consulted and Enter goes onto their half-typed line.
+	//
+	// A chip that IS the whole body stays confirmation — that is the collapsed
+	// paste this test opens by pinning.
+	assert.False(t, confirmed("❯ [Pasted text #1 +42 lines] file the dev bug", long),
+		"a chip with someone's typing beside it is a human composer, not proof our paste is alone there")
+	assert.False(t, confirmed("❯ file the dev bug [Pasted text #1 +42 lines]", long),
+		"nor when their text comes first")
+	assert.True(t, confirmed("❯ [Pasted text #1 +42 lines]  ", long),
+		"trailing whitespace does not make a whole-body chip partial")
 }
 
 // TestCodexTranscriptDoesNotConfirmAPaste pins required:true fallback safety:
