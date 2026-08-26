@@ -34,12 +34,26 @@ func TestMain(m *testing.M) {
 	os.Exit(raceChild())
 }
 
-// childrenSettled reports whether every child has recorded a verdict, so no
-// sibling can still be inside its check-unlink-bind window. The parent cannot
-// wg.Wait here because the winner is waiting on this signal.
+// childrenSettled reports whether every child has recorded a verdict AND none
+// is still inside Listen, so no sibling can be in its check-unlink-bind window.
+// The parent cannot wg.Wait here because the winner is waiting on this signal.
+//
+// The second condition is not redundant, and omitting it was a flake worth a
+// CI failure. A .settled marker is written after Listen returns, so a child
+// blocked on reclaimStale's flock has written nothing and does not hold the
+// count back. The parent released the winner, the winner closed — and closing a
+// Go unix listener UNLINKS its path — so the straggler emerged, found a stale
+// file, and won legitimately. Two winners, with the production lock never
+// violated: the harness had manufactured a second race after declaring the
+// first one over. It took a loaded machine to show (1/10 under CPU contention,
+// 0/80 idle), which is why CI saw it first.
 func childrenSettled(gate string, want int) bool {
-	matches, err := filepath.Glob(gate + ".settled.*")
-	return err == nil && len(matches) >= want
+	settled, err := filepath.Glob(gate + ".settled.*")
+	if err != nil || len(settled) < want {
+		return false
+	}
+	inflight, err := filepath.Glob(gate + ".inflight.*")
+	return err == nil && len(inflight) == 0
 }
 
 func childrenSpinning(gate string, want int) bool {
@@ -65,7 +79,17 @@ func raceChild() int {
 			return 1
 		}
 	}
+	// Bracket Listen with an in-flight marker. .settled alone cannot express
+	// "still racing": it is written only after Listen RETURNS, so a child
+	// blocked on reclaimStale's flock has recorded nothing and is invisible to
+	// the parent — which then released the winner while that child was still
+	// mid-reclaim. See childrenSettled.
+	inflight := gate + fmt.Sprintf(".inflight.%d", os.Getpid())
+	if f, ferr := os.Create(inflight); ferr == nil {
+		f.Close()
+	}
 	ln, err := Listen(path)
+	_ = os.Remove(inflight)
 	if f, ferr := os.Create(gate + fmt.Sprintf(".settled.%d", os.Getpid())); ferr == nil {
 		f.Close()
 	}
