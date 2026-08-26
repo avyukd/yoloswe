@@ -246,15 +246,9 @@ func (p *fakePanes) recorded() []string {
 	return append([]string(nil), p.writes...)
 }
 
-// echoPanes builds a pane writer whose pastes show up in target's pane, so the
-// courier's paste verification sees what it just wrote.
 // echoPanes stands in for a CLI that echoes a pasted message into its composer.
-//
-// The echo is written as a real claude pane: the composer line between two
-// rules, with the status lines below. That shape is load-bearing now that
-// pasteConfirmed reads only the composer — a bare line with no chrome cannot be
-// located, and a fake that emits one would exercise a pane claude never
-// produces (measured: 10/10 live panes are locatable at capture depth).
+// It writes real claude chrome because pasteConfirmed reads only a locatable
+// composer, not a bare line.
 func echoPanes(target *fakeTarget) *fakePanes {
 	p := &fakePanes{}
 	p.echo = func(text string) { target.appendPane(claudeComposerPane(text)) }
@@ -1202,9 +1196,8 @@ func TestNoReportIsLostWhenManySubagentsFinishAtOnce(t *testing.T) {
 	parentID, _ := ids(t)
 	target.set(parentID, StatusRunning, RunnerTypeTmux)
 
-	// Slow enough that the emitter below runs far ahead of the handler. Against
-	// the bounded channel this replaced, that is what lost events — measured, 8
-	// of the 150 below.
+	// Slow enough that the emitter runs far ahead of the handler, which is what
+	// lost events with a bounded channel.
 	target.mu.Lock()
 	target.captureDelay = 2 * time.Millisecond
 	target.mu.Unlock()
@@ -2144,16 +2137,9 @@ func TestComposerDraftUnknownForUnreadableProviders(t *testing.T) {
 	}
 }
 
-// TestDraftHoldIsBoundedByElapsedTime: a composer is cleared only by a
-// keypress, so a draft left by someone who has walked away holds every later
-// delivery to that session behind it. Round 2 added the hold with no exit;
-// round 3 bounded it by counting write attempts, which measured how often
-// bramble happened to look at the pane rather than how long the draft had sat
-// there — Drain has four callers and only one is the retry timer.
-//
-// The property is elapsed time on an UNCHANGED draft, so that is what is
-// asserted here, with an injected clock. An attempt-count assertion would pass
-// with the grace period removed entirely.
+// TestDraftHoldIsBoundedByElapsedTime pins elapsed time on an unchanged draft.
+// Counting write attempts measures how often bramble looked at the pane, not
+// how long the draft sat there.
 func TestDraftHoldIsBoundedByElapsedTime(t *testing.T) {
 	t.Parallel()
 	target := newFakeTarget()
@@ -2181,24 +2167,11 @@ func TestDraftHoldIsBoundedByElapsedTime(t *testing.T) {
 	require.Zero(t, panes.pasteCount(), "50 attempts inside the grace period must not release")
 	require.Len(t, c.Pending("s1"), 1)
 
-	// Past the grace period the delivery is STILL held, and deliberately so.
-	//
-	// This branch used to paste anyway, on the reasoning that a delivery never
-	// made is worse than one landing beside typed text. That trade does not
-	// survive contact with tmux: paste-buffer APPENDS, so the Enter that
-	// follows submits this message joined to the human's half-written sentence
-	// — their words, sent under their name, with no way to take it back. There
-	// is no keystroke bramble may send to clear the line first, because
-	// clearing a composer destroys the draft to deliver a report.
-	//
-	// So an unchanged composer holds, whatever is in it, and the operator is
-	// told once which session is blocked and by what. Nothing retires it
-	// automatically: maxDeliveryAge prunes only at process start and DELETES
-	// rather than delivers, so it is not a backstop for a running bramble —
-	// saying it was, as an earlier version of this comment did, was worse than
-	// saying nothing. A paste chip is not the exception it once was here; see
-	// TestAnUnownedChipIsNeitherPastedOverNorSubmitted for why the pane cannot
-	// answer whose paste it is.
+	// Past the grace period the delivery still holds. tmux paste-buffer appends,
+	// so pressing Enter would submit the report joined to the human's draft.
+	// maxDeliveryAge prunes only at process start and deletes rather than
+	// delivers, so it is not a running-process backstop. A paste chip cannot
+	// answer whose paste it is; see TestAnUnownedChipIsNeitherPastedOverNorSubmitted.
 	now = now.Add(composerHoldGrace + time.Second)
 	c.Drain(context.Background(), "s1")
 
@@ -2541,12 +2514,9 @@ func TestADifferentStagedMessageStillHolds(t *testing.T) {
 	assert.Len(t, c.Pending("s1"), 1, "the delivery is held for the next transition")
 }
 
-// TestStagedDeliveryIsNotAppendedByPasteVerification: the alreadyStaged guard
-// has to cover BOTH pastes. Round 7 guarded the first one, but the
-// paste-verification block thirty lines below pasted unconditionally — and
-// claude is now required:true, so whenever the probe cannot see the text the
-// code performed exactly the append the guard exists to prevent, submitting
-// <staged copy><second copy> as one prompt.
+// TestStagedDeliveryIsNotAppendedByPasteVerification pins that alreadyStaged
+// covers both the first paste and the paste-verification retry. Otherwise
+// <staged copy><second copy> is submitted as one prompt.
 //
 // The two predicates disagree most cleanly when the pane shows less of the
 // message than pasteProbeLen: composerHoldsThisDelivery matches on a prefix in
