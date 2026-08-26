@@ -41,11 +41,8 @@ const (
 	TypePaneNewWindow    MsgType = "pane.new_window"
 	TypePaneKill         MsgType = "pane.kill"
 
-	// Streaming: subscribe to live pane output. The server pushes TypePaneDelta
-	// frames (correlated by SubID) until TypePaneUnsubscribe. A terminal
-	// TypePaneError frame (also SubID-correlated) ends a subscription when the
-	// pane can no longer be captured, so a dead stream surfaces as an error
-	// rather than going silently dark.
+	// Streaming: subscribe to live pane output. TypePaneDelta carries SubID-
+	// correlated snapshots; TypePaneError ends a dead stream explicitly.
 	TypePaneSubscribe   MsgType = "pane.subscribe"
 	TypePaneUnsubscribe MsgType = "pane.unsubscribe"
 	TypePaneDelta       MsgType = "pane.delta"
@@ -55,9 +52,8 @@ const (
 	TypeResponse MsgType = "response"
 )
 
-// Msg is the single envelope for every request, response, and pushed frame. A
-// request carries an ID the response echoes; a subscription carries a SubID the
-// pushed deltas echo. Payloads are typed structs marshaled into Payload.
+// Msg is the envelope for requests, responses, and pushed frames. ID correlates
+// requests; SubID correlates subscriptions.
 type Msg struct {
 	Type    MsgType         `json:"type"`
 	ID      string          `json:"id,omitempty"`     // request/response correlation
@@ -77,29 +73,21 @@ type SessionRef struct {
 type SendInputReq struct {
 	SessionID string `json:"session_id,omitempty"` // session-centric form
 	Target    string `json:"target,omitempty"`     // raw-pane form
-	// From is the sender's session ID, when the sender is itself a session.
-	// A subagent messaging its own parent this way replaces the completion
-	// report bramble would otherwise generate for it.
+	// From is the sender session; subagents use it to replace their automatic
+	// completion report.
 	From string `json:"from,omitempty"`
 	Text string `json:"text"`
-	// Submit presses Enter after the paste. Required when Queue is set — text
-	// staged into a composer without Enter is never delivered, and it then
-	// looks like a human draft to every later delivery, holding them behind it.
-	// Queue with Submit false is refused rather than quietly submitted.
+	// Submit presses Enter after paste. Queue requires it because staged text
+	// otherwise looks like a human draft and blocks later delivery.
 	Submit bool `json:"submit"`
-	// Queue holds the text back until the recipient is idle instead of typing
-	// it into a live turn, where it would land in the recipient's next prompt
-	// stripped of its context. Requires SessionID: a raw pane target has no
-	// status to wait on. Queued delivery also reaches TUI-mode sessions, which
-	// have no pane at all.
+	// Queue holds text until the recipient is idle. It requires SessionID,
+	// because raw panes have no status to wait on.
 	Queue bool `json:"queue,omitempty"`
 }
 
-// SendInputResult reports what happened to a send_input request. Queued is true
-// when the message is waiting to be written rather than having been written
-// already — either because the recipient is busy, or because a write to it
-// failed and is being retried; it is omitted otherwise, so an unqueued send is
-// wire-identical to the OKResult this endpoint used to return.
+// SendInputResult reports a send_input outcome. Queued means the message is
+// waiting or retrying; omitted Queued keeps unqueued sends wire-compatible with
+// the earlier OKResult.
 type SendInputResult struct {
 	OK     bool `json:"ok"`
 	Queued bool `json:"queued,omitempty"`
@@ -168,17 +156,15 @@ type NewWindowResult struct {
 	WindowID string `json:"window_id"`
 }
 
-// PaneDelta is one pushed live-output frame for a subscription. Lines is the
-// current content snapshot (ANSI-stripped); Status is the parsed agent status
-// when available.
+// PaneDelta is one pushed subscription frame: current ANSI-stripped lines plus
+// parsed status when available.
 type PaneDelta struct {
 	Status *PaneStatusJSON `json:"status,omitempty"`
 	Lines  []string        `json:"lines"`
 }
 
-// PaneError is the terminal frame for a subscription that can no longer be
-// served (e.g. the pane was killed). It is SubID-correlated like PaneDelta so it
-// rides the same delta-routing path to the subscriber.
+// PaneError is the SubID-correlated terminal frame for a subscription that can
+// no longer be served.
 type PaneError struct {
 	Error string `json:"error"`
 }
@@ -208,10 +194,9 @@ type Response struct {
 	Result json.RawMessage `json:"result,omitempty"`
 }
 
-// Hello is the first frame an agent sends to the hub on connect. The hub
-// authenticates Token, records the machine, and rejects a ProtocolVersion
-// mismatch. It is sent as a TypeHello Msg payload, not over the Msg envelope's
-// request/response fields, because it precedes normal dispatch.
+// Hello is the first frame an agent sends to the hub. It precedes normal
+// dispatch, so it is carried as a TypeHello payload instead of request/response
+// fields.
 type Hello struct {
 	MachineID       string `json:"machine_id"`
 	Hostname        string `json:"hostname"`
@@ -268,8 +253,7 @@ func errResponse(id string, err error) *Msg {
 	return &Msg{Type: TypeResponse, ID: id, Payload: payload}
 }
 
-// NewErr builds a failed TypeResponse Msg with the given error message. Used by
-// relays (the hub) that synthesize responses without a Go error value.
+// NewErr builds a failed TypeResponse Msg from a synthesized error message.
 func NewErr(id, message string) *Msg {
 	payload, _ := json.Marshal(Response{Error: message})
 	return &Msg{Type: TypeResponse, ID: id, Payload: payload}
