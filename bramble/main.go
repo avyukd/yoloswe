@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"expvar"
 	"fmt"
 	"io"
@@ -330,16 +331,17 @@ func runTUI(cmd *cobra.Command, args []string) error {
 		os.Setenv(control.SockEnvVar, controlSockPath)
 	}
 
-	// The IPC server has not started yet, so its path is the one it is about to
-	// bind. Publish it up front; clear it below if the bind fails.
-	ipcSockPath := ipcSocketPath()
+	// Bind first, publish the path actually bound, then accept. A stable address
+	// can receive callbacks from pre-existing tmux windows as soon as it binds,
+	// while sessions created before publish would carry an empty address forever.
+	// That is publishSockPaths' precondition.
+	// If another bramble is already serving the stable name, bindIPCServer takes
+	// a pid-scoped fallback instead of stealing that live socket.
+	ipcServer, ipcSockPath := bindIPCServer(registry, wtRoot, repoName)
 	publishSockPaths(sessionManager, &sharedManagerConfig, ipcSockPath, controlSockPath)
-
-	// Start IPC server so child processes can request new sessions.
-	// The registry aggregates all repo managers so IPC handlers can find
-	// sessions from any repo, including those opened later via Alt-R.
-	ipcServer := startIPCServer(registry, ipcSockPath, wtRoot, repoName)
 	if ipcServer != nil {
+		// Published above, so it is safe to take requests now.
+		ipcServer.Serve()
 		defer ipcServer.Close()
 		os.Setenv(ipc.SockEnvVar, ipcSockPath)
 	} else {
@@ -511,27 +513,137 @@ func detectRepoFromPath(cwd, wtRoot string) (string, error) {
 // socketDir is where this process's Unix domain sockets live. It prefers
 // $XDG_RUNTIME_DIR (user-private, tmpfs) over /tmp to avoid symlink/TOCTOU
 // risks in world-writable directories.
+//
+// Without XDG_RUNTIME_DIR, the fallback is a 0700 per-user subdirectory of
+// os.TempDir(), not os.TempDir() itself. The directory is what makes the stable,
+// predictable socket name private; pre-created or non-private directories are
+// refused rather than inherited.
+// In shared temp, another local user could pre-bind the stable name, receive
+// traffic from frozen tmux windows, or force every bramble onto pid fallback.
+// A directory only its owner can traverse removes that reach.
 func socketDir() string {
-	if runDir := os.Getenv("XDG_RUNTIME_DIR"); runDir != "" {
-		return runDir
-	}
-	return os.TempDir()
+	dir, _ := socketDirPrivate()
+	return dir
 }
 
-// ipcSocketPath and controlSocketPath derive each server's socket path from the
-// pid alone, so a path is knowable before its server exists. runTUI depends on
-// that: it must publish the IPC path to the manager before the IPC server binds,
-// because that server starts serving session-creating requests immediately.
-//
-// Each is called exactly once per process, into a local that is then both
-// published and handed to the server, so the advertised path and the bound path
-// cannot diverge even though socketDir() re-reads the environment.
+// socketDirPrivate returns the socket directory and whether stable socket names
+// may be safely published there.
+// Callers publishing stable names must check private; a predictable name in a
+// shared directory can be claimed by another local user.
+func socketDirPrivate() (dir string, private bool) {
+	// XDG_RUNTIME_DIR is verified, not trusted, because it is inherited from the
+	// environment.
+	// It may point at another user's session or a world-writable directory.
+	if runDir := os.Getenv("XDG_RUNTIME_DIR"); runDir != "" {
+		if isPrivateDir(runDir) {
+			return runDir, true
+		}
+		slog.Warn("XDG_RUNTIME_DIR is not a private directory owned by this user; ignoring it",
+			"dir", runDir)
+	}
+	dir = filepath.Join(os.TempDir(), fmt.Sprintf("bramble-%d", os.Getuid()))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		slog.Warn("could not create a private socket directory; sockets will use pid-scoped names",
+			"dir", dir, "error", err)
+		return os.TempDir(), false
+	}
+	// MkdirAll leaves an existing directory's mode and owner alone, including a
+	// pre-created squat.
+	if !isPrivateDir(dir) {
+		slog.Warn("socket directory is not private to this user; sockets will use pid-scoped names",
+			"dir", dir)
+		return os.TempDir(), false
+	}
+	return dir, true
+}
+
+// isPrivateDir reports whether path is a directory this user alone can traverse.
+// Both halves matter: someone else's 0700 directory is not ours, and looser bits
+// are not private.
+func isPrivateDir(path string) bool {
+	// Lstat, not Stat: resolving symlinks would judge the private target instead
+	// of the attacker-chosen socket location.
+	// A link is never the private directory this process created.
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	return info.Mode().Perm() == 0o700 && ownedByCurrentUser(info)
+}
+
+// ownedByCurrentUser reports whether a stat result belongs to the running uid.
+// A directory in a world-writable parent is only private if we own it.
+func ownedByCurrentUser(info os.FileInfo) bool {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false // unknown platform: do not claim privacy we cannot verify
+	}
+	return int(st.Uid) == os.Getuid()
+}
+
+// Stable names are what frozen tmux-window callbacks keep pointing at across a
+// TUI restart. The uid keeps the fallback root per-user even without systemd.
+// Pid-scoped names remain only as the collision fallback for a second live
+// bramble.
+const (
+	ipcSockBase     = "bramble"
+	controlSockBase = "bramble-control"
+)
+
+// userSockName adds the uid while keeping the path stable across restarts.
+func userSockName(base string) string {
+	return fmt.Sprintf("%s-%d.sock", base, os.Getuid())
+}
+
+// ipcSocketPath and controlSocketPath return the stable per-user path each
+// server tries first. Sessions bake the address into their environment at window
+// creation and cannot update it, so pid-scoped paths strand them after a crash,
+// kill -9, or fresh launch under a new pid.
+// tmux set-environment reaches only later processes, and agent CLIs read hook
+// settings once at startup. A stranded Stop hook fires into a dead socket,
+// --silent swallows the failure, and parent mail never drains.
+// syscall.Exec keeps the pid, so in-place restart was not the failing case.
 func ipcSocketPath() string {
-	return filepath.Join(socketDir(), fmt.Sprintf("bramble-%d.sock", os.Getpid()))
+	return stableOrPidScoped(ipcSockBase)
 }
 
 func controlSocketPath() string {
-	return filepath.Join(socketDir(), fmt.Sprintf("bramble-control-%d.sock", os.Getpid()))
+	return stableOrPidScoped(controlSockBase)
+}
+
+// stableOrPidScoped returns the socket path to publish, or "" when no private
+// directory exists. Both stable and pid-scoped names are unsafe in shared
+// directories, so this fails closed and runs without that socket instead of
+// serving IPC over a path another local user can take.
+// A pid is observable, and an abandoned pid-scoped path can be pre-bound before
+// restart just like a stable one.
+// Unpredictability was never the protection; directory ownership is.
+// startIPCServer tolerates a nil server, so degraded operation is intentional.
+func stableOrPidScoped(base string) string {
+	dir, private := socketDirPrivate()
+	if !private {
+		slog.Error("refusing to publish a socket outside a private directory; "+
+			"subagent callbacks and remote control are disabled for this session",
+			"dir", dir, "socket", base)
+		return ""
+	}
+	return filepath.Join(dir, userSockName(base))
+}
+
+// pidScopedSocketPath is the fallback when a live bramble already serves the
+// stable path. It isolates the second process without unlinking the first
+// process's live socket.
+// Sessions this process starts get the fallback address; sessions owned by the
+// stable process keep reaching the stable address.
+func pidScopedSocketPath(base string) string {
+	// Same rule as stableOrPidScoped: no private directory, no socket.
+	// This derives its own path, so it must not re-enter bare socketDir().
+	dir, private := socketDirPrivate()
+	if !private {
+		return ""
+	}
+	// Keep the uid qualifier so the fallback stays per-user too.
+	return filepath.Join(dir, fmt.Sprintf("%s-%d-%d.sock", base, os.Getuid(), os.Getpid()))
 }
 
 // publishSockPaths makes both socket paths visible to every session the manager
@@ -551,10 +663,60 @@ func publishSockPaths(m *session.Manager, shared *session.ManagerConfig, ipcSock
 	shared.ControlSockPath = controlSockPath
 }
 
-// startIPCServer binds the IPC server to sockPath, which the caller has already
-// published to the session manager. Taking the path as a parameter rather than
-// recomputing it is what guarantees the two agree.
-func startIPCServer(registry *session.SessionRegistry, sockPath, wtRoot, repoName string) *ipc.Server {
+// bindWithFallback binds the stable path, falling back only when another live
+// bramble serves it. The sockets are published together, so fallback decisions
+// live here once; non-in-use errors fail closed instead of taking a collision
+// path that cannot fix them.
+// A window with one live address and one dead one is exactly the drift this
+// guard avoids.
+// The inUse sentinel is the only fallback cause; permission and setup errors are
+// not fixed by pid scoping.
+func bindWithFallback(kind, stable, base string, inUse error, bind func(path string) error) string {
+	if stable == "" {
+		// stableOrPidScoped already logged the missing-private-directory case.
+		return ""
+	}
+	err := bind(stable)
+	if err == nil {
+		return stable
+	}
+	if !errors.Is(err, inUse) {
+		slog.Warn("socket failed to bind", "kind", kind, "path", stable, "err", err)
+		return ""
+	}
+	fallback := pidScopedSocketPath(base)
+	if fallback == "" {
+		return ""
+	}
+	slog.Warn("stable socket is served by another bramble; falling back",
+		"kind", kind, "stable", stable, "fallback", fallback)
+	if err := bind(fallback); err != nil {
+		slog.Warn("socket failed to bind", "kind", kind, "path", fallback, "err", err)
+		return ""
+	}
+	return fallback
+}
+
+// bindIPCServer returns the server and the path actually bound, so the caller
+// publishes an address that is really listening.
+func bindIPCServer(registry *session.SessionRegistry, wtRoot, repoName string) (*ipc.Server, string) {
+	var srv *ipc.Server
+	bound := bindWithFallback("ipc", ipcSocketPath(), ipcSockBase, ipc.ErrSocketInUse,
+		func(path string) error {
+			var err error
+			srv, err = startIPCServer(registry, path, wtRoot, repoName)
+			return err
+		})
+	if bound == "" {
+		return nil, ""
+	}
+	return srv, bound
+}
+
+// startIPCServer binds sockPath but does not accept until the caller publishes
+// the bound path and calls Serve.
+// Taking the path as a parameter guarantees advertised and bound paths agree.
+func startIPCServer(registry *session.SessionRegistry, sockPath, wtRoot, repoName string) (*ipc.Server, error) {
 	srv := ipc.NewServer(sockPath)
 
 	srv.Handle(ipc.RequestPing, func(_ context.Context, _ *ipc.Request) (any, error) {
@@ -642,11 +804,11 @@ func startIPCServer(registry *session.SessionRegistry, sockPath, wtRoot, repoNam
 		return "ok", nil
 	})
 
-	if err := srv.Start(); err != nil {
-		slog.Warn("IPC server failed to start", "err", err)
-		return nil
+	// The caller needs the error class to decide whether fallback is valid.
+	if err := srv.Bind(); err != nil {
+		return nil, err
 	}
-	return srv
+	return srv, nil
 }
 
 // newDispatcher builds a control dispatcher, enabling queued delivery when a
@@ -661,13 +823,18 @@ func newDispatcher(registry *session.SessionRegistry, courier *session.Courier) 
 	return disp
 }
 
-// startControlServer starts the control-protocol Unix server backed by the
-// session registry and a real tmux controller. Returns nil if it fails to
-// start (non-fatal — the TUI still runs, only remote/CLI control is absent).
+// startControlServer uses the same fallback policy as IPC because both socket
+// paths are published together.
+// They must make the same choice about an occupied stable path.
 func startControlServer(registry *session.SessionRegistry, courier *session.Courier) *control.UnixServer {
-	srv := control.NewUnixServer(controlSocketPath(), newDispatcher(registry, courier))
-	if err := srv.Start(); err != nil {
-		slog.Warn("control server failed to start", "err", err)
+	dispatcher := newDispatcher(registry, courier)
+	var srv *control.UnixServer
+	bound := bindWithFallback("control", controlSocketPath(), controlSockBase, control.ErrSocketInUse,
+		func(path string) error {
+			srv = control.NewUnixServer(path, dispatcher)
+			return srv.Start()
+		})
+	if bound == "" {
 		return nil
 	}
 	return srv
@@ -1361,7 +1528,10 @@ TUI-mode session has no pane to type into at all.
 
 With --queue the message is held until the recipient goes idle and is then
 delivered through whichever path its runner supports. Use --queue for anything
-the recipient should read as part of its own work.`,
+the recipient should read as part of its own work.
+
+--queue requires --submit. Queued text that is staged without Enter is never
+delivered, and then blocks the next delivery as a draft in the composer.`,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		sessionID, _ := cmd.Flags().GetString("session-id")
 		target, _ := cmd.Flags().GetString("target")
@@ -1374,6 +1544,11 @@ the recipient should read as part of its own work.`,
 			// subagent reporting to its parent replaces bramble's generated
 			// report instead of arriving alongside it.
 			from = os.Getenv(session.SessionIDEnvVar)
+		}
+		// Staged text without Enter is never delivered and then blocks later
+		// delivery as a draft; reject it before the control round trip.
+		if queue && !submit {
+			return fmt.Errorf("--queue requires --submit: text staged without Enter is never delivered")
 		}
 
 		typ := control.TypeSessionSendInput
@@ -1550,7 +1725,7 @@ func init() {
 	sendInputCmd.Flags().Bool("submit", false, "Press Enter after delivering the text")
 	sendInputCmd.Flags().Bool("queue", false,
 		"Hold the text until the session is idle instead of typing into a live turn "+
-			"(requires --session-id; also reaches TUI-mode sessions)")
+			"(requires --session-id and --submit; also reaches TUI-mode sessions)")
 	sendInputCmd.Flags().String("from", "",
 		"Sender's session ID (defaults to $"+session.SessionIDEnvVar+"); a subagent "+
 			"messaging its parent this way replaces bramble's generated report")

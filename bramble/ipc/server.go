@@ -7,8 +7,9 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"sync"
+
+	"github.com/bazelment/yoloswe/bramble/sockguard"
 )
 
 // Handler processes an IPC request and returns a result or error.
@@ -45,34 +46,99 @@ func (s *Server) SocketPath() string {
 	return s.socketPath
 }
 
-// Start begins listening on the Unix domain socket. It removes any stale socket file first.
+// ErrSocketInUse reports that another live process is already serving the
+// socket path. Callers that can fall back to a different path check for this;
+// everything else treats it as fatal.
+//
+// Wraps sockguard.ErrInUse: the bind logic is shared with the control socket
+// (the two are published together and must make the same decision), while this
+// package keeps its own sentinel because callers already match on it.
+var ErrSocketInUse = fmt.Errorf("ipc: %w", sockguard.ErrInUse)
+
+// Start begins listening on the Unix domain socket.
+//
+// A socket file left behind by a dead process is removed and rebound; one that
+// still answers belongs to a live server and is left strictly alone. The
+// distinction matters because the path is stable across restarts: unlinking it
+// blindly would steal every running session's callback address from whichever
+// bramble is still serving them, and those sessions have that path frozen in
+// their tmux window environment with no way to learn a new one.
+//
+// The bind is attempted BEFORE any unlink, so the common case never touches a
+// file it does not own, and the reclaim of a stale file is serialized by a lock
+// file. Both are needed. Binding first makes the kernel the arbiter for a live
+// socket, but it cannot order the stale path: two processes can both fail the
+// bind, both find nothing listening, and then one unlinks and binds while the
+// other unlinks that now-live socket and binds over it — stranding the first,
+// which keeps serving a path that no longer refers to it.
 func (s *Server) Start() error {
-	// Remove stale socket if it exists
-	if err := os.Remove(s.socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("failed to remove stale socket %s: %w", s.socketPath, err)
+	if err := s.Bind(); err != nil {
+		return err
 	}
-
-	ln, err := net.Listen("unix", s.socketPath)
-	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %w", s.socketPath, err)
-	}
-	s.listener = ln
-
-	s.wg.Add(1)
-	go s.acceptLoop()
-
+	s.Serve()
 	return nil
 }
 
-// Close shuts down the server, closes the listener, waits for in-flight connections, and removes the socket file.
+// Bind acquires the socket without accepting anything yet.
+//
+// Splitting bind from serve is what lets a caller publish the address it
+// actually bound BEFORE any request can be handled. That ordering is
+// load-bearing here: this server creates sessions, a session snapshots the
+// socket paths at creation and keeps them for life, and the path is stable
+// across restarts — so a tmux window left by a previous bramble can fire into
+// it the instant it binds. A session built in that window before the path was
+// published would carry an empty address and stay mute forever, which is the
+// failure this split exists to close.
+//
+// Call Serve once the path has been published. Start does both, for callers
+// with nothing to publish.
+func (s *Server) Bind() error {
+	ln, err := sockguard.Listen(s.socketPath)
+	if err != nil {
+		if errors.Is(err, sockguard.ErrInUse) {
+			return fmt.Errorf("%w: %s", ErrSocketInUse, s.socketPath)
+		}
+		return err
+	}
+	s.listener = ln
+	return nil
+}
+
+// Serve starts accepting on an already-bound listener. No-op if Bind failed.
+func (s *Server) Serve() {
+	if s.listener == nil {
+		return
+	}
+	s.wg.Add(1)
+	go s.acceptLoop()
+}
+
+// Close shuts down the server, waits for in-flight connections, and removes the
+// socket file — but only if this server is the one that bound it.
+//
+// The ownership rule Start establishes has to hold here too: a server whose
+// Start returned ErrSocketInUse never owned the path, and unlinking it would
+// delete a live peer's socket, stranding every window that has that address
+// frozen in its environment. `srv := New(path); defer srv.Close()` before a
+// Start that may lose is the natural Go shape, so this must be safe by
+// construction rather than by caller discipline.
 func (s *Server) Close() error {
 	s.cancel()
 	var err error
 	if s.listener != nil {
+		// Do not unlink separately. *net.UnixListener unlinks the path inside
+		// Close for a listener it created, so this already removes our socket —
+		// and it does so while we still hold it. An explicit os.Remove after
+		// wg.Wait would run arbitrarily later, once in-flight handlers drain, by
+		// which time a successor bramble can have bound the now-free stable path.
+		// Removing then deletes the SUCCESSOR's socket file: it keeps serving an
+		// unlinked inode while every window's baked BRAMBLE_SOCK resolves to
+		// nothing, which is exactly the stranding the stable path prevents.
+		// Under the old PID-scoped names no other process could hold this path
+		// during Close, so the hazard arrived with the stable name.
 		err = s.listener.Close()
 	}
 	s.wg.Wait()
-	os.Remove(s.socketPath)
 	return err
 }
 

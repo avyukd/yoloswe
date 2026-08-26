@@ -1,8 +1,9 @@
 package main
 
 import (
-	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -111,24 +112,30 @@ func TestRestartRequesterDeliversAndClears(t *testing.T) {
 	assert.Error(t, r.request(app.RestartRequestedMsg{}))
 }
 
-// TestSocketPathsSurviveAnExecRestart pins the property the whole in-place
-// restart depends on.
+// TestSocketPathsSurviveAnyRestart pins the property the whole restart story
+// depends on.
 //
-// Both socket paths are a pure function of the pid, and syscall.Exec preserves
-// the pid — so the replacement image recomputes exactly the paths that are
-// already baked into every live tmux window's environment, and re-binds them.
-// If either helper ever mixed in something that changes across an exec (a start
-// timestamp, a random suffix, a boot id), every already-running session would
-// go permanently mute on the notify and control paths, silently.
-func TestSocketPathsSurviveAnExecRestart(t *testing.T) {
+// A session's callback address is baked into its tmux window environment at
+// creation and can never be updated afterwards — tmux set-environment reaches
+// only processes started later, and an agent CLI reads its hook settings once
+// at startup. So the replacement bramble has to recompute exactly the paths
+// already frozen into every live window.
+//
+// These used to be a pure function of the pid, which held for the in-place
+// restart because syscall.Exec preserves it — but not for a crash, a kill -9,
+// or a fresh launch, after which every running session went permanently mute:
+// the Stop hook fired into a socket that no longer existed, --silent swallowed
+// it, and the session was never seen to go idle, so its parent's mail never
+// drained. The paths are stable now, so nothing that varies between processes
+// (a pid, a start timestamp, a random suffix, a boot id) may feed into them.
+func TestSocketPathsSurviveAnyRestart(t *testing.T) {
 	t.Parallel()
 
-	pid := os.Getpid()
-	assert.Contains(t, ipcSocketPath(), fmt.Sprintf("bramble-%d.sock", pid))
-	assert.Contains(t, controlSocketPath(), fmt.Sprintf("bramble-control-%d.sock", pid))
+	assert.NotContains(t, filepath.Base(ipcSocketPath()), strconv.Itoa(os.Getpid()),
+		"a pid-scoped path does not survive a restart under a new pid")
+	assert.NotContains(t, filepath.Base(controlSocketPath()), strconv.Itoa(os.Getpid()))
 
-	// Recomputing after the process image is replaced must yield the same
-	// answer; nothing but the pid may feed into these.
+	// Recomputing in any later process must yield the same answer.
 	assert.Equal(t, ipcSocketPath(), ipcSocketPath())
 	assert.Equal(t, controlSocketPath(), controlSocketPath())
 }

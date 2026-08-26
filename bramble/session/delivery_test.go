@@ -1,10 +1,12 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +32,7 @@ type fakeTarget struct { //nolint:govet // fieldalignment: readability over pack
 	// makes the courier's event handling slow enough to test what happens to the
 	// events arriving behind it.
 	captureDelay  time.Duration
+	captureCount  int
 	markedRunning []SessionID
 }
 
@@ -71,6 +74,16 @@ func (f *fakeTarget) annotate(id SessionID, fn func(*SessionInfo)) {
 	f.sessions[id] = info
 }
 
+// setBackend records which agent CLI backs a session. Paste verification is
+// provider-specific — only a backend known to drop pastes is re-pasted — so a
+// test that exercises the strict path has to say which one it means.
+func (f *fakeTarget) setBackend(id SessionID, backend, model string) {
+	f.annotate(id, func(i *SessionInfo) {
+		i.Backend = backend
+		i.Model = model
+	})
+}
+
 func (f *fakeTarget) SessionInfo(id SessionID) (SessionInfo, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -99,6 +112,7 @@ func (f *fakeTarget) ResolveTmuxTarget(id SessionID) (string, error) {
 
 func (f *fakeTarget) CapturePaneText(id SessionID, _ int) ([]string, error) {
 	f.mu.Lock()
+	f.captureCount++
 	delay := f.captureDelay
 	err := f.captureErr
 	lines := f.captured[id]
@@ -117,6 +131,23 @@ func (f *fakeTarget) CapturePaneText(id SessionID, _ int) ([]string, error) {
 // appendPane mirrors text into every session's pane buffer. The courier only
 // ever reads back the pane it just wrote to, so a shared buffer is enough and
 // keeps the fake from needing to know which session a paste targeted.
+func (f *fakeTarget) captures() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.captureCount
+}
+
+// setPane REPLACES every session's pane buffer, for tests that need the pane to
+// stop saying what it said before — appendPane only ever adds, so an earlier
+// working marker would still be found in the tail.
+func (f *fakeTarget) setPane(text string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id := range f.sessions {
+		f.captured[id] = strings.Split(text, "\n")
+	}
+}
+
 func (f *fakeTarget) appendPane(text string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -161,6 +192,9 @@ type fakePanes struct { //nolint:govet // fieldalignment: readability over packi
 	// onSubmit, when set, stands in for a TUI accepting Enter: the composer
 	// clears and the text moves up into the transcript.
 	onSubmit func()
+	// enterErr, when set, stands in for a tmux send-keys that failed: the text
+	// is in the composer and no turn was started.
+	enterErr error
 }
 
 func (p *fakePanes) Paste(_ context.Context, target, text string) error {
@@ -179,12 +213,31 @@ func (p *fakePanes) Paste(_ context.Context, target, text string) error {
 func (p *fakePanes) SendEnter(_ context.Context, target string) error {
 	p.mu.Lock()
 	onSubmit := p.onSubmit
+	enterErr := p.enterErr
 	p.writes = append(p.writes, "enter("+target+")")
 	p.mu.Unlock()
+	if enterErr != nil {
+		return enterErr
+	}
 	if onSubmit != nil {
 		onSubmit()
 	}
 	return nil
+}
+
+// pasteCount reports how many pastes reached the pane. Counting the writes
+// rather than the echoes: a test whose echo is unset still needs to know
+// whether the courier pasted once or twice.
+func (p *fakePanes) pasteCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, w := range p.writes {
+		if strings.HasPrefix(w, "paste(") {
+			n++
+		}
+	}
+	return n
 }
 
 func (p *fakePanes) recorded() []string {
@@ -193,17 +246,27 @@ func (p *fakePanes) recorded() []string {
 	return append([]string(nil), p.writes...)
 }
 
-// echoPanes builds a pane writer whose pastes show up in target's pane, so the
-// courier's paste verification sees what it just wrote.
+// echoPanes stands in for a CLI that echoes a pasted message into its composer.
+// It writes real claude chrome because pasteConfirmed reads only a locatable
+// composer, not a bare line.
 func echoPanes(target *fakeTarget) *fakePanes {
 	p := &fakePanes{}
-	p.echo = func(text string) { target.appendPane(text) }
-	// Submitting scrolls the composer contents up into the transcript. The
-	// courier decides that by looking at the pane's tail, so stand in for the
-	// fresh empty composer with enough lines to push the submitted text out of
-	// it.
-	p.onSubmit = func() { target.appendPane("> ") }
+	p.echo = func(text string) { target.appendPane(claudeComposerPane(text)) }
+	// Submitting scrolls the composer contents up into the transcript, leaving
+	// a fresh empty composer behind.
+	p.onSubmit = func() { target.appendPane(claudeComposerPane("")) }
 	return p
+}
+
+// claudeComposerPane renders a composer holding body as claude draws it.
+func claudeComposerPane(body string) string {
+	return strings.Join([]string{
+		"────────────────────────────────────────────",
+		"❯ " + body,
+		"────────────────────────────────────────────",
+		"  ~/wt/branch  main  Opus 4.6  ctx:43%  tokens:20k",
+		"  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+	}, "\n")
 }
 
 // testCourierResultDir names a result dir inside this test's temp dir without
@@ -462,6 +525,12 @@ func TestSendToUnknownSessionErrors(t *testing.T) {
 
 // TestDrainDiscardsQueueForTerminalSession stops the on-disk queue leaking when
 // a recipient dies with mail still waiting.
+//
+// It asserts on EVERY per-recipient map, not just the queue. discard is the
+// only lifecycle cleanup point the courier has, so a map it forgets is a map
+// that never empties: one entry per session that ever held a delivery, kept for
+// the process lifetime, and inherited by any session ID reused after a terminal
+// transition.
 func TestDrainDiscardsQueueForTerminalSession(t *testing.T) {
 	t.Parallel()
 	c, target, _ := newTestCourier(t)
@@ -469,10 +538,55 @@ func TestDrainDiscardsQueueForTerminalSession(t *testing.T) {
 	_, err := c.Send(context.Background(), "", "s1", "hello", true)
 	require.NoError(t, err)
 
+	// Populate the state a held delivery leaves behind, so the assertions below
+	// are about release and not about maps that were empty all along.
+	c.noteStaged("s1", "hello")
+	c.noteDraftHold("s1", "a half-typed line")
+	require.True(t, c.noteBlockedReport("s1", "a half-typed line"))
+	c.notePaneHold("s1", []string{"some pane content"})
+	c.mu.Lock()
+	for name, populated := range map[string]bool{
+		"staged":          len(c.staged) == 1,
+		"heldForDraft":    len(c.heldForDraft) == 1,
+		"reportedBlocked": len(c.reportedBlocked) == 1,
+		"heldForPane":     len(c.heldForPane) == 1,
+	} {
+		require.True(t, populated, "%s must hold an entry before discard for this test to prove anything", name)
+	}
+	c.mu.Unlock()
+
 	target.set("s1", StatusFailed, RunnerTypeTmux)
 	c.Drain(context.Background(), "s1")
 
 	assert.Empty(t, c.Pending("s1"))
+	c.mu.Lock()
+	assert.Empty(t, c.pending, "pending")
+	assert.Empty(t, c.staged, "staged")
+	assert.Empty(t, c.heldForDraft, "heldForDraft")
+	assert.Empty(t, c.reportedBlocked, "reportedBlocked")
+	assert.Empty(t, c.heldForPane, "heldForPane")
+	c.mu.Unlock()
+
+	// And again with NO queue, which is the ordinary case: Drain removes
+	// pending itself once the last message lands, so a recipient whose mail all
+	// delivered and then went terminal reaches discard with nothing queued.
+	// Gating the release on a queue made the cleanup miss exactly that session.
+	c.noteStaged("s1", "hello")
+	c.noteDraftHold("s1", "a half-typed line")
+	require.True(t, c.noteBlockedReport("s1", "a half-typed line"))
+	c.notePaneHold("s1", []string{"some pane content"})
+	c.mu.Lock()
+	require.Empty(t, c.pending, "this half of the test is only meaningful with no queue")
+	c.mu.Unlock()
+
+	c.discard("s1")
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	assert.Empty(t, c.staged, "staged, with no queue to gate on")
+	assert.Empty(t, c.heldForDraft, "heldForDraft, with no queue to gate on")
+	assert.Empty(t, c.reportedBlocked, "reportedBlocked, with no queue to gate on")
+	assert.Empty(t, c.heldForPane, "heldForPane, with no queue to gate on")
 }
 
 // TestQueueSurvivesReload is why the queue is on disk: a bramble restart must
@@ -1082,9 +1196,8 @@ func TestNoReportIsLostWhenManySubagentsFinishAtOnce(t *testing.T) {
 	parentID, _ := ids(t)
 	target.set(parentID, StatusRunning, RunnerTypeTmux)
 
-	// Slow enough that the emitter below runs far ahead of the handler. Against
-	// the bounded channel this replaced, that is what lost events — measured, 8
-	// of the 150 below.
+	// Slow enough that the emitter runs far ahead of the handler, which is what
+	// lost events with a bounded channel.
 	target.mu.Lock()
 	target.captureDelay = 2 * time.Millisecond
 	target.mu.Unlock()
@@ -1626,6 +1739,48 @@ func TestQueuedFollowUpRearmsReportingWhenDelivered(t *testing.T) {
 	assert.Len(t, c.Pending(parentID), 2)
 }
 
+// TestHeldWriteDoesNotRearmReporting covers the case the assertion in
+// TestQueuedFollowUpRearmsReportingWhenDelivered is worded for but cannot reach.
+// That test queues by making the recipient StatusRunning, so deliver skips the
+// write branch and write is never entered. A HELD write is different: the
+// recipient is idle, write runs, captures the pane, finds a draft, and returns
+// errComposerBusy having written nothing.
+//
+// The re-arm must follow what was written, not what was attempted. Nothing was
+// written and no turn started, so the child's next idle is the same turn the
+// parent already has -- re-arming there delivers the parent a duplicate report,
+// and for a tmux child costs another full pane capture and another result file.
+// This is steady state, not a rare failure: errComposerBusy repeats every
+// retryDelay for as long as the user's draft sits there.
+func TestHeldWriteDoesNotRearmReporting(t *testing.T) {
+	t.Parallel()
+	c, target, parentID, childID := reportFixture(t, StatusIdle)
+	target.setBackend(childID, ProviderClaude, "claude-opus-5")
+
+	reportNow(c, target, childID)
+	require.Len(t, c.Pending(parentID), 1, "precondition: the child's first idle is reported")
+
+	// A user is mid-sentence in the child's composer, so the reply is held.
+	target.appendPane("❯ file the dev deprovisioning bug")
+	queued, err := c.Send(context.Background(), parentID, childID, "round two", true)
+	require.NoError(t, err)
+	require.True(t, queued, "precondition: a held delivery stays queued")
+
+	target.setChild(childID, parentID, StatusIdle, RunnerTypeTmux)
+	reportNow(c, target, childID)
+	assert.Len(t, c.Pending(parentID), 1,
+		"a held write started no turn, so it must not re-arm idle reporting")
+
+	// Holding is not dropping: once the composer clears, the delivery lands and
+	// the turn it starts IS reportable again.
+	target.setPane("❯ ")
+	c.Drain(context.Background(), childID)
+	target.setChild(childID, parentID, StatusIdle, RunnerTypeTmux)
+	reportNow(c, target, childID)
+	assert.Len(t, c.Pending(parentID), 2,
+		"once the write actually lands, the turn it starts is news again")
+}
+
 // TestSubmittedWriteMarksSessionRunning pins the fix for a bug that silently
 // ended every two-way conversation after one round.
 //
@@ -1708,6 +1863,9 @@ func TestDroppedPasteIsRetried(t *testing.T) {
 	t.Parallel()
 	target := newFakeTarget()
 	target.set("s1", StatusIdle, RunnerTypeTmux)
+	// Codex is the provider whose TUI drops pastes, and the only one the
+	// courier re-pastes for.
+	target.setBackend("s1", ProviderCodex, "gpt-5.4-mini")
 
 	panes := echoPanes(target)
 	var pastes int
@@ -1737,6 +1895,7 @@ func TestPersistentlyDroppedPasteKeepsDeliveryQueued(t *testing.T) {
 	t.Parallel()
 	target := newFakeTarget()
 	target.set("s1", StatusRunning, RunnerTypeTmux)
+	target.setBackend("s1", ProviderCodex, "gpt-5.4-mini")
 
 	panes := &fakePanes{} // echo unset: every paste is swallowed
 	c, err := NewCourier(target, panes, testCourierConfig(t))
@@ -1837,4 +1996,1260 @@ func TestConcurrentDrainAndSendKeepsQueueConsistent(t *testing.T) {
 	require.NoError(t, err)
 	assert.Lenf(t, reloaded.Pending("parent"), len(inMemory),
 		"the persisted queue disagrees with the live one")
+}
+
+// TestCursorDeliveryPastesOnceAndSubmits: cursor-agent collapses a bracketed
+// paste into a "[Pasted text #N]" chip and never echoes the characters, so
+// looking for the text itself can never succeed. Before this was provider-aware
+// every cursor delivery pasted twice and then refused to submit.
+//
+// What fixes cursor is that it is not verified at all — Courier.write checks
+// pasteVerifyRequired before it probes, and cursor's entry is required:false —
+// NOT that a chip is accepted as proof. Measured: deleting cursor's chipMarkers
+// leaves the end-to-end half of this test green and fails only the direct
+// pasteConfirmed asserts below, which exercise a branch production never
+// reaches for cursor. Those asserts are kept as the pin on the table entry
+// itself, which is inert until cursor becomes required:true; the regression
+// signal for the shipped cursor fix is TestUnverifiablePasteStillSubmits.
+func TestCursorDeliveryPastesOnceAndSubmits(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderCursor, "cursor-composer-2")
+
+	panes := &fakePanes{}
+	var pastes int
+	panes.echo = func(string) {
+		pastes++
+		// What cursor actually shows: a chip standing in for the content.
+		target.appendPane("[Pasted text #1 +12 lines]")
+	}
+	panes.onSubmit = func() { target.appendPane("> ") }
+
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "the report body", true)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, pastes, "a chip is proof enough; the text must not be pasted twice")
+	assert.Contains(t, panes.recorded(), "enter(@7)", "the delivery must be submitted")
+	assert.Equal(t, []SessionID{"s1"}, target.markedRunning)
+	assert.Empty(t, c.Pending("s1"), "a delivered message must leave the queue")
+
+	// Below this line the subject changes: the delivery above succeeded because
+	// cursor is not verified, and these two asserts pin the table entry rather
+	// than the delivery. They are the only thing that would notice cursor's
+	// chipMarkers being dropped, and they matter for the day cursor becomes
+	// required:true — at which point scanning for the pasted characters could
+	// never succeed and only the chip would confirm.
+	assert.True(t, pasteConfirmed(ProviderCursor,
+		[]string{"[Pasted text #1 +12 lines]"}, "the report body", pasteProbe("the report body")),
+		"a chip stands in for the pasted text")
+	assert.False(t, pasteConfirmed(ProviderCodex,
+		[]string{"[Pasted text #1 +12 lines]"}, "the report body", pasteProbe("the report body")),
+		"a chip is cursor's chrome; codex must not accept it as evidence")
+}
+
+// TestUnverifiablePasteStillSubmits is the regression test for the reported
+// bug. tmux reported the paste succeeded; a pane we cannot read back is
+// silence, not a negative. Re-pasting on silence is what put the message in
+// the composer twice and then never submitted it.
+func TestUnverifiablePasteStillSubmits(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		backend string
+		model   string
+	}{
+		{"cursor renders nothing we can match", ProviderCursor, "cursor-composer-2"},
+		{"unresolvable model has no known chrome", "", "not-a-real-model"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			target := newFakeTarget()
+			target.set("s1", StatusIdle, RunnerTypeTmux)
+			if tc.backend != "" || tc.model != "" {
+				target.setBackend("s1", tc.backend, tc.model)
+			}
+
+			panes := &fakePanes{} // echo unset: the pane never shows the text
+			c, err := NewCourier(target, panes, testCourierConfig(t))
+			require.NoError(t, err)
+
+			_, err = c.Send(context.Background(), "", "s1", "never echoed", true)
+			require.NoError(t, err)
+
+			assert.Equal(t, 1, panes.pasteCount(), "one paste only — never double-paste on silence")
+			assert.Contains(t, panes.recorded(), "enter(@7)", "the message must still be submitted")
+			assert.Empty(t, c.Pending("s1"), "the delivery must not stay queued")
+		})
+	}
+}
+
+// TestDeliveryHeldWhileComposerHasDraft: a paste appends to whatever the user
+// is typing, and the Enter that follows submits their half-written sentence
+// wearing the delivered text. The idle probe cannot catch this on its own —
+// a composer holding a draft still reads as idle.
+func TestDeliveryHeldWhileComposerHasDraft(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	// A real claude composer mid-sentence. The glyph is followed by U+00A0.
+	target.appendPane("❯ file the dev deprovisioning bug")
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	assert.Zero(t, panes.pasteCount(), "nothing may be pasted into a draft")
+	assert.NotContains(t, panes.recorded(), "enter(@7)", "the user's draft must not be submitted")
+	assert.Len(t, c.Pending("s1"), 1, "the message stays queued for the next transition")
+	assert.Empty(t, target.markedRunning, "no turn started")
+}
+
+// TestDeliveryProceedsOnceDraftIsCleared: holding is not dropping. Once the
+// composer is empty the queued message goes out on the next drain.
+func TestDeliveryProceedsOnceDraftIsCleared(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.appendPane("❯ half a thought")
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "queued while typing", true)
+	require.NoError(t, err)
+	require.Len(t, c.Pending("s1"), 1, "held while the draft was there")
+
+	// The user submits or clears the line: the composer is empty again.
+	target.appendPane("❯ ")
+	c.Drain(context.Background(), "s1")
+
+	assert.Contains(t, panes.recorded(), "enter(@7)", "delivery resumes once the composer is clear")
+	assert.Empty(t, c.Pending("s1"), "the queue drains")
+}
+
+// TestComposerBodyIsUnicodeAwareAtEveryReader pins the byte that decides
+// whether any mail is ever delivered to a claude session, at the one helper all
+// three composer readers share. The prompt glyph is followed by a non-breaking
+// space (U+00A0), so trimming only ordinary spaces leaves " " behind.
+//
+// Testing composerBody rather than each caller is the point: the same regression
+// breaks the three readers in three different directions — judgeComposerLine
+// reports a draft on every empty composer and holds back every delivery on the
+// host, composerHoldsThisDelivery stops recognizing bramble's own staged text,
+// and confirmsComposer stops confirming a landed paste and drives write() into a
+// second paste plus a re-queue. Before the extraction each reader re-derived the
+// body inline and only this file's caller was covered, so an ASCII cutset in
+// either of the other two passed the whole suite.
+func TestComposerBodyIsUnicodeAwareAtEveryReader(t *testing.T) {
+	t.Parallel()
+	for _, line := range []string{
+		"❯ ", // real capture: glyph + NBSP
+		"❯ ", // glyph + ordinary space
+		"❯",  // bare glyph
+	} {
+		body, hasGlyph := composerBody(line)
+		assert.True(t, hasGlyph, "the glyph is present: %q", line)
+		assert.Equal(t, "", body, "an empty composer has an empty body: %q", line)
+	}
+	for _, line := range []string{
+		"❯ real text",
+		"❯ real text",
+	} {
+		body, hasGlyph := composerBody(line)
+		assert.True(t, hasGlyph, "%q", line)
+		assert.Equal(t, "real text", body, "the separator is not part of the body: %q", line)
+	}
+	// No glyph is not a composer at all; judgeComposerLine turns this into
+	// known=false rather than into a verdict.
+	if _, hasGlyph := composerBody("  Add a follow-up"); hasGlyph {
+		t.Fatal("a line without the glyph must not report one")
+	}
+}
+
+// TestEmptyClaudeComposerIsNotADraft keeps the caller-level assertion beside the
+// helper-level one: composerBody is only correct if the verdict it feeds is.
+func TestEmptyClaudeComposerIsNotADraft(t *testing.T) {
+	t.Parallel()
+	for _, line := range []string{
+		"❯ ", // real capture: glyph + NBSP
+		"❯ ", // glyph + ordinary space
+		"❯",  // bare glyph
+	} {
+		draft, known := composerDraft(ProviderClaude, []string{line})
+		assert.True(t, known, "a claude composer is readable: %q", line)
+		assert.False(t, draft, "an empty composer is not a draft: %q", line)
+	}
+
+	// Both spellings of the separator, so neither trim can regress to an
+	// ASCII-only cutset without a test noticing.
+	for _, line := range []string{
+		"❯ real text", // ordinary space
+		"❯ real text", // NBSP, as the real TUI writes it
+	} {
+		draft, known := composerDraft(ProviderClaude, []string{line})
+		assert.True(t, known, "%q", line)
+		assert.True(t, draft, "typed text is a draft: %q", line)
+	}
+}
+
+// TestComposerDraftUnknownForUnreadableProviders: cursor and codex render
+// placeholder text that disappears the moment the user types, so a draft is
+// indistinguishable from a CLI that has not finished booting. Unknown must mean
+// "deliver anyway" — refusing to write to every pane we cannot parse would
+// strand mail rather than protect it.
+func TestComposerDraftUnknownForUnreadableProviders(t *testing.T) {
+	t.Parallel()
+	for _, provider := range []string{ProviderCursor, ProviderCodex, ""} {
+		_, known := composerDraft(provider, []string{"  → Add a follow-up"})
+		assert.False(t, known, "provider %q composer is not judged", provider)
+	}
+}
+
+// TestDraftHoldIsBoundedByElapsedTime pins elapsed time on an unchanged draft.
+// Counting write attempts measures how often bramble looked at the pane, not
+// how long the draft sat there.
+func TestDraftHoldIsBoundedByElapsedTime(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.appendPane("❯ a half-typed line whose author has gone home")
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+	require.Len(t, c.Pending("s1"), 1, "the first attempt holds")
+	require.Zero(t, panes.pasteCount(), "nothing is pasted while the hold stands")
+
+	// Any number of attempts inside the grace period must keep holding: the
+	// bound is time, not attempts.
+	for i := 0; i < 50; i++ {
+		c.Drain(context.Background(), "s1")
+	}
+	require.Zero(t, panes.pasteCount(), "50 attempts inside the grace period must not release")
+	require.Len(t, c.Pending("s1"), 1)
+
+	// Past the grace period the delivery still holds. tmux paste-buffer appends,
+	// so pressing Enter would submit the report joined to the human's draft.
+	// maxDeliveryAge prunes only at process start and deletes rather than
+	// delivers, so it is not a running-process backstop. A paste chip cannot
+	// answer whose paste it is; see TestAnUnownedChipIsNeitherPastedOverNorSubmitted.
+	now = now.Add(composerHoldGrace + time.Second)
+	c.Drain(context.Background(), "s1")
+
+	assert.Zero(t, panes.pasteCount(),
+		"a human's draft is never pasted over, however long it has sat there")
+	assert.Len(t, c.Pending("s1"), 1, "the delivery stays queued and keeps retrying")
+}
+
+// TestActivelyEditedDraftHoldsIndefinitely: a changing draft means somebody is
+// at the keyboard, and a drafter who is present should be waited for, not
+// raced. This is the case a call-counting bound got wrong — a wrapped draft's
+// continuation lines are not chrome, so every keystroke flips contentChanged,
+// revives the session, and would have burned one attempt from the budget.
+func TestActivelyEditedDraftHoldsIndefinitely(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.appendPane("❯ file the")
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+	require.Len(t, c.Pending("s1"), 1)
+
+	// Someone keeps typing, well past the grace period in total.
+	for _, draft := range []string{
+		"❯ file the dev",
+		"❯ file the dev deprovisioning",
+		"❯ file the dev deprovisioning bug",
+	} {
+		now = now.Add(composerHoldGrace)
+		target.appendPane(draft)
+		c.Drain(context.Background(), "s1")
+	}
+
+	assert.Zero(t, panes.pasteCount(),
+		"a draft being actively edited must never be delivered over")
+	assert.Len(t, c.Pending("s1"), 1, "the delivery stays queued while the user types")
+}
+
+// TestDraftHoldResetsWhenTheComposerClears: the grace applies to a single
+// uninterrupted draft, not to a session's lifetime.
+func TestDraftHoldResetsWhenTheComposerClears(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.appendPane("❯ typing")
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "first", true)
+	require.NoError(t, err)
+	require.Len(t, c.Pending("s1"), 1)
+
+	// The user finishes the line; the delivery lands normally.
+	target.appendPane("❯ ")
+	c.Drain(context.Background(), "s1")
+	require.Empty(t, c.Pending("s1"), "the delivery went out on a clear composer")
+
+	// A fresh draft is held again, with the full grace period.
+	target.appendPane("❯ typing again")
+	_, err = c.Send(context.Background(), "", "s1", "second", true)
+	require.NoError(t, err)
+	assert.Len(t, c.Pending("s1"), 1, "a new draft is held, not delivered over")
+}
+
+// TestBrambleOwnStagedDeliveryIsOverwritten: a composer holding a message
+// bramble itself staged is not a human draft. Nothing but a keypress clears a
+// composer, so holding for it waits for someone who is not coming and every
+// later delivery queues behind it forever.
+//
+// Ownership is decided by matching what is actually queued for the recipient,
+// not by the "[bramble]" prefix — a user can type that themselves, and their
+// draft must still be protected.
+func TestBrambleOwnStagedDeliveryIsOverwritten(t *testing.T) {
+	t.Parallel()
+
+	t.Run("our own staged delivery does not hold the queue", func(t *testing.T) {
+		t.Parallel()
+		target := newFakeTarget()
+		target.set("s1", StatusIdle, RunnerTypeTmux)
+		target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+		panes := echoPanes(target)
+		c, err := NewCourier(target, panes, testCourierConfig(t))
+		require.NoError(t, err)
+
+		staged := subagentReportPrefix + " subagent child-1 (planner, opus) is idle"
+		// The message is queued and its text is sitting in the composer, as it
+		// would be after a --queue send that never pressed Enter.
+		_, err = c.Send(context.Background(), "", "s1", staged, true)
+		require.NoError(t, err)
+		target.appendPane("❯ " + staged)
+		c.Drain(context.Background(), "s1")
+
+		assert.Empty(t, c.Pending("s1"), "bramble's own staged text must not wedge its queue")
+	})
+
+	t.Run("a user draft wearing the prefix is still protected", func(t *testing.T) {
+		t.Parallel()
+		target := newFakeTarget()
+		target.set("s1", StatusIdle, RunnerTypeTmux)
+		target.setBackend("s1", ProviderClaude, "claude-opus-5")
+		// Someone typed the prefix themselves; nothing matching it is queued.
+		target.appendPane("❯ " + subagentReportPrefix + " I was about to ask about")
+
+		panes := echoPanes(target)
+		c, err := NewCourier(target, panes, testCourierConfig(t))
+		require.NoError(t, err)
+
+		_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+		require.NoError(t, err)
+
+		assert.Zero(t, panes.pasteCount(),
+			"a user draft must be protected even when it wears bramble's prefix")
+		assert.Len(t, c.Pending("s1"), 1, "the delivery stays queued")
+	})
+}
+
+// TestOwnDeliveryOverwriteIsNotLoggedAsAGraceExpiry: the grace-period warning
+// says a human's unchanged draft was typed over after composerHoldGrace. When
+// bramble overwrites its own staged text, none of that happened — no draft was
+// held and no grace elapsed — so borrowing that line tells an operator the
+// opposite of the truth, inverting the distinct diagnostic this PR added.
+func TestOwnDeliveryOverwriteIsNotLoggedAsAGraceExpiry(t *testing.T) {
+	// Not parallel: it captures the shared standard logger.
+	var logs bytes.Buffer
+	oldOut, oldFlags := log.Writer(), log.Flags()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(oldOut); log.SetFlags(oldFlags) })
+
+	target := newFakeTarget()
+	// Busy, so the first Send only queues: the delivery must still be pending
+	// when the staged text is already sitting in the composer, which is the
+	// state the own-delivery branch exists for.
+	target.set("s1", StatusRunning, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	staged := subagentReportPrefix + " subagent child-1 (planner, opus) is idle"
+	queued, err := c.Send(context.Background(), "", "s1", staged, true)
+	require.NoError(t, err)
+	require.True(t, queued, "precondition: the delivery is queued, not written")
+
+	// The same text is in the composer — a --queue send that never pressed
+	// Enter — and the session is now idle, so the drain attempts a write.
+	target.appendPane("❯ " + staged)
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	c.Drain(context.Background(), "s1")
+
+	// The delivery goes out without a second paste — the text is already in the
+	// composer, and tmux paste-buffer appends (see
+	// TestStagedDeliveryIsSubmittedNotRePasted). What matters here is that it
+	// was not held.
+	require.Contains(t, panes.recorded(), "enter(@7)",
+		"precondition: bramble's own staged text must be submitted, not held")
+	require.Empty(t, c.Pending("s1"), "precondition: and must leave the queue")
+	assert.NotContains(t, logs.String(), "past the grace period",
+		"overwriting bramble's own text must not claim a human draft was typed over")
+}
+
+// TestClaudePasteIsVerified: claude's composer echoes a pasted message
+// verbatim — measured across 13 live panes, none of which rendered a
+// "[Pasted text …]" chip — so paste evidence is readable for it and must be
+// required.
+//
+// This is the same composer composerDraftText reads: the draft protection in
+// this change rests on claude's composer being legible, so declining to check
+// it would be the two tables contradicting each other. A paste claude's TUI
+// dropped would otherwise go unnoticed, because deliver() writes directly
+// rather than queueing — the message is lost and MarkRunning wedges the session
+// on a turn that never started.
+func TestClaudePasteIsVerified(t *testing.T) {
+	t.Parallel()
+
+	require.True(t, pasteVerifyRequired(ProviderClaude),
+		"claude's composer is readable, so its paste must be confirmed before Enter")
+
+	t.Run("an echoed paste is submitted once", func(t *testing.T) {
+		t.Parallel()
+		target := newFakeTarget()
+		target.set("s1", StatusIdle, RunnerTypeTmux)
+		target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+		panes := echoPanes(target) // claude echoes, as the live panes show
+		c, err := NewCourier(target, panes, testCourierConfig(t))
+		require.NoError(t, err)
+
+		_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+		require.NoError(t, err)
+
+		assert.Equal(t, 1, panes.pasteCount(), "a confirmed paste is never repeated")
+		assert.Contains(t, panes.recorded(), "enter(@7)", "and is submitted")
+		assert.Empty(t, c.Pending("s1"))
+	})
+
+	t.Run("a paste that never lands is queued, not submitted", func(t *testing.T) {
+		t.Parallel()
+		target := newFakeTarget()
+		target.set("s1", StatusIdle, RunnerTypeTmux)
+		target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+		panes := &fakePanes{} // the pane never shows the text: the TUI dropped it
+		c, err := NewCourier(target, panes, testCourierConfig(t))
+		require.NoError(t, err)
+
+		_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+		require.NoError(t, err)
+
+		assert.NotContains(t, panes.recorded(), "enter(@7)",
+			"never press Enter on a paste that did not arrive — that starts a turn with no prompt")
+		assert.Len(t, c.Pending("s1"), 1, "the delivery stays queued for the next transition")
+	})
+}
+
+// TestUnreadableComposerCostsNoPaneCapture: composerDraftText returns unknown
+// for every provider but claude, so capturing the pane first made each codex,
+// cursor and unresolved-model delivery pay a tmux round-trip for an answer that
+// is thrown away — the same waste the pasteVerifyRequired ordering avoids, and
+// it widens the same paste-to-Enter window.
+func TestUnreadableComposerCostsNoPaneCapture(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderCursor, "cursor-composer-2")
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	// Cursor's composer cannot be read and its paste evidence is not required,
+	// so neither of those checks may reach tmux.
+	require.False(t, composerReadable(ProviderCursor), "precondition")
+	require.False(t, pasteVerifyRequired(ProviderCursor), "precondition")
+	// One capture total, however many questions are asked of it. Cursor does
+	// have an idle probe — the only thing standing between a delivery and a
+	// live cursor turn, since cursor reports no turn ends at all and
+	// info.Status can say idle for a session that is running — so the pane is
+	// read once and every reader shares that frame. Two captures would both
+	// cost a second round-trip and let the readers disagree about the pane.
+	require.True(t, providerHasIdleProbe(ProviderCursor), "precondition")
+	assert.Equal(t, 1, target.captures(),
+		"the pane is captured once and shared; the discarded checks add nothing")
+}
+
+// TestNothingReadablePaysNoPaneCapture: a provider with neither an idle probe
+// nor a readable composer has no question worth asking of its pane, so it must
+// not pay a tmux round-trip for two verdicts that are both discarded.
+func TestNothingReadablePaysNoPaneCapture(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", "", "some-unknown-model")
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	require.False(t, providerHasIdleProbe(""), "precondition")
+	require.False(t, composerReadable(""), "precondition")
+	assert.Zero(t, target.captures(),
+		"no pane capture may be made when nothing can read the pane")
+	assert.Contains(t, panes.recorded(), "enter(@7)", "and the delivery still goes out")
+}
+
+// TestStagedDeliveryIsSubmittedNotRePasted: tmux paste-buffer APPENDS into the
+// composer — PaneWriter.Paste is set-buffer + paste-buffer with no clearing
+// step. So when an earlier attempt already pasted this message and then failed
+// before pressing Enter, pasting again would leave two copies and submit both
+// as one prompt: the double-paste symptom this change set out to remove,
+// re-created on the failure path.
+//
+// The state is reachable through failure paths this PR itself creates — a
+// SendEnter error requeues with the text still staged, and claude's now-required
+// paste verification requeues after a re-paste.
+func TestStagedDeliveryIsSubmittedNotRePasted(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+	staged := subagentReportPrefix + " subagent child-1 (planner, opus) is idle"
+	// The message is already in the composer from a previous attempt.
+	target.appendPane("❯ " + staged)
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", staged, true)
+	require.NoError(t, err)
+
+	assert.Zero(t, panes.pasteCount(),
+		"the message is already staged; pasting again would submit it twice in one prompt")
+	assert.Contains(t, panes.recorded(), "enter(@7)", "it must still be submitted")
+	assert.Empty(t, c.Pending("s1"), "and leave the queue")
+}
+
+// TestADifferentStagedMessageStillHolds: a composer holding a DIFFERENT bramble
+// message is still a composer that must not be pasted into — appending would
+// submit both messages as a single prompt. Only the message about to be written
+// may skip the paste.
+func TestADifferentStagedMessageStillHolds(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.appendPane("❯ " + subagentReportPrefix + " subagent OTHER-child is idle")
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1",
+		subagentReportPrefix+" subagent child-1 is idle", true)
+	require.NoError(t, err)
+
+	assert.Zero(t, panes.pasteCount(),
+		"a different staged message must not be appended to")
+	assert.Len(t, c.Pending("s1"), 1, "the delivery is held for the next transition")
+}
+
+// TestStagedDeliveryIsNotAppendedByPasteVerification pins that alreadyStaged
+// covers both the first paste and the paste-verification retry. Otherwise
+// <staged copy><second copy> is submitted as one prompt.
+//
+// The two predicates disagree most cleanly when the pane shows less of the
+// message than pasteProbeLen: composerHoldsThisDelivery matches on a prefix in
+// either direction, while the probe wants a fixed 24 characters.
+func TestStagedDeliveryIsNotAppendedByPasteVerification(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+	// A short prefix of the message, as a narrow pane would show it.
+	target.appendPane(claudeComposerPane(subagentReportPrefix + " sub"))
+
+	panes := &fakePanes{} // no echo: the pane keeps showing only that prefix
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	full := subagentReportPrefix + " subagent child-1 (planner, opus) is idle"
+	_, err = c.Send(context.Background(), "", "s1", full, true)
+	require.NoError(t, err)
+
+	assert.Zero(t, panes.pasteCount(),
+		"verification must not append a second copy of a message already staged")
+}
+
+// TestPlainQueuedMessageIsNotDuplicated: a queued CLI message carries no
+// "[bramble]" prefix, so requiring one classified it as a human draft — the
+// retry after a failed SendEnter then pasted it again and submitted a
+// duplicate. Ownership is decided by matching the queued text, not a prefix.
+func TestPlainQueuedMessageIsNotDuplicated(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.appendPane(claudeComposerPane("hello"))
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "hello", true)
+	require.NoError(t, err)
+
+	assert.Zero(t, panes.pasteCount(),
+		"a plain queued message already in the composer must not be pasted again")
+	// Both halves matter: requiring the "[bramble]" prefix also leaves
+	// pasteCount at zero, but by classifying the message as a HUMAN draft and
+	// holding it — so the queue never drains. Assert it was actually delivered.
+	assert.Contains(t, panes.recorded(), "enter(@7)", "it must be submitted, not held")
+	assert.Empty(t, c.Pending("s1"), "and must leave the queue")
+}
+
+// TestUserPasteIsNotMistakenForOurOwnStagedDelivery pins the ownership rule
+// that decides whether a non-empty composer gets Enter pressed on it.
+//
+// A "[Pasted text #N]" chip is what claude renders for ANY paste, including one
+// the USER made and has not yet submitted. Accepting a chip as proof that
+// bramble staged the delivery meant that user's block was submitted for them —
+// the exact harm the draft hold exists to prevent — while the delivery itself
+// was never written yet was dropped from the queue as though it had been.
+//
+// The only thing that can answer "did bramble put this here" is bramble's own
+// record of having pasted it, which this courier has not.
+func TestUserPasteIsNotMistakenForOurOwnStagedDelivery(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	// The user pasted something and has not hit Enter.
+	target.appendPane(claudeComposerPane("[Pasted text #3 +45 lines]"))
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	assert.NotContains(t, panes.recorded(), "enter(@7)",
+		"a chip is not proof the composer is ours; submitting it sends the user's paste")
+	assert.Len(t, c.Pending("s1"), 1,
+		"and the delivery must stay queued rather than be dropped as delivered")
+}
+
+// TestShortDraftPrefixingTheMessageIsNotOurs is the same rule in miniature: a
+// one-sided prefix match let a short typed line that happens to begin the
+// message pass as bramble's own staged text.
+func TestShortDraftPrefixingTheMessageIsNotOurs(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.appendPane(claudeComposerPane("a report"))
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	assert.NotContains(t, panes.recorded(), "enter(@7)",
+		"a typed line that merely prefixes the message must not be submitted")
+	assert.Len(t, c.Pending("s1"), 1, "the delivery stays queued")
+}
+
+// TestPaneShowingAWorkingTurnHoldsTheDelivery covers the loop seen in
+// production: bramble's bookkeeping said idle (codex's notify hook fires ahead
+// of its prompt being ready), so a delivery was pasted into a live turn, the
+// TUI discarded it, verification failed, and the pair repeated every retryDelay
+// for as long as the turn ran — one "paste did not reach ...'s prompt" warning
+// per retry, per stuck session.
+//
+// The recipient's own pane is the authority on whether its turn is over.
+func TestPaneShowingAWorkingTurnHoldsTheDelivery(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux) // bookkeeping says idle...
+	target.setBackend("s1", ProviderCodex, "gpt-5.6-terra")
+	// ...but codex's own pane says otherwise.
+	target.appendPane(strings.Join([]string{
+		"• Ran 3 commands · ctrl + t to view transcript",
+		"◦ Working (28s • esc to interrupt)",
+		"",
+		"› Ask Codex to do anything",
+	}, "\n"))
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	assert.Zero(t, panes.pasteCount(),
+		"nothing may be pasted into a pane whose CLI says a turn is in flight")
+	assert.Len(t, c.Pending("s1"), 1, "the delivery rides the next idle transition")
+}
+
+// TestUnknownPaneStillDelivers is the other half of that rule. Only a POSITIVE
+// working verdict holds; refusing to deliver into every pane bramble cannot
+// read would strand mail, which is the failure class this PR exists to close.
+func TestUnknownPaneStillDelivers(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderCodex, "gpt-5.6-terra")
+	// No codex chrome at all: the pane says nothing either way.
+	target.appendPane("some unrelated output")
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	assert.Contains(t, panes.recorded(), "enter(@7)", "an unreadable pane must not wedge the queue")
+	assert.Empty(t, c.Pending("s1"))
+}
+
+// TestStagedRecordDoesNotVouchForAChangedComposer: the staged record proves
+// bramble PASTED the text, never that the composer still HOLDS it. A composer
+// is editable between a failed attempt and its retry, so a user who clears it
+// and pastes their own block inside the retry window must not have Enter
+// pressed on their paste.
+//
+// A chip was the case that made this concrete: it is the rendering of *a*
+// paste, so accepting one on the strength of the record alone submitted
+// whatever the user had put there and dropped the delivery as delivered.
+func TestStagedRecordDoesNotVouchForAChangedComposer(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+	text := "a report from a subagent"
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	// An earlier attempt pasted the text and could not submit it.
+	c.noteStaged("s1", text)
+	// The user has since replaced the composer contents with their own paste.
+	target.appendPane(claudeComposerPane("[Pasted text #7 +90 lines]"))
+
+	_, err = c.Send(context.Background(), "", "s1", text, true)
+	require.NoError(t, err)
+
+	assert.NotContains(t, panes.recorded(), "enter(@7)",
+		"the record must not authorize submitting text the composer no longer holds")
+	assert.Len(t, c.Pending("s1"), 1, "and the delivery stays queued")
+}
+
+// TestPaneHoldIsBoundedByElapsedTime: the working verdict is one frame's, and a
+// frame can be wrong in a way that never corrects itself. claudeLineVerdict
+// reports work for a `●` tool line with no sparkle below it — what an
+// interrupted turn leaves on screen — and spinnerRe matches any line opening
+// "* " or "· ", so echoed content can read as a spinner. A pane that is static
+// because the session is idle never changes its mind.
+//
+// Unbounded, that is the "parent's mail never drains" failure this PR exists to
+// close, re-entered through a different door. Bounded, it costs latency.
+func TestPaneHoldIsBoundedByElapsedTime(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderCodex, "gpt-5.6-terra")
+	// A pane stuck reporting work, which never changes because nothing is
+	// running to change it.
+	target.appendPane(strings.Join([]string{
+		"◦ Working (28s • esc to interrupt)",
+		"",
+		"› Ask Codex to do anything",
+	}, "\n"))
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+	require.Len(t, c.Pending("s1"), 1, "precondition: the first verdict holds the delivery")
+	require.Zero(t, panes.pasteCount(), "precondition: nothing was written")
+
+	// Still inside the grace period: still held.
+	now = now.Add(paneHoldGrace - time.Second)
+	c.Drain(context.Background(), "s1")
+	assert.Len(t, c.Pending("s1"), 1, "a hold inside the grace period stands")
+
+	// Past it: the verdict has been unchanged too long to be a real turn.
+	now = now.Add(2 * time.Second)
+	c.Drain(context.Background(), "s1")
+	assert.Empty(t, c.Pending("s1"),
+		"a pane stuck on working must not strand mail for the life of the process")
+}
+
+// TestPaneHoldResetsWhenTheTurnEnds: the grace period covers one uninterrupted
+// run of working verdicts, not the session's lifetime. A turn that ends and a
+// later one that starts must each get the full budget, or a busy session would
+// accumulate its way to the bound and deliver into a live turn.
+func TestPaneHoldResetsWhenTheTurnEnds(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderCodex, "gpt-5.6-terra")
+	working := "◦ Working (28s • esc to interrupt)\n\n› Ask Codex to do anything"
+	target.appendPane(working)
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+	require.Len(t, c.Pending("s1"), 1, "precondition: held")
+
+	// The turn ends, the delivery goes out, and a NEW turn starts.
+	now = now.Add(paneHoldGrace - time.Second)
+	target.setPane("› Ask Codex to do anything")
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	c.Drain(context.Background(), "s1")
+	require.Empty(t, c.Pending("s1"), "precondition: an idle pane delivers")
+
+	target.setPane(working)
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	_, err = c.Send(context.Background(), "", "s1", "a second report", true)
+	require.NoError(t, err)
+	require.Len(t, c.Pending("s1"), 1, "precondition: the new turn holds")
+
+	// Only a second past the FIRST hold's start. If the clock had not been
+	// reset by the intervening idle pane, this would deliver into a live turn.
+	now = now.Add(2 * time.Second)
+	c.Drain(context.Background(), "s1")
+	assert.Len(t, c.Pending("s1"), 1,
+		"each uninterrupted run of working verdicts gets the full grace period")
+}
+
+// TestALongRunningTurnIsNeverReleasedByTheGrace: the pane hold's bound is on
+// STALENESS, not on turn length. A real turn repaints — its elapsed timer moves
+// every second — so however long it runs it keeps restarting the clock and is
+// never released. Only a pane that has stopped changing expires, which is the
+// shape of a false positive rather than of a long turn.
+//
+// Without that distinction the grace period would eventually deliver into a
+// live turn, which is the harm the gate exists to prevent.
+func TestALongRunningTurnIsNeverReleasedByTheGrace(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderCodex, "gpt-5.6-terra")
+	working := func(elapsed int) string {
+		return fmt.Sprintf("◦ Working (%ds • esc to interrupt)\n\n› Ask Codex to do anything", elapsed)
+	}
+	target.setPane(working(1))
+
+	panes := echoPanes(target)
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+	require.Len(t, c.Pending("s1"), 1, "precondition: the turn holds the delivery")
+
+	// Run far past the grace period, repainting as a real turn does.
+	for i := 0; i < 10; i++ {
+		now = now.Add(paneHoldGrace / 2)
+		target.setPane(working(i + 2))
+		target.set("s1", StatusIdle, RunnerTypeTmux)
+		c.Drain(context.Background(), "s1")
+	}
+
+	assert.Len(t, c.Pending("s1"), 1,
+		"a turn that keeps repainting is still working, however long it runs")
+	assert.Zero(t, panes.pasteCount(), "and nothing may be written into it")
+}
+
+// TestTextTypedOntoOurStagedLineIsNotSubmitted: the record widens an exact
+// match to a prefix match in ONE direction only. A composer showing less than
+// we pasted is a capture truncated at the pane width, which is consistent with
+// our paste and nothing else. A composer showing our line AND MORE is our text
+// with something typed onto the end of it — submitting that sends the user's
+// edit while the delivery is dropped as delivered.
+func TestTextTypedOntoOurStagedLineIsNotSubmitted(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+	text := "a report from a subagent"
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	// An earlier attempt pasted the text and could not submit it; the user has
+	// since typed onto the end of the line.
+	c.noteStaged("s1", text)
+	target.setPane(claudeComposerPane(text + " and my own question"))
+
+	_, err = c.Send(context.Background(), "", "s1", text, true)
+	require.NoError(t, err)
+
+	assert.NotContains(t, panes.recorded(), "enter(@7)",
+		"our line with the user's text appended is their draft, not our staged delivery")
+	assert.Len(t, c.Pending("s1"), 1, "the delivery stays queued")
+}
+
+// TestTruncatedCaptureOfOurStagedLineStillCounts is the direction that IS safe,
+// pinned so the fix above cannot be tightened into never matching at all: a
+// capture stops at the pane width, so a composer showing a prefix of what we
+// pasted is that paste seen through a narrow pane.
+func TestTruncatedCaptureOfOurStagedLineStillCounts(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+	text := "a report from a subagent that runs past the width of this pane"
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	c.noteStaged("s1", text)
+	target.setPane(claudeComposerPane("a report from a subagent that runs"))
+
+	_, err = c.Send(context.Background(), "", "s1", text, true)
+	require.NoError(t, err)
+
+	assert.Zero(t, panes.pasteCount(),
+		"the text is already staged; pasting again would submit it twice in one prompt")
+	assert.Contains(t, panes.recorded(), "enter(@7)", "it must still be submitted")
+	assert.Empty(t, c.Pending("s1"))
+}
+
+// TestAChippedPasteLeavesNoStagedRecord: the staged record is only worth
+// keeping if a retry could RECOGNIZE the text in the composer, and a chipped
+// paste can never be matched by any text comparison — claude collapses a large
+// enough paste to "[Pasted text #N]", and a chip is what ANY paste looks like.
+//
+// Kept anyway, such a record would vouch for whatever the chip turned out to
+// be. Dropped, the retry reads an unidentified draft and holds, which costs
+// composerHoldGrace instead of pasting the message on top of its own chip and
+// submitting both in one prompt — the double-paste symptom section 1 removes.
+func TestAChippedPasteLeavesNoStagedRecord(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+
+	text := "a report from a subagent"
+	panes := &fakePanes{}
+	// The CLI chips the paste rather than echoing it, and Enter then fails.
+	panes.echo = func(string) { target.setPane(claudeComposerPane("[Pasted text #1 +80 lines]")) }
+	panes.enterErr = errors.New("send-keys failed")
+
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", text, true)
+	require.NoError(t, err, "Send queues; the write failure surfaces as a retained queue")
+	require.Contains(t, panes.recorded(), "enter(@7)", "precondition: Enter was attempted")
+	require.Len(t, c.Pending("s1"), 1, "precondition: the failed Enter left the delivery queued")
+
+	assert.Empty(t, c.stagedText("s1"),
+		"a record no later comparison could use must not survive the attempt that made it")
+}
+
+// TestAnUnownedChipIsNeitherPastedOverNorSubmitted: a "[Pasted text #N]" chip is
+// what claude renders for ANY paste, so it cannot tell bramble's own unsent
+// paste from a block the user pasted and has not submitted.
+//
+// An earlier version of this branch submitted it, reasoning that "the only
+// paste in play here is one of ours". That is the chip-as-provenance reasoning
+// already removed from composerHoldsThisDelivery, and it is doubly unavailable
+// here: a chipped paste deliberately leaves no staged record (see
+// TestAChippedPasteLeavesNoStagedRecord), so by construction bramble has no way
+// to know whose chip it is. Pressing Enter on it would submit the user's paste
+// and drop this delivery as though it had been sent.
+//
+// Neither pasted over nor submitted: held, and reported.
+func TestAnUnownedChipIsNeitherPastedOverNorSubmitted(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	// A chip this courier has never pasted anything to account for.
+	target.setPane(claudeComposerPane("[Pasted text #1 +80 lines]"))
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+	require.Zero(t, panes.pasteCount(), "precondition: an unidentified composer holds at first")
+
+	now = now.Add(composerHoldGrace + time.Second)
+	c.Drain(context.Background(), "s1")
+
+	assert.Zero(t, panes.pasteCount(), "pasting would append to whatever the chip represents")
+	assert.NotContains(t, panes.recorded(), "enter(@7)",
+		"submitting would send a paste bramble cannot show is its own")
+	assert.Len(t, c.Pending("s1"), 1, "the delivery stays queued rather than being dropped as sent")
+}
+
+// TestOneStandingBlockIsReportedOnce: the grace branch is reached on every
+// retry for as long as the composer holds the same thing, so warning there
+// unconditionally is one line every retryDelay for the life of the block — the
+// log-flood shape errPaneBusy is logged at Debug to avoid. One standing
+// condition is one report.
+func TestOneStandingBlockIsReportedOnce(t *testing.T) {
+	t.Parallel()
+	c := &Courier{
+		reportedBlocked: map[SessionID]string{},
+		heldForDraft:    map[SessionID]draftHold{},
+	}
+
+	assert.True(t, c.noteBlockedReport("s1", "❯ a half-typed line"), "the first block is reported")
+	for i := 0; i < 20; i++ {
+		assert.False(t, c.noteBlockedReport("s1", "❯ a half-typed line"),
+			"the same block must not be reported again on every retry")
+	}
+	assert.True(t, c.noteBlockedReport("s1", "❯ a different half-typed line"),
+		"a new blocking draft is a new situation and is reported")
+
+	// A block that ENDED and came back is a new standing condition, not the
+	// same one repeating. The record is released where the block ends —
+	// clearDraftHold, on the path that goes on to paste — so without that
+	// release "once per block" silently means "once per session per text for
+	// the life of the process", and the second standing block goes unreported.
+	//
+	// clearDraftHold is called directly because that IS the end-of-block
+	// signal: write calls it on the path that proceeds to paste, once the
+	// composer no longer holds a draft.
+	c.clearDraftHold("s1")
+	assert.True(t, c.noteBlockedReport("s1", "❯ a different half-typed line"),
+		"a block that cleared and returned is a new standing condition and is reported again")
+}
+
+// TestAChipBesideTypedTextIsStillAHumanDraft: a chip with text beside it is
+// unambiguously a person's composer — a paste happened AND somebody typed. It
+// holds for the same reason a bare chip does, and this pins the clearer case so
+// no future attempt to read provenance off a chip can start from the easy end.
+func TestAChipBesideTypedTextIsStillAHumanDraft(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.setPane(claudeComposerPane("[Pasted text #1 +80 lines] and my own question"))
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+	now = now.Add(composerHoldGrace + time.Second)
+	c.Drain(context.Background(), "s1")
+
+	assert.Zero(t, panes.pasteCount(),
+		"a chip beside typed text has an author at the keyboard; never paste over it")
+	assert.Len(t, c.Pending("s1"), 1, "the delivery stays queued")
+}
+
+// TestUserTypingDuringPasteVerificationIsNotPastedInto covers the window the
+// draft check cannot: a person starts typing AFTER composerDraftText read an
+// empty composer and BEFORE pasteVerdict returns. The composer then holds
+// "their draft" + "our text", which confirmsComposer's one-way prefix rule
+// correctly refuses to accept as our paste.
+//
+// Refusing is only half the answer. That refusal is a readable negative, and a
+// readable negative used to mean "the TUI dropped it, paste again" — so the
+// repair for a dropped paste ran on a pane where nothing was dropped, appending
+// a second copy to a person's unsent line. Enter would then submit their
+// sentence wearing both copies.
+//
+// The rule this pins: a re-paste is the repair for an EMPTY composer only. A
+// composer holding text bramble cannot own is interference, and interference
+// fails closed the same way a draft found up front does — provenance dropped,
+// delivery re-queued.
+//
+// The pane is mutated from the echo hook because that is the only seam that
+// runs between the two captures; setting it up front would be caught by the
+// draft check instead and would test nothing new.
+func TestUserTypingDuringPasteVerificationIsNotPastedInto(t *testing.T) {
+	t.Parallel()
+	const delivery = "a report from a subagent that ran for a while"
+	const draft = "what were we doing with the "
+
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	// The composer is empty when the draft check reads it, so the write path
+	// proceeds to paste. This is the precondition, not the subject.
+	target.appendPane(claudeComposerPane(""))
+
+	panes := &fakePanes{}
+	panes.echo = func(text string) {
+		// The human was mid-word when our paste landed; tmux paste-buffer
+		// appends, so their line now carries our text too.
+		target.appendPane(claudeComposerPane(draft + text))
+	}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", delivery, true)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, panes.pasteCount(),
+		"a composer holding someone else's draft is not a dropped paste: pasting again appends a second copy to their unsent line")
+	assert.NotContains(t, panes.recorded(), "enter(@7)",
+		"and Enter would submit their half-typed sentence with our delivery riding on it")
+	assert.Len(t, c.Pending("s1"), 1,
+		"the delivery is held, not lost, and lands once the composer clears")
+	assert.Empty(t, c.stagedText("s1"),
+		"a composer bramble does not own cannot be its staged record")
+}
+
+// TestDroppedPasteIntoAnEmptyComposerIsStillRetried is the other half of the
+// rule above, kept adjacent so neither can be tightened without the other being
+// read. An empty composer after a paste IS a dropped paste, and the retry that
+// repairs it must survive the interference check.
+func TestDroppedPasteIntoAnEmptyComposerIsStillRetried(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.appendPane(claudeComposerPane(""))
+
+	// The pane never shows the text: the TUI dropped every paste.
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, panes.pasteCount(),
+		"an empty composer is a real dropped paste; the one retry must not be suppressed as interference")
+	assert.NotContains(t, panes.recorded(), "enter(@7)")
+	assert.Len(t, c.Pending("s1"), 1)
+}
+
+// TestUserTypingBesideAPasteChipIsNotSubmitted is the chip form of the race
+// TestUserTypingDuringPasteVerificationIsNotPastedInto pins for echoed text.
+//
+// Claude collapses a large paste into "[Pasted text #N]", so the echoed-text
+// path never runs for it and the one-way prefix rule never gets a chance to
+// refuse. If a merely-contained chip counts as confirmation, a person typing
+// inside the verification window produces "❯ [Pasted text #1 …] their words",
+// pasteVerdict reports landed, composerHoldsForeignText is never consulted, and
+// Enter submits their line with the delivery riding on it.
+//
+// The rule: a chip proves arrival only when it is the WHOLE composer body.
+// Anything outside its brackets was typed by a person.
+func TestUserTypingBesideAPasteChipIsNotSubmitted(t *testing.T) {
+	t.Parallel()
+	const delivery = "a report from a subagent that ran for a while"
+
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	// Empty when the draft check reads it, so the write path proceeds to paste.
+	target.appendPane(claudeComposerPane(""))
+
+	panes := &fakePanes{}
+	panes.echo = func(string) {
+		// Claude collapsed our paste to a chip, and the human kept typing.
+		target.appendPane(claudeComposerPane("[Pasted text #1 +42 lines] what were we doing with the"))
+	}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", delivery, true)
+	require.NoError(t, err)
+
+	assert.NotContains(t, panes.recorded(), "enter(@7)",
+		"a chip with someone's typing beside it must not be read as proof our paste sits there alone")
+	assert.Len(t, c.Pending("s1"), 1, "the delivery is held, not lost")
+	assert.Empty(t, c.stagedText("s1"),
+		"a composer bramble does not own cannot be its staged record")
+}
+
+// TestAWholeBodyChipStillConfirms keeps the other half adjacent: the chip is
+// exactly what a confirmed claude paste looks like, and tightening the rule
+// above must not turn every large delivery into a re-paste-and-requeue loop.
+func TestAWholeBodyChipStillConfirms(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.appendPane(claudeComposerPane(""))
+
+	panes := &fakePanes{}
+	panes.echo = func(string) {
+		target.appendPane(claudeComposerPane("[Pasted text #1 +42 lines]"))
+	}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent that ran for a while", true)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, panes.pasteCount(), "a chip confirms arrival: never paste a second copy")
+	assert.Contains(t, panes.recorded(), "enter(@7)", "and the delivery is submitted")
+	assert.Empty(t, c.Pending("s1"))
 }

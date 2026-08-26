@@ -29,6 +29,20 @@ type DelegatorScenarioConfig struct { //nolint:govet // fieldalignment: keep rel
 	// of auto-notification.
 	FollowUps map[int]string
 
+	// Nudge is sent when a turn produces no tool calls at all and there is
+	// nothing else queued to say. A conversational model routinely opens with
+	// a clarifying question instead of acting, and without a reply the
+	// scenario would end on that first turn having exercised nothing — the
+	// single largest source of flakiness in these tests. Empty disables it,
+	// which is what a test asserting "the delegator asked rather than acted"
+	// wants.
+	Nudge string
+
+	// MaxNudges bounds how many times Nudge is sent, so a model that will
+	// never use its tools ends the scenario instead of burning MaxTurns on
+	// small talk. Zero means one nudge when Nudge is set.
+	MaxNudges int
+
 	// Model is the Claude model to use (default: "haiku").
 	Model string
 
@@ -89,6 +103,12 @@ func RunDelegatorScenario(ctx context.Context, cfg DelegatorScenarioConfig) (*De
 	}
 	defer s.Stop()
 
+	maxNudges := cfg.MaxNudges
+	if maxNudges <= 0 && cfg.Nudge != "" {
+		maxNudges = 1
+	}
+	nudges := 0
+
 	result := &DelegatorScenarioResult{Mock: mock}
 
 	// Send initial prompt.
@@ -125,11 +145,6 @@ func RunDelegatorScenario(ctx context.Context, cfg DelegatorScenarioConfig) (*De
 		result.Turns = append(result.Turns, tr)
 		result.TotalCost += tr.CostUSD
 
-		// If no tool calls this turn, the delegator is done talking.
-		if len(tr.ToolCalls) == 0 {
-			break
-		}
-
 		// Determine next message.
 		var nextMsg string
 
@@ -137,6 +152,22 @@ func RunDelegatorScenario(ctx context.Context, cfg DelegatorScenarioConfig) (*De
 		if cfg.FollowUps != nil {
 			if msg, ok := cfg.FollowUps[turn]; ok {
 				nextMsg = msg
+			}
+		}
+
+		// A turn with no tool calls is the delegator talking rather than
+		// acting. It used to end the scenario outright, which made every test
+		// here a coin flip on whether the model opened with a question: the run
+		// would stop at turn one having started nothing. An explicit follow-up
+		// still wins; otherwise nudge it once (or MaxNudges times) and let it
+		// act. With no nudge configured the old behaviour stands.
+		if len(tr.ToolCalls) == 0 {
+			if nextMsg == "" && cfg.Nudge != "" && nudges < maxNudges {
+				nudges++
+				nextMsg = cfg.Nudge
+			}
+			if nextMsg == "" {
+				break
 			}
 		}
 

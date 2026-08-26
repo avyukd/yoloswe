@@ -3,9 +3,11 @@ package ipc
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -169,4 +171,346 @@ func TestHandlerError(t *testing.T) {
 	require.False(t, resp.OK)
 	require.Equal(t, "req-err", resp.ID)
 	require.Contains(t, resp.Error, "worktree not found")
+}
+
+// TestStaleSocketIsRebound: a socket file left behind by a killed bramble has
+// no listener, so the path is free and must be reclaimed. Without this a crash
+// would make the stable path unusable until someone deleted it by hand.
+func TestStaleSocketIsRebound(t *testing.T) {
+	t.Parallel()
+	sockPath := filepath.Join(t.TempDir(), "test.sock")
+
+	// Abandon the file without unlinking, as a SIGKILL would. Go removes the
+	// socket on a graceful Close, so SetUnlinkOnClose(false) is what makes this
+	// a crash rather than a clean shutdown.
+	first := NewServer(sockPath)
+	require.NoError(t, first.Start())
+	unixLn, ok := first.listener.(*net.UnixListener)
+	require.True(t, ok, "expected a unix listener")
+	unixLn.SetUnlinkOnClose(false)
+	require.NoError(t, unixLn.Close())
+	require.FileExists(t, sockPath, "the socket file outlives the listener")
+
+	second := NewServer(sockPath)
+	second.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+		return "pong", nil
+	})
+	require.NoError(t, second.Start(), "a stale socket must be reclaimed")
+	defer second.Close()
+
+	require.NoError(t, NewClient(sockPath).Ping())
+}
+
+// TestLiveSocketIsNotStolen is what protects a second bramble from stranding
+// the first one's sessions. The path is stable across restarts and frozen into
+// every tmux window's environment, so unlinking a socket someone is still
+// serving would silently cut off every session that depends on it.
+func TestLiveSocketIsNotStolen(t *testing.T) {
+	t.Parallel()
+	sockPath := filepath.Join(t.TempDir(), "test.sock")
+
+	first := NewServer(sockPath)
+	first.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+		return "pong", nil
+	})
+	require.NoError(t, first.Start())
+	defer first.Close()
+
+	second := NewServer(sockPath)
+	err := second.Start()
+	require.Error(t, err, "a live socket must not be taken over")
+	require.ErrorIs(t, err, ErrSocketInUse, "callers fall back on this specific error")
+
+	// The incumbent is still serving: the whole point of refusing.
+	require.NoError(t, NewClient(sockPath).Ping(), "the first server still answers")
+}
+
+// TestSocketPathSurvivesRestart is the end-to-end shape of the bug this fixes:
+// a session holds one address for its whole life, and a bramble that comes back
+// at the same path must be reachable at it.
+func TestSocketPathSurvivesRestart(t *testing.T) {
+	t.Parallel()
+	sockPath := filepath.Join(t.TempDir(), "test.sock")
+
+	first := NewServer(sockPath)
+	first.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+		return "pong", nil
+	})
+	require.NoError(t, first.Start())
+	require.NoError(t, first.Close())
+
+	// What a session baked into its environment before the restart.
+	client := NewClient(sockPath)
+
+	second := NewServer(sockPath)
+	second.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+		return "pong", nil
+	})
+	require.NoError(t, second.Start())
+	defer second.Close()
+
+	require.NoError(t, client.Ping(), "the address a live session holds still works")
+}
+
+// TestConcurrentStartNeverUnlinksALiveSocket pins the invariant the stable
+// socket path depends on: exactly one server binds, and the loser must never
+// remove the winner's socket.
+//
+// Checking liveness and then unlinking is not atomic — both processes can
+// observe the path as free, one binds, and the other then removes the live
+// socket out from under it. Every session holding that path in its frozen tmux
+// environment is stranded at that moment, which is the failure the stable path
+// was introduced to fix.
+func TestConcurrentStartNeverUnlinksALiveSocket(t *testing.T) {
+	t.Parallel()
+	sockPath := filepath.Join(t.TempDir(), "contended.sock")
+
+	const racers = 8
+	start := make(chan struct{})
+	results := make(chan error, racers)
+	servers := make([]*Server, racers)
+
+	for i := range servers {
+		srv := NewServer(sockPath)
+		srv.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+			return "pong", nil
+		})
+		servers[i] = srv
+		go func() {
+			<-start // release them together so the binds actually contend
+			results <- srv.Start()
+		}()
+	}
+	close(start)
+
+	var won int
+	for i := 0; i < racers; i++ {
+		err := <-results
+		if err == nil {
+			won++
+			continue
+		}
+		require.ErrorIs(t, err, ErrSocketInUse,
+			"a loser must report the path as taken, not fail some other way")
+	}
+	require.Equal(t, 1, won, "exactly one server may hold the socket")
+
+	for _, srv := range servers {
+		defer srv.Close()
+	}
+
+	// The decisive assertion: the winner is still reachable. If any loser had
+	// unlinked and rebound, this either fails or reaches a different listener.
+	require.NoError(t, NewClient(sockPath).Ping(),
+		"the live socket must still be served after the contention")
+}
+
+// TestStaleSocketFileIsReclaimed is the other half: a socket file left behind by
+// a killed process has no listener, so it must be removed and rebound rather
+// than treated as live. Without this a crash would make the stable path
+// permanently unusable.
+func TestStaleSocketFileIsReclaimed(t *testing.T) {
+	t.Parallel()
+	sockPath := filepath.Join(t.TempDir(), "stale.sock")
+
+	// Leave a bound socket file with no listener behind it, the way a killed
+	// process does. Go's UnixListener unlinks on Close, so a normal
+	// Listen/Close cannot reproduce it — SetUnlinkOnClose(false) is what makes
+	// the file outlive its listener.
+	ln, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	ln.(*net.UnixListener).SetUnlinkOnClose(false)
+	require.NoError(t, ln.Close())
+	_, err = os.Stat(sockPath)
+	require.NoError(t, err, "precondition: a socket file is left on disk")
+
+	srv := NewServer(sockPath)
+	srv.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+		return "pong", nil
+	})
+	require.NoError(t, srv.Start(), "a stale socket file must be reclaimed")
+	defer srv.Close()
+
+	require.NoError(t, NewClient(sockPath).Ping())
+}
+
+// TestConcurrentStaleReclaimNeverStrandsTheWinner: binding first settles a
+// contest over a LIVE socket, but not over a stale one. Two processes can both
+// fail the bind, both find nothing listening, and then one unlinks and binds
+// while the other unlinks that now-live socket and binds over it. The first
+// keeps serving a path that no longer refers to it, so every window holding
+// that address in its frozen environment is stranded — the failure the stable
+// path was introduced to fix.
+func TestConcurrentStaleReclaimNeverStrandsTheWinner(t *testing.T) {
+	t.Parallel()
+	sockPath := filepath.Join(t.TempDir(), "stale-contended.sock")
+
+	// Leave a socket file with no listener behind it, as a killed process does.
+	seed, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	seed.(*net.UnixListener).SetUnlinkOnClose(false)
+	require.NoError(t, seed.Close())
+
+	const racers = 8
+	start := make(chan struct{})
+	results := make(chan error, racers)
+	servers := make([]*Server, racers)
+	for i := range servers {
+		srv := NewServer(sockPath)
+		srv.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+			return "pong", nil
+		})
+		servers[i] = srv
+		go func() {
+			<-start
+			results <- srv.Start()
+		}()
+	}
+	close(start)
+
+	var won int
+	for i := 0; i < racers; i++ {
+		if err := <-results; err == nil {
+			won++
+		} else {
+			require.ErrorIs(t, err, ErrSocketInUse,
+				"a loser must report the path as taken, not fail some other way")
+		}
+	}
+	require.Equal(t, 1, won, "exactly one server may reclaim a stale socket")
+	for _, srv := range servers {
+		defer srv.Close()
+	}
+
+	// The decisive assertion: whoever won is still the one reachable at the
+	// path. If a loser had unlinked and rebound, this reaches a listener with
+	// no handlers registered and the ping fails.
+	require.NoError(t, NewClient(sockPath).Ping(),
+		"the winner must still own the path after the contention")
+}
+
+// TestCloseDoesNotUnlinkASocketItDoesNotOwn: the ownership rule Start
+// establishes has to hold in Close too. `srv := New(path); defer srv.Close()`
+// before a Start that may lose is the natural Go shape, and a loser removing
+// the winner's socket strands exactly the sessions the stable path protects.
+func TestCloseDoesNotUnlinkASocketItDoesNotOwn(t *testing.T) {
+	t.Parallel()
+	sockPath := filepath.Join(t.TempDir(), "owned.sock")
+
+	winner := NewServer(sockPath)
+	winner.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+		return "pong", nil
+	})
+	require.NoError(t, winner.Start())
+	defer winner.Close()
+
+	loser := NewServer(sockPath)
+	require.ErrorIs(t, loser.Start(), ErrSocketInUse, "precondition: the loser never binds")
+	require.NoError(t, loser.Close(), "closing an unbound server must be harmless")
+
+	_, err := os.Stat(sockPath)
+	require.NoError(t, err, "the winner's socket file must survive the loser's Close")
+	require.NoError(t, NewClient(sockPath).Ping(), "and must still be served")
+}
+
+// TestBindDoesNotAcceptUntilServe: a caller that must publish its address
+// before handling requests needs bind and accept to be separable.
+//
+// This server creates sessions, a session snapshots the socket paths at
+// creation and keeps them for life, and the path is now stable across restarts
+// — so a tmux window left by a previous bramble can fire into it the instant it
+// binds. A session built from that request before the path was published would
+// carry an empty address and stay mute forever, which is the failure
+// deliverable 3 exists to close.
+func TestBindDoesNotAcceptUntilServe(t *testing.T) {
+	t.Parallel()
+	sockPath := filepath.Join(t.TempDir(), "deferred.sock")
+
+	srv := NewServer(sockPath)
+	srv.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+		return "pong", nil
+	})
+	require.NoError(t, srv.Bind())
+	defer srv.Close()
+
+	// Bound: the path exists and a dial is accepted by the kernel's backlog...
+	_, err := os.Stat(sockPath)
+	require.NoError(t, err, "Bind must acquire the socket")
+
+	// ...but nothing is handling requests yet, so a full round-trip must not
+	// complete. This is the window in which the caller publishes.
+	client := NewClient(sockPath)
+	done := make(chan error, 1)
+	go func() { done <- client.Ping() }()
+	select {
+	case err := <-done:
+		t.Fatalf("a request completed before Serve: %v", err)
+	case <-time.After(150 * time.Millisecond):
+		// Correct: no handler has run.
+	}
+
+	// Once serving, the same path answers.
+	srv.Serve()
+	require.NoError(t, NewClient(sockPath).Ping(), "Serve must start handling")
+}
+
+// TestCloseDoesNotUnlinkASuccessorsSocket pins the other half of the ownership
+// rule. TestCloseDoesNotUnlinkASocketItDoesNotOwn covers the server that never
+// bound; this covers the server that DID bind and then handed the path on.
+//
+// The window is real because Close drains in-flight handlers: ln.Close() unlinks
+// immediately, but wg.Wait() can block for as long as a handler runs, and the
+// stable path is free for that whole time. A successor bramble binding it during
+// the drain used to have its socket file deleted by the predecessor's trailing
+// os.Remove — leaving it serving an unlinked inode while every window's baked
+// BRAMBLE_SOCK resolved to nothing.
+func TestCloseDoesNotUnlinkASuccessorsSocket(t *testing.T) {
+	t.Parallel()
+	sockPath := filepath.Join(t.TempDir(), "handoff.sock")
+
+	inHandler := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	old := NewServer(sockPath)
+	old.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+		close(inHandler)
+		<-releaseHandler // hold Close in wg.Wait() while the successor binds
+		return "pong", nil
+	})
+	require.NoError(t, old.Start())
+
+	// Park a request inside the handler so the drain has something to wait on.
+	go func() { _ = NewClient(sockPath).Ping() }()
+	select {
+	case <-inHandler:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never ran; the drain would not block")
+	}
+
+	closed := make(chan struct{})
+	go func() { defer close(closed); _ = old.Close() }()
+
+	// ln.Close() unlinks synchronously, so the path frees before the drain ends.
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(sockPath)
+		return os.IsNotExist(err)
+	}, 5*time.Second, 10*time.Millisecond, "the old listener must release the path")
+
+	successor := NewServer(sockPath)
+	successor.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+		return "successor", nil
+	})
+	require.NoError(t, successor.Start(), "the successor binds the freed stable path")
+	defer successor.Close()
+
+	// Now let the predecessor finish. Its trailing unlink, if any, lands here.
+	close(releaseHandler)
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old server never finished closing")
+	}
+
+	_, err := os.Stat(sockPath)
+	require.NoError(t, err, "the predecessor's Close must not delete the successor's socket file")
+	require.NoError(t, NewClient(sockPath).Ping(), "and the successor must still be reachable at the stable path")
 }

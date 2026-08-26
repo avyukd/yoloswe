@@ -12,6 +12,7 @@ go_library(
     deps = [
         "//agent-cli-wrapper/llmendpoint",
         "//bramble/session",
+        "//bramble/sockguard",
     ],
 )
 

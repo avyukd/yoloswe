@@ -16,24 +16,17 @@ import (
 	"github.com/bazelment/yoloswe/bramble/session"
 )
 
-// stubModel routes to the scripted stand-in: bramble picks a backend from the
-// model ID, and any gpt-* model means "run the codex binary".
+// stubModel routes gpt-* model IDs to the scripted codex stand-in.
 const stubModel = "gpt-5.5"
 
-// stubCursorModel routes to the cursor stand-in the same way: a composer-*
-// model means "run the binary named agent". It is the hookless backend, so a
-// session on it is only ever seen to finish by reading its pane.
+// stubCursorModel routes composer-* IDs to the hookless cursor stand-in.
 const stubCursorModel = "composer-3"
 
 // reportMarker is the prefix of every report bramble generates for a parent.
 const reportMarker = "[bramble] subagent"
 
-// deliveredReportMarker counts reports the recipient actually took a turn on.
-//
-// Counting reportMarker alone over-counts badly: the text appears once where it
-// was pasted, once in the stand-in's echo of the submitted line, and once in its
-// reply. Only the reply means the prompt was submitted and a turn ran, which is
-// what "the parent was told" has to mean.
+// deliveredReportMarker counts reports the recipient actually answered, not
+// merely text that was pasted or echoed in its pane.
 const deliveredReportMarker = "STUB-REPLY " + reportMarker
 
 // TestSubagentLineageIsRecorded pins the link a subagent's whole return path
@@ -81,13 +74,9 @@ func TestTopLevelSessionHasNoParent(t *testing.T) {
 	}
 }
 
-// TestSubagentReportsToParentOnItsOwn is the headline behaviour: a subagent
-// finishes and its parent is told, with a path to the full output.
-//
-// This is what makes a non-Claude backend usable as a subagent at all. Codex
-// has no system prompt, no MCP and no tool restrictions through this wrapper,
-// so it cannot be reliably instructed to call back — bramble generates the
-// report from the session's own state instead.
+// TestSubagentReportsToParentOnItsOwn pins bramble-generated reports: non-Claude
+// backends cannot be reliably instructed to call back through this wrapper, so
+// bramble reports from the session's own state.
 func TestSubagentReportsToParentOnItsOwn(t *testing.T) {
 	h := newHarness(t, true)
 
@@ -102,15 +91,13 @@ func TestSubagentReportsToParentOnItsOwn(t *testing.T) {
 	report := h.pane(parent)
 	assert.Contains(t, report, string(child), "the report should name the child")
 	assert.Contains(t, report, "result:", "the report should point at the child's output")
-	// Pointer, not payload: the child's actual answer belongs in the file, not
-	// pasted into the parent's context.
+		// Pointer, not payload: do not paste the child's transcript into the parent.
 	assert.NotContains(t, report, "STUB-REPLY CHILD-ANSWERS-THIS",
 		"the report should carry a path, not the child's transcript")
 }
 
-// TestSubagentNotifyHookMarksItIdle covers the hook that everything else waits
-// on. Without it a codex window sits at "running" forever after answering:
-// nothing drains its queue, and its parent hears only when the window dies.
+// TestSubagentNotifyHookMarksItIdle covers the hook that moves codex sessions
+// off "running" so queues drain and parents hear before window exit.
 func TestSubagentNotifyHookMarksItIdle(t *testing.T) {
 	h := newHarness(t, true)
 
@@ -131,9 +118,8 @@ func TestQueuedDeliveryWaitsForIdle(t *testing.T) {
 	h.awaitStatus(target, "idle")
 	dumpPanesOnFailure(t, h, target)
 
-	// Put the session mid-turn, then queue behind it. SLOW-TURN keeps the stub
-	// busy only briefly, so the assertion below races it deliberately: what
-	// matters is that the queued text is not written *while* it is running.
+		// SLOW-TURN keeps the stub busy only briefly, so this deliberately races
+		// the idle transition; queued text must not be written mid-turn.
 	_, err := h.send("", target, "SLOW-TURN", false)
 	require.NoError(t, err)
 
@@ -141,12 +127,9 @@ func TestQueuedDeliveryWaitsForIdle(t *testing.T) {
 	require.NoError(t, err)
 
 	if result.Queued {
-		// The interesting case: held back rather than typed into a live turn.
-		assert.Equal(t, 1, h.deliveryQueueLen(), "a queued delivery should be persisted")
+		assert.Equal(t, 1, h.queuedFor(target), "a queued delivery should be persisted")
 		h.awaitPane(target, "STUB-REPLY QUEUED-BEHIND", "the queued message never landed")
 	} else {
-		// The session had already gone idle, so it was written immediately —
-		// still correct, just not the path this test is aiming at.
 		h.awaitPane(target, "STUB-REPLY QUEUED-BEHIND", "an immediate delivery never landed")
 	}
 
@@ -162,7 +145,6 @@ func TestQueuedDeliveryToTerminalSessionIsRefused(t *testing.T) {
 	target := h.spawn("builder", stubModel, "", "BOOT")
 	h.awaitStatus(target, "idle")
 
-	// Killing the window ends the session.
 	_, err := h.tmux("kill-window", "-t", h.tmuxTargetOf(target))
 	require.NoError(t, err)
 	h.awaitStatus(target, "completed", "failed", "stopped")
@@ -172,13 +154,11 @@ func TestQueuedDeliveryToTerminalSessionIsRefused(t *testing.T) {
 	assert.Equal(t, 0, h.deliveryQueueLen(), "nothing should be queued for a dead session")
 }
 
-// TestDeliveryReachesPaneInCopyMode is a regression test for a silent failure
-// that is invisible from inside bramble.
-//
-// A pane someone scrolled back in sits in tmux copy mode, where the pager
-// consumes every key — including the Enter that submits a delivered prompt.
-// tmux reports success for both the paste and the key, so the message lands in
-// the composer and is never read. Bramble leaves copy mode before writing.
+// TestDeliveryReachesPaneInCopyMode pins a silent tmux failure: copy mode
+// consumes Enter while tmux reports success, so bramble must leave copy mode
+// before writing.
+// Otherwise the message can sit in the composer forever without bramble seeing
+// an error.
 func TestDeliveryReachesPaneInCopyMode(t *testing.T) {
 	h := newHarness(t, true)
 
@@ -187,7 +167,6 @@ func TestDeliveryReachesPaneInCopyMode(t *testing.T) {
 	h.awaitPane(target, "STUB-REPLY BOOT", "the agent never answered its opening prompt")
 	dumpPanesOnFailure(t, h, target)
 
-	// Scroll the pane back, exactly as a human watching the session would.
 	tmuxTarget := h.tmuxTargetOf(target)
 	_, err := h.tmux("copy-mode", "-t", tmuxTarget)
 	require.NoError(t, err)
@@ -202,14 +181,11 @@ func TestDeliveryReachesPaneInCopyMode(t *testing.T) {
 		"delivery to a pane in copy mode was swallowed")
 }
 
-// TestTwoWayConversationKeepsReporting is the whole feature end to end, and the
-// case that stayed broken longest.
-//
-// A tmux session's status comes entirely from outside — its agent reports
-// idleness and nothing reports the opposite — so a session bramble typed into
-// stayed "idle" through the turn, and the notify that ended that turn was
-// dropped by SetSessionIdle's guard. No state change meant no second report:
-// every conversation went silent after one round.
+// TestTwoWayConversationKeepsReporting pins the state transition after queued
+// delivery: a child must leave "idle" when bramble types into it, or the notify
+// ending that turn is dropped and the conversation goes silent.
+// tmux status comes from outside the session, so bramble has to create the
+// "running" transition for turns it submits itself.
 func TestTwoWayConversationKeepsReporting(t *testing.T) {
 	h := newHarness(t, true)
 
@@ -219,32 +195,27 @@ func TestTwoWayConversationKeepsReporting(t *testing.T) {
 	child := h.spawn("codetalk", stubModel, string(parent), "ROUND-ONE")
 	dumpPanesOnFailure(t, h, parent, child)
 
-	// Round 1: the child answers and its parent is told.
 	h.awaitPane(child, "STUB-REPLY ROUND-ONE", "the child never answered round one")
 	require.Eventually(t, func() bool {
 		return h.countInPane(parent, deliveredReportMarker) >= 1
 	}, settleTimeout, pollInterval, "no report for round one")
 
-	// The parent replies. Submitting must move the child off "idle", or the
-	// notify that ends this turn is discarded and nothing more is ever said.
+	// Submitting must move the child off "idle".
 	_, err := h.send(parent, child, "ROUND-TWO", true)
 	require.NoError(t, err)
 	h.awaitPane(child, "STUB-REPLY ROUND-TWO", "the parent's reply never reached the child")
 
-	// Round 2: the answer to the reply is reported too.
 	h.awaitPaneCond(parent, func() bool {
 		return h.countInPane(parent, deliveredReportMarker) >= 2
 	}, "round two was never reported — the conversation went silent after one exchange")
 }
 
 // TestSubagentIsReportedOnceNotOnEveryStateChange keeps a finished subagent
-// from nagging its parent. A session emits several state changes around one
-// turn, and an earlier draft reported on each of them.
+// from reporting the same turn on every later state change.
 //
-// The narrower rules — a completed that follows a report is silent, a failure
-// never is — are pinned deterministically in the unit tests
-// (TestCompletedAfterIdleIsSilent, TestFailureIsReportedEvenAfterAnIdleReport),
-// which do not depend on how an agent CLI happens to exit.
+// The completed-vs-failed terminal rules are pinned deterministically by the
+// session delivery unit tests.
+// Completed after an idle report is silent; failure is never silent.
 func TestSubagentIsReportedOnceNotOnEveryStateChange(t *testing.T) {
 	h := newHarness(t, true)
 
@@ -263,20 +234,11 @@ func TestSubagentIsReportedOnceNotOnEveryStateChange(t *testing.T) {
 	}, 8*time.Second, pollInterval, "the parent was told more than once about one turn")
 }
 
-// TestReadoptedCursorSubagentIsStillSeenToFinish is the restart path, and the
-// only test that runs the monitor loop a re-adopted session gets.
+// TestReadoptedCursorSubagentIsStillSeenToFinish pins the restart monitor loop.
+// Cursor has no completion hook, so a re-adopted cursor subagent must be polled
+// from its pane or it stays "running" forever and drains no queued mail.
 //
-// A session bramble started is watched by runSession's loop; one bramble
-// re-adopts after a restart is watched by monitorTrackedTmuxWindow instead.
-// Cursor has no completion hook — its idleness is read off its pane — so a
-// re-adopt loop that does not poll the pane leaves the subagent running
-// forever: nothing drains its queued mail and its parent is never told it
-// finished. That gap shipped once and is invisible to every unit test, because
-// neither loop can be driven without a tmux server.
-//
-// The second turn is what matters. The first proves the child works before the
-// restart; the assertion is on the one after it, which only the re-adopted
-// loop can observe.
+// The second turn is the proof because only the re-adopted loop can observe it.
 func TestReadoptedCursorSubagentIsStillSeenToFinish(t *testing.T) {
 	h := newHarness(t, true)
 
@@ -286,22 +248,18 @@ func TestReadoptedCursorSubagentIsStillSeenToFinish(t *testing.T) {
 	child := h.spawn("codetalk", stubCursorModel, string(parent), "BEFORE-RESTART")
 	dumpPanesOnFailure(t, h, parent, child)
 
-	// Before the restart the child is watched by the loop that started it.
 	h.awaitPane(child, "CURSOR-STUB-REPLY BEFORE-RESTART", "the cursor stand-in never answered")
 	h.awaitStatus(child, "idle")
 
 	h.restart()
 
-	// The re-adopted child takes another turn. Queued rather than typed
-	// directly: this has to go through the courier, which is what needs the
-	// child to be seen going idle again.
+	// Queued delivery exercises the courier path that needs the child to go idle.
 	h.awaitStatus(child, "idle")
 	_, err := h.send(parent, child, "AFTER-RESTART", true)
 	require.NoError(t, err)
 	h.awaitPane(child, "CURSOR-STUB-REPLY AFTER-RESTART", "the message never reached the re-adopted child")
 
-	// The whole point: the re-adopted loop must see the pane go quiet again.
-	// Without it the child stays "running" for the rest of the process.
+	// The re-adopted loop must see the pane go quiet again.
 	h.awaitPaneCond(child, func() bool {
 		return h.status(child) == "idle"
 	}, "the re-adopted cursor session was never seen to finish its turn — nothing polls its pane")
@@ -309,25 +267,15 @@ func TestReadoptedCursorSubagentIsStillSeenToFinish(t *testing.T) {
 
 // --- live backends -----------------------------------------------------------
 
-// TestLiveSubagentTwoWay drives the real agent CLIs, one subtest per backend.
-//
-// The stubbed cases above pin bramble's own logic; these pin the part that only
-// a real CLI can tell you. Every bug this feature shipped with was of that kind:
-// codex not reporting idle, a session never leaving "running", a paste dropped
-// while a TUI finished painting, an Enter eaten by copy mode. None of them are
-// visible without the real thing in a real pane.
-//
-// They run by default and skip only when a backend is missing or logged out, so
-// what is exercised depends on the machine rather than on remembering a flag.
-// A live run costs real tokens on each backend it finds.
+// TestLiveSubagentTwoWay drives real agent CLIs because hook delivery, pane
+// idleness, paste timing, and TUI copy-mode failures are only visible in a real
+// pane. It skips per backend only when that backend is unavailable.
 func TestLiveSubagentTwoWay(t *testing.T) {
 	for _, backend := range liveBackends {
 		t.Run(backend.provider, func(t *testing.T) {
 			model := backend.require(t)
 			h := newHarness(t, false)
 
-			// The parent is Claude: that is the orchestrator in practice, and
-			// it is the side that has to receive and read the report.
 			parentModel := liveBackends[0].require(t)
 			parent := h.spawn("builder", parentModel, "",
 				"You are the PARENT in an automated test. Say exactly: PARENT READY. Then wait. Do not read or edit files.")
@@ -337,19 +285,16 @@ func TestLiveSubagentTwoWay(t *testing.T) {
 				"Reply with exactly one line and nothing else: R1 ARTICHOKE. Do not read files. Do not run commands.")
 			dumpPanesOnFailure(t, h, parent, child)
 
-			// Round one. Reaching idle at all is the backend-specific part:
-			// claude and codex report it through a hook, cursor has neither and
-			// is read off its pane.
+			// Reaching idle is backend-specific: hooks for claude/codex, pane
+			// polling for cursor.
 			h.awaitPaneClearingDialogs(child, "ARTICHOKE", "the subagent never answered round one")
 			h.awaitStatus(child, "idle")
 			h.awaitPaneCond(parent, func() bool {
 				return h.countInPane(parent, reportMarker) >= 1
 			}, "the parent was never told about its %s subagent", backend.provider)
 
-			// The report is a pointer, so the path is the part the parent has
-			// to be able to use. Asserting only that "result:" appeared would
-			// pass on a report naming a file that was never written — which is
-			// what a failed pane capture produces.
+			// The report path must be usable; "result:" alone can point at a
+			// file that failed pane capture never wrote.
 			resultPath, ok := reportedResultPath(h.pane(parent))
 			require.Truef(t, ok, "the report carried no result path\n--- parent pane ---\n%s", h.pane(parent))
 			body, err := os.ReadFile(resultPath)
@@ -357,10 +302,8 @@ func TestLiveSubagentTwoWay(t *testing.T) {
 			assert.Containsf(t, string(body), "ARTICHOKE",
 				"the %s subagent's answer is missing from its result file %s", backend.provider, resultPath)
 
-			// Round two: the parent replies, and the answer comes back. This is
-			// the leg that stayed broken longest — a delivery has to move the
-			// child off idle, or the turn it starts produces no state change and
-			// the conversation goes quiet.
+			// Delivery must move the child off idle or round two produces no
+			// state change and the conversation goes quiet.
 			result, err := h.send(parent, child,
 				"R2: reply with exactly one line and nothing else: R2 CONFIRMED", true)
 			if err != nil {
@@ -382,20 +325,11 @@ func TestLiveSubagentTwoWay(t *testing.T) {
 	}
 }
 
-// TestLiveQueuedDeliveryWaitsForALiveTurn is the live counterpart to the
-// stubbed queue tests, and covers two things nothing else does against a real
-// CLI.
-//
-// First, the queue itself. Every other live assertion delivers to an *idle*
-// child, so the deferred path — the reason the courier exists — was only ever
-// exercised against a stand-in. Here the child is genuinely mid-turn.
-//
-// Second, and more valuable: that a real agent working for twenty seconds is
-// not mistaken for an idle one. That is the harmful direction. Claude and codex
-// report their own turn ends, but cursor's state is read off its pane, and a
-// false idle there would release this queued message straight into the running
-// turn — precisely what the queue prevents. The unit tests pin that against a
-// synthetic pane; only this pins it against the real chrome.
+// TestLiveQueuedDeliveryWaitsForALiveTurn pins deferred delivery against real
+// CLIs. A false idle, especially from cursor pane polling, would release queued
+// text straight into the running turn.
+// Other live assertions send to idle children; this one holds a real child
+// mid-turn so the deferred path is exercised against real TUI chrome.
 func TestLiveQueuedDeliveryWaitsForALiveTurn(t *testing.T) {
 	for _, backend := range liveBackends {
 		t.Run(backend.provider, func(t *testing.T) {
@@ -406,8 +340,7 @@ func TestLiveQueuedDeliveryWaitsForALiveTurn(t *testing.T) {
 				"You are the PARENT in an automated test. Say exactly: PARENT READY. Then wait.")
 			h.awaitReady(parent)
 
-			// A builder, not a codetalk: the child has to be able to run a
-			// command to occupy itself for a known length of time.
+			// Builder can run the sleep command that keeps the child mid-turn.
 			child := h.spawn("builder", model, string(parent), longTurnPrompt("LONG-DONE"))
 			dumpPanesOnFailure(t, h, parent, child)
 			h.awaitWorking(child, "sleep")
@@ -416,46 +349,41 @@ func TestLiveQueuedDeliveryWaitsForALiveTurn(t *testing.T) {
 			require.NoErrorf(t, err, "could not queue for the %s subagent", backend.provider)
 			require.Truef(t, result.Queued,
 				"a message sent to a %s subagent mid-turn should have been held, not written", backend.provider)
-			assert.Equal(t, 1, h.deliveryQueueLen(), "the held message should be persisted")
+			assert.Equal(t, 1, h.queuedFor(child), "the held message should be persisted")
 
-			// While the turn runs: the session must stay running, and nothing
-			// may be typed into it.
+			// While the turn runs, the session must stay running and untouched.
 			watchFor := (longTurnSeconds - 6) * int(time.Second)
 			h.neverDuring(child, time.Duration(watchFor), func() bool {
 				return h.status(child) == "idle" || strings.Contains(h.pane(child), "QUEUED-MID-TURN")
 			}, "the %s subagent was treated as idle mid-turn, or the queued message was typed into a live turn",
 				backend.provider)
 
-			// The turn ends, and only then does the message land.
 			h.awaitPaneClearingDialogs(child, "LONG-DONE", "the subagent never finished its long turn")
 			h.awaitPaneClearingDialogs(child, "QUEUED-MID-TURN", "the held message never landed after the turn ended")
-			require.Eventually(t, func() bool { return h.deliveryQueueLen() == 0 },
+			// Check the child's queue, not the whole spool; the live parent may
+			// still be consuming its own report.
+			require.Eventually(t, func() bool { return h.queuedFor(child) == 0 },
 				settleTimeout, pollInterval, "the queue should drain once delivered")
 		})
 	}
 }
 
-// concurrentSubagents is how many children the fan-out tests spawn. Enough for
-// their reports to genuinely overlap without making the suite slow.
+// concurrentSubagents gives reports room to overlap without making the suite slow.
 const concurrentSubagents = 3
 
 // TestConcurrentSubagentsAllReport covers a fan-out: one parent, several
 // subagents working at once, all reporting to the same place.
 //
-// This is where the queue takes concurrent writes — every child's completion
-// races the others into one recipient's queue — and where reports can be lost
-// quietly rather than loudly. A dropped report is not a crash: the parent
-// simply waits forever for a subagent that already finished.
-//
-// The parent is deliberately left mid-turn while they finish, so every report
-// has to queue rather than being written straight through.
+// Every child's completion races the others into one recipient's queue. The
+// parent is deliberately left mid-turn so reports must queue, where drops are
+// silent rather than crashes.
+// A dropped report leaves the parent waiting for a child that already finished.
 func TestConcurrentSubagentsAllReport(t *testing.T) {
 	h := newHarness(t, true)
 
 	parent := h.spawn("builder", stubModel, "", "PARENT-BOOT")
 	h.awaitStatus(parent, "idle")
 
-	// Occupy the parent so the reports pile up behind a live turn.
 	_, err := h.send("", parent, "PARENT-BUSY", true)
 	require.NoError(t, err)
 
@@ -470,9 +398,7 @@ func TestConcurrentSubagentsAllReport(t *testing.T) {
 		h.awaitStatus(child, "idle")
 	}
 
-	// Every child must be named in the parent's pane exactly once. Checking
-	// the count as well as the presence is what catches a report delivered
-	// twice, which is as wrong as one delivered never.
+	// Count as well as presence, because duplicated reports are also wrong.
 	for _, child := range children {
 		want := deliveredReportMarker + " " + string(child)
 		h.awaitPaneCond(parent, func() bool { return h.countInPane(parent, want) >= 1 },
@@ -487,26 +413,18 @@ func TestConcurrentSubagentsAllReport(t *testing.T) {
 		settleTimeout, pollInterval, "every queued report should drain")
 }
 
-// TestConcurrentSubagentsQueueDurablyWhileParentIsBusy pins the durability half
-// of a fan-out.
+// TestConcurrentSubagentsQueueDurablyWhileParentIsBusy pins durable fan-out:
+// reports arriving while a parent is mid-turn must live on disk, because a
+// restart otherwise drops reports that only existed in memory.
 //
-// Reports that arrive while a parent is mid-turn live on disk until it is free,
-// and a queue written from several goroutines at once used to lose some of them
-// there. Nothing looked wrong at the time — delivery in the running process
-// still worked off the in-memory queue — so the loss only showed up as a
-// restart that dropped reports for subagents that had already finished.
-//
-// The parent is held busy deliberately: without that it answers each report the
-// instant it lands and the queue never has more than one thing in it, which is
-// not the case being tested.
+// The parent is held busy so the queue has concurrent contents, not one report
+// at a time.
 func TestConcurrentSubagentsQueueDurablyWhileParentIsBusy(t *testing.T) {
 	h := newHarness(t, true)
 
 	parent := h.spawn("builder", stubModel, "", "PARENT-BOOT")
 	h.awaitStatus(parent, "idle")
 
-	// Hold the parent mid-turn for long enough that every child finishes while
-	// it is still busy.
 	_, err := h.send("", parent, "STUB-SLEEP 8", true)
 	require.NoError(t, err)
 	h.awaitStatus(parent, "running")
@@ -520,8 +438,7 @@ func TestConcurrentSubagentsQueueDurablyWhileParentIsBusy(t *testing.T) {
 		h.awaitStatus(child, "idle")
 	}
 
-	// While the parent is still busy, every report must be on disk. This is
-	// the state a restarted bramble would resume from.
+	// While the parent is busy, every report must be on disk.
 	queued := h.queuedTextFor(parent)
 	require.NotEmptyf(t, queued, "no report was queued while the parent was busy\n--- parent pane ---\n%s", h.pane(parent))
 	for _, child := range children {
@@ -529,7 +446,6 @@ func TestConcurrentSubagentsQueueDurablyWhileParentIsBusy(t *testing.T) {
 			"the persisted queue is missing %s; a restart here would drop it", child)
 	}
 
-	// And they all still arrive once it frees up.
 	for _, child := range children {
 		want := deliveredReportMarker + " " + string(child)
 		h.awaitPaneCond(parent, func() bool { return h.countInPane(parent, want) >= 1 },
@@ -537,16 +453,9 @@ func TestConcurrentSubagentsQueueDurablyWhileParentIsBusy(t *testing.T) {
 	}
 }
 
-// TestSubagentOnItsOwnWorktreeIsIsolated covers the other half of the worktree
-// story. A subagent with no branch of its own works on its parent's tree; with
-// `--create-worktree -b <branch>` it gets one of its own, on a new branch off
-// the base.
-//
-// The isolation is the point: two subagents editing one tree would corrupt each
-// other's work, so "it got its own worktree" has to be asserted against git,
-// not just against the path bramble reports. And the return path has to keep
-// working across that boundary — lineage travels by session ID, not by tree,
-// but nothing proved it until now.
+// TestSubagentOnItsOwnWorktreeIsIsolated pins branch worktree isolation and the
+// return path across it. Isolation must be asserted against git, not only the
+// path bramble reports.
 func TestSubagentOnItsOwnWorktreeIsIsolated(t *testing.T) {
 	h := newHarness(t, true)
 
@@ -561,8 +470,7 @@ func TestSubagentOnItsOwnWorktreeIsIsolated(t *testing.T) {
 		"the subagent was put on its parent's tree instead of a new one")
 	require.DirExists(t, worktree)
 
-	// Ask git, not bramble: a path that exists proves nothing about whether a
-	// worktree was actually added on the right branch off the right base.
+	// Ask git; path existence does not prove the branch or base.
 	assert.Equal(t, branch, h.gitIn(worktree, "branch", "--show-current"),
 		"the new worktree is not on the requested branch")
 	assert.Equal(t,
@@ -570,13 +478,10 @@ func TestSubagentOnItsOwnWorktreeIsIsolated(t *testing.T) {
 		h.gitIn(worktree, "rev-parse", "HEAD"),
 		"the new branch is not based on main")
 
-	// Edits on one tree must not appear on the other.
 	require.NoError(t, os.WriteFile(filepath.Join(worktree, "child-only.txt"), []byte("x\n"), 0o644))
 	assert.NoFileExists(t, filepath.Join(h.worktreePath, "child-only.txt"),
 		"a file written on the subagent's tree showed up on its parent's")
 
-	// bramble reports the session against its own worktree, which is what the
-	// command centre and `list-sessions --parent` show.
 	var found bool
 	for _, s := range h.sessions() {
 		if s.ID != string(child) {
@@ -588,7 +493,6 @@ func TestSubagentOnItsOwnWorktreeIsIsolated(t *testing.T) {
 	}
 	require.True(t, found, "the subagent is missing from list-sessions")
 
-	// The return path still works across the worktree boundary.
 	h.awaitPane(parent, reportMarker, "a subagent on its own worktree never reported to its parent")
 	_, err := h.send(parent, child, "CROSS-TREE-FOLLOWUP", true)
 	require.NoError(t, err)
@@ -616,4 +520,98 @@ func TestSubagentWorktreeIsReusedNotDuplicated(t *testing.T) {
 		"respawning on the same branch should reuse the worktree, not make another")
 	assert.NotEqual(t, first, second, "each spawn is still its own session")
 	h.awaitPane(second, "STUB-REPLY SECOND-ATTEMPT", "the second subagent never ran")
+}
+
+// TestCursorDeliveryIsPastedOnceAndSubmitted covers the hookless backend end to
+// end: one paste, submitted, queue drained.
+//
+// A shell stand-in cannot reproduce cursor-agent's paste chip, because the
+// terminal echoes the delivered text. The chip and unverifiable-paste branches
+// are pinned in bramble/session; this tmux test pins exactly one paste and one
+// Enter reaching a cursor-shaped session.
+// A decorative chip in the stand-in would not prove provenance; it looks the
+// same no matter who printed it.
+func TestCursorDeliveryIsPastedOnceAndSubmitted(t *testing.T) {
+	h := newHarness(t, true)
+
+	target := h.spawn("builder", stubCursorModel, "", "BOOT")
+	h.awaitStatus(target, "idle")
+	dumpPanesOnFailure(t, h, target)
+
+	_, err := h.send("", target, "CURSOR-DELIVERY", true)
+	require.NoError(t, err)
+
+	h.awaitPane(target, "CURSOR-STUB-REPLY CURSOR-DELIVERY",
+		"the delivery was never submitted to the cursor session")
+
+	// A re-paste would drive a second turn.
+	assert.Equal(t, 1, h.countInPane(target, "CURSOR-STUB-REPLY CURSOR-DELIVERY"),
+		"the message must be delivered once, not re-pasted and run twice")
+
+	require.Eventually(t, func() bool { return h.deliveryQueueLen() == 0 },
+		settleTimeout, pollInterval, "a delivered message must leave the queue")
+}
+
+// TestDeliveryIntoADraftIsHeldOnlyWhereTheComposerCanBeRead documents a
+// deliberate limit: delivery is held only when the composer has a validated
+// prompt glyph that makes drafts distinguishable from startup placeholders.
+//
+// Codex and cursor are not protected today. Guessing on unreadable composers
+// would hold mail forever on panes bramble failed to parse, so this test pins
+// the known unprotected outcome until a live-capture-backed draft check exists.
+// Claude is protected separately by tests that validate its prompt glyph against
+// captured pane bytes.
+func TestDeliveryIntoADraftIsHeldOnlyWhereTheComposerCanBeRead(t *testing.T) {
+	h := newHarness(t, true)
+
+	target := h.spawn("builder", stubModel, "", "BOOT")
+	h.awaitStatus(target, "idle")
+	h.awaitPane(target, "STUB-REPLY BOOT", "the agent never answered its opening prompt")
+	dumpPanesOnFailure(t, h, target)
+
+	tmuxTarget := h.tmuxTargetOf(target)
+	_, err := h.tmux("send-keys", "-t", tmuxTarget, "HALF-TYPED-THOUGHT")
+	require.NoError(t, err)
+	h.awaitPane(target, "HALF-TYPED-THOUGHT", "the draft never appeared in the composer")
+
+	_, err = h.send("", target, "ARRIVES-MID-SENTENCE", true)
+	require.NoError(t, err)
+
+	// Assert the exact unprotected concatenation so a future codex draft check
+	// breaks this test instead of passing against the old behavior.
+	h.awaitPane(target, "STUB-REPLY HALF-TYPED-THOUGHTARRIVES-MID-SENTENCE",
+		"expected the known-unprotected path: a codex-shaped composer cannot be read for a draft")
+
+	require.Eventually(t, func() bool { return h.deliveryQueueLen() == 0 },
+		settleTimeout, pollInterval, "the delivery still leaves the queue")
+}
+
+// TestSessionsStillReachBrambleAfterARestart pins the stranded-parent bug:
+// session callback addresses are frozen into tmux windows and agent hooks at
+// startup, so a pid-scoped socket leaves pre-restart windows reporting to a dead
+// address and stuck "running".
+// The hook used --silent, so the failure was swallowed; Drain then refused the
+// parent's mail because the child never returned to idle.
+func TestSessionsStillReachBrambleAfterARestart(t *testing.T) {
+	h := newHarness(t, true)
+
+	parent := h.spawn("builder", stubModel, "", "PARENT-BOOT")
+	h.awaitStatus(parent, "idle")
+	dumpPanesOnFailure(t, h, parent)
+
+	sockBefore := h.ipcSock
+
+	h.restart()
+
+	assert.Equal(t, sockBefore, h.ipcSock,
+		"the restarted bramble must bind the same path its live windows still point at")
+
+	// A pre-restart session can update status only if its frozen socket resolves.
+	h.awaitStatus(parent, "idle")
+	_, err := h.send("", parent, "AFTER-RESTART", true)
+	require.NoError(t, err)
+	h.awaitPane(parent, "STUB-REPLY AFTER-RESTART", "a pre-restart session was unreachable afterwards")
+
+	require.Eventually(t, func() bool { return h.deliveryQueueLen() == 0 },
+		settleTimeout, pollInterval, "the queue must drain, which needs the session to be seen going idle")
 }

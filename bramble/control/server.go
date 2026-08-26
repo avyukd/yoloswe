@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"sync"
 
 	"github.com/bazelment/yoloswe/bramble/session"
+	"github.com/bazelment/yoloswe/bramble/sockguard"
 )
 
 // SockEnvVar is the environment variable carrying the control socket path,
@@ -39,14 +39,32 @@ func NewUnixServer(socketPath string, disp *Dispatcher) *UnixServer {
 // SocketPath returns the listening socket path.
 func (s *UnixServer) SocketPath() string { return s.socketPath }
 
-// Start removes any stale socket and begins accepting connections.
+// ErrSocketInUse reports that another live process already serves the socket
+// path, so this server must not unlink it.
+//
+// Wraps sockguard.ErrInUse, which is where the bind-before-unlink logic now
+// lives: this socket and the IPC socket are published together and must make
+// the same decision about an occupied path, and the two hand-kept copies had
+// already drifted. This package keeps its own sentinel because callers —
+// main.go among them — already match on it.
+var ErrSocketInUse = fmt.Errorf("control: %w", sockguard.ErrInUse)
+
+// Start binds the control socket.
+//
+// A stale socket file is removed and rebound, but one that still answers is
+// left alone: the path is stable across restarts, and unlinking a live peer's
+// socket would strand every session that has it frozen in its environment.
+//
+// Bind first, then adjudicate, and serialize the stale reclaim under a lock.
+// That whole sequence lives in sockguard, which the IPC socket uses too, so the
+// two paths published together cannot disagree about an occupied path.
 func (s *UnixServer) Start() error {
-	if err := os.Remove(s.socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("control: remove stale socket: %w", err)
-	}
-	ln, err := net.Listen("unix", s.socketPath)
+	ln, err := sockguard.Listen(s.socketPath)
 	if err != nil {
-		return fmt.Errorf("control: listen %s: %w", s.socketPath, err)
+		if errors.Is(err, sockguard.ErrInUse) {
+			return fmt.Errorf("%w: %s", ErrSocketInUse, s.socketPath)
+		}
+		return fmt.Errorf("control: %w", err)
 	}
 	s.ln = ln
 	s.wg.Add(1)
@@ -73,15 +91,19 @@ func (s *UnixServer) acceptLoop() {
 	}
 }
 
-// Close stops the server, closes the listener, waits for in-flight connections,
-// and removes the socket file.
+// Close stops the server and removes the socket file, but only if this server
+// bound it. Mirrors ipc.Server.Close: a server whose Start lost to a live peer
+// never owned the path, and unlinking it would strand that peer's sessions.
 func (s *UnixServer) Close() error {
 	s.cancel()
 	var err error
 	if s.ln != nil {
+		// Mirrors ipc.Server.Close: UnixListener.Close unlinks the path itself,
+		// while we still own it. A separate os.Remove after wg.Wait can land
+		// after a successor has bound the stable path and would delete its
+		// socket file instead of ours.
 		err = s.ln.Close()
 	}
 	s.wg.Wait()
-	os.Remove(s.socketPath)
 	return err
 }

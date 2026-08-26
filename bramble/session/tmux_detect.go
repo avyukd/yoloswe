@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // IsInsideTmux returns true if the current process is running inside tmux.
@@ -15,10 +16,18 @@ func IsInsideTmux() bool {
 	return os.Getenv("TMUX") != ""
 }
 
-// IsTmuxAvailable returns true if the tmux command is available in PATH.
-func IsTmuxAvailable() bool {
+// tmuxAvailable resolves tmux on PATH once. Every tmux helper guards on this,
+// and the pane-idle monitor calls several per session per poll, so an uncached
+// lookup re-stats every PATH entry a few times a second to re-answer a question
+// whose answer cannot change within a process.
+var tmuxAvailable = sync.OnceValue(func() bool {
 	_, err := exec.LookPath("tmux")
 	return err == nil
+})
+
+// IsTmuxAvailable returns true if the tmux command is available in PATH.
+func IsTmuxAvailable() bool {
+	return tmuxAvailable()
 }
 
 // ListTmuxWindows returns a list of window names in the current tmux session.

@@ -14,7 +14,10 @@ import (
 
 // fakeRegistry is a hand fake of the Registry interface for dispatcher tests.
 type fakeRegistry struct {
-	targets    map[string]string // sessionID -> tmux target
+	targets map[string]string // sessionID -> tmux target
+	// onResolve, when set, runs inside ResolveTmuxTarget. It lets a test park a
+	// request inside a live handler so Close's drain has something to wait on.
+	onResolve  func()
 	resolveErr error
 	captureErr error
 	stopErr    error
@@ -26,6 +29,9 @@ type fakeRegistry struct {
 func (f *fakeRegistry) GetAllSessions() []session.SessionInfo { return f.sessions }
 
 func (f *fakeRegistry) ResolveTmuxTarget(id session.SessionID) (string, error) {
+	if f.onResolve != nil {
+		f.onResolve()
+	}
 	if f.resolveErr != nil {
 		return "", f.resolveErr
 	}
@@ -350,9 +356,40 @@ func TestSendInputQueueSurfacesCourierError(t *testing.T) {
 	d.SetCourier(&fakeCourier{sendErr: fmt.Errorf("session s1 is completed and cannot receive messages")})
 
 	resp := d.Handle(context.Background(), req(t, TypeSessionSendInput,
-		SendInputReq{SessionID: "s1", Text: "hello", Queue: true}))
+		// Submit is set because Queue requires it; this test is about the
+		// courier's error reaching the caller, not the flag combination.
+		SendInputReq{SessionID: "s1", Text: "hello", Submit: true, Queue: true}))
 
 	err := resp.DecodeResponse(nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cannot receive messages")
+}
+
+// TestSendInputQueueRequiresSubmit: a queued delivery must be submitted, and
+// asking otherwise is refused rather than silently ignored.
+//
+// Submit is a documented wire field, so quietly overriding it would tell a
+// caller OK and then do something else. And staging text into a composer
+// without Enter delivers nothing: it sits there looking like a human draft,
+// holding every later delivery to that session behind it for the full grace
+// period before being pasted on top.
+//
+// Enforced here rather than only in the CLI because every producer reaches the
+// courier through this dispatcher; the hub forwards SendInputReq from remote
+// agents, which never pass through cobra's flags.
+func TestSendInputQueueRequiresSubmit(t *testing.T) {
+	t.Parallel()
+	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+	d, _ := newDispatcher(reg)
+	courier := &fakeCourier{queued: true}
+	d.SetCourier(courier)
+
+	resp := d.Handle(context.Background(), req(t, TypeSessionSendInput,
+		SendInputReq{SessionID: "s1", From: "s0", Text: "hello", Submit: false, Queue: true}))
+
+	var result SendInputResult
+	err := resp.DecodeResponse(&result)
+	require.Error(t, err, "the combination must be refused, not quietly submitted")
+	assert.Contains(t, err.Error(), "submit")
+	assert.Empty(t, courier.sends, "nothing may be queued for a request that cannot be honoured")
 }
