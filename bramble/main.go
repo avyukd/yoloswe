@@ -1528,7 +1528,10 @@ TUI-mode session has no pane to type into at all.
 
 With --queue the message is held until the recipient goes idle and is then
 delivered through whichever path its runner supports. Use --queue for anything
-the recipient should read as part of its own work.`,
+the recipient should read as part of its own work.
+
+--queue requires --submit. Queued text that is staged without Enter is never
+delivered, and then blocks the next delivery as a draft in the composer.`,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		sessionID, _ := cmd.Flags().GetString("session-id")
 		target, _ := cmd.Flags().GetString("target")
@@ -1722,7 +1725,7 @@ func init() {
 	sendInputCmd.Flags().Bool("submit", false, "Press Enter after delivering the text")
 	sendInputCmd.Flags().Bool("queue", false,
 		"Hold the text until the session is idle instead of typing into a live turn "+
-			"(requires --session-id; also reaches TUI-mode sessions)")
+			"(requires --session-id and --submit; also reaches TUI-mode sessions)")
 	sendInputCmd.Flags().String("from", "",
 		"Sender's session ID (defaults to $"+session.SessionIDEnvVar+"); a subagent "+
 			"messaging its parent this way replaces bramble's generated report")

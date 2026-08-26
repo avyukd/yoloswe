@@ -296,7 +296,7 @@ func composerHoldsThisDelivery(provider, composer, staged, text string) bool {
 	if !composerReadable(provider) {
 		return false
 	}
-	body := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(composer), claudePromptGlyph))
+	body, _ := composerBody(composer)
 	if body == "" {
 		return false
 	}
@@ -456,13 +456,33 @@ func (c *Courier) retryLater(ctx context.Context, to SessionID) {
 	c.retryArmed = true
 	c.mu.Unlock()
 
+	// Release the cancellation hook when the timer fires. A hold is steady
+	// state, not a rare failure: errComposerBusy and errPaneBusy each arm one
+	// retry per retryDelay for the whole life of the hold, and a composer hold
+	// has no built-in end. Discarding the stop func would leave one registration
+	// per retry on the courier's process-lifetime context, freed only at
+	// shutdown.
+	//
+	// Ordering: the timer goroutine and this one both touch stopHook, and the
+	// timer may fire before context.AfterFunc has returned, so the handoff goes
+	// through a channel rather than a bare variable. The buffered send never
+	// blocks this goroutine, and the receive takes the zero value only if the
+	// send has not happened yet — in which case there is no hook to release.
+	stopHook := make(chan func() bool, 1)
 	timer := time.AfterFunc(retryDelay, func() {
+		select {
+		case stop := <-stopHook:
+			stop()
+		default:
+		}
 		if ctx.Err() != nil {
 			return
 		}
 		c.Drain(ctx, to)
 	})
-	context.AfterFunc(ctx, func() { timer.Stop() })
+	// AfterFunc runs the hook immediately when ctx is already cancelled, so this
+	// still stops a timer armed during shutdown.
+	stopHook <- context.AfterFunc(ctx, func() { timer.Stop() })
 }
 
 // claimWrite reserves the right to write to a recipient, reporting whether it
@@ -658,7 +678,7 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 		// ignored should not pay the sleeps and capture round trips, and probing
 		// widens the window between the draft check and SendEnter.
 		if !alreadyStaged && pasteVerifyRequired(provider) {
-			landed, readable := c.pasteVerdict(ctx, info.ID, provider, text)
+			landed, readable, foreign := c.pasteVerdict(ctx, info.ID, provider, text)
 			switch {
 			case landed:
 				// Confirmed in the composer; nothing to do.
@@ -667,14 +687,35 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 				// re-pasting here is the duplicate-copy loop.
 				slog.Debug("paste could not be verified because the pane was unreadable; submitting anyway",
 					"session", info.ID, "provider", provider)
+			case foreign:
+				// Someone else's text is in the composer, so this is not a
+				// dropped paste and a re-paste would append a second copy to
+				// their unsent line. The usual cause is a user who started
+				// typing after the draft check and before this verdict; the
+				// window is the verification budget, up to ~1.8s wide.
+				//
+				// Fail closed exactly as the draft check does: drop provenance,
+				// since a composer we do not own cannot be our staged record,
+				// and keep the delivery queued for a later idle composer.
+				// Pressing Enter is equally unsafe — it would submit their line
+				// with our text riding on it.
+				c.clearStaged(info.ID)
+				return errComposerBusy
 			default:
-				// Readable and absent is a real negative. Retry once, then queue.
+				// Readable, absent, and the composer is empty: a real dropped
+				// paste. Retry once, then queue.
 				if err := c.panes.Paste(ctx, target, text); err != nil {
 					c.clearStaged(info.ID)
 					return err
 				}
 				c.noteStaged(info.ID, text)
-				if landed, readable := c.pasteVerdict(ctx, info.ID, provider, text); !landed && readable {
+				landed, readable, foreign := c.pasteVerdict(ctx, info.ID, provider, text)
+				if foreign {
+					// Interference arrived during the retry. Same rule.
+					c.clearStaged(info.ID)
+					return errComposerBusy
+				}
+				if !landed && readable {
 					// Erroring keeps the delivery queued.
 					return fmt.Errorf("paste did not reach session %s's prompt", info.ID)
 				}
@@ -790,21 +831,29 @@ func (c *Courier) pasteIsReadableAsText(ctx context.Context, id SessionID, provi
 		func(line string) bool { return strings.Contains(line, probe) })
 }
 
-// pasteVerdict reports whether the paste is visible, and whether the pane was
-// readable enough to make absence meaningful. Silence is not a negative: when
-// the pane cannot be captured or the composer cannot be located, re-pasting
-// appends duplicate copies and never submits them. Only a readable pane that
-// does not show the paste is a real negative.
+// pasteVerdict reports whether the paste is visible, whether the pane was
+// readable enough to make absence meaningful, and whether the composer holds
+// text that is not ours. Silence is not a negative: when the pane cannot be
+// captured or the composer cannot be located, re-pasting appends duplicate
+// copies and never submits them. Only a readable pane that does not show the
+// paste is a real negative.
+//
+// foreign splits that negative in two, because a re-paste is the right repair
+// for only one of them. An empty composer is a dropped paste. A composer holding
+// someone else's text is interference — a user typing inside the verification
+// window, most often — and pasting there appends to their unsent line. The
+// caller cannot re-derive this: by the time it sees (false, true) the capture is
+// gone, so the shape is decided here where the lines are still in hand.
 //
 // The search is intentionally bounded to a probe, not the whole message. TUIs
 // wrap and decorate long prompts, and some providers render a paste chip instead
 // of echoing text; pasteConfirmed decides which evidence is acceptable.
-func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text string) (landed, readable bool) {
+func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text string) (landed, readable, foreign bool) {
 	var obscured bool
 	probe := pasteProbe(text)
 	first := pasteFirstLine(text)
 	if probe == "" {
-		return true, true // nothing distinctive to look for; do not block delivery
+		return true, true, false // nothing distinctive to look for; do not block delivery
 	}
 	// One budget: only providers whose verdict is required reach here.
 	for i := 0; i < pasteVerifyAttempts; i++ {
@@ -812,7 +861,7 @@ func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text
 		if i > 0 {
 			select {
 			case <-ctx.Done():
-				return false, readable
+				return false, readable, foreign
 			case <-time.After(pasteVerifyInterval):
 			}
 		}
@@ -821,14 +870,17 @@ func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text
 			continue
 		}
 		if pasteConfirmed(provider, lines, first, probe) {
-			return true, true
+			return true, true, false
 		}
 		// A located composer that lacks the text is a negative; an obscured
-		// composer is silence, and the final capture decides readability.
+		// composer is silence, and the final capture decides readability. The
+		// last capture decides foreign for the same reason: it is the one that
+		// describes the pane the caller is about to write into.
 		obscured = pasteEvidenceObscured(provider, lines)
 		readable = !obscured
+		foreign = composerHoldsForeignText(provider, lines, first)
 	}
-	return false, readable
+	return false, readable, foreign
 }
 
 // pasteProbe picks the tail of the first line, not the head. Subagent reports
@@ -1032,7 +1084,14 @@ func isHeld(err error) bool {
 // pane holds as queued waiting states.
 func logWriteFailure(failMsg string, to SessionID, err error) {
 	if errors.Is(err, errComposerBusy) {
-		logDeliveryWarn("holding delivery: recipient has an unsubmitted draft", to, err)
+		// Debug, not warn, for the same reason as errPaneBusy and more so: a
+		// draft left in the composer holds the delivery for as long as it sits
+		// there, and neither write() arm ever delivers, so warning here is one
+		// line every retryDelay with no end. The operator-visible signal for a
+		// standing block is the single noteBlockedReport warning; a second
+		// undeduped line here would just cancel that dedup out.
+		slog.Debug("holding delivery: recipient has an unsubmitted draft",
+			"session", to, "error", err)
 		return
 	}
 	if errors.Is(err, errPaneBusy) {

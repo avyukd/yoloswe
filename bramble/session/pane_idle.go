@@ -499,6 +499,37 @@ func pasteVerifyRequired(provider string) bool {
 	return pasteEvidenceProbes[provider].required
 }
 
+// composerHoldsForeignText reports that the composer was read, is not empty, and
+// does not hold this delivery. That is the one shape a re-paste must never see.
+//
+// A negative paste verdict has two causes that look identical to the caller but
+// call for opposite responses. An EMPTY composer means the paste was genuinely
+// dropped, and pasting again is the repair. A composer holding text that is not
+// ours means something else got there — most often a user who started typing
+// inside the ~1.8s verification window, since a draft-prefixed body can never
+// satisfy confirmsComposer's one-way prefix rule — and pasting again appends a
+// second copy to that person's unsent line.
+//
+// Only a located composer can answer. An unlocatable one is silence, already
+// handled as unreadable by pasteEvidenceObscured, and a provider with no
+// readable composer cannot distinguish these shapes at all.
+func composerHoldsForeignText(provider string, lines []string, first string) bool {
+	if !composerReadable(provider) {
+		return false
+	}
+	composerIdx, _ := claudeComposerIdx(lines)
+	if composerIdx < 0 {
+		return false
+	}
+	body, _ := composerBody(lines[composerIdx])
+	if body == "" {
+		return false // an empty composer is a dropped paste, not interference
+	}
+	// The same one-way rule confirmsComposer uses: our own text may be truncated
+	// by pane width, so a body that prefixes this delivery is still ours.
+	return !strings.HasPrefix(first, body)
+}
+
 // pasteEvidenceObscured reports the one readable-but-silent shape: provider
 // chrome is present, but the composer could not be located within it. Other
 // unreadable captures remain negative because an empty or half-painted pane is
@@ -595,7 +626,7 @@ func confirmsComposer(line, first string, chips []string) bool {
 	if containsAny(line, chips) {
 		return true
 	}
-	body := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), claudePromptGlyph))
+	body, _ := composerBody(line)
 	// An empty composer confirms nothing: that is what a dropped paste looks
 	// like, and every string has the empty prefix.
 	if body == "" {
@@ -606,6 +637,27 @@ func confirmsComposer(line, first string, chips []string) bool {
 
 // claudePromptGlyph is the composer prompt in claude-code's TUI, U+276F.
 const claudePromptGlyph = "❯"
+
+// composerBody strips the prompt glyph off a captured composer line and returns
+// what the user or bramble put after it, reporting whether the glyph was there
+// at all.
+//
+// This is the one place the glyph is stripped. Every reader needs the same two
+// Unicode-aware trims and gets them wrong in the same way: claude separates
+// `❯` from the body with U+00A0, so an ASCII-only cutset leaves that byte
+// behind and reads every EMPTY composer as holding text. That single regression
+// breaks each caller in a different direction — judgeComposerLine reports a
+// draft on every idle pane, composerHoldsThisDelivery stops recognizing
+// bramble's own staged text, and confirmsComposer stops confirming a landed
+// paste and drives write() into a second paste — which is why they share one
+// implementation and one test rather than three copies of the expression.
+func composerBody(line string) (body string, hasGlyph bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, claudePromptGlyph) {
+		return strings.TrimSpace(trimmed), false
+	}
+	return strings.TrimSpace(strings.TrimPrefix(trimmed, claudePromptGlyph)), true
+}
 
 // composerReadable reports whether bramble can distinguish an empty composer
 // from a draft. Only claude has a stable prompt glyph for that.
@@ -676,15 +728,14 @@ func searchedForComposer(lines []string) bool {
 	return statusSepIdx(lines) >= 0
 }
 
-// judgeComposerLine reports whether one composer line holds a draft. TrimSpace
-// is required because claude separates `❯` from the body with U+00A0; an
-// ASCII-only trim would read every empty composer as a draft.
+// judgeComposerLine reports whether one composer line holds a draft. The
+// glyph and the U+00A0 that follows it are handled by composerBody, which every
+// composer reader shares.
 func judgeComposerLine(line string) (draft, known bool) {
-	trimmed := strings.TrimSpace(line)
-	if !strings.HasPrefix(trimmed, claudePromptGlyph) {
+	body, hasGlyph := composerBody(line)
+	if !hasGlyph {
 		return false, false
 	}
-	body := strings.TrimSpace(strings.TrimPrefix(trimmed, claudePromptGlyph))
 	if body == "" {
 		return false, true
 	}

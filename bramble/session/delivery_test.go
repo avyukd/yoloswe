@@ -2137,11 +2137,47 @@ func TestDeliveryProceedsOnceDraftIsCleared(t *testing.T) {
 	assert.Empty(t, c.Pending("s1"), "the queue drains")
 }
 
-// TestEmptyClaudeComposerIsNotADraft pins the byte that decides whether any
-// mail is ever delivered to a claude session. The prompt glyph is followed by
-// a non-breaking space (U+00A0), so trimming only ordinary spaces leaves
-// " " behind and reports a draft on every empty composer — holding back
-// every delivery on the host.
+// TestComposerBodyIsUnicodeAwareAtEveryReader pins the byte that decides
+// whether any mail is ever delivered to a claude session, at the one helper all
+// three composer readers share. The prompt glyph is followed by a non-breaking
+// space (U+00A0), so trimming only ordinary spaces leaves " " behind.
+//
+// Testing composerBody rather than each caller is the point: the same regression
+// breaks the three readers in three different directions — judgeComposerLine
+// reports a draft on every empty composer and holds back every delivery on the
+// host, composerHoldsThisDelivery stops recognizing bramble's own staged text,
+// and confirmsComposer stops confirming a landed paste and drives write() into a
+// second paste plus a re-queue. Before the extraction each reader re-derived the
+// body inline and only this file's caller was covered, so an ASCII cutset in
+// either of the other two passed the whole suite.
+func TestComposerBodyIsUnicodeAwareAtEveryReader(t *testing.T) {
+	t.Parallel()
+	for _, line := range []string{
+		"❯ ", // real capture: glyph + NBSP
+		"❯ ", // glyph + ordinary space
+		"❯",  // bare glyph
+	} {
+		body, hasGlyph := composerBody(line)
+		assert.True(t, hasGlyph, "the glyph is present: %q", line)
+		assert.Equal(t, "", body, "an empty composer has an empty body: %q", line)
+	}
+	for _, line := range []string{
+		"❯ real text",
+		"❯ real text",
+	} {
+		body, hasGlyph := composerBody(line)
+		assert.True(t, hasGlyph, "%q", line)
+		assert.Equal(t, "real text", body, "the separator is not part of the body: %q", line)
+	}
+	// No glyph is not a composer at all; judgeComposerLine turns this into
+	// known=false rather than into a verdict.
+	if _, hasGlyph := composerBody("  Add a follow-up"); hasGlyph {
+		t.Fatal("a line without the glyph must not report one")
+	}
+}
+
+// TestEmptyClaudeComposerIsNotADraft keeps the caller-level assertion beside the
+// helper-level one: composerBody is only correct if the verdict it feeds is.
 func TestEmptyClaudeComposerIsNotADraft(t *testing.T) {
 	t.Parallel()
 	for _, line := range []string{
@@ -3072,4 +3108,83 @@ func TestAChipBesideTypedTextIsStillAHumanDraft(t *testing.T) {
 	assert.Zero(t, panes.pasteCount(),
 		"a chip beside typed text has an author at the keyboard; never paste over it")
 	assert.Len(t, c.Pending("s1"), 1, "the delivery stays queued")
+}
+
+// TestUserTypingDuringPasteVerificationIsNotPastedInto covers the window the
+// draft check cannot: a person starts typing AFTER composerDraftText read an
+// empty composer and BEFORE pasteVerdict returns. The composer then holds
+// "their draft" + "our text", which confirmsComposer's one-way prefix rule
+// correctly refuses to accept as our paste.
+//
+// Refusing is only half the answer. That refusal is a readable negative, and a
+// readable negative used to mean "the TUI dropped it, paste again" — so the
+// repair for a dropped paste ran on a pane where nothing was dropped, appending
+// a second copy to a person's unsent line. Enter would then submit their
+// sentence wearing both copies.
+//
+// The rule this pins: a re-paste is the repair for an EMPTY composer only. A
+// composer holding text bramble cannot own is interference, and interference
+// fails closed the same way a draft found up front does — provenance dropped,
+// delivery re-queued.
+//
+// The pane is mutated from the echo hook because that is the only seam that
+// runs between the two captures; setting it up front would be caught by the
+// draft check instead and would test nothing new.
+func TestUserTypingDuringPasteVerificationIsNotPastedInto(t *testing.T) {
+	t.Parallel()
+	const delivery = "a report from a subagent that ran for a while"
+	const draft = "what were we doing with the "
+
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	// The composer is empty when the draft check reads it, so the write path
+	// proceeds to paste. This is the precondition, not the subject.
+	target.appendPane(claudeComposerPane(""))
+
+	panes := &fakePanes{}
+	panes.echo = func(text string) {
+		// The human was mid-word when our paste landed; tmux paste-buffer
+		// appends, so their line now carries our text too.
+		target.appendPane(claudeComposerPane(draft + text))
+	}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", delivery, true)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, panes.pasteCount(),
+		"a composer holding someone else's draft is not a dropped paste: pasting again appends a second copy to their unsent line")
+	assert.NotContains(t, panes.recorded(), "enter(@7)",
+		"and Enter would submit their half-typed sentence with our delivery riding on it")
+	assert.Len(t, c.Pending("s1"), 1,
+		"the delivery is held, not lost, and lands once the composer clears")
+	assert.Empty(t, c.stagedText("s1"),
+		"a composer bramble does not own cannot be its staged record")
+}
+
+// TestDroppedPasteIntoAnEmptyComposerIsStillRetried is the other half of the
+// rule above, kept adjacent so neither can be tightened without the other being
+// read. An empty composer after a paste IS a dropped paste, and the retry that
+// repairs it must survive the interference check.
+func TestDroppedPasteIntoAnEmptyComposerIsStillRetried(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.appendPane(claudeComposerPane(""))
+
+	// The pane never shows the text: the TUI dropped every paste.
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, panes.pasteCount(),
+		"an empty composer is a real dropped paste; the one retry must not be suppressed as interference")
+	assert.NotContains(t, panes.recorded(), "enter(@7)")
+	assert.Len(t, c.Pending("s1"), 1)
 }
