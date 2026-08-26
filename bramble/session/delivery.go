@@ -547,10 +547,23 @@ func (c *Courier) Drain(ctx context.Context, to SessionID) {
 }
 
 // write puts text into the session using whichever path its runner supports.
-func (c *Courier) write(ctx context.Context, info SessionInfo, text string, submit bool) error {
+func (c *Courier) write(ctx context.Context, info SessionInfo, text string, submit bool) (err error) {
 	// Anything written starts the recipient's next turn, so whatever it says at
 	// the end of that turn is fresh news for its parent.
-	defer c.resetIdleReport(info.ID)
+	//
+	// A held delivery is the exception, and it is the common case rather than a
+	// rare failure: errPaneBusy answers every turn bramble's bookkeeping calls
+	// idle while the pane still shows work, and errComposerBusy repeats every
+	// retryDelay for as long as a user's draft sits in the composer. Those paths
+	// reach here having written nothing and started no turn, so the recipient's
+	// next idle is the SAME turn the parent was already told about. Re-arming
+	// there sends the parent a duplicate report, which for a tmux child also
+	// costs another 2000-line pane capture and another result file.
+	defer func() {
+		if !isHeld(err) {
+			c.resetIdleReport(info.ID)
+		}
+	}()
 
 	switch info.RunnerType {
 	case RunnerTypeTUI:
@@ -1008,6 +1021,15 @@ func logDeliveryWarn(msg string, to SessionID, err error) {
 
 // logWriteFailure reports real write failures while classifying composer and
 // pane holds as queued waiting states.
+// isHeld reports whether an error means the delivery was held rather than
+// written: the recipient's pane or composer was busy, so nothing reached it and
+// no turn started. Both callers must agree on this set -- logWriteFailure uses
+// it to pick a log level, and write uses it to decide whether re-arming idle
+// reporting is justified -- so it lives in one place.
+func isHeld(err error) bool {
+	return errors.Is(err, errComposerBusy) || errors.Is(err, errPaneBusy)
+}
+
 func logWriteFailure(failMsg string, to SessionID, err error) {
 	if errors.Is(err, errComposerBusy) {
 		logDeliveryWarn("holding delivery: recipient has an unsubmitted draft", to, err)

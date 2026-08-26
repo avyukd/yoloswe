@@ -1739,6 +1739,48 @@ func TestQueuedFollowUpRearmsReportingWhenDelivered(t *testing.T) {
 	assert.Len(t, c.Pending(parentID), 2)
 }
 
+// TestHeldWriteDoesNotRearmReporting covers the case the assertion in
+// TestQueuedFollowUpRearmsReportingWhenDelivered is worded for but cannot reach.
+// That test queues by making the recipient StatusRunning, so deliver skips the
+// write branch and write is never entered. A HELD write is different: the
+// recipient is idle, write runs, captures the pane, finds a draft, and returns
+// errComposerBusy having written nothing.
+//
+// The re-arm must follow what was written, not what was attempted. Nothing was
+// written and no turn started, so the child's next idle is the same turn the
+// parent already has -- re-arming there delivers the parent a duplicate report,
+// and for a tmux child costs another full pane capture and another result file.
+// This is steady state, not a rare failure: errComposerBusy repeats every
+// retryDelay for as long as the user's draft sits there.
+func TestHeldWriteDoesNotRearmReporting(t *testing.T) {
+	t.Parallel()
+	c, target, parentID, childID := reportFixture(t, StatusIdle)
+	target.setBackend(childID, ProviderClaude, "claude-opus-5")
+
+	reportNow(c, target, childID)
+	require.Len(t, c.Pending(parentID), 1, "precondition: the child's first idle is reported")
+
+	// A user is mid-sentence in the child's composer, so the reply is held.
+	target.appendPane("❯ file the dev deprovisioning bug")
+	queued, err := c.Send(context.Background(), parentID, childID, "round two", true)
+	require.NoError(t, err)
+	require.True(t, queued, "precondition: a held delivery stays queued")
+
+	target.setChild(childID, parentID, StatusIdle, RunnerTypeTmux)
+	reportNow(c, target, childID)
+	assert.Len(t, c.Pending(parentID), 1,
+		"a held write started no turn, so it must not re-arm idle reporting")
+
+	// Holding is not dropping: once the composer clears, the delivery lands and
+	// the turn it starts IS reportable again.
+	target.setPane("❯ ")
+	c.Drain(context.Background(), childID)
+	target.setChild(childID, parentID, StatusIdle, RunnerTypeTmux)
+	reportNow(c, target, childID)
+	assert.Len(t, c.Pending(parentID), 2,
+		"once the write actually lands, the turn it starts is news again")
+}
+
 // TestSubmittedWriteMarksSessionRunning pins the fix for a bug that silently
 // ended every two-way conversation after one round.
 //
