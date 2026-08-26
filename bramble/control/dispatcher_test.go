@@ -14,7 +14,10 @@ import (
 
 // fakeRegistry is a hand fake of the Registry interface for dispatcher tests.
 type fakeRegistry struct {
-	targets    map[string]string // sessionID -> tmux target
+	targets map[string]string // sessionID -> tmux target
+	// onResolve, when set, runs inside ResolveTmuxTarget. It lets a test park a
+	// request inside a live handler so Close's drain has something to wait on.
+	onResolve  func()
 	resolveErr error
 	captureErr error
 	stopErr    error
@@ -26,6 +29,9 @@ type fakeRegistry struct {
 func (f *fakeRegistry) GetAllSessions() []session.SessionInfo { return f.sessions }
 
 func (f *fakeRegistry) ResolveTmuxTarget(id session.SessionID) (string, error) {
+	if f.onResolve != nil {
+		f.onResolve()
+	}
 	if f.resolveErr != nil {
 		return "", f.resolveErr
 	}

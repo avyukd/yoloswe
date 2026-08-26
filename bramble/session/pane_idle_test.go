@@ -1,8 +1,8 @@
 package session
 
 import (
-	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -798,34 +798,67 @@ func TestClaudeAcceptsAPasteChip(t *testing.T) {
 
 	require.True(t, pasteVerifyRequired(ProviderClaude), "precondition")
 
+	confirmed := func(composer, text string) bool {
+		return pasteConfirmed(ProviderClaude,
+			claudePaneComposer(composer, "✻ Worked for 12s"),
+			pasteFirstLine(text), pasteProbe(text))
+	}
+
 	// Real chrome is needed so the composer can be located.
-	assert.True(t, pasteConfirmed(ProviderClaude,
-		claudePaneComposer("❯ [Pasted text #1 +42 lines]", "✻ Worked for 12s"),
-		"a report from a subagent"),
+	assert.True(t, confirmed("❯ [Pasted text #1 +42 lines]", "a report from a subagent"),
 		"a collapsed paste is still a paste that arrived")
 
 	// An empty composer is not confirmation.
-	assert.False(t, pasteConfirmed(ProviderClaude,
-		claudePaneComposer("❯ ", "✻ Worked for 12s"), "a report from a subagent"))
+	assert.False(t, confirmed("❯ ", "a report from a subagent"))
 
 	// Transcript echoes must not confirm a dropped paste into an empty composer.
 	assert.False(t, pasteConfirmed(ProviderClaude,
 		claudePaneComposer("❯ ", "❯ a report from a subagent", "● I read it."),
-		"a report from a subagent"),
+		pasteFirstLine("a report from a subagent"), pasteProbe("a report from a subagent")),
 		"transcript history must not confirm a paste that never arrived")
 
-	// Narrow panes may show only a prefix of a paste that did arrive; treating
-	// that as negative re-pastes into the located composer.
-	long := strings.Repeat("x", pasteProbeLen*2)
-	require.Greater(t, len(pasteProbe(long)), 8, "precondition: the probe must be longer than the truncation below")
-	assert.True(t, pasteConfirmed(ProviderClaude,
-		claudePaneComposer("❯ "+pasteProbe(long)[:8], "✻ Worked for 12s"), long),
-		"a composer showing a truncation of the paste confirms it; the pane is simply narrow")
+	// Narrow panes show only the HEAD of a paste that did arrive, because the
+	// composer renders from the start of the text and tmux truncates the row at
+	// the pane width. The text below is heterogeneous on purpose: with a
+	// repeated character head and tail are indistinguishable, so the assertion
+	// passes whichever end the matcher anchors at and pins nothing.
+	long := "report from subagent alpha about session 7f3a91c2 finishing"
+	require.Greater(t, len([]rune(long)), pasteProbeLen, "precondition: long enough to be truncated")
+	require.NotEqual(t, pasteFirstLine(long)[:8], pasteProbe(long)[:8],
+		"precondition: head and tail must differ, or this test cannot tell them apart")
+	assert.True(t, confirmed("❯ "+long[:30], long),
+		"a composer showing the head of the paste confirms it; the pane is simply narrow")
 
 	// Truncation is evidence only when it is a prefix of this paste.
-	assert.False(t, pasteConfirmed(ProviderClaude,
-		claudePaneComposer("❯ zzzz", "✻ Worked for 12s"), long),
+	assert.False(t, confirmed("❯ zzzz", long),
 		"an unrelated short line is not a truncation of our paste")
+
+	// The tail is precisely what a claude composer does NOT show first. Before
+	// this was head-anchored, only the tail matched, so every delivery wider
+	// than the pane read as dropped and was pasted a second time.
+	assert.False(t, confirmed("❯ "+pasteProbe(long), long),
+		"a row holding only the tail is not the head of our first line")
+
+	// The probe must cut on a rune boundary. This string is chosen so that the
+	// last pasteProbeLen BYTES begin inside the 2-byte "é": a byte slice yields
+	// "\xa9日🎉🎉🎉🎉🎉", invalid UTF-8 that matches nothing any pane can render,
+	// so a paste that did land reads as dropped. For claude, required:true, that
+	// false negative pastes a second copy and re-queues.
+	multibyte := "xxxxxxxxxxaé日🎉🎉🎉🎉🎉"
+	require.False(t, utf8.ValidString(multibyte[len(multibyte)-pasteProbeLen:]),
+		"precondition: a byte slice of this string must split a rune, or the case proves nothing")
+	require.True(t, utf8.ValidString(pasteProbe(multibyte)),
+		"the probe must never be cut mid-rune")
+
+	// The draft race, pinned here because head anchoring is what closes it.
+	// The composer is read once BEFORE the paste, but verification then costs up
+	// to pasteVerifyAttempts*pasteVerifyInterval, and a user typing inside that
+	// window has their draft appended to by tmux. Confirming such a composer
+	// would press Enter on the human's half-written sentence wearing our text.
+	// A tail probe matched it (our text is present, at the end); the one-way
+	// head rule does not, because the visible body starts with the draft.
+	assert.False(t, confirmed("❯ file the dev bug "+long, long),
+		"a composer whose body starts with a user's draft is not our paste, however much of our text trails it")
 }
 
 // TestCodexTranscriptDoesNotConfirmAPaste pins required:true fallback safety:
@@ -848,7 +881,7 @@ func TestCodexTranscriptDoesNotConfirmAPaste(t *testing.T) {
 	// The echoed report sits close enough that only probe uniqueness can save it.
 	other := "[bramble] subagent wt-builder-b2b2b2b2 (builder) is completed"
 	shortReply := codexPane(false, "  › "+other, "  • Noted, waiting on the others.")
-	assert.False(t, pasteConfirmed(ProviderCodex, shortReply, probe),
+	assert.False(t, pasteConfirmed(ProviderCodex, shortReply, pasteFirstLine(report), probe),
 		"a DIFFERENT delivery echoed two rows up must not confirm this one, which may have been dropped")
 
 	// The same echo deeper in history is still not confirmation.
@@ -856,7 +889,7 @@ func TestCodexTranscriptDoesNotConfirmAPaste(t *testing.T) {
 	for len(deep) < pasteVerifyLines {
 		deep = append(deep, "  • still working through it")
 	}
-	assert.False(t, pasteConfirmed(ProviderCodex, codexPane(false, deep...), probe),
+	assert.False(t, pasteConfirmed(ProviderCodex, codexPane(false, deep...), pasteFirstLine(report), probe),
 		"and neither does the same echo far above the composer")
 
 	// Wrapped deliveries still confirm; their first line moves upward with the
@@ -865,12 +898,12 @@ func TestCodexTranscriptDoesNotConfirmAPaste(t *testing.T) {
 	for i := 0; i < 12; i++ {
 		wrapped = append(wrapped, "    continuation of the wrapped delivery")
 	}
-	assert.True(t, pasteConfirmed(ProviderCodex, codexPane(false, wrapped...), probe),
+	assert.True(t, pasteConfirmed(ProviderCodex, codexPane(false, wrapped...), pasteFirstLine(report), probe),
 		"a wrapped delivery's first line is still the composer, however far up it sits")
 
 	// Ordinary bottom-of-pane paste.
 	assert.True(t, pasteConfirmed(ProviderCodex,
-		codexPane(false, "  • an earlier turn", "  › "+report), probe),
+		codexPane(false, "  • an earlier turn", "  › "+report), pasteFirstLine(report), probe),
 		"a paste sitting at the bottom of the pane is what the check is for")
 }
 
@@ -889,7 +922,7 @@ func TestCodexPaneVerdictIsBoundedByWhatBrambleCanSee(t *testing.T) {
 	// Two deliveries whose first lines agree over the probe window.
 	same := "[bramble] subagent wt-builder-9a9a9a9a (builder) is completed"
 	pane := codexPane(false, "  › "+same, "  • Noted.")
-	assert.True(t, pasteConfirmed(ProviderCodex, pane, pasteProbe(same)),
+	assert.True(t, pasteConfirmed(ProviderCodex, pane, pasteFirstLine(same), pasteProbe(same)),
 		"KNOWN GAP: an echo of a delivery with the same probe confirms a paste that may have been dropped")
 
 	// Reading less would also miss ordinary wrapped composers.

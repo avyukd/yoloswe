@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -203,4 +204,63 @@ func TestControlConcurrentStaleReclaim(t *testing.T) {
 	require.NoError(t, err)
 	_, err = Request(context.Background(), sock, req)
 	require.NoError(t, err, "the winner must still own the path after the contention")
+}
+
+// TestCloseDoesNotUnlinkASuccessorsSocket mirrors the ipc.Server test of the
+// same name: both servers bind a stable per-user path, so both can hand it to a
+// successor mid-drain. ln.Close() unlinks at once, but wg.Wait() blocks for as
+// long as an in-flight handler runs, and a trailing os.Remove after that drain
+// would delete whatever now holds the path — the successor's socket, not ours.
+func TestCloseDoesNotUnlinkASuccessorsSocket(t *testing.T) {
+	t.Parallel()
+	sock := filepath.Join(t.TempDir(), "handoff.sock")
+
+	inHandler := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	reg := &fakeRegistry{
+		targets:   map[string]string{"s1": "@4"},
+		onResolve: func() { close(inHandler); <-releaseHandler },
+	}
+	old := NewUnixServer(sock, NewDispatcher(reg, tmuxctl.NewFake()))
+	require.NoError(t, old.Start())
+
+	req, err := NewRequest(TypeSessionSendInput, "r1",
+		SendInputReq{SessionID: "s1", Text: "hello", Submit: true})
+	require.NoError(t, err)
+	go func() { _, _ = Request(context.Background(), sock, req) }()
+	select {
+	case <-inHandler:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never ran; the drain would not block")
+	}
+
+	closed := make(chan struct{})
+	go func() { defer close(closed); _ = old.Close() }()
+
+	require.Eventually(t, func() bool {
+		_, statErr := os.Stat(sock)
+		return os.IsNotExist(statErr)
+	}, 5*time.Second, 10*time.Millisecond, "the old listener must release the path")
+
+	successor := NewUnixServer(sock,
+		NewDispatcher(&fakeRegistry{targets: map[string]string{"s2": "@9"}}, tmuxctl.NewFake()))
+	require.NoError(t, successor.Start(), "the successor binds the freed stable path")
+	t.Cleanup(func() { _ = successor.Close() })
+
+	close(releaseHandler)
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old server never finished closing")
+	}
+
+	_, err = os.Stat(sock)
+	require.NoError(t, err, "the predecessor's Close must not delete the successor's socket file")
+
+	// Reachability, not just presence: the successor must still answer here.
+	ping, err := NewRequest(TypeSessionSendInput, "r2",
+		SendInputReq{SessionID: "s2", Text: "hi", Submit: true})
+	require.NoError(t, err)
+	_, err = Request(context.Background(), sock, ping)
+	require.NoError(t, err, "the successor must still be reachable at the stable path")
 }

@@ -768,9 +768,13 @@ func (c *Courier) pasteIsReadableAsText(ctx context.Context, id SessionID, provi
 	if err != nil {
 		return false
 	}
-	// Share pasteConfirmed's scan scope, but require text rather than a chip.
-	textOnly := func(line string) bool { return strings.Contains(line, probe) }
-	return scanForPaste(provider, lines, textOnly, textOnly)
+	// Share pasteConfirmed's scan scope and its anchoring, but require text
+	// rather than a chip: the composer shows the head of the first line, the
+	// transcript tail echoes it whole.
+	first := pasteFirstLine(text)
+	return scanForPaste(provider, lines,
+		func(line string) bool { return confirmsComposer(line, first, nil) },
+		func(line string) bool { return strings.Contains(line, probe) })
 }
 
 // pasteVerdict reports whether the paste is visible, and whether the pane was
@@ -785,6 +789,7 @@ func (c *Courier) pasteIsReadableAsText(ctx context.Context, id SessionID, provi
 func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text string) (landed, readable bool) {
 	var obscured bool
 	probe := pasteProbe(text)
+	first := pasteFirstLine(text)
 	if probe == "" {
 		return true, true // nothing distinctive to look for; do not block delivery
 	}
@@ -802,7 +807,7 @@ func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text
 		if err != nil {
 			continue
 		}
-		if pasteConfirmed(provider, lines, probe) {
+		if pasteConfirmed(provider, lines, first, probe) {
 			return true, true
 		}
 		// A located composer that lacks the text is a negative; an obscured
@@ -824,12 +829,21 @@ func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text
 // dangerous: the next SendEnter may land on an empty composer while MarkRunning
 // records a turn that never started.
 func pasteProbe(text string) string {
-	first, _, _ := strings.Cut(text, "\n")
-	first = strings.TrimSpace(first)
-	if len(first) > pasteProbeLen {
-		first = first[len(first)-pasteProbeLen:]
+	first := pasteFirstLine(text)
+	// Slice on a rune boundary. A byte cut can split a multi-byte rune, and the
+	// resulting invalid UTF-8 matches nothing in the pane, so a paste that did
+	// land reads as dropped.
+	if r := []rune(first); len(r) > pasteProbeLen {
+		first = string(r[len(r)-pasteProbeLen:])
 	}
 	return first
+}
+
+// pasteFirstLine is what a composer holding this delivery shows: composers render
+// from the start of the text, so the head is what survives a narrow pane.
+func pasteFirstLine(text string) string {
+	first, _, _ := strings.Cut(text, "\n")
+	return strings.TrimSpace(first)
 }
 
 // discard drops a recipient's queue and per-recipient courier state.

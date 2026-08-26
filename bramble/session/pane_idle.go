@@ -527,13 +527,16 @@ func pasteEvidenceObscured(provider string, lines []string) bool {
 // A residual remains: two first lines identical across the probe window still
 // collide when the provider has no readable composer. Closing that needs pre-
 // and post-paste evidence from the delivery path; the test documents the gap.
-func pasteConfirmed(provider string, lines []string, probe string) bool {
+// The two arms are handed different anchors on purpose: a located composer shows
+// the head of the first line, while the tail scan reads transcript rows that
+// echo it whole. See confirmsComposer and pasteProbe.
+func pasteConfirmed(provider string, lines []string, first, probe string) bool {
 	if probe == "" {
 		return true // nothing distinctive to look for
 	}
 	chips := pasteEvidenceProbes[provider].chipMarkers
 	return scanForPaste(provider, lines,
-		func(line string) bool { return confirmsComposer(line, probe, chips) },
+		func(line string) bool { return confirmsComposer(line, first, chips) },
 		func(line string) bool { return strings.Contains(line, probe) || containsAny(line, chips) })
 }
 
@@ -575,12 +578,21 @@ func scanForPaste(provider string, lines []string, onComposer, onTail func(strin
 // echoes from confirming a paste that never arrived.
 const pasteConfirmTailLines = pasteVerifyLines - 8
 
-// confirmsComposer checks a located composer line. The composer may show only a
-// truncated prefix of the probe, so this matches in the same one-way direction
-// as composerHoldsThisDelivery; otherwise a narrow pane creates false negatives
-// that trigger duplicate re-pastes.
-func confirmsComposer(line, probe string, chips []string) bool {
-	if strings.Contains(line, probe) || containsAny(line, chips) {
+// confirmsComposer checks a located composer line against the delivery's whole
+// first line, not against pasteProbe. The two anchor at opposite ends: a
+// composer wraps, so claudeComposerIdx returns its topmost row and tmux truncates
+// that row at the pane width, leaving the HEAD of the line visible — while
+// pasteProbe deliberately returns the TAIL. Matching a head-truncated row against
+// a tail probe fails for every delivery whose first line exceeds the pane width,
+// and for claude that false negative is not cosmetic: pasteVerifyRequired is
+// true, so write's `default` branch pastes a second copy and re-queues, which is
+// the duplicate-paste loop this package exists to prevent.
+//
+// The comparison is the same one-way rule composerHoldsThisDelivery uses: the
+// visible body must be a prefix of what we sent. Narrow panes then read as
+// confirmation rather than as a dropped paste.
+func confirmsComposer(line, first string, chips []string) bool {
+	if containsAny(line, chips) {
 		return true
 	}
 	body := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), claudePromptGlyph))
@@ -589,7 +601,7 @@ func confirmsComposer(line, probe string, chips []string) bool {
 	if body == "" {
 		return false
 	}
-	return strings.HasPrefix(probe, body)
+	return strings.HasPrefix(first, body)
 }
 
 // claudePromptGlyph is the composer prompt in claude-code's TUI, U+276F.

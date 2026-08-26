@@ -453,3 +453,64 @@ func TestBindDoesNotAcceptUntilServe(t *testing.T) {
 	srv.Serve()
 	require.NoError(t, NewClient(sockPath).Ping(), "Serve must start handling")
 }
+
+// TestCloseDoesNotUnlinkASuccessorsSocket pins the other half of the ownership
+// rule. TestCloseDoesNotUnlinkASocketItDoesNotOwn covers the server that never
+// bound; this covers the server that DID bind and then handed the path on.
+//
+// The window is real because Close drains in-flight handlers: ln.Close() unlinks
+// immediately, but wg.Wait() can block for as long as a handler runs, and the
+// stable path is free for that whole time. A successor bramble binding it during
+// the drain used to have its socket file deleted by the predecessor's trailing
+// os.Remove — leaving it serving an unlinked inode while every window's baked
+// BRAMBLE_SOCK resolved to nothing.
+func TestCloseDoesNotUnlinkASuccessorsSocket(t *testing.T) {
+	t.Parallel()
+	sockPath := filepath.Join(t.TempDir(), "handoff.sock")
+
+	inHandler := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	old := NewServer(sockPath)
+	old.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+		close(inHandler)
+		<-releaseHandler // hold Close in wg.Wait() while the successor binds
+		return "pong", nil
+	})
+	require.NoError(t, old.Start())
+
+	// Park a request inside the handler so the drain has something to wait on.
+	go func() { _ = NewClient(sockPath).Ping() }()
+	select {
+	case <-inHandler:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never ran; the drain would not block")
+	}
+
+	closed := make(chan struct{})
+	go func() { defer close(closed); _ = old.Close() }()
+
+	// ln.Close() unlinks synchronously, so the path frees before the drain ends.
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(sockPath)
+		return os.IsNotExist(err)
+	}, 5*time.Second, 10*time.Millisecond, "the old listener must release the path")
+
+	successor := NewServer(sockPath)
+	successor.Handle(RequestPing, func(_ context.Context, _ *Request) (any, error) {
+		return "successor", nil
+	})
+	require.NoError(t, successor.Start(), "the successor binds the freed stable path")
+	defer successor.Close()
+
+	// Now let the predecessor finish. Its trailing unlink, if any, lands here.
+	close(releaseHandler)
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old server never finished closing")
+	}
+
+	_, err := os.Stat(sockPath)
+	require.NoError(t, err, "the predecessor's Close must not delete the successor's socket file")
+	require.NoError(t, NewClient(sockPath).Ping(), "and the successor must still be reachable at the stable path")
+}

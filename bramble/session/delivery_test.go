@@ -2002,10 +2002,10 @@ func TestCursorDeliveryPastesOnceAndSubmits(t *testing.T) {
 	// required:true — at which point scanning for the pasted characters could
 	// never succeed and only the chip would confirm.
 	assert.True(t, pasteConfirmed(ProviderCursor,
-		[]string{"[Pasted text #1 +12 lines]"}, "the report body"),
+		[]string{"[Pasted text #1 +12 lines]"}, "the report body", pasteProbe("the report body")),
 		"a chip stands in for the pasted text")
 	assert.False(t, pasteConfirmed(ProviderCodex,
-		[]string{"[Pasted text #1 +12 lines]"}, "the report body"),
+		[]string{"[Pasted text #1 +12 lines]"}, "the report body", pasteProbe("the report body")),
 		"a chip is cursor's chrome; codex must not accept it as evidence")
 }
 

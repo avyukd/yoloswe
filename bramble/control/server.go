@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"sync"
 
 	"github.com/bazelment/yoloswe/bramble/session"
@@ -98,15 +97,13 @@ func (s *UnixServer) acceptLoop() {
 func (s *UnixServer) Close() error {
 	s.cancel()
 	var err error
-	bound := s.ln != nil
-	if bound {
+	if s.ln != nil {
+		// Mirrors ipc.Server.Close: UnixListener.Close unlinks the path itself,
+		// while we still own it. A separate os.Remove after wg.Wait can land
+		// after a successor has bound the stable path and would delete its
+		// socket file instead of ours.
 		err = s.ln.Close()
 	}
 	s.wg.Wait()
-	// Only a server that bound the path may unlink it; ln is assigned on nothing
-	// but a successful bind.
-	if bound {
-		os.Remove(s.socketPath)
-	}
 	return err
 }

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"sync"
 
 	"github.com/bazelment/yoloswe/bramble/sockguard"
@@ -126,16 +125,20 @@ func (s *Server) Serve() {
 func (s *Server) Close() error {
 	s.cancel()
 	var err error
-	bound := s.listener != nil
-	if bound {
+	if s.listener != nil {
+		// Do not unlink separately. *net.UnixListener unlinks the path inside
+		// Close for a listener it created, so this already removes our socket —
+		// and it does so while we still hold it. An explicit os.Remove after
+		// wg.Wait would run arbitrarily later, once in-flight handlers drain, by
+		// which time a successor bramble can have bound the now-free stable path.
+		// Removing then deletes the SUCCESSOR's socket file: it keeps serving an
+		// unlinked inode while every window's baked BRAMBLE_SOCK resolves to
+		// nothing, which is exactly the stranding the stable path prevents.
+		// Under the old PID-scoped names no other process could hold this path
+		// during Close, so the hazard arrived with the stable name.
 		err = s.listener.Close()
 	}
 	s.wg.Wait()
-	// Only a server that bound the path may unlink it; the listener is assigned
-	// on nothing but a successful bind.
-	if bound {
-		os.Remove(s.socketPath)
-	}
 	return err
 }
 
