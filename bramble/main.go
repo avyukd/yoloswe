@@ -1037,13 +1037,7 @@ func handleListSessions(registry *session.SessionRegistry) *ipc.ListSessionsResu
 			Model:           s.Model,
 			Backend:         s.Backend,
 			ParentSessionID: string(s.ParentSessionID),
-			// ID only, deliberately unlike control.Dispatcher.sessionList,
-			// which falls back to the window name: a name is not a stable
-			// target. NotifyTmuxWindow renames the window to TmuxNotifyPrefix
-			// +name the moment the session wants attention, which invalidates
-			// any name a caller is holding. A session with no captured window
-			// ID reports no target rather than a weaker one.
-			TmuxTarget: s.TmuxWindowID,
+			TmuxTarget:      s.TmuxWindowID,
 		}
 	}
 	return &ipc.ListSessionsResult{Sessions: summaries}
