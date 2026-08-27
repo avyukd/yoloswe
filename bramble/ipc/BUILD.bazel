@@ -18,7 +18,10 @@ go_library(
 
 go_test(
     name = "ipc_test",
-    srcs = ["server_test.go"],
+    srcs = [
+        "protocol_test.go",
+        "server_test.go",
+    ],
     embed = [":ipc"],
     deps = ["@com_github_stretchr_testify//require"],
 )

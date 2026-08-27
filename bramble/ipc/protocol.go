@@ -101,6 +101,10 @@ type SessionSummary struct {
 	// ParentSessionID is the session that spawned this one, so a caller can
 	// pick its own subagents out of the list. Empty for a top-level session.
 	ParentSessionID string `json:"parent_session_id,omitempty"`
+	// TmuxTarget is the session's stable tmux window id, so a caller can act on
+	// one session's window without matching on a name (bramble decorates names
+	// with an attention prefix) or an index (both are reused across sessions).
+	TmuxTarget string `json:"tmux_target,omitempty"`
 }
 
 // NotifyParams are the parameters for a notify request.
