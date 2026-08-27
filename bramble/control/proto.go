@@ -143,7 +143,12 @@ type SessionSummary struct {
 	Model        string `json:"model"`
 	Backend      string `json:"backend,omitempty"`
 	RunnerType   string `json:"runner_type"`
-	TmuxTarget   string `json:"tmux_target"`
+	// TmuxTarget is the session's tmux window ID, falling back to the window
+	// name when no ID is known. Always present (no omitempty) so a remote
+	// client sees "" rather than a missing key when there is no target. This
+	// is a different, weaker contract than ipc.SessionSummary.TmuxTarget,
+	// which is ID-only and never falls back to a name.
+	TmuxTarget string `json:"tmux_target"`
 }
 
 // CaptureResult holds captured pane lines.

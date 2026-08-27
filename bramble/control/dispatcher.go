@@ -123,10 +123,6 @@ func (d *Dispatcher) sessionList() SessionListResult {
 	out := SessionListResult{Sessions: make([]SessionSummary, 0, len(infos))}
 	for i := range infos {
 		s := &infos[i]
-		target := s.TmuxWindowID
-		if target == "" {
-			target = s.TmuxWindowName
-		}
 		out.Sessions = append(out.Sessions, SessionSummary{
 			ID:           string(s.ID),
 			Type:         string(s.Type),
@@ -135,7 +131,7 @@ func (d *Dispatcher) sessionList() SessionListResult {
 			Model:        s.Model,
 			Backend:      s.Backend,
 			RunnerType:   s.RunnerType,
-			TmuxTarget:   target,
+			TmuxTarget:   s.TmuxTarget(),
 		})
 	}
 	return out

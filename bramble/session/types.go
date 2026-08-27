@@ -105,9 +105,14 @@ const (
 	RunnerTypeTmuxTracked = "tmux-tracked"
 )
 
-// tmuxTarget is the session's tmux window, preferring the stable window ID over
-// the name, which a rename can change. Empty when the session has neither.
-func (s SessionInfo) tmuxTarget() string {
+// TmuxTarget is the session's tmux window, preferring the stable window ID
+// over the name, which a rename can change. Empty when the session has
+// neither. This is the fallback variant: callers that need a target to act
+// on right now (send-input, kill, capture-pane) use this. Callers handing a
+// target to an external caller across an API boundary should prefer a
+// stable-ID-only projection instead (see ipc.SessionSummary.TmuxTarget) so a
+// decorated name is never mistaken for a durable handle.
+func (s SessionInfo) TmuxTarget() string {
 	if s.TmuxWindowID != "" {
 		return s.TmuxWindowID
 	}

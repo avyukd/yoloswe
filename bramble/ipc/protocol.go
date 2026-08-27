@@ -101,6 +101,13 @@ type SessionSummary struct {
 	// ParentSessionID is the session that spawned this one, so a caller can
 	// pick its own subagents out of the list. Empty for a top-level session.
 	ParentSessionID string `json:"parent_session_id,omitempty"`
+	// TmuxTarget is the session's stable tmux window ID, empty when
+	// unavailable. Deliberately does NOT fall back to the window name — a
+	// caller needs to know it has no stable handle rather than be handed a
+	// name a rename can invalidate. This is a different contract from
+	// control.SessionSummary.TmuxTarget, which falls back to the name for
+	// the control UI's own use.
+	TmuxTarget string `json:"tmux_target,omitempty"`
 }
 
 // NotifyParams are the parameters for a notify request.

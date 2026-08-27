@@ -1296,10 +1296,7 @@ func (m *Manager) monitorTrackedTmuxWindow(session *Session) {
 		if statusAtCapture != StatusRunning && statusAtCapture != StatusIdle {
 			return
 		}
-		target := wID
-		if target == "" {
-			target = wName
-		}
+		target := SessionInfo{TmuxWindowID: wID, TmuxWindowName: wName}.TmuxTarget()
 		if target == "" {
 			return
 		}
@@ -2925,10 +2922,7 @@ func (m *Manager) CapturePaneText(id SessionID, n int) ([]string, error) {
 		return nil, fmt.Errorf("session %q is not a tmux session (runner type: %s)", id, runnerType)
 	}
 
-	target := windowID
-	if target == "" {
-		target = windowName
-	}
+	target := SessionInfo{TmuxWindowID: windowID, TmuxWindowName: windowName}.TmuxTarget()
 	if target == "" {
 		return nil, fmt.Errorf("session %q has no tmux window target", id)
 	}
@@ -2962,10 +2956,7 @@ func (m *Manager) ResolveTmuxTarget(id SessionID) (string, error) {
 		return "", fmt.Errorf("session %q is not a tmux session (runner type: %s)", id, runnerType)
 	}
 
-	target := windowID
-	if target == "" {
-		target = windowName
-	}
+	target := SessionInfo{TmuxWindowID: windowID, TmuxWindowName: windowName}.TmuxTarget()
 	if target == "" {
 		return "", fmt.Errorf("session %q has no tmux window target", id)
 	}

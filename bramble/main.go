@@ -778,10 +778,7 @@ func startIPCServer(registry *session.SessionRegistry, sockPath, wtRoot, repoNam
 		if !ok {
 			return nil, fmt.Errorf("session not found: %s", params.SessionID)
 		}
-		windowTarget := info.TmuxWindowID
-		if windowTarget == "" {
-			windowTarget = info.TmuxWindowName
-		}
+		windowTarget := info.TmuxTarget()
 		if windowTarget != "" && info.TmuxWindowName != "" {
 			// Skip visual notification if user is already viewing this window —
 			// the alerts are designed for background sessions, not the active one.
@@ -1037,6 +1034,7 @@ func handleListSessions(registry *session.SessionRegistry) *ipc.ListSessionsResu
 			Model:           s.Model,
 			Backend:         s.Backend,
 			ParentSessionID: string(s.ParentSessionID),
+			TmuxTarget:      s.TmuxWindowID,
 		}
 	}
 	return &ipc.ListSessionsResult{Sessions: summaries}
