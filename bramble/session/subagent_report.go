@@ -177,7 +177,7 @@ func (c *Courier) resultPathFor(child SessionInfo) string {
 		// completed session, which is precisely when this runs. The window
 		// itself often outlives it — tmux keeps it open under remain-on-exit —
 		// so fall back to the target recorded on the event's own snapshot.
-		if target := child.tmuxTarget(); target != "" {
+		if target := child.TmuxTarget(); target != "" {
 			lines, err = CaptureTmuxPane(target, tmuxCaptureLines)
 		}
 	}
