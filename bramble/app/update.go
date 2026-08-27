@@ -663,10 +663,8 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 			if m.selectedSessionIndex >= 0 && m.selectedSessionIndex < len(currentSessions) {
 				sess := currentSessions[m.selectedSessionIndex]
-				if sess.TmuxWindowID != "" {
-					return m, selectTmuxWindowCmd(sess.TmuxWindowID)
-				} else if sess.TmuxWindowName != "" {
-					return m, selectTmuxWindowCmd(sess.TmuxWindowName)
+				if target := sess.TmuxTarget(); target != "" {
+					return m, selectTmuxWindowCmd(target)
 				}
 			} else {
 				toastCmd := m.addToast("No sessions to switch to", ToastInfo)
@@ -1098,14 +1096,10 @@ func (m Model) handleDropdownMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			// In tmux mode, switch to the tmux window if available
 			if m.sessionManager.IsInTmuxMode() {
 				if info, ok := m.sessionManager.GetSessionInfo(sessID); ok {
-					if info.TmuxWindowID != "" {
+					if target := info.TmuxTarget(); target != "" {
 						m.sessionDropdown.Close()
 						m.focus = FocusOutput
-						return m, selectTmuxWindowCmd(info.TmuxWindowID)
-					} else if info.TmuxWindowName != "" {
-						m.sessionDropdown.Close()
-						m.focus = FocusOutput
-						return m, selectTmuxWindowCmd(info.TmuxWindowName)
+						return m, selectTmuxWindowCmd(target)
 					}
 				}
 			}
@@ -2338,10 +2332,8 @@ func (m Model) switchToSession(sess *session.SessionInfo) (tea.Model, tea.Cmd) {
 	}
 
 	if m.sessionManager.IsInTmuxMode() {
-		if sess.TmuxWindowID != "" {
-			return m, selectTmuxWindowCmd(sess.TmuxWindowID)
-		} else if sess.TmuxWindowName != "" {
-			return m, selectTmuxWindowCmd(sess.TmuxWindowName)
+		if target := sess.TmuxTarget(); target != "" {
+			return m, selectTmuxWindowCmd(target)
 		}
 		toastCmd := m.addToast("Session has no tmux window", ToastInfo)
 		return m, toastCmd
