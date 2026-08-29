@@ -25,6 +25,7 @@ go_library(
         "//bramble/session",
         "//bramble/taskrouter",
         "//bramble/tmuxctl",
+        "//cliapp",
         "//logging/klogfmt",
         "//multiagent/agent",
         "//wt",

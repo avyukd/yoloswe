@@ -340,10 +340,9 @@ func (c *Courier) noteBlockedReport(to SessionID, composer string) bool {
 // Without it, a prompt that never accepts the text warns every retryDelay for
 // the life of the process, exactly as noteBlockedReport prevents for drafts.
 //
-// Keyed on the pane rather than a bare bool so a pane that changes — a new
-// screen, a different turn — is worth reporting again.
-func (c *Courier) noteUnlandedReport(to SessionID, pane []string) bool {
-	fingerprint := paneFingerprint(pane)
+// Keyed on the pane's fingerprint rather than a bare bool so a pane that
+// changes — a new screen, a different turn — is worth reporting again.
+func (c *Courier) noteUnlandedReport(to SessionID, fingerprint string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.reportedUnlanded[to] == fingerprint {
@@ -717,9 +716,7 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 			v := c.pasteVerdict(ctx, info.ID, provider, text)
 			switch {
 			case v.landed:
-				// Confirmed in the composer; nothing to do. The prompt accepted
-				// this paste, so any stall already reported has ended.
-				c.clearUnlandedReport(info.ID)
+				// Confirmed in the composer; nothing to do.
 			case !v.readable:
 				// Unreadable is silence, not a negative. Trust tmux paste-buffer;
 				// re-pasting here is the duplicate-copy loop.
@@ -758,16 +755,18 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 					// the retry timer fires every retryDelay for as long as the
 					// prompt keeps refusing, and warning each time buries the
 					// signal it exists to give.
-					if c.noteUnlandedReport(info.ID, retry.pane) {
+					if c.noteUnlandedReport(info.ID, retry.fingerprint) {
 						logDeliveryWarn("paste did not reach the prompt; delivery stays queued until it is accepted",
 							info.ID, errPasteUnlanded)
 					}
 					return errPasteUnlanded
 				}
-				// The retry landed, or the pane went silent and will be
-				// submitted; either way this recipient is no longer stalled.
-				c.clearUnlandedReport(info.ID)
 			}
+			// Every arm that reaches here goes on to submit: the paste landed,
+			// the pane went silent, or the re-paste repaired it. The arms that
+			// leave the recipient stalled have already returned, so this is the
+			// one place a stall ends.
+			c.clearUnlandedReport(info.ID)
 		}
 		// Only an unsubmitted staged record must be recognizable on retry.
 		if !submit && !alreadyStaged && !c.pasteIsReadableAsText(ctx, info.ID, provider, text) {
@@ -906,12 +905,12 @@ func (c *Courier) pasteIsReadableAsText(ctx context.Context, id SessionID, provi
 // wrap and decorate long prompts, and some providers render a paste chip instead
 // of echoing text; pasteConfirmed decides which evidence is acceptable.
 func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text string) (v pasteJudgement) {
-	var obscured bool
 	probe := pasteProbe(text)
 	first := pasteFirstLine(text)
 	if probe == "" {
 		// Nothing distinctive to look for; do not block delivery.
-		return pasteJudgement{landed: true, readable: true}
+		v.landed, v.readable = true, true
+		return v
 	}
 	// One budget: only providers whose verdict is required reach here.
 	for i := 0; i < pasteVerifyAttempts; i++ {
@@ -927,16 +926,16 @@ func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text
 		if err != nil {
 			continue
 		}
-		v.pane = lines
 		if pasteConfirmed(provider, lines, first, probe) {
-			return pasteJudgement{landed: true, readable: true, pane: lines}
+			v.landed, v.readable = true, true
+			return v
 		}
 		// A located composer that lacks the text is a negative; an obscured
 		// composer is silence, and the final capture decides readability. The
 		// last capture decides foreign for the same reason: it is the one that
 		// describes the pane the caller is about to write into.
-		obscured = pasteEvidenceObscured(provider, lines)
-		v.readable = !obscured
+		v.fingerprint = paneFingerprint(lines)
+		v.readable = !pasteEvidenceObscured(provider, lines)
 		v.foreign = composerHoldsForeignText(provider, lines, first)
 	}
 	return v
@@ -944,16 +943,14 @@ func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text
 
 // pasteJudgement is what one verification budget concluded about a pane.
 //
-// pane is the last capture judged, kept so a caller reporting a stall can
-// fingerprint the pane it is about to give up on. It is the same frame the
-// readable and foreign verdicts describe, for the reason those two are taken
-// from the final capture: it is the one that describes the pane the caller is
-// about to write into.
+// fingerprint identifies the last capture judged, kept so a caller reporting a
+// stall can tell one stuck frame from the next without holding the capture
+// itself. See pasteVerdict for why the last capture is the authoritative one.
 type pasteJudgement struct {
-	pane     []string
-	landed   bool
-	readable bool
-	foreign  bool
+	fingerprint string
+	landed      bool
+	readable    bool
+	foreign     bool
 }
 
 // pasteProbe picks the tail of the first line, not the head. Subagent reports
@@ -1148,39 +1145,38 @@ func logDeliveryWarn(msg string, to SessionID, err error) {
 // isHeld reports whether an error means the delivery was held rather than
 // written: the recipient's pane or composer was busy, so nothing reached it and
 // no turn started. write uses it to decide whether re-arming idle reporting is
-// justified. logWriteFailure tests the same two errors separately because it
-// must tell them apart to pick a log level, not merely recognize a hold.
+// justified. logWriteFailure recognizes a wider set (see quietHolds) because it
+// only needs to pick a log level, not decide whether a turn may have started.
 func isHeld(err error) bool {
 	return errors.Is(err, errComposerBusy) || errors.Is(err, errPaneBusy)
 }
 
-// logWriteFailure reports real write failures while classifying composer and
-// pane holds as queued waiting states.
+// quietHolds are the errors write() returns for a delivery that is waiting
+// rather than failing, with the line each one logs at Debug.
+//
+// Debug, not warn, for one reason shared by all three: every one of them
+// repeats every retryDelay for as long as the condition stands, so warning here
+// is an endless line. Where an operator-visible signal is wanted, it comes from
+// a deduped report at the point the condition is detected — noteBlockedReport
+// for a draft, noteUnlandedReport for a refused paste — and a second undeduped
+// line here would only cancel that dedup out.
+var quietHolds = []struct {
+	err error
+	msg string
+}{
+	{errComposerBusy, "holding delivery: recipient has an unsubmitted draft"},
+	{errPaneBusy, "holding delivery: recipient's pane shows a turn in flight"},
+	{errPasteUnlanded, "holding delivery: the recipient's prompt did not take the paste"},
+}
+
+// logWriteFailure reports real write failures while classifying the holds above
+// as queued waiting states.
 func logWriteFailure(failMsg string, to SessionID, err error) {
-	if errors.Is(err, errComposerBusy) {
-		// Debug, not warn, for the same reason as errPaneBusy and more so: a
-		// draft left in the composer holds the delivery for as long as it sits
-		// there, and neither write() arm ever delivers, so warning here is one
-		// line every retryDelay with no end. The operator-visible signal for a
-		// standing block is the single noteBlockedReport warning; a second
-		// undeduped line here would just cancel that dedup out.
-		slog.Debug("holding delivery: recipient has an unsubmitted draft",
-			"session", to, "error", err)
-		return
-	}
-	if errors.Is(err, errPaneBusy) {
-		// Debug, not warn: a long-running turn repeats this every retryDelay.
-		slog.Debug("holding delivery: recipient's pane shows a turn in flight",
-			"session", to, "error", err)
-		return
-	}
-	if errors.Is(err, errPasteUnlanded) {
-		// Debug, not warn: write() already reported this once per stuck pane
-		// through noteUnlandedReport. Warning again here would emit a second,
-		// undeduped line every retryDelay and cancel that dedup out.
-		slog.Debug("holding delivery: the recipient's prompt did not take the paste",
-			"session", to, "error", err)
-		return
+	for _, h := range quietHolds {
+		if errors.Is(err, h.err) {
+			slog.Debug(h.msg, "session", to, "error", err)
+			return
+		}
 	}
 	logDeliveryWarn(failMsg, to, err)
 }

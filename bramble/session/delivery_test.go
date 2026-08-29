@@ -273,11 +273,15 @@ func claudeComposerPane(body string) string {
 // body echoed above. Codex has no readable composer, so paste confirmation
 // scans the pane tail — but the tail only counts as evidence when codex's own
 // prompt chrome is on screen, so a codex test must paint it.
+//
+// Built on codexPane so the prompt marker lives in exactly one place; this
+// wrapper only joins it for setPane, which takes the pane as one string.
 func codexPromptPane(body string) string {
-	if body == "" {
-		return "› Ask Codex to do anything"
+	var transcript []string
+	if body != "" {
+		transcript = append(transcript, body)
 	}
-	return body + "\n› Ask Codex to do anything"
+	return strings.Join(codexPane(false, transcript...), "\n")
 }
 
 // testCourierResultDir names a result dir inside this test's temp dir without
@@ -554,7 +558,7 @@ func TestDrainDiscardsQueueForTerminalSession(t *testing.T) {
 	c.noteStaged("s1", "hello")
 	c.noteDraftHold("s1", "a half-typed line")
 	require.True(t, c.noteBlockedReport("s1", "a half-typed line"))
-	require.True(t, c.noteUnlandedReport("s1", []string{"some pane content"}))
+	require.True(t, c.noteUnlandedReport("s1", paneFingerprint([]string{"some pane content"})))
 	c.notePaneHold("s1", []string{"some pane content"})
 	c.mu.Lock()
 	for name, populated := range map[string]bool{
@@ -588,7 +592,7 @@ func TestDrainDiscardsQueueForTerminalSession(t *testing.T) {
 	c.noteStaged("s1", "hello")
 	c.noteDraftHold("s1", "a half-typed line")
 	require.True(t, c.noteBlockedReport("s1", "a half-typed line"))
-	require.True(t, c.noteUnlandedReport("s1", []string{"some pane content"}))
+	require.True(t, c.noteUnlandedReport("s1", paneFingerprint([]string{"some pane content"})))
 	c.notePaneHold("s1", []string{"some pane content"})
 	c.mu.Lock()
 	require.Empty(t, c.pending, "this half of the test is only meaningful with no queue")
@@ -3126,13 +3130,13 @@ func TestAStuckPasteIsWarnedAboutOnce(t *testing.T) {
 	t.Parallel()
 	c := &Courier{reportedUnlanded: map[SessionID]string{}}
 
-	pane := []string{"────────────", "❯ ", "────────────"}
+	pane := paneFingerprint([]string{"────────────", "❯ ", "────────────"})
 	assert.True(t, c.noteUnlandedReport("s1", pane), "the first stall is reported")
 	for i := 0; i < 20; i++ {
 		assert.False(t, c.noteUnlandedReport("s1", pane),
 			"the same refusing prompt must not be reported again on every retry")
 	}
-	assert.True(t, c.noteUnlandedReport("s1", []string{"a different frame entirely"}),
+	assert.True(t, c.noteUnlandedReport("s1", paneFingerprint([]string{"a different frame entirely"})),
 		"a pane that changed is a new situation and is reported")
 
 	// A stall that ENDED and came back is a new standing condition. The record
@@ -3140,7 +3144,7 @@ func TestAStuckPasteIsWarnedAboutOnce(t *testing.T) {
 	// that release "once per stall" would mean "once per session for the life
 	// of the process", and a later genuine stall would go unreported.
 	c.clearUnlandedReport("s1")
-	assert.True(t, c.noteUnlandedReport("s1", []string{"a different frame entirely"}),
+	assert.True(t, c.noteUnlandedReport("s1", paneFingerprint([]string{"a different frame entirely"})),
 		"a stall that cleared and returned is reported again")
 }
 
@@ -3175,7 +3179,7 @@ func TestAStuckPasteKeepsRetryingWhileWarningOnce(t *testing.T) {
 			"the delivery is retried, not dropped: a report nobody receives leaves a parent waiting forever")
 		pane, err := target.CapturePaneText("s1", pasteVerifyLines)
 		require.NoError(t, err)
-		assert.False(t, c.noteUnlandedReport("s1", pane),
+		assert.False(t, c.noteUnlandedReport("s1", paneFingerprint(pane)),
 			"the unchanged pane stays deduped across retries, so the warning is not repeated")
 	}
 }

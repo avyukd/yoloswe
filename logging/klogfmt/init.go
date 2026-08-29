@@ -59,6 +59,28 @@ func InitWithLogFile(logPath string, opts ...Option) (func() error, error) {
 	return f.Close, nil
 }
 
+// InitToFile sends every record to the file at logPath and NOTHING to stderr.
+// It creates parent directories as needed and returns a closer for the file.
+//
+// This is the member of the Init family for a process that does not own its
+// terminal. A TUI painting inline is corrupted by a single stderr line landing
+// mid-frame, so the writer must be the file alone — Init and InitWithLogFile
+// both keep stderr in the writer set and cannot serve that caller.
+//
+// slog.SetDefault also redirects the standard library's log package into the
+// default handler, so log.Printf call sites follow the file without changing.
+func InitToFile(logPath string, opts ...Option) (func() error, error) {
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	slog.SetDefault(slog.New(New(f, opts...)))
+	return f.Close, nil
+}
+
 // InitWithLogFileAndLevels sets up a dual-level logger: the file receives all
 // records at fileLevel and above; stderr receives only records at stderrLevel
 // and above. This lets INFO/DEBUG detail flow to the log file while keeping
