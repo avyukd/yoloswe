@@ -1801,6 +1801,44 @@ func TestHeldWriteDoesNotRearmReporting(t *testing.T) {
 		"once the write actually lands, the turn it starts is news again")
 }
 
+// TestUnlandedPasteDoesNotRearmReporting is the same rule as
+// TestHeldWriteDoesNotRearmReporting for the other error that writes nothing.
+//
+// A paste that never reached the prompt started no turn, so the child's next
+// idle is still the turn the parent already has. errPasteUnlanded repeats every
+// retryDelay for the life of the stall, so re-arming here is steady state: one
+// duplicate report per retry, each costing a tmux child another full pane
+// capture and another result file.
+func TestUnlandedPasteDoesNotRearmReporting(t *testing.T) {
+	t.Parallel()
+	parentID, childID := ids(t)
+	target := newFakeTarget()
+	// Echo unset: every paste is swallowed, which is what a dropped paste is.
+	// reportFixture cannot be used here because it wires echoPanes, under which
+	// a paste always lands and nothing is ever held.
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+	target.set(parentID, StatusRunning, RunnerTypeTmux)
+	target.setChild(childID, parentID, StatusIdle, RunnerTypeTmux)
+	target.setBackend(childID, ProviderClaude, "claude-opus-5")
+	// Located and empty: readable, and the text is genuinely not there, which
+	// is the one shape write() treats as a confirmed dropped paste.
+	target.setPane(claudeComposerPane(""))
+
+	reportNow(c, target, childID)
+	require.Len(t, c.Pending(parentID), 1, "precondition: the child's first idle is reported")
+
+	queued, err := c.Send(context.Background(), parentID, childID, "round two", true)
+	require.NoError(t, err)
+	require.True(t, queued, "precondition: an unlanded paste stays queued")
+
+	target.setChild(childID, parentID, StatusIdle, RunnerTypeTmux)
+	reportNow(c, target, childID)
+	assert.Len(t, c.Pending(parentID), 1,
+		"a paste that never reached the prompt started no turn, so it must not re-arm idle reporting")
+}
+
 // TestSubmittedWriteMarksSessionRunning pins the fix for a bug that silently
 // ended every two-way conversation after one round.
 //

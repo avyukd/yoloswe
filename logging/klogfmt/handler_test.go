@@ -3,6 +3,8 @@ package klogfmt
 import (
 	"bytes"
 	"context"
+	"io"
+	"log"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -232,5 +234,65 @@ func TestInitWithLogFile(t *testing.T) {
 	}
 	if !strings.Contains(got, "foo=bar") {
 		t.Errorf("expected attrs in file, got: %s", got)
+	}
+}
+
+// TestInitToFileWritesNothingToStderr pins the one property that separates
+// InitToFile from Init and InitWithLogFile: the writer is the file ALONE.
+//
+// This is load-bearing rather than cosmetic. A caller that does not own its
+// terminal — a TUI painting inline — is corrupted by a single stderr line
+// landing mid-frame, and the other two constructors both keep stderr in the
+// writer set. Without this test, swapping InitToFile for InitWithLogFile leaves
+// every other assertion green while the corruption returns in full.
+func TestInitToFileWritesNothingToStderr(t *testing.T) {
+	defer slog.SetDefault(slog.Default())
+
+	// Replace the process's stderr with a pipe so anything written to it is
+	// captured rather than printed. Restored before the test returns.
+	realStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	defer func() { os.Stderr = realStderr }()
+
+	logPath := filepath.Join(t.TempDir(), "sub", "test.log")
+	closer, err := InitToFile(logPath, WithLevel(slog.LevelDebug))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	slog.Warn("a slog record")
+	log.Printf("a stdlib log record")
+
+	if err := closer(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	captured, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(captured) != 0 {
+		t.Errorf("InitToFile wrote to stderr, which corrupts a TUI's frame:\n%s", captured)
+	}
+
+	// The records must still have gone somewhere: silence on stderr is only
+	// correct if the file received them.
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(data)
+	if !strings.Contains(body, "a slog record") {
+		t.Errorf("slog record missing from log file:\n%s", body)
+	}
+	if !strings.Contains(body, "a stdlib log record") {
+		t.Errorf("stdlib log record missing from log file:\n%s", body)
 	}
 }

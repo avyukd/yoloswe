@@ -21,10 +21,11 @@ import (
 // delivery courier can emit one every retryDelay for as long as a recipient
 // refuses its mail.
 //
-// klogfmt.InitToFile is what makes this work for more than slog: it calls
-// slog.SetDefault, which also redirects the standard library's log package into
-// the default handler, so the log.Printf calls in session and ipc follow the
-// same file without those call sites changing.
+// klogfmt.InitToFile calls slog.SetDefault, which also redirects the standard
+// library's log package into the default handler. Bramble's own diagnostics all
+// go through slog directly — a record bridged from stdlib log carries PC == 0,
+// so klogfmt stamps it "???:0]" at Info however the text is worded — but the
+// bridge still catches anything a dependency logs that way.
 //
 // Only the TUI does this. The subcommands under this binary are ordinary CLI
 // tools whose operators expect diagnostics on the terminal.

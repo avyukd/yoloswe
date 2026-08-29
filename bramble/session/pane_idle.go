@@ -570,8 +570,13 @@ func promptChromeAbsent(provider string, lines []string) bool {
 	}
 	markers := paneIdleProbes[provider].promptMarkers
 	if len(markers) == 0 {
-		// No chrome to look for, so this predicate cannot speak for the pane.
-		return false
+		// No chrome to look for, so the pane cannot testify either way — and
+		// silence is obscured, not readable. Answering "readable" here is the
+		// pre-fix classification that turned a silent pane into a hard negative
+		// and drove the re-paste loop. TestEveryVerifiedProviderCanBeRead keeps
+		// this branch unreachable in production; it is the fail-safe for a
+		// provider added to pasteEvidenceProbes without prompt chrome.
+		return true
 	}
 	_, found := findPromptLine(lines, markers)
 	return !found

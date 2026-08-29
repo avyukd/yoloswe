@@ -1028,6 +1028,31 @@ func TestCodexPaneWithoutItsPromptIsSilence(t *testing.T) {
 		"codex's prompt on screen makes an absent paste a real negative — the swallowed-paste shape that must still cost one re-paste")
 }
 
+// TestEveryVerifiedProviderCanBeRead enforces the coupling between two maps
+// that are otherwise independent: pasteEvidenceProbes decides whose paste must
+// be verified, and paneIdleProbes supplies the chrome that verification reads.
+//
+// A provider whose verdict is required but whose composer bramble cannot read
+// has exactly one way left to tell "the composer is empty" from "no composer is
+// on screen": its prompt markers. Without them pasteEvidenceObscured falls back
+// to reporting silence for every pane, which is safe but blind — every paste
+// into that provider becomes unverifiable. Today codex is the only provider in
+// this class and it carries markers; this test is what makes that a rule rather
+// than a coincidence.
+func TestEveryVerifiedProviderCanBeRead(t *testing.T) {
+	t.Parallel()
+
+	for provider, evidence := range pasteEvidenceProbes {
+		if !evidence.required || composerReadable(provider) {
+			continue
+		}
+		assert.NotEmpty(t, paneIdleProbes[provider].promptMarkers,
+			"provider %q needs its paste verified and has no readable composer, "+
+				"so it must supply promptMarkers or its pane can never testify "+
+				"that a paste was dropped", provider)
+	}
+}
+
 // TestComposerBoundFollowsTheCapture: the walk's bound must be sized against
 // the capture it runs over, not against a guess at composer height. At 6 it
 // manufactured the unfound case for ordinary panes.

@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -2518,7 +2518,8 @@ func (m *Manager) emitSessionStateChange(evt SessionStateChangeEvent) {
 	select {
 	case m.events <- evt:
 	default:
-		log.Printf("WARNING: events channel full, dropping state change event for session %s (%s -> %s)", evt.SessionID, evt.OldStatus, evt.NewStatus)
+		slog.Warn("events channel full, dropping state change event",
+			"session", evt.SessionID, "old_status", evt.OldStatus, "new_status", evt.NewStatus)
 	}
 
 	// Notify state subscribers. Called outside the lock so a sink is never
@@ -2552,7 +2553,7 @@ func (m *Manager) addOutput(sessionID SessionID, line OutputLine) {
 		Line:      line,
 	}:
 	default:
-		log.Printf("WARNING: events channel full, dropping output event for session %s", sessionID)
+		slog.Warn("events channel full, dropping output event", "session", sessionID)
 	}
 }
 
@@ -2582,7 +2583,7 @@ func (m *Manager) appendOrAddOutput(sessionID SessionID, lineType OutputLineType
 	select {
 	case m.events <- SessionOutputEvent{SessionID: sessionID}:
 	default:
-		log.Printf("WARNING: events channel full, dropping %s append event for session %s", lineType, sessionID)
+		slog.Warn("events channel full, dropping append event", "line_type", lineType, "session", sessionID)
 	}
 }
 
@@ -2633,7 +2634,7 @@ func (m *Manager) updateToolOutput(sessionID SessionID, toolID string, fn func(*
 				Line:      lineCopy,
 			}:
 			default:
-				log.Printf("WARNING: events channel full, dropping tool update event for session %s", sessionID)
+				slog.Warn("events channel full, dropping tool update event", "session", sessionID)
 			}
 			return
 		}
@@ -3186,7 +3187,7 @@ func (m *Manager) protocolLogPath(sessionID SessionID, suffix string) (string, b
 		return "", false
 	}
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
-		log.Printf("WARNING: failed to create protocol log dir %q: %v", logDir, err)
+		slog.Warn("failed to create protocol log dir", "dir", logDir, "error", err)
 		return "", false
 	}
 	return filepath.Join(logDir, fmt.Sprintf("%s-%s", sessionID, suffix)), true
@@ -3269,7 +3270,7 @@ func newFileAppendHandler(path string) func([]byte) {
 	w := newFileAppendWriter(path)
 	return func(data []byte) {
 		if _, err := w.Write(data); err != nil {
-			log.Printf("WARNING: failed to write log %q: %v", path, err)
+			slog.Warn("failed to write log", "path", path, "error", err)
 		}
 	}
 }

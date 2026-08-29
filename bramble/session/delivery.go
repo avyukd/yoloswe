@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -764,10 +763,16 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 			}
 			// Every arm that reaches here goes on to submit: the paste landed,
 			// the pane went silent, or the re-paste repaired it. The arms that
-			// leave the recipient stalled have already returned, so this is the
-			// one place a stall ends.
-			c.clearUnlandedReport(info.ID)
+			// leave the recipient stalled have already returned.
 		}
+		// Outside the verification block on purpose. The likeliest way a stall
+		// ends is the paste finally landing, which the NEXT attempt sees as
+		// alreadyStaged — and that path skips verification entirely. Releasing
+		// only inside it would turn "once per stall" into "once per session for
+		// the life of the process", the failure clearUnlandedReport exists to
+		// prevent. Every arm still reaching here goes on to submit; the ones
+		// that leave the recipient stalled returned above.
+		c.clearUnlandedReport(info.ID)
 		// Only an unsubmitted staged record must be recognizable on retry.
 		if !submit && !alreadyStaged && !c.pasteIsReadableAsText(ctx, info.ID, provider, text) {
 			// A paste chip cannot be matched as text on retry. Drop provenance
@@ -1139,16 +1144,24 @@ const maxDeliveryAge = 7 * 24 * time.Hour
 // logDeliveryWarn reports non-fatal courier problems from paths with no caller
 // to return them to.
 func logDeliveryWarn(msg string, to SessionID, err error) {
-	log.Printf("WARNING: %s for session %s: %v", msg, to, err)
+	slog.Warn(msg, "session", to, "error", err)
 }
 
 // isHeld reports whether an error means the delivery was held rather than
-// written: the recipient's pane or composer was busy, so nothing reached it and
-// no turn started. write uses it to decide whether re-arming idle reporting is
-// justified. logWriteFailure recognizes a wider set (see quietHolds) because it
-// only needs to pick a log level, not decide whether a turn may have started.
+// written: nothing reached the recipient and no turn started, so the recipient's
+// next idle is the same turn the parent was already told about. write uses it to
+// decide whether re-arming idle reporting is justified; see
+// TestHeldWriteDoesNotRearmReporting for why re-arming on a hold costs the
+// parent a duplicate report and a tmux child another full pane capture.
+//
+// The test is what was written, not what was attempted. errPasteUnlanded
+// belongs here for the same reason the retry.foreign arm returns
+// errComposerBusy after pasting: a paste that never reached the prompt started
+// no turn, and it repeats every retryDelay for the life of the stall.
 func isHeld(err error) bool {
-	return errors.Is(err, errComposerBusy) || errors.Is(err, errPaneBusy)
+	return errors.Is(err, errComposerBusy) ||
+		errors.Is(err, errPaneBusy) ||
+		errors.Is(err, errPasteUnlanded)
 }
 
 // quietHolds are the errors write() returns for a delivery that is waiting

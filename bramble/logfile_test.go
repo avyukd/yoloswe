@@ -17,6 +17,11 @@ func TestRedirectLogsToFileCapturesStdlibLog(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
+	// redirectLogsToFile replaces the process-wide default handler, and the
+	// file it points at is closed below. Without this, every later test in this
+	// package that logs writes to a closed descriptor.
+	defer slog.SetDefault(slog.Default())
+
 	path, closeLog, err := redirectLogsToFile()
 	if err != nil {
 		t.Fatalf("redirectLogsToFile: %v", err)

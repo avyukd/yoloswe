@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 type options struct {
@@ -78,7 +79,18 @@ func InitToFile(logPath string, opts ...Option) (func() error, error) {
 		return nil, err
 	}
 	slog.SetDefault(slog.New(New(f, opts...)))
-	return f.Close, nil
+	// Sync before close, and tolerate a second call: this log is often the only
+	// record of a run that ended badly, and its closer is wired to a defer that
+	// a caller may also invoke explicitly.
+	var once sync.Once
+	return func() error {
+		var err error
+		once.Do(func() {
+			_ = f.Sync()
+			err = f.Close()
+		})
+		return err
+	}, nil
 }
 
 // InitWithLogFileAndLevels sets up a dual-level logger: the file receives all
