@@ -388,6 +388,21 @@ func (c *Courier) noteUnverifiableReport(to SessionID, fingerprint string) bool 
 	return true
 }
 
+// clearUnverifiableReport forgets the reported pane once one becomes readable
+// again. Without it "once per unreadable run" becomes "once per process", and
+// every later delivery into that pane is lost in silence — worse than the stall
+// case, which at least keeps its delivery queued.
+//
+// Deliberately NOT called beside clearUnlandedReport: the !v.readable arm falls
+// through to that line, so releasing there would erase the record it just set
+// and warn on every delivery instead of once. The condition ends where the pane
+// proves readable, which is the landed arm and the alreadyStaged path.
+func (c *Courier) clearUnverifiableReport(to SessionID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.reportedUnverifiable, to)
+}
+
 // composerHoldGrace is wall-clock time, not a retry count: Drain has multiple
 // callers, so attempts measure how often bramble looked, not how long the draft
 // has been sitting there.
@@ -701,6 +716,10 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 				slog.Debug("delivery is already staged in the composer; submitting without re-pasting",
 					"session", info.ID)
 				alreadyStaged = true
+				// The composer was read and matched this delivery, so the pane is
+				// demonstrably readable again. This path skips verification
+				// entirely, so it is the other place the unreadable run ends.
+				c.clearUnverifiableReport(info.ID)
 			case !c.noteDraftHold(info.ID, composerText):
 				// A human draft is in the way; any staged record is no longer ours.
 				c.clearStaged(info.ID)
@@ -743,7 +762,9 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 			v := c.pasteVerdict(ctx, info.ID, provider, text)
 			switch {
 			case v.landed:
-				// Confirmed in the composer; nothing to do.
+				// Confirmed in the composer. The pane just proved it can be
+				// read, so any unreadable-pane warning is over.
+				c.clearUnverifiableReport(info.ID)
 			case !v.readable:
 				// Unreadable is silence, not a negative. Trust tmux paste-buffer;
 				// re-pasting here is the duplicate-copy loop.
@@ -754,9 +775,9 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 				// nowhere, Enter went to something else, and a parent waiting on
 				// that report waits forever — the exact outcome the at-least-once
 				// comment in Drain names. Every other arm either lands the text or
-				// keeps it queued. Deduped per frame by the same record the stall
-				// path uses, so an unreadable pane costs one line, not one per
-				// retryDelay.
+				// keeps it queued. Deduped per frame by reportedUnverifiable,
+				// which is separate from the stall record precisely because that
+				// one is released on every submit and this describes a submit.
 				if c.noteUnverifiableReport(info.ID, v.fingerprint) {
 					logDeliveryWarn("submitting into a pane bramble cannot read; if the paste did not land the delivery is lost",
 						info.ID, errPasteUnverifiable)

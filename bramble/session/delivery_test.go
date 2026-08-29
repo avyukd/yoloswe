@@ -3258,6 +3258,22 @@ func TestSubmittingIntoAnUnreadablePaneIsWarnedAboutOnce(t *testing.T) {
 
 	assert.True(t, c.noteUnverifiableReport("s1", paneFingerprint([]string{"a different frame"})),
 		"a pane that changed is a new situation and is reported")
+
+	// An unreadable run that ENDED and came back is a new condition. Without a
+	// release, "once per unreadable run" becomes "once per process" — and here
+	// that is worse than the stall case, because each occurrence LOSES a
+	// delivery rather than queuing it. The record is released where the pane
+	// proves readable: the landed arm and the alreadyStaged path.
+	c.clearUnverifiableReport("s1")
+	assert.True(t, c.noteUnverifiableReport("s1", paneFingerprint([]string{"a different frame"})),
+		"an unreadable run that cleared and returned is reported again")
+
+	// The sharpest case: captures that keep failing yield "" every time, so
+	// without a release that session is warned about once and silently loses
+	// every delivery after.
+	c.clearUnverifiableReport("s1")
+	assert.True(t, c.noteUnverifiableReport("s1", ""),
+		"a session whose captures keep failing is reported again after a release")
 }
 
 // TestAPaneNoCaptureSucceedsOnIsStillWarnedAbout drives the real write() path
@@ -3298,6 +3314,51 @@ func TestAPaneNoCaptureSucceedsOnIsStillWarnedAbout(t *testing.T) {
 	// And it must not warn twice for the same unreadable pane.
 	assert.False(t, c.noteUnverifiableReport("s1", ""),
 		"the same unreadable pane must not be reported again")
+}
+
+// TestAnUnreadableRunThatEndsIsWarnedAboutAgain drives the release through the
+// real write() path. A pane that goes unreadable, becomes readable, then goes
+// unreadable again is two distinct incidents, and each one can lose a delivery
+// — so each must be warned about. Without a release point the second is silent
+// for the life of the process.
+func TestAnUnreadableRunThatEndsIsWarnedAboutAgain(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	// No claude chrome: unreadable, so write() submits on trust and warns.
+	target.setPane("(END)")
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "first report", true)
+	require.NoError(t, err)
+	c.mu.Lock()
+	_, warnedFirst := c.reportedUnverifiable["s1"]
+	c.mu.Unlock()
+	require.True(t, warnedFirst, "precondition: the unreadable pane was reported")
+	require.Empty(t, c.Pending("s1"),
+		"precondition: the unreadable arm submits rather than queuing, so nothing is left behind")
+
+	// The pane becomes readable again AND the paste lands, which is what proves
+	// readability and ends the unreadable run.
+	panes.echo = func(text string) { target.appendPane(claudeComposerPane(text)) }
+	panes.onSubmit = func() { target.setPane(claudeComposerPane("")) }
+	target.setPane(claudeComposerPane(""))
+	// The first delivery submitted, so the recipient is running. It has to be
+	// idle again before a second delivery can be written.
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	queued, err := c.Send(context.Background(), "", "s1", "second report", true)
+	require.NoError(t, err)
+	require.False(t, queued, "precondition: the second delivery must actually land")
+
+	c.mu.Lock()
+	_, stillHeld := c.reportedUnverifiable["s1"]
+	c.mu.Unlock()
+	assert.False(t, stillHeld,
+		"a pane that proved readable ends the unreadable run, so the record must be released")
 }
 
 // TestAChipBesideTypedTextIsStillAHumanDraft: a chip with text beside it is
