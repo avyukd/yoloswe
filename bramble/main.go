@@ -132,6 +132,18 @@ func main() {
 }
 
 func runTUI(cmd *cobra.Command, args []string) error {
+	// Take the terminal back from the logger before anything can write to it.
+	// This must precede every goroutine started below, or a record emitted
+	// during startup still lands on the frame the TUI is about to paint.
+	logPath, closeLog, err := redirectLogsToFile()
+	if err != nil {
+		// Not fatal: losing the log file is worse than a corrupted frame, and
+		// stderr is where klogfmt.Init already pointed.
+		slog.Warn("logging to stderr; this will interleave with the TUI", "error", err)
+	} else {
+		defer closeLog()
+	}
+
 	// Setup context with signal handling
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -397,6 +409,13 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	// restartRequester exists to be able to do.
 	restartRequests.set(nil)
 	stopRestartSignal()
+
+	// Safe only now: the TUI has released the terminal, so this cannot land in
+	// a painted frame. Worth saying at all because the redirect makes the log
+	// invisible during the run, and a diagnostic nobody can find is not one.
+	if logPath != "" {
+		fmt.Fprintf(os.Stderr, "Logs written to: %s\n", logPath)
+	}
 
 	if err != nil {
 		return fmt.Errorf("TUI error: %w", err)

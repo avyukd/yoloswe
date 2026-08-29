@@ -969,12 +969,19 @@ func TestTallComposerIsHeldNotDelivered(t *testing.T) {
 }
 
 // TestObscuredPasteEvidenceIsNotANegative pins the distinction that ends the
-// re-paste loop: a capture showing claude's chrome but no locatable composer
-// says NOTHING about whether the paste arrived, while an empty or unpainted
-// pane is a real negative.
+// re-paste loop. For claude there are exactly three rows, and only the first is
+// a real negative:
 //
-// Conflating them re-pasted on silence, appending a second copy of the message
-// every retry and submitting none of them.
+//	composer located, no text  -> readable: a genuine dropped paste, re-paste once
+//	chrome on screen, composer unfound -> obscured: silence
+//	no chrome at all           -> obscured: silence
+//
+// Rows two and three are the same answer for the same reason — the composer was
+// never read, so the pane cannot say the text is absent from it. Row three was
+// once treated as a negative because readability keyed off a status separator
+// being on screen; that made an alt-screen pager or a restarted CLI look like
+// proof of a dropped paste, and the courier re-pasted on silence, appending a
+// second copy of the message every retry and submitting none of them.
 func TestObscuredPasteEvidenceIsNotANegative(t *testing.T) {
 	t.Parallel()
 
@@ -987,12 +994,12 @@ func TestObscuredPasteEvidenceIsNotANegative(t *testing.T) {
 	assert.True(t, pasteEvidenceObscured(ProviderClaude, obscured),
 		"chrome present but composer unfound is silence, not a negative")
 
-	// Nothing painted at all: a real negative, or a dropped paste would be
-	// submitted on an empty prompt.
-	assert.False(t, pasteEvidenceObscured(ProviderClaude, nil),
-		"an unpainted pane is exactly what a dropped paste looks like")
-	assert.False(t, pasteEvidenceObscured(ProviderClaude, []string{"nothing here"}),
-		"a pane with no claude chrome is a negative")
+	// Nothing painted at all, and a pane holding something else entirely: the
+	// composer was not read, so neither can report the paste as dropped.
+	assert.True(t, pasteEvidenceObscured(ProviderClaude, nil),
+		"an unpainted pane shows no composer, so it cannot say the paste was dropped")
+	assert.True(t, pasteEvidenceObscured(ProviderClaude, []string{"nothing here"}),
+		"a pane with no claude chrome is the most obscured case, not the least")
 
 	// A locatable composer is readable, so its verdict is real either way.
 	assert.False(t, pasteEvidenceObscured(ProviderClaude, claudePaneComposer("❯ ", "✻ Worked for 12s")),
@@ -1000,6 +1007,25 @@ func TestObscuredPasteEvidenceIsNotANegative(t *testing.T) {
 
 	// Providers whose composer bramble does not read never reach this path.
 	assert.False(t, pasteEvidenceObscured(ProviderCursor, nil), "cursor's evidence is never obscured")
+}
+
+// TestCodexPaneWithoutItsPromptIsSilence is the same rule for a provider whose
+// composer bramble cannot read at all. Codex confirmation scans the pane tail,
+// so the question its readability turns on is whether that tail was a codex
+// prompt in the first place.
+//
+// Without this, every codex pane was declared readable, so any unconfirmed
+// paste — including one into a pager or a CLI that had exited — was a hard
+// negative that re-pasted and re-queued every retryDelay forever.
+func TestCodexPaneWithoutItsPromptIsSilence(t *testing.T) {
+	t.Parallel()
+
+	assert.True(t, pasteEvidenceObscured(ProviderCodex, []string{"$ ", "(END)"}),
+		"a pane with no codex prompt was never showing a composer, so its silence proves nothing")
+	assert.True(t, pasteEvidenceObscured(ProviderCodex, nil),
+		"an unpainted codex pane is silence for the same reason")
+	assert.False(t, pasteEvidenceObscured(ProviderCodex, []string{"› Ask Codex to do anything"}),
+		"codex's prompt on screen makes an absent paste a real negative — the swallowed-paste shape that must still cost one re-paste")
 }
 
 // TestComposerBoundFollowsTheCapture: the walk's bound must be sized against

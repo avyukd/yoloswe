@@ -269,6 +269,17 @@ func claudeComposerPane(body string) string {
 	}, "\n")
 }
 
+// codexPromptPane renders codex's prompt as its pane shows it, optionally with
+// body echoed above. Codex has no readable composer, so paste confirmation
+// scans the pane tail — but the tail only counts as evidence when codex's own
+// prompt chrome is on screen, so a codex test must paint it.
+func codexPromptPane(body string) string {
+	if body == "" {
+		return "› Ask Codex to do anything"
+	}
+	return body + "\n› Ask Codex to do anything"
+}
+
 // testCourierResultDir names a result dir inside this test's temp dir without
 // creating it. Deliberately not pre-created: the courier's own MkdirAll must be
 // what brings it into existence, or TestResultArtifactsAreNotWorldReadable
@@ -543,13 +554,15 @@ func TestDrainDiscardsQueueForTerminalSession(t *testing.T) {
 	c.noteStaged("s1", "hello")
 	c.noteDraftHold("s1", "a half-typed line")
 	require.True(t, c.noteBlockedReport("s1", "a half-typed line"))
+	require.True(t, c.noteUnlandedReport("s1", []string{"some pane content"}))
 	c.notePaneHold("s1", []string{"some pane content"})
 	c.mu.Lock()
 	for name, populated := range map[string]bool{
-		"staged":          len(c.staged) == 1,
-		"heldForDraft":    len(c.heldForDraft) == 1,
-		"reportedBlocked": len(c.reportedBlocked) == 1,
-		"heldForPane":     len(c.heldForPane) == 1,
+		"staged":           len(c.staged) == 1,
+		"heldForDraft":     len(c.heldForDraft) == 1,
+		"reportedBlocked":  len(c.reportedBlocked) == 1,
+		"reportedUnlanded": len(c.reportedUnlanded) == 1,
+		"heldForPane":      len(c.heldForPane) == 1,
 	} {
 		require.True(t, populated, "%s must hold an entry before discard for this test to prove anything", name)
 	}
@@ -564,6 +577,7 @@ func TestDrainDiscardsQueueForTerminalSession(t *testing.T) {
 	assert.Empty(t, c.staged, "staged")
 	assert.Empty(t, c.heldForDraft, "heldForDraft")
 	assert.Empty(t, c.reportedBlocked, "reportedBlocked")
+	assert.Empty(t, c.reportedUnlanded, "reportedUnlanded")
 	assert.Empty(t, c.heldForPane, "heldForPane")
 	c.mu.Unlock()
 
@@ -574,6 +588,7 @@ func TestDrainDiscardsQueueForTerminalSession(t *testing.T) {
 	c.noteStaged("s1", "hello")
 	c.noteDraftHold("s1", "a half-typed line")
 	require.True(t, c.noteBlockedReport("s1", "a half-typed line"))
+	require.True(t, c.noteUnlandedReport("s1", []string{"some pane content"}))
 	c.notePaneHold("s1", []string{"some pane content"})
 	c.mu.Lock()
 	require.Empty(t, c.pending, "this half of the test is only meaningful with no queue")
@@ -586,6 +601,7 @@ func TestDrainDiscardsQueueForTerminalSession(t *testing.T) {
 	assert.Empty(t, c.staged, "staged, with no queue to gate on")
 	assert.Empty(t, c.heldForDraft, "heldForDraft, with no queue to gate on")
 	assert.Empty(t, c.reportedBlocked, "reportedBlocked, with no queue to gate on")
+	assert.Empty(t, c.reportedUnlanded, "reportedUnlanded, with no queue to gate on")
 	assert.Empty(t, c.heldForPane, "heldForPane, with no queue to gate on")
 }
 
@@ -1866,6 +1882,10 @@ func TestDroppedPasteIsRetried(t *testing.T) {
 	// Codex is the provider whose TUI drops pastes, and the only one the
 	// courier re-pastes for.
 	target.setBackend("s1", ProviderCodex, "gpt-5.4-mini")
+	// Codex's own prompt must be on screen. Without it the pane says nothing
+	// about the paste, and silence is not a dropped paste — see
+	// TestCodexPaneWithoutItsPromptIsSilence.
+	target.setPane(codexPromptPane(""))
 
 	panes := echoPanes(target)
 	var pastes int
@@ -1873,7 +1893,7 @@ func TestDroppedPasteIsRetried(t *testing.T) {
 		// The first paste is swallowed, as codex does mid-finalize.
 		pastes++
 		if pastes > 1 {
-			target.appendPane(text)
+			target.appendPane(codexPromptPane(text))
 		}
 	}
 	c, err := NewCourier(target, panes, testCourierConfig(t))
@@ -1891,11 +1911,17 @@ func TestDroppedPasteIsRetried(t *testing.T) {
 // the text, the message must stay queued for the next idle rather than being
 // reported as delivered — and the session must not be marked running for a
 // turn that never started.
+//
+// Codex's prompt line is a precondition here, not decoration. A pane that shows
+// the prompt and still lacks the text is the swallowed-paste shape this test
+// describes; a pane showing no codex chrome at all is silence, and silence
+// submits rather than requeues (TestCodexPaneWithoutItsPromptIsSilence).
 func TestPersistentlyDroppedPasteKeepsDeliveryQueued(t *testing.T) {
 	t.Parallel()
 	target := newFakeTarget()
 	target.set("s1", StatusRunning, RunnerTypeTmux)
 	target.setBackend("s1", ProviderCodex, "gpt-5.4-mini")
+	target.setPane(codexPromptPane(""))
 
 	panes := &fakePanes{} // echo unset: every paste is swallowed
 	c, err := NewCourier(target, panes, testCourierConfig(t))
@@ -2465,6 +2491,12 @@ func TestClaudePasteIsVerified(t *testing.T) {
 		target := newFakeTarget()
 		target.set("s1", StatusIdle, RunnerTypeTmux)
 		target.setBackend("s1", ProviderClaude, "claude-opus-5")
+		// The composer must be locatable and empty. That is what a dropped
+		// paste looks like, and it is the only shape that can be told apart
+		// from a pane bramble simply cannot read — see
+		// TestAPaneWithNoClaudeChromeIsSilenceNotADroppedPaste, where the
+		// absence of chrome means the opposite and must submit.
+		target.setPane(claudeComposerPane(""))
 
 		panes := &fakePanes{} // the pane never shows the text: the TUI dropped it
 		c, err := NewCourier(target, panes, testCourierConfig(t))
@@ -3083,6 +3115,71 @@ func TestOneStandingBlockIsReportedOnce(t *testing.T) {
 		"a block that cleared and returned is a new standing condition and is reported again")
 }
 
+// TestAStuckPasteIsWarnedAboutOnce is the same rule for the other standing
+// condition. A prompt that keeps refusing a paste is reached on every retry, so
+// warning there unconditionally is one WARNING every retryDelay for the life of
+// the process — the shape that flooded a running bramble's terminal.
+//
+// The dedup bounds the LOG, not the retry: the delivery must keep being tried,
+// because a subagent report that is dropped leaves its parent waiting forever.
+func TestAStuckPasteIsWarnedAboutOnce(t *testing.T) {
+	t.Parallel()
+	c := &Courier{reportedUnlanded: map[SessionID]string{}}
+
+	pane := []string{"────────────", "❯ ", "────────────"}
+	assert.True(t, c.noteUnlandedReport("s1", pane), "the first stall is reported")
+	for i := 0; i < 20; i++ {
+		assert.False(t, c.noteUnlandedReport("s1", pane),
+			"the same refusing prompt must not be reported again on every retry")
+	}
+	assert.True(t, c.noteUnlandedReport("s1", []string{"a different frame entirely"}),
+		"a pane that changed is a new situation and is reported")
+
+	// A stall that ENDED and came back is a new standing condition. The record
+	// is released where the stall ends — on a paste that lands — so without
+	// that release "once per stall" would mean "once per session for the life
+	// of the process", and a later genuine stall would go unreported.
+	c.clearUnlandedReport("s1")
+	assert.True(t, c.noteUnlandedReport("s1", []string{"a different frame entirely"}),
+		"a stall that cleared and returned is reported again")
+}
+
+// TestAStuckPasteKeepsRetryingWhileWarningOnce is the end-to-end half: a claude
+// composer that is located and stays empty is a genuine dropped paste, so the
+// delivery must stay queued and be retried for as long as it takes — while the
+// operator hears about it once rather than every retryDelay.
+func TestAStuckPasteKeepsRetryingWhileWarningOnce(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	// Located and empty: readable, and the text is genuinely not there.
+	target.setPane(claudeComposerPane(""))
+
+	panes := &fakePanes{} // every paste is swallowed
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+	require.Len(t, c.Pending("s1"), 1, "a dropped paste keeps its delivery queued")
+
+	c.mu.Lock()
+	reportedAfterFirst := len(c.reportedUnlanded)
+	c.mu.Unlock()
+	require.Equal(t, 1, reportedAfterFirst, "the first stall is recorded as reported")
+
+	for i := 0; i < 3; i++ {
+		c.Drain(context.Background(), "s1")
+		assert.Len(t, c.Pending("s1"), 1,
+			"the delivery is retried, not dropped: a report nobody receives leaves a parent waiting forever")
+		pane, err := target.CapturePaneText("s1", pasteVerifyLines)
+		require.NoError(t, err)
+		assert.False(t, c.noteUnlandedReport("s1", pane),
+			"the unchanged pane stays deduped across retries, so the warning is not repeated")
+	}
+}
+
 // TestAChipBesideTypedTextIsStillAHumanDraft: a chip with text beside it is
 // unambiguously a person's composer — a paste happened AND somebody typed. It
 // holds for the same reason a bare chip does, and this pins the clearer case so
@@ -3187,6 +3284,52 @@ func TestDroppedPasteIntoAnEmptyComposerIsStillRetried(t *testing.T) {
 		"an empty composer is a real dropped paste; the one retry must not be suppressed as interference")
 	assert.NotContains(t, panes.recorded(), "enter(@7)")
 	assert.Len(t, c.Pending("s1"), 1)
+}
+
+// TestAPaneWithNoClaudeChromeIsSilenceNotADroppedPaste is the third row of the
+// verdict table, and the one that was missing. The two rows above it are
+// covered by TestObscuredPasteEvidenceIsNotANegative (chrome on screen, composer
+// unfound: silence) and by the test above (composer located and empty: a real
+// dropped paste). This is the case where the pane shows no claude chrome at all.
+//
+// Real panes reach that shape often: an alt-screen pager, fullscreen tool
+// output, /help, a CLI that restarted, or a bare shell prompt. None of them say
+// anything about whether the paste arrived — the composer may well be holding it
+// underneath. Readability was keyed off a status separator being on screen, so
+// this shape read as "readable, and the text is not there", which is the one
+// combination write() treats as a confirmed dropped paste.
+//
+// The cost of getting it wrong is not a missed warning. The courier pasted a
+// second copy, failed the identical verdict, returned "paste did not reach ...",
+// requeued, and retried every retryDelay for the life of the process — appending
+// another copy of the message each round and never pressing Enter.
+func TestAPaneWithNoClaudeChromeIsSilenceNotADroppedPaste(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	// A fullscreen pager: no separator, no prompt glyph, no claude chrome.
+	target.setPane(strings.Join([]string{
+		"diff --git a/main.go b/main.go",
+		"@@ -1,4 +1,9 @@",
+		"-old line",
+		"+new line",
+		"(END)",
+	}, "\n"))
+
+	// The pane never echoes: bramble cannot see the composer either way.
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, panes.pasteCount(),
+		"a pane showing no claude chrome cannot say the paste was dropped; a second paste appends a duplicate copy and the loop never ends")
+	assert.Contains(t, panes.recorded(), "enter(@7)",
+		"silence must not wedge the queue: trust tmux paste-buffer and submit, as an unlocatable composer already does")
+	assert.Empty(t, c.Pending("s1"), "the delivery must leave the queue rather than retry forever")
 }
 
 // TestUserTypingBesideAPasteChipIsNotSubmitted is the chip form of the race

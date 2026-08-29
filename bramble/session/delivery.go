@@ -118,6 +118,11 @@ type Courier struct { //nolint:govet // fieldalignment: grouping by role reads b
 	// has already been warned about, so one standing block is reported once
 	// rather than on every retry. See noteBlockedReport.
 	reportedBlocked map[SessionID]string
+	// reportedUnlanded remembers, per recipient, the pane an operator has
+	// already been warned about after a paste failed to land, so a prompt that
+	// keeps swallowing pastes is reported once rather than every retryDelay.
+	// See noteUnlandedReport.
+	reportedUnlanded map[SessionID]string
 	// now is injectable so tests assert elapsed time rather than call count.
 	now func() time.Time
 	seq uint64
@@ -147,18 +152,19 @@ func NewCourier(target DeliveryTarget, panes PaneWriter, config CourierConfig) (
 		return nil, fmt.Errorf("failed to create result dir %s: %w", resultDir, err)
 	}
 	c := &Courier{
-		target:          target,
-		panes:           panes,
-		dir:             deliveryDir,
-		resultDir:       resultDir,
-		pending:         make(map[SessionID][]Delivery),
-		heldForDraft:    make(map[SessionID]draftHold),
-		staged:          make(map[SessionID]string),
-		heldForPane:     make(map[SessionID]paneHold),
-		reportedBlocked: make(map[SessionID]string),
-		now:             time.Now,
-		reported:        make(map[SessionID]map[SessionStatus]bool),
-		writing:         make(map[SessionID]bool),
+		target:           target,
+		panes:            panes,
+		dir:              deliveryDir,
+		resultDir:        resultDir,
+		pending:          make(map[SessionID][]Delivery),
+		heldForDraft:     make(map[SessionID]draftHold),
+		staged:           make(map[SessionID]string),
+		heldForPane:      make(map[SessionID]paneHold),
+		reportedBlocked:  make(map[SessionID]string),
+		reportedUnlanded: make(map[SessionID]string),
+		now:              time.Now,
+		reported:         make(map[SessionID]map[SessionStatus]bool),
+		writing:          make(map[SessionID]bool),
 	}
 	if err := c.load(); err != nil {
 		return nil, err
@@ -328,6 +334,32 @@ func (c *Courier) noteBlockedReport(to SessionID, composer string) bool {
 	}
 	c.reportedBlocked[to] = composer
 	return true
+}
+
+// noteUnlandedReport reports once per distinct pane that swallowed a paste.
+// Without it, a prompt that never accepts the text warns every retryDelay for
+// the life of the process, exactly as noteBlockedReport prevents for drafts.
+//
+// Keyed on the pane rather than a bare bool so a pane that changes — a new
+// screen, a different turn — is worth reporting again.
+func (c *Courier) noteUnlandedReport(to SessionID, pane []string) bool {
+	fingerprint := paneFingerprint(pane)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.reportedUnlanded[to] == fingerprint {
+		return false
+	}
+	c.reportedUnlanded[to] = fingerprint
+	return true
+}
+
+// clearUnlandedReport forgets the reported pane once a paste lands or the
+// recipient goes away. Without it "once per stuck run" silently becomes "once
+// per process", and the next genuine stall would never be reported.
+func (c *Courier) clearUnlandedReport(to SessionID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.reportedUnlanded, to)
 }
 
 // composerHoldGrace is wall-clock time, not a retry count: Drain has multiple
@@ -682,16 +714,18 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 		// ignored should not pay the sleeps and capture round trips, and probing
 		// widens the window between the draft check and SendEnter.
 		if !alreadyStaged && pasteVerifyRequired(provider) {
-			landed, readable, foreign := c.pasteVerdict(ctx, info.ID, provider, text)
+			v := c.pasteVerdict(ctx, info.ID, provider, text)
 			switch {
-			case landed:
-				// Confirmed in the composer; nothing to do.
-			case !readable:
+			case v.landed:
+				// Confirmed in the composer; nothing to do. The prompt accepted
+				// this paste, so any stall already reported has ended.
+				c.clearUnlandedReport(info.ID)
+			case !v.readable:
 				// Unreadable is silence, not a negative. Trust tmux paste-buffer;
 				// re-pasting here is the duplicate-copy loop.
 				slog.Debug("paste could not be verified because the pane was unreadable; submitting anyway",
 					"session", info.ID, "provider", provider)
-			case foreign:
+			case v.foreign:
 				// Someone else's text is in the composer, so this is not a
 				// dropped paste and a re-paste would append a second copy to
 				// their unsent line. The usual cause is a user who started
@@ -713,16 +747,26 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 					return err
 				}
 				c.noteStaged(info.ID, text)
-				landed, readable, foreign := c.pasteVerdict(ctx, info.ID, provider, text)
-				if foreign {
+				retry := c.pasteVerdict(ctx, info.ID, provider, text)
+				if retry.foreign {
 					// Interference arrived during the retry. Same rule.
 					c.clearStaged(info.ID)
 					return errComposerBusy
 				}
-				if !landed && readable {
-					// Erroring keeps the delivery queued.
-					return fmt.Errorf("paste did not reach session %s's prompt", info.ID)
+				if !retry.landed && retry.readable {
+					// Erroring keeps the delivery queued. Report once per pane:
+					// the retry timer fires every retryDelay for as long as the
+					// prompt keeps refusing, and warning each time buries the
+					// signal it exists to give.
+					if c.noteUnlandedReport(info.ID, retry.pane) {
+						logDeliveryWarn("paste did not reach the prompt; delivery stays queued until it is accepted",
+							info.ID, errPasteUnlanded)
+					}
+					return errPasteUnlanded
 				}
+				// The retry landed, or the pane went silent and will be
+				// submitted; either way this recipient is no longer stalled.
+				c.clearUnlandedReport(info.ID)
 			}
 		}
 		// Only an unsubmitted staged record must be recognizable on retry.
@@ -765,6 +809,15 @@ var errComposerBusy = errors.New("composer holds an unsubmitted draft")
 
 // errPaneBusy keeps a delivery queued while the recipient pane shows work in flight.
 var errPaneBusy = errors.New("pane shows a turn still in flight")
+
+// errPasteUnlanded keeps a delivery queued when a readable prompt did not take
+// the paste, even after the one re-paste that repairs a dropped one.
+//
+// A sentinel, not a bare fmt.Errorf, so logWriteFailure can recognize it and
+// leave the reporting to noteUnlandedReport's dedup. Without that, the generic
+// fall-through logged a second, undeduped warning per retry and cancelled the
+// dedup out — the same trap the errComposerBusy arm documents.
+var errPasteUnlanded = errors.New("paste did not reach the prompt")
 
 // paneSaysWorking asks the recipient's pane whether a turn is running. Unknown
 // means fail open: deliver rather than strand mail on an unreadable pane.
@@ -852,12 +905,13 @@ func (c *Courier) pasteIsReadableAsText(ctx context.Context, id SessionID, provi
 // The search is intentionally bounded to a probe, not the whole message. TUIs
 // wrap and decorate long prompts, and some providers render a paste chip instead
 // of echoing text; pasteConfirmed decides which evidence is acceptable.
-func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text string) (landed, readable, foreign bool) {
+func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text string) (v pasteJudgement) {
 	var obscured bool
 	probe := pasteProbe(text)
 	first := pasteFirstLine(text)
 	if probe == "" {
-		return true, true, false // nothing distinctive to look for; do not block delivery
+		// Nothing distinctive to look for; do not block delivery.
+		return pasteJudgement{landed: true, readable: true}
 	}
 	// One budget: only providers whose verdict is required reach here.
 	for i := 0; i < pasteVerifyAttempts; i++ {
@@ -865,7 +919,7 @@ func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text
 		if i > 0 {
 			select {
 			case <-ctx.Done():
-				return false, readable, foreign
+				return v
 			case <-time.After(pasteVerifyInterval):
 			}
 		}
@@ -873,18 +927,33 @@ func (c *Courier) pasteVerdict(ctx context.Context, id SessionID, provider, text
 		if err != nil {
 			continue
 		}
+		v.pane = lines
 		if pasteConfirmed(provider, lines, first, probe) {
-			return true, true, false
+			return pasteJudgement{landed: true, readable: true, pane: lines}
 		}
 		// A located composer that lacks the text is a negative; an obscured
 		// composer is silence, and the final capture decides readability. The
 		// last capture decides foreign for the same reason: it is the one that
 		// describes the pane the caller is about to write into.
 		obscured = pasteEvidenceObscured(provider, lines)
-		readable = !obscured
-		foreign = composerHoldsForeignText(provider, lines, first)
+		v.readable = !obscured
+		v.foreign = composerHoldsForeignText(provider, lines, first)
 	}
-	return false, readable, foreign
+	return v
+}
+
+// pasteJudgement is what one verification budget concluded about a pane.
+//
+// pane is the last capture judged, kept so a caller reporting a stall can
+// fingerprint the pane it is about to give up on. It is the same frame the
+// readable and foreign verdicts describe, for the reason those two are taken
+// from the final capture: it is the one that describes the pane the caller is
+// about to write into.
+type pasteJudgement struct {
+	pane     []string
+	landed   bool
+	readable bool
+	foreign  bool
 }
 
 // pasteProbe picks the tail of the first line, not the head. Subagent reports
@@ -926,6 +995,7 @@ func (c *Courier) discard(to SessionID) {
 	delete(c.heldForPane, to)
 	delete(c.heldForDraft, to)
 	delete(c.reportedBlocked, to)
+	delete(c.reportedUnlanded, to)
 	if _, queued := c.pending[to]; !queued {
 		// No queue, so nothing on disk to unlink.
 		c.mu.Unlock()
@@ -1101,6 +1171,14 @@ func logWriteFailure(failMsg string, to SessionID, err error) {
 	if errors.Is(err, errPaneBusy) {
 		// Debug, not warn: a long-running turn repeats this every retryDelay.
 		slog.Debug("holding delivery: recipient's pane shows a turn in flight",
+			"session", to, "error", err)
+		return
+	}
+	if errors.Is(err, errPasteUnlanded) {
+		// Debug, not warn: write() already reported this once per stuck pane
+		// through noteUnlandedReport. Warning again here would emit a second,
+		// undeduped line every retryDelay and cancel that dedup out.
+		slog.Debug("holding delivery: the recipient's prompt did not take the paste",
 			"session", to, "error", err)
 		return
 	}
