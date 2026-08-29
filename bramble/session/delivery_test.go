@@ -3222,6 +3222,36 @@ func TestAStuckPasteKeepsRetryingWhileWarningOnce(t *testing.T) {
 	}
 }
 
+// TestSubmittingIntoAnUnreadablePaneIsWarnedAboutOnce covers the one arm of
+// write() that can LOSE a delivery. A pane bramble cannot read is submitted
+// into on trust, which dequeues the delivery permanently — so if the paste went
+// to an alt-screen pager or an exited CLI, the report is gone and its parent
+// waits forever. That deserves an operator-visible line.
+//
+// It needs its own dedup record rather than sharing reportedUnlanded: that one
+// is released on every submit, and this warning describes a submit, so sharing
+// it would warn on every single delivery into an unreadable pane.
+func TestSubmittingIntoAnUnreadablePaneIsWarnedAboutOnce(t *testing.T) {
+	t.Parallel()
+	c := &Courier{reportedUnverifiable: map[SessionID]string{}, reportedUnlanded: map[SessionID]string{}}
+
+	pane := paneFingerprint([]string{"(END)", "a fullscreen pager"})
+	assert.True(t, c.noteUnverifiableReport("s1", pane), "the first unreadable pane is reported")
+	for i := 0; i < 20; i++ {
+		assert.False(t, c.noteUnverifiableReport("s1", pane),
+			"the same unreadable frame must not be reported on every delivery")
+	}
+
+	// Releasing the stall record must not release this one: they describe
+	// opposite outcomes and are cleared at different times.
+	c.clearUnlandedReport("s1")
+	assert.False(t, c.noteUnverifiableReport("s1", pane),
+		"clearing the stall record must not re-arm the unreadable-pane warning")
+
+	assert.True(t, c.noteUnverifiableReport("s1", paneFingerprint([]string{"a different frame"})),
+		"a pane that changed is a new situation and is reported")
+}
+
 // TestAChipBesideTypedTextIsStillAHumanDraft: a chip with text beside it is
 // unambiguously a person's composer — a paste happened AND somebody typed. It
 // holds for the same reason a bare chip does, and this pins the clearer case so

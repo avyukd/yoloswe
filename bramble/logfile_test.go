@@ -9,10 +9,14 @@ import (
 	"testing"
 )
 
-// TestRedirectLogsToFileCapturesStdlibLog is the load-bearing property of the
-// redirect: it must capture the standard library's log package, not just slog.
-// The delivery courier's warnings — the ones that corrupted the TUI — go
-// through log.Printf, so a redirect that only moved slog would fix nothing.
+// TestRedirectLogsToFileCapturesStdlibLog pins the stdlib-log bridge: the
+// redirect must capture the standard library's log package, not just slog.
+//
+// Bramble's own diagnostics no longer go through log.Printf — they were all
+// moved to slog, so a grep of bramble/ for log.Printf now finds nothing. That
+// is exactly why this test is worth keeping rather than deleting: the bridge is
+// what stops anything a DEPENDENCY logs through stdlib log from reaching the
+// TTY the TUI is painting.
 func TestRedirectLogsToFileCapturesStdlibLog(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

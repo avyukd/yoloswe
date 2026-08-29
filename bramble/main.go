@@ -147,6 +147,12 @@ func runTUI(cmd *cobra.Command, args []string) error {
 		slog.SetDefault(slog.New(slog.DiscardHandler))
 	} else {
 		defer closeLog()
+		// Deferred, not printed at the end of the happy path: several startup
+		// failures below return before ever reaching it, and those are exactly
+		// the runs whose log the operator most needs to find. Safe on every exit
+		// because a defer runs after p.Run has released the terminal, so this
+		// cannot land in a painted frame.
+		defer func() { fmt.Fprintf(os.Stderr, "Logs written to: %s\n", logPath) }()
 	}
 
 	// Setup context with signal handling
@@ -414,13 +420,6 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	// restartRequester exists to be able to do.
 	restartRequests.set(nil)
 	stopRestartSignal()
-
-	// Safe only now: the TUI has released the terminal, so this cannot land in
-	// a painted frame. Worth saying at all because the redirect makes the log
-	// invisible during the run, and a diagnostic nobody can find is not one.
-	if logPath != "" {
-		fmt.Fprintf(os.Stderr, "Logs written to: %s\n", logPath)
-	}
 
 	if err != nil {
 		return fmt.Errorf("TUI error: %w", err)

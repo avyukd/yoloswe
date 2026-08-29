@@ -122,6 +122,11 @@ type Courier struct { //nolint:govet // fieldalignment: grouping by role reads b
 	// keeps swallowing pastes is reported once rather than every retryDelay.
 	// See noteUnlandedReport.
 	reportedUnlanded map[SessionID]string
+	// reportedUnverifiable is the same dedup for the opposite outcome: a pane
+	// bramble could not read, submitted into anyway. Separate from
+	// reportedUnlanded because that record is released the moment a delivery
+	// submits, which is exactly when this one must survive.
+	reportedUnverifiable map[SessionID]string
 	// now is injectable so tests assert elapsed time rather than call count.
 	now func() time.Time
 	seq uint64
@@ -151,19 +156,20 @@ func NewCourier(target DeliveryTarget, panes PaneWriter, config CourierConfig) (
 		return nil, fmt.Errorf("failed to create result dir %s: %w", resultDir, err)
 	}
 	c := &Courier{
-		target:           target,
-		panes:            panes,
-		dir:              deliveryDir,
-		resultDir:        resultDir,
-		pending:          make(map[SessionID][]Delivery),
-		heldForDraft:     make(map[SessionID]draftHold),
-		staged:           make(map[SessionID]string),
-		heldForPane:      make(map[SessionID]paneHold),
-		reportedBlocked:  make(map[SessionID]string),
-		reportedUnlanded: make(map[SessionID]string),
-		now:              time.Now,
-		reported:         make(map[SessionID]map[SessionStatus]bool),
-		writing:          make(map[SessionID]bool),
+		target:               target,
+		panes:                panes,
+		dir:                  deliveryDir,
+		resultDir:            resultDir,
+		pending:              make(map[SessionID][]Delivery),
+		heldForDraft:         make(map[SessionID]draftHold),
+		staged:               make(map[SessionID]string),
+		heldForPane:          make(map[SessionID]paneHold),
+		reportedBlocked:      make(map[SessionID]string),
+		reportedUnlanded:     make(map[SessionID]string),
+		reportedUnverifiable: make(map[SessionID]string),
+		now:                  time.Now,
+		reported:             make(map[SessionID]map[SessionStatus]bool),
+		writing:              make(map[SessionID]bool),
 	}
 	if err := c.load(); err != nil {
 		return nil, err
@@ -358,6 +364,19 @@ func (c *Courier) clearUnlandedReport(to SessionID) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.reportedUnlanded, to)
+}
+
+// noteUnverifiableReport reports once per distinct unreadable pane submitted
+// into. Kept separate from noteUnlandedReport because that record is cleared on
+// every submit, and this warning describes a submit.
+func (c *Courier) noteUnverifiableReport(to SessionID, fingerprint string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.reportedUnverifiable[to] == fingerprint {
+		return false
+	}
+	c.reportedUnverifiable[to] = fingerprint
+	return true
 }
 
 // composerHoldGrace is wall-clock time, not a retry count: Drain has multiple
@@ -719,8 +738,20 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 			case !v.readable:
 				// Unreadable is silence, not a negative. Trust tmux paste-buffer;
 				// re-pasting here is the duplicate-copy loop.
-				slog.Debug("paste could not be verified because the pane was unreadable; submitting anyway",
-					"session", info.ID, "provider", provider)
+				//
+				// Warn rather than Debug, because this is the ONE arm that can
+				// lose a delivery. Submitting dequeues it permanently, so if the
+				// pane was an alt-screen pager or an exited CLI, the paste went
+				// nowhere, Enter went to something else, and a parent waiting on
+				// that report waits forever — the exact outcome the at-least-once
+				// comment in Drain names. Every other arm either lands the text or
+				// keeps it queued. Deduped per frame by the same record the stall
+				// path uses, so an unreadable pane costs one line, not one per
+				// retryDelay.
+				if c.noteUnverifiableReport(info.ID, v.fingerprint) {
+					logDeliveryWarn("submitting into a pane bramble cannot read; if the paste did not land the delivery is lost",
+						info.ID, errPasteUnverifiable)
+				}
 			case v.foreign:
 				// Someone else's text is in the composer, so this is not a
 				// dropped paste and a re-paste would append a second copy to
@@ -822,6 +853,12 @@ var errPaneBusy = errors.New("pane shows a turn still in flight")
 // fall-through logged a second, undeduped warning per retry and cancelled the
 // dedup out — the same trap the errComposerBusy arm documents.
 var errPasteUnlanded = errors.New("paste did not reach the prompt")
+
+// errPasteUnverifiable labels the one arm that submits without evidence: the
+// pane could not testify either way, so bramble trusts tmux paste-buffer and
+// presses Enter. It is never returned — the delivery proceeds — and exists only
+// to give that warning a stable identity in the log.
+var errPasteUnverifiable = errors.New("pane could not confirm the paste")
 
 // paneSaysWorking asks the recipient's pane whether a turn is running. Unknown
 // means fail open: deliver rather than strand mail on an unreadable pane.
@@ -998,6 +1035,7 @@ func (c *Courier) discard(to SessionID) {
 	delete(c.heldForDraft, to)
 	delete(c.reportedBlocked, to)
 	delete(c.reportedUnlanded, to)
+	delete(c.reportedUnverifiable, to)
 	if _, queued := c.pending[to]; !queued {
 		// No queue, so nothing on disk to unlink.
 		c.mu.Unlock()
