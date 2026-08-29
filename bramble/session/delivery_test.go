@@ -3155,6 +3155,14 @@ func TestOneStandingBlockIsReportedOnce(t *testing.T) {
 	c.clearDraftHold("s1")
 	assert.True(t, c.noteBlockedReport("s1", "❯ a different half-typed line"),
 		"a block that cleared and returned is a new standing condition and is reported again")
+
+	// An empty composer is a real key, not "never reported": composerDraftText
+	// fail-closes with "" when claude's composer region exists but cannot be
+	// read, and that block deserves its one warning like any other.
+	assert.True(t, c.noteBlockedReport("s2", ""),
+		"an unreadable composer is still a standing block and is reported once")
+	assert.False(t, c.noteBlockedReport("s2", ""),
+		"and it must not be reported again on every retry")
 }
 
 // TestAStuckPasteIsWarnedAboutOnce is the same rule for the other standing
@@ -3250,6 +3258,46 @@ func TestSubmittingIntoAnUnreadablePaneIsWarnedAboutOnce(t *testing.T) {
 
 	assert.True(t, c.noteUnverifiableReport("s1", paneFingerprint([]string{"a different frame"})),
 		"a pane that changed is a new situation and is reported")
+}
+
+// TestAPaneNoCaptureSucceedsOnIsStillWarnedAbout drives the real write() path
+// for the worst shape of the delivery-losing case: every pane capture fails,
+// because the tmux window was killed or the server restarted mid-delivery.
+//
+// pasteVerdict then returns its zero value — readable false, fingerprint "" —
+// so write() submits blind and Drain dequeues permanently. That is the most
+// likely genuine loss there is, and a dedup keyed on `c.m[to] == key` swallowed
+// precisely it: an empty fingerprint is indistinguishable from "never reported".
+// The helper must distinguish presence from value.
+func TestAPaneNoCaptureSucceedsOnIsStillWarnedAbout(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.mu.Lock()
+	target.captureErr = errors.New("window is gone")
+	target.mu.Unlock()
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	// The empty fingerprint must have been RECORDED, not swallowed. If the
+	// helper compared against the map's zero value this stays absent, and the
+	// operator's only signal for a lost delivery is never emitted.
+	c.mu.Lock()
+	prev, seen := c.reportedUnverifiable["s1"]
+	c.mu.Unlock()
+	assert.True(t, seen,
+		"an unreadable pane must be recorded as reported even when its fingerprint is empty")
+	assert.Equal(t, "", prev, "no capture succeeded, so there is no frame to fingerprint")
+
+	// And it must not warn twice for the same unreadable pane.
+	assert.False(t, c.noteUnverifiableReport("s1", ""),
+		"the same unreadable pane must not be reported again")
 }
 
 // TestAChipBesideTypedTextIsStillAHumanDraft: a chip with text beside it is

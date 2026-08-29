@@ -331,10 +331,19 @@ func composerHoldsThisDelivery(provider, composer, staged, text string) bool {
 
 // noteBlockedReport reports once per distinct blocking draft. Without this, a
 // draft that sits past composerHoldGrace logs once per retry.
+//
+// Presence, not value: every dedup helper here must test `seen && prev == key`
+// rather than `c.m[to] == key`. An empty key is a real key — an unreadable
+// composer and a pane no capture succeeded on both produce one — and comparing
+// against the map's zero value makes that case indistinguishable from "never
+// reported", swallowing the FIRST report. In each of these the swallowed line is
+// the only signal the operator gets, and the emptiest key is the most degraded
+// pane, so the collision silences exactly the worst case. Same distinction
+// composerHoldsThisDelivery already draws for staged provenance.
 func (c *Courier) noteBlockedReport(to SessionID, composer string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.reportedBlocked[to] == composer {
+	if prev, seen := c.reportedBlocked[to]; seen && prev == composer {
 		return false
 	}
 	c.reportedBlocked[to] = composer
@@ -350,7 +359,7 @@ func (c *Courier) noteBlockedReport(to SessionID, composer string) bool {
 func (c *Courier) noteUnlandedReport(to SessionID, fingerprint string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.reportedUnlanded[to] == fingerprint {
+	if prev, seen := c.reportedUnlanded[to]; seen && prev == fingerprint {
 		return false
 	}
 	c.reportedUnlanded[to] = fingerprint
@@ -372,7 +381,7 @@ func (c *Courier) clearUnlandedReport(to SessionID) {
 func (c *Courier) noteUnverifiableReport(to SessionID, fingerprint string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.reportedUnverifiable[to] == fingerprint {
+	if prev, seen := c.reportedUnverifiable[to]; seen && prev == fingerprint {
 		return false
 	}
 	c.reportedUnverifiable[to] = fingerprint
