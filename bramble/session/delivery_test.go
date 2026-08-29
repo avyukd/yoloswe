@@ -269,6 +269,21 @@ func claudeComposerPane(body string) string {
 	}, "\n")
 }
 
+// codexPromptPane renders codex's prompt as its pane shows it, optionally with
+// body echoed above. Codex has no readable composer, so paste confirmation
+// scans the pane tail — but the tail only counts as evidence when codex's own
+// prompt chrome is on screen, so a codex test must paint it.
+//
+// Built on codexPane so the prompt marker lives in exactly one place; this
+// wrapper only joins it for setPane, which takes the pane as one string.
+func codexPromptPane(body string) string {
+	var transcript []string
+	if body != "" {
+		transcript = append(transcript, body)
+	}
+	return strings.Join(codexPane(false, transcript...), "\n")
+}
+
 // testCourierResultDir names a result dir inside this test's temp dir without
 // creating it. Deliberately not pre-created: the courier's own MkdirAll must be
 // what brings it into existence, or TestResultArtifactsAreNotWorldReadable
@@ -543,13 +558,15 @@ func TestDrainDiscardsQueueForTerminalSession(t *testing.T) {
 	c.noteStaged("s1", "hello")
 	c.noteDraftHold("s1", "a half-typed line")
 	require.True(t, c.noteBlockedReport("s1", "a half-typed line"))
+	require.True(t, c.noteUnlandedReport("s1", paneFingerprint([]string{"some pane content"})))
 	c.notePaneHold("s1", []string{"some pane content"})
 	c.mu.Lock()
 	for name, populated := range map[string]bool{
-		"staged":          len(c.staged) == 1,
-		"heldForDraft":    len(c.heldForDraft) == 1,
-		"reportedBlocked": len(c.reportedBlocked) == 1,
-		"heldForPane":     len(c.heldForPane) == 1,
+		"staged":           len(c.staged) == 1,
+		"heldForDraft":     len(c.heldForDraft) == 1,
+		"reportedBlocked":  len(c.reportedBlocked) == 1,
+		"reportedUnlanded": len(c.reportedUnlanded) == 1,
+		"heldForPane":      len(c.heldForPane) == 1,
 	} {
 		require.True(t, populated, "%s must hold an entry before discard for this test to prove anything", name)
 	}
@@ -564,6 +581,7 @@ func TestDrainDiscardsQueueForTerminalSession(t *testing.T) {
 	assert.Empty(t, c.staged, "staged")
 	assert.Empty(t, c.heldForDraft, "heldForDraft")
 	assert.Empty(t, c.reportedBlocked, "reportedBlocked")
+	assert.Empty(t, c.reportedUnlanded, "reportedUnlanded")
 	assert.Empty(t, c.heldForPane, "heldForPane")
 	c.mu.Unlock()
 
@@ -574,6 +592,7 @@ func TestDrainDiscardsQueueForTerminalSession(t *testing.T) {
 	c.noteStaged("s1", "hello")
 	c.noteDraftHold("s1", "a half-typed line")
 	require.True(t, c.noteBlockedReport("s1", "a half-typed line"))
+	require.True(t, c.noteUnlandedReport("s1", paneFingerprint([]string{"some pane content"})))
 	c.notePaneHold("s1", []string{"some pane content"})
 	c.mu.Lock()
 	require.Empty(t, c.pending, "this half of the test is only meaningful with no queue")
@@ -586,6 +605,7 @@ func TestDrainDiscardsQueueForTerminalSession(t *testing.T) {
 	assert.Empty(t, c.staged, "staged, with no queue to gate on")
 	assert.Empty(t, c.heldForDraft, "heldForDraft, with no queue to gate on")
 	assert.Empty(t, c.reportedBlocked, "reportedBlocked, with no queue to gate on")
+	assert.Empty(t, c.reportedUnlanded, "reportedUnlanded, with no queue to gate on")
 	assert.Empty(t, c.heldForPane, "heldForPane, with no queue to gate on")
 }
 
@@ -1781,6 +1801,44 @@ func TestHeldWriteDoesNotRearmReporting(t *testing.T) {
 		"once the write actually lands, the turn it starts is news again")
 }
 
+// TestUnlandedPasteDoesNotRearmReporting is the same rule as
+// TestHeldWriteDoesNotRearmReporting for the other error that writes nothing.
+//
+// A paste that never reached the prompt started no turn, so the child's next
+// idle is still the turn the parent already has. errPasteUnlanded repeats every
+// retryDelay for the life of the stall, so re-arming here is steady state: one
+// duplicate report per retry, each costing a tmux child another full pane
+// capture and another result file.
+func TestUnlandedPasteDoesNotRearmReporting(t *testing.T) {
+	t.Parallel()
+	parentID, childID := ids(t)
+	target := newFakeTarget()
+	// Echo unset: every paste is swallowed, which is what a dropped paste is.
+	// reportFixture cannot be used here because it wires echoPanes, under which
+	// a paste always lands and nothing is ever held.
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+	target.set(parentID, StatusRunning, RunnerTypeTmux)
+	target.setChild(childID, parentID, StatusIdle, RunnerTypeTmux)
+	target.setBackend(childID, ProviderClaude, "claude-opus-5")
+	// Located and empty: readable, and the text is genuinely not there, which
+	// is the one shape write() treats as a confirmed dropped paste.
+	target.setPane(claudeComposerPane(""))
+
+	reportNow(c, target, childID)
+	require.Len(t, c.Pending(parentID), 1, "precondition: the child's first idle is reported")
+
+	queued, err := c.Send(context.Background(), parentID, childID, "round two", true)
+	require.NoError(t, err)
+	require.True(t, queued, "precondition: an unlanded paste stays queued")
+
+	target.setChild(childID, parentID, StatusIdle, RunnerTypeTmux)
+	reportNow(c, target, childID)
+	assert.Len(t, c.Pending(parentID), 1,
+		"a paste that never reached the prompt started no turn, so it must not re-arm idle reporting")
+}
+
 // TestSubmittedWriteMarksSessionRunning pins the fix for a bug that silently
 // ended every two-way conversation after one round.
 //
@@ -1866,6 +1924,10 @@ func TestDroppedPasteIsRetried(t *testing.T) {
 	// Codex is the provider whose TUI drops pastes, and the only one the
 	// courier re-pastes for.
 	target.setBackend("s1", ProviderCodex, "gpt-5.4-mini")
+	// Codex's own prompt must be on screen. Without it the pane says nothing
+	// about the paste, and silence is not a dropped paste — see
+	// TestCodexPaneWithoutItsPromptIsSilence.
+	target.setPane(codexPromptPane(""))
 
 	panes := echoPanes(target)
 	var pastes int
@@ -1873,7 +1935,7 @@ func TestDroppedPasteIsRetried(t *testing.T) {
 		// The first paste is swallowed, as codex does mid-finalize.
 		pastes++
 		if pastes > 1 {
-			target.appendPane(text)
+			target.appendPane(codexPromptPane(text))
 		}
 	}
 	c, err := NewCourier(target, panes, testCourierConfig(t))
@@ -1891,11 +1953,17 @@ func TestDroppedPasteIsRetried(t *testing.T) {
 // the text, the message must stay queued for the next idle rather than being
 // reported as delivered — and the session must not be marked running for a
 // turn that never started.
+//
+// Codex's prompt line is a precondition here, not decoration. A pane that shows
+// the prompt and still lacks the text is the swallowed-paste shape this test
+// describes; a pane showing no codex chrome at all is silence, and silence
+// submits rather than requeues (TestCodexPaneWithoutItsPromptIsSilence).
 func TestPersistentlyDroppedPasteKeepsDeliveryQueued(t *testing.T) {
 	t.Parallel()
 	target := newFakeTarget()
 	target.set("s1", StatusRunning, RunnerTypeTmux)
 	target.setBackend("s1", ProviderCodex, "gpt-5.4-mini")
+	target.setPane(codexPromptPane(""))
 
 	panes := &fakePanes{} // echo unset: every paste is swallowed
 	c, err := NewCourier(target, panes, testCourierConfig(t))
@@ -2465,6 +2533,12 @@ func TestClaudePasteIsVerified(t *testing.T) {
 		target := newFakeTarget()
 		target.set("s1", StatusIdle, RunnerTypeTmux)
 		target.setBackend("s1", ProviderClaude, "claude-opus-5")
+		// The composer must be locatable and empty. That is what a dropped
+		// paste looks like, and it is the only shape that can be told apart
+		// from a pane bramble simply cannot read — see
+		// TestAPaneWithNoClaudeChromeIsSilenceNotADroppedPaste, where the
+		// absence of chrome means the opposite and must submit.
+		target.setPane(claudeComposerPane(""))
 
 		panes := &fakePanes{} // the pane never shows the text: the TUI dropped it
 		c, err := NewCourier(target, panes, testCourierConfig(t))
@@ -3081,6 +3155,210 @@ func TestOneStandingBlockIsReportedOnce(t *testing.T) {
 	c.clearDraftHold("s1")
 	assert.True(t, c.noteBlockedReport("s1", "❯ a different half-typed line"),
 		"a block that cleared and returned is a new standing condition and is reported again")
+
+	// An empty composer is a real key, not "never reported": composerDraftText
+	// fail-closes with "" when claude's composer region exists but cannot be
+	// read, and that block deserves its one warning like any other.
+	assert.True(t, c.noteBlockedReport("s2", ""),
+		"an unreadable composer is still a standing block and is reported once")
+	assert.False(t, c.noteBlockedReport("s2", ""),
+		"and it must not be reported again on every retry")
+}
+
+// TestAStuckPasteIsWarnedAboutOnce is the same rule for the other standing
+// condition. A prompt that keeps refusing a paste is reached on every retry, so
+// warning there unconditionally is one WARNING every retryDelay for the life of
+// the process — the shape that flooded a running bramble's terminal.
+//
+// The dedup bounds the LOG, not the retry: the delivery must keep being tried,
+// because a subagent report that is dropped leaves its parent waiting forever.
+func TestAStuckPasteIsWarnedAboutOnce(t *testing.T) {
+	t.Parallel()
+	c := &Courier{reportedUnlanded: map[SessionID]string{}}
+
+	pane := paneFingerprint([]string{"────────────", "❯ ", "────────────"})
+	assert.True(t, c.noteUnlandedReport("s1", pane), "the first stall is reported")
+	for i := 0; i < 20; i++ {
+		assert.False(t, c.noteUnlandedReport("s1", pane),
+			"the same refusing prompt must not be reported again on every retry")
+	}
+	assert.True(t, c.noteUnlandedReport("s1", paneFingerprint([]string{"a different frame entirely"})),
+		"a pane that changed is a new situation and is reported")
+
+	// A stall that ENDED and came back is a new standing condition. The record
+	// is released where the stall ends — on a paste that lands — so without
+	// that release "once per stall" would mean "once per session for the life
+	// of the process", and a later genuine stall would go unreported.
+	c.clearUnlandedReport("s1")
+	assert.True(t, c.noteUnlandedReport("s1", paneFingerprint([]string{"a different frame entirely"})),
+		"a stall that cleared and returned is reported again")
+}
+
+// TestAStuckPasteKeepsRetryingWhileWarningOnce is the end-to-end half: a claude
+// composer that is located and stays empty is a genuine dropped paste, so the
+// delivery must stay queued and be retried for as long as it takes — while the
+// operator hears about it once rather than every retryDelay.
+func TestAStuckPasteKeepsRetryingWhileWarningOnce(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	// Located and empty: readable, and the text is genuinely not there.
+	target.setPane(claudeComposerPane(""))
+
+	panes := &fakePanes{} // every paste is swallowed
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+	require.Len(t, c.Pending("s1"), 1, "a dropped paste keeps its delivery queued")
+
+	c.mu.Lock()
+	reportedAfterFirst := len(c.reportedUnlanded)
+	c.mu.Unlock()
+	require.Equal(t, 1, reportedAfterFirst, "the first stall is recorded as reported")
+
+	for i := 0; i < 3; i++ {
+		c.Drain(context.Background(), "s1")
+		assert.Len(t, c.Pending("s1"), 1,
+			"the delivery is retried, not dropped: a report nobody receives leaves a parent waiting forever")
+		pane, err := target.CapturePaneText("s1", pasteVerifyLines)
+		require.NoError(t, err)
+		assert.False(t, c.noteUnlandedReport("s1", paneFingerprint(pane)),
+			"the unchanged pane stays deduped across retries, so the warning is not repeated")
+	}
+}
+
+// TestSubmittingIntoAnUnreadablePaneIsWarnedAboutOnce covers the one arm of
+// write() that can LOSE a delivery. A pane bramble cannot read is submitted
+// into on trust, which dequeues the delivery permanently — so if the paste went
+// to an alt-screen pager or an exited CLI, the report is gone and its parent
+// waits forever. That deserves an operator-visible line.
+//
+// It needs its own dedup record rather than sharing reportedUnlanded: that one
+// is released on every submit, and this warning describes a submit, so sharing
+// it would warn on every single delivery into an unreadable pane.
+func TestSubmittingIntoAnUnreadablePaneIsWarnedAboutOnce(t *testing.T) {
+	t.Parallel()
+	c := &Courier{reportedUnverifiable: map[SessionID]string{}, reportedUnlanded: map[SessionID]string{}}
+
+	pane := paneFingerprint([]string{"(END)", "a fullscreen pager"})
+	assert.True(t, c.noteUnverifiableReport("s1", pane), "the first unreadable pane is reported")
+	for i := 0; i < 20; i++ {
+		assert.False(t, c.noteUnverifiableReport("s1", pane),
+			"the same unreadable frame must not be reported on every delivery")
+	}
+
+	// Releasing the stall record must not release this one: they describe
+	// opposite outcomes and are cleared at different times.
+	c.clearUnlandedReport("s1")
+	assert.False(t, c.noteUnverifiableReport("s1", pane),
+		"clearing the stall record must not re-arm the unreadable-pane warning")
+
+	assert.True(t, c.noteUnverifiableReport("s1", paneFingerprint([]string{"a different frame"})),
+		"a pane that changed is a new situation and is reported")
+
+	// An unreadable run that ENDED and came back is a new condition. Without a
+	// release, "once per unreadable run" becomes "once per process" — and here
+	// that is worse than the stall case, because each occurrence LOSES a
+	// delivery rather than queuing it. The record is released where the pane
+	// proves readable: the landed arm and the alreadyStaged path.
+	c.clearUnverifiableReport("s1")
+	assert.True(t, c.noteUnverifiableReport("s1", paneFingerprint([]string{"a different frame"})),
+		"an unreadable run that cleared and returned is reported again")
+
+	// The sharpest case: captures that keep failing yield "" every time, so
+	// without a release that session is warned about once and silently loses
+	// every delivery after.
+	c.clearUnverifiableReport("s1")
+	assert.True(t, c.noteUnverifiableReport("s1", ""),
+		"a session whose captures keep failing is reported again after a release")
+}
+
+// TestAPaneNoCaptureSucceedsOnIsStillWarnedAbout drives the real write() path
+// for the worst shape of the delivery-losing case: every pane capture fails,
+// because the tmux window was killed or the server restarted mid-delivery.
+//
+// pasteVerdict then returns its zero value — readable false, fingerprint "" —
+// so write() submits blind and Drain dequeues permanently. That is the most
+// likely genuine loss there is, and a dedup keyed on `c.m[to] == key` swallowed
+// precisely it: an empty fingerprint is indistinguishable from "never reported".
+// The helper must distinguish presence from value.
+func TestAPaneNoCaptureSucceedsOnIsStillWarnedAbout(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	target.mu.Lock()
+	target.captureErr = errors.New("window is gone")
+	target.mu.Unlock()
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	// The empty fingerprint must have been RECORDED, not swallowed. If the
+	// helper compared against the map's zero value this stays absent, and the
+	// operator's only signal for a lost delivery is never emitted.
+	c.mu.Lock()
+	prev, seen := c.reportedUnverifiable["s1"]
+	c.mu.Unlock()
+	assert.True(t, seen,
+		"an unreadable pane must be recorded as reported even when its fingerprint is empty")
+	assert.Equal(t, "", prev, "no capture succeeded, so there is no frame to fingerprint")
+
+	// And it must not warn twice for the same unreadable pane.
+	assert.False(t, c.noteUnverifiableReport("s1", ""),
+		"the same unreadable pane must not be reported again")
+}
+
+// TestAnUnreadableRunThatEndsIsWarnedAboutAgain drives the release through the
+// real write() path. A pane that goes unreadable, becomes readable, then goes
+// unreadable again is two distinct incidents, and each one can lose a delivery
+// — so each must be warned about. Without a release point the second is silent
+// for the life of the process.
+func TestAnUnreadableRunThatEndsIsWarnedAboutAgain(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	// No claude chrome: unreadable, so write() submits on trust and warns.
+	target.setPane("(END)")
+
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "first report", true)
+	require.NoError(t, err)
+	c.mu.Lock()
+	_, warnedFirst := c.reportedUnverifiable["s1"]
+	c.mu.Unlock()
+	require.True(t, warnedFirst, "precondition: the unreadable pane was reported")
+	require.Empty(t, c.Pending("s1"),
+		"precondition: the unreadable arm submits rather than queuing, so nothing is left behind")
+
+	// The pane becomes readable again AND the paste lands, which is what proves
+	// readability and ends the unreadable run.
+	panes.echo = func(text string) { target.appendPane(claudeComposerPane(text)) }
+	panes.onSubmit = func() { target.setPane(claudeComposerPane("")) }
+	target.setPane(claudeComposerPane(""))
+	// The first delivery submitted, so the recipient is running. It has to be
+	// idle again before a second delivery can be written.
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	queued, err := c.Send(context.Background(), "", "s1", "second report", true)
+	require.NoError(t, err)
+	require.False(t, queued, "precondition: the second delivery must actually land")
+
+	c.mu.Lock()
+	_, stillHeld := c.reportedUnverifiable["s1"]
+	c.mu.Unlock()
+	assert.False(t, stillHeld,
+		"a pane that proved readable ends the unreadable run, so the record must be released")
 }
 
 // TestAChipBesideTypedTextIsStillAHumanDraft: a chip with text beside it is
@@ -3187,6 +3465,52 @@ func TestDroppedPasteIntoAnEmptyComposerIsStillRetried(t *testing.T) {
 		"an empty composer is a real dropped paste; the one retry must not be suppressed as interference")
 	assert.NotContains(t, panes.recorded(), "enter(@7)")
 	assert.Len(t, c.Pending("s1"), 1)
+}
+
+// TestAPaneWithNoClaudeChromeIsSilenceNotADroppedPaste is the third row of the
+// verdict table, and the one that was missing. The two rows above it are
+// covered by TestObscuredPasteEvidenceIsNotANegative (chrome on screen, composer
+// unfound: silence) and by the test above (composer located and empty: a real
+// dropped paste). This is the case where the pane shows no claude chrome at all.
+//
+// Real panes reach that shape often: an alt-screen pager, fullscreen tool
+// output, /help, a CLI that restarted, or a bare shell prompt. None of them say
+// anything about whether the paste arrived — the composer may well be holding it
+// underneath. Readability was keyed off a status separator being on screen, so
+// this shape read as "readable, and the text is not there", which is the one
+// combination write() treats as a confirmed dropped paste.
+//
+// The cost of getting it wrong is not a missed warning. The courier pasted a
+// second copy, failed the identical verdict, returned "paste did not reach ...",
+// requeued, and retried every retryDelay for the life of the process — appending
+// another copy of the message each round and never pressing Enter.
+func TestAPaneWithNoClaudeChromeIsSilenceNotADroppedPaste(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("s1", StatusIdle, RunnerTypeTmux)
+	target.setBackend("s1", ProviderClaude, "claude-opus-5")
+	// A fullscreen pager: no separator, no prompt glyph, no claude chrome.
+	target.setPane(strings.Join([]string{
+		"diff --git a/main.go b/main.go",
+		"@@ -1,4 +1,9 @@",
+		"-old line",
+		"+new line",
+		"(END)",
+	}, "\n"))
+
+	// The pane never echoes: bramble cannot see the composer either way.
+	panes := &fakePanes{}
+	c, err := NewCourier(target, panes, testCourierConfig(t))
+	require.NoError(t, err)
+
+	_, err = c.Send(context.Background(), "", "s1", "a report from a subagent", true)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, panes.pasteCount(),
+		"a pane showing no claude chrome cannot say the paste was dropped; a second paste appends a duplicate copy and the loop never ends")
+	assert.Contains(t, panes.recorded(), "enter(@7)",
+		"silence must not wedge the queue: trust tmux paste-buffer and submit, as an unlocatable composer already does")
+	assert.Empty(t, c.Pending("s1"), "the delivery must leave the queue rather than retry forever")
 }
 
 // TestUserTypingBesideAPasteChipIsNotSubmitted is the chip form of the race

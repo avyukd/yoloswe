@@ -530,18 +530,56 @@ func composerHoldsForeignText(provider string, lines []string, first string) boo
 	return !strings.HasPrefix(first, body)
 }
 
-// pasteEvidenceObscured reports the one readable-but-silent shape: provider
-// chrome is present, but the composer could not be located within it. Other
-// unreadable captures remain negative because an empty or half-painted pane is
-// what a dropped paste looks like.
+// pasteEvidenceObscured reports that the pane cannot answer whether the paste
+// arrived. For a provider whose composer bramble reads, evidence is readable
+// only when the composer was actually located: that is the one shape able to
+// tell an EMPTY composer (a real dropped paste, repaired by one re-paste) from
+// an ABSENT one (silence, where re-pasting appends a duplicate copy forever).
+//
+// An unlocatable composer is silence whether or not claude chrome is on screen.
+// A pane showing no chrome at all — an alt-screen pager, fullscreen tool output,
+// /help, a restarted CLI, a bare shell — is the MOST obscured case, not the
+// least: nothing about it says the paste was dropped, and the composer may be
+// holding it out of view. Keying readability off a status separator classified
+// that silence as a hard negative, which re-pasted and re-queued every
+// retryDelay for the life of the process.
 func pasteEvidenceObscured(provider string, lines []string) bool {
 	if !composerReadable(provider) {
+		return promptChromeAbsent(provider, lines)
+	}
+	composerIdx, _ := claudeComposerIdx(lines)
+	return composerIdx < 0
+}
+
+// promptChromeAbsent reports that a pane for a provider with no readable
+// composer showed none of that CLI's prompt chrome. It is the counterpart of a
+// located composer: without the prompt on screen, the tail that scanForPaste
+// searched was not a composer at all, so its silence is not evidence the paste
+// was dropped.
+//
+// This does not make every unconfirmed paste unreadable for such providers.
+// Codex really does swallow pastes while finalizing a turn, and that shape —
+// prompt on screen, text absent from the tail — must still cost one re-paste.
+// Only a pane with no prompt chrome anywhere in the tail is silence.
+func promptChromeAbsent(provider string, lines []string) bool {
+	// Only a provider whose paste verdict is actually consulted can be held to
+	// this rule. Others never reach pasteVerdict, and claiming their evidence
+	// is obscured would answer a question nothing asks.
+	if !pasteVerifyRequired(provider) {
 		return false
 	}
-	if composerIdx, _ := claudeComposerIdx(lines); composerIdx >= 0 {
-		return false
+	markers := paneIdleProbes[provider].promptMarkers
+	if len(markers) == 0 {
+		// No chrome to look for, so the pane cannot testify either way — and
+		// silence is obscured, not readable. Answering "readable" here is the
+		// pre-fix classification that turned a silent pane into a hard negative
+		// and drove the re-paste loop. TestEveryVerifiedProviderCanBeRead keeps
+		// this branch unreachable in production; it is the fail-safe for a
+		// provider added to pasteEvidenceProbes without prompt chrome.
+		return true
 	}
-	return searchedForComposer(lines)
+	_, found := findPromptLine(lines, markers)
+	return !found
 }
 
 // pasteConfirmed reports whether the pane shows the paste arrived, either as

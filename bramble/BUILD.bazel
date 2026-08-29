@@ -3,6 +3,7 @@ load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 go_library(
     name = "bramble_lib",
     srcs = [
+        "logfile.go",
         "main.go",
         "restart.go",
         "restart_signals_other.go",
@@ -24,6 +25,7 @@ go_library(
         "//bramble/session",
         "//bramble/taskrouter",
         "//bramble/tmuxctl",
+        "//cliapp",
         "//logging/klogfmt",
         "//multiagent/agent",
         "//wt",
@@ -45,6 +47,7 @@ go_test(
     name = "bramble_test",
     srcs = [
         "list_sessions_test.go",
+        "logfile_test.go",
         "main_test.go",
         "new_session_test.go",
         "notify_cmd_test.go",

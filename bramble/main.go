@@ -132,6 +132,29 @@ func main() {
 }
 
 func runTUI(cmd *cobra.Command, args []string) error {
+	// Take the terminal back from the logger before anything can write to it.
+	// This must precede every goroutine started below, or a record emitted
+	// during startup still lands on the frame the TUI is about to paint.
+	logPath, closeLog, err := redirectLogsToFile()
+	if err != nil {
+		// Not fatal, but stderr is not the fallback: it is the TTY bubbletea is
+		// about to paint, so leaving slog pointed there reinstates the exact
+		// corruption this call exists to prevent. Discard instead — the log file
+		// is already lost either way, and a silent run beats a shredded frame.
+		// Reported before the handler is swapped, so this line still reaches the
+		// operator on the terminal they are about to hand over.
+		slog.Warn("could not open the log file; discarding logs for this run", "error", err)
+		slog.SetDefault(slog.New(slog.DiscardHandler))
+	} else {
+		defer closeLog()
+		// Deferred, not printed at the end of the happy path: several startup
+		// failures below return before ever reaching it, and those are exactly
+		// the runs whose log the operator most needs to find. Safe on every exit
+		// because a defer runs after p.Run has released the terminal, so this
+		// cannot land in a painted frame.
+		defer func() { fmt.Fprintf(os.Stderr, "Logs written to: %s\n", logPath) }()
+	}
+
 	// Setup context with signal handling
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

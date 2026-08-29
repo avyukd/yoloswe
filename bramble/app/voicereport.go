@@ -2,7 +2,7 @@ package app
 
 import (
 	"context"
-	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -73,13 +73,13 @@ func (vr *VoiceReporter) Report(ctx context.Context, info session.SessionInfo) {
 		Voice: synthVoice,
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "voice report: synthesis failed for session %s: %v\n", info.ID, err)
+		slog.Warn("voice report synthesis failed", "session", info.ID, "error", err)
 		return
 	}
 
 	result, err := vr.handler.Play(ctx, audio.Data, audio.Format)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "voice report: playback failed for session %s: %v\n", info.ID, err)
+		slog.Warn("voice report playback failed", "session", info.ID, "error", err)
 		return
 	}
 
@@ -88,7 +88,7 @@ func (vr *VoiceReporter) Report(ctx context.Context, info session.SessionInfo) {
 		if title == "" {
 			title = string(info.ID)
 		}
-		fmt.Fprintf(os.Stderr, "voice report for %s: saved to %s\n", title, result.FilePath)
+		slog.Info("voice report saved", "title", title, "path", result.FilePath)
 	}
 }
 
@@ -114,7 +114,7 @@ func BuildVoiceReporter(apiKey, voice, mode, saveDir string) *VoiceReporter {
 	case PlaybackModeDirect, PlaybackModeFile, PlaybackModeRedirect:
 		// valid
 	default:
-		fmt.Fprintf(os.Stderr, "Warning: unknown voice-report-mode %q, falling back to file\n", mode)
+		slog.Warn("unknown voice-report-mode, falling back to file", "mode", mode)
 		resolvedMode = PlaybackModeFile
 	}
 
@@ -132,7 +132,7 @@ func BuildVoiceReporter(apiKey, voice, mode, saveDir string) *VoiceReporter {
 	} else {
 		provider, err := elevenlabs.NewProvider(apiKey)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: voice reports disabled: %v\n", err)
+			slog.Warn("voice reports disabled", "error", err)
 			return nil
 		}
 		reporterCfg.Provider = provider

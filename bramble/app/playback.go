@@ -3,7 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -99,14 +99,14 @@ type RedirectTextWriter struct {
 // On failure (disk full, permissions), logs a warning and discards — never blocks.
 func (r *RedirectTextWriter) WriteText(text string) error {
 	if err := os.MkdirAll(r.Dir, 0o700); err != nil {
-		log.Printf("voice redirect: failed to create dir %s: %v", r.Dir, err)
+		slog.Warn("voice redirect: failed to create dir", "dir", r.Dir, "error", err)
 		return nil //nolint:nilerr // discard on failure per design
 	}
 
 	// Write latest (overwrite).
 	latestPath := filepath.Join(r.Dir, "voice-report-latest.txt")
 	if err := os.WriteFile(latestPath, []byte(text+"\n"), 0o600); err != nil {
-		log.Printf("voice redirect: failed to write latest: %v", err)
+		slog.Warn("voice redirect: failed to write latest", "error", err)
 		return nil //nolint:nilerr // discard on failure per design
 	}
 
@@ -114,14 +114,14 @@ func (r *RedirectTextWriter) WriteText(text string) error {
 	logPath := filepath.Join(r.Dir, "voice-report-log.txt")
 	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
-		log.Printf("voice redirect: failed to open log: %v", err)
+		slog.Warn("voice redirect: failed to open log", "error", err)
 		return nil //nolint:nilerr // discard on failure per design
 	}
 	defer f.Close()
 
 	entry := fmt.Sprintf("[%s] %s\n", time.Now().Format(time.RFC3339), text)
 	if _, err := f.WriteString(entry); err != nil {
-		log.Printf("voice redirect: failed to append log: %v", err)
+		slog.Warn("voice redirect: failed to append log", "error", err)
 	}
 
 	return nil

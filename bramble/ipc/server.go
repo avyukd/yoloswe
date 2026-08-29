@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"sync"
 
@@ -150,7 +150,7 @@ func (s *Server) acceptLoop() {
 			if s.ctx.Err() != nil {
 				return // shutting down
 			}
-			log.Printf("ipc: accept error: %v", err)
+			slog.Warn("ipc accept error", "error", err)
 			continue
 		}
 		s.wg.Add(1)
