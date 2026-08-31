@@ -18,31 +18,18 @@ type Registry interface {
 	StopSession(id session.SessionID) error
 }
 
-// Courier is the narrow slice of *session.Courier the dispatcher needs to hold
-// a message back until its recipient is idle. Consumer-side, like Registry, so
-// the queue branch can be tested without a real delivery directory.
-type Courier interface {
-	Send(ctx context.Context, from, to session.SessionID, text string, submit bool) (bool, error)
-}
-
 // Dispatcher handles control protocol requests against a registry (session
 // -centric ops) and a tmuxctl.Controller (raw-pane ops). It is transport
 // -agnostic: the local CLI and the remote hub client both call Handle.
 type Dispatcher struct {
-	reg     Registry
-	ctl     tmuxctl.Controller
-	courier Courier
+	reg Registry
+	ctl tmuxctl.Controller
 }
 
-// NewDispatcher constructs a Dispatcher. Queued delivery is unavailable until
-// SetCourier is called; a send_input asking for it gets a clear error rather
-// than silently interrupting the recipient.
+// NewDispatcher constructs a Dispatcher.
 func NewDispatcher(reg Registry, ctl tmuxctl.Controller) *Dispatcher {
 	return &Dispatcher{reg: reg, ctl: ctl}
 }
-
-// SetCourier enables queued delivery.
-func (d *Dispatcher) SetCourier(c Courier) { d.courier = c }
 
 // Handle processes one request Msg and returns a response Msg. It never returns
 // a nil Msg for a known request: failures are encoded as a TypeResponse with an
@@ -178,35 +165,19 @@ func (d *Dispatcher) sendInput(ctx context.Context, req *Msg, sessionScoped bool
 		return SendInputResult{}, err
 	}
 
-	// The queued path goes through the courier, which knows how to reach a
-	// session whatever its runner. The unqueued path below types straight into
-	// a pane, which stays the right behaviour for a deliberate interrupt and
-	// for raw pane targets.
+	// Queued delivery is gone. It promised to hold a message until the
+	// recipient was ready, which required guessing readiness from a pane and
+	// then keeping undeliverable mail on disk; both halves misfired. Completion
+	// is now read from the run directory, and this endpoint is only the
+	// deliberate interrupt it always was for the unqueued case.
+	//
+	// Refused rather than silently downgraded to an immediate paste: a caller
+	// that asked to wait for an idle recipient must not get a mid-turn
+	// interrupt instead.
 	if r.Queue {
-		if r.SessionID == "" {
-			return SendInputResult{}, fmt.Errorf("queue requires session_id: a raw pane target has no status to wait on")
-		}
-		if d.courier == nil {
-			return SendInputResult{}, fmt.Errorf("queued delivery is not available on this bramble")
-		}
-		// A queued delivery must be submitted, and saying otherwise is refused
-		// rather than silently ignored: Submit is a documented field, and a
-		// caller that asked to stage text deserves to learn that this endpoint
-		// cannot do that, not to be told OK and get a submitted message.
-		//
-		// Staging into a composer without pressing Enter delivers nothing, and
-		// the text then sits there looking like a human draft — it holds every
-		// later delivery to that session behind it for the full grace period
-		// and is then pasted on top.
-		if !r.Submit {
-			return SendInputResult{}, fmt.Errorf(
-				"queue requires submit: text staged without Enter is never delivered and blocks the queue behind it")
-		}
-		queued, err := d.courier.Send(ctx, session.SessionID(r.From), session.SessionID(r.SessionID), r.Text, r.Submit)
-		if err != nil {
-			return SendInputResult{}, err
-		}
-		return SendInputResult{OK: true, Queued: queued}, nil
+		return SendInputResult{}, fmt.Errorf(
+			"queued delivery has been removed: send without --queue for a deliberate interrupt, " +
+				"or let the orchestrator read completion from the run directory")
 	}
 
 	target, err := d.targetFor(r.SessionID, r.Target, sessionScoped)

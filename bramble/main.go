@@ -267,10 +267,10 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	// Discover repos (other than the initial one) still holding a non-terminal
 	// tmux session, so the TUI can auto-open them and fully re-adopt those
 	// sessions. This is a read-only probe: it never marks a dead session
-	// completed, because that transition is what carries a subagent's report to
-	// its parent and there is no courier here to hear it. That is also why a
-	// repo whose window already died is returned — its manager still owes the
-	// transition.
+	// completed, because that transition is how a session's status becomes
+	// accurate, and the manager that owns it has to be the one to record it.
+	// That is also why a repo whose window already died is returned — its
+	// manager still owes the transition.
 	resumeRepos := session.ReposNeedingTmuxReconcile(store, repoName, sharedManagerConfig.SessionMode)
 
 	// The scan above only finds repos with a session still to reconcile, so
@@ -322,31 +322,19 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	// Start the control server (read+write tmux control plane) on its own Unix
 	// socket. Local CLI subcommands (send-input, send-key) and the remote hub
 	// agent client both drive the same control.Dispatcher.
-	// The courier is created before the control server because the server's
-	// dispatcher takes it: a send-input asking to be queued must either work or
-	// say plainly that it cannot, never fall through to interrupting the
-	// recipient. OnRegister covers the manager registered just above as well as
-	// any repo opened later with Alt-R.
-	courier := startCourier(ctx, registry)
+	// OnRegister covers the manager registered just above as well as any repo
+	// opened later with Alt-R.
+	startNotifier(ctx, registry)
 
 	// Reconcile previously-running tmux sessions against live tmux windows.
-	//
-	// After the courier, not before: reconciliation is where a subagent that
-	// finished while bramble was down gets its terminal transition, and that
-	// is the only announcement its parent's report will ever get. Run it
-	// first and the event is emitted into a courier that does not exist yet.
+	// A session that finished while bramble was down gets its terminal
+	// transition here; nothing is owed to its parent beyond an accurate status,
+	// which the orchestrator reads with list-sessions.
 	if err := sessionManager.ReconcileTmuxSessions(); err != nil {
 		slog.Warn("tmux session reconciliation failed", "err", err)
 	}
 
-	// Sweep again now that reconciliation has re-adopted the stored sessions:
-	// the sweep inside OnRegister ran before they existed, so a recipient that
-	// came back idle was not reachable yet.
-	if courier != nil {
-		courier.DrainIdle(ctx)
-	}
-
-	controlServer := startControlServer(registry, courier)
+	controlServer := startControlServer(registry)
 	controlSockPath := ""
 	if controlServer != nil {
 		defer controlServer.Close()
@@ -376,7 +364,7 @@ func runTUI(cmd *cobra.Command, args []string) error {
 
 	// If a hub is configured, dial out to it so the user can reach this
 	// machine's sessions remotely. The agent client reuses the same dispatcher.
-	if stopRemote := startRemoteAgent(ctx, registry, courier); stopRemote != nil {
+	if stopRemote := startRemoteAgent(ctx, registry); stopRemote != nil {
 		defer stopRemote()
 	}
 
@@ -831,23 +819,16 @@ func startIPCServer(registry *session.SessionRegistry, sockPath, wtRoot, repoNam
 	return srv, nil
 }
 
-// newDispatcher builds a control dispatcher, enabling queued delivery when a
-// courier is available. The nil check is not decoration: courier is a concrete
-// pointer and SetCourier takes an interface, so passing a nil one through would
-// store a non-nil interface holding a nil pointer and panic on first use.
-func newDispatcher(registry *session.SessionRegistry, courier *session.Courier) *control.Dispatcher {
-	disp := control.NewDispatcher(registry, tmuxctl.New())
-	if courier != nil {
-		disp.SetCourier(courier)
-	}
-	return disp
+// newDispatcher builds a control dispatcher.
+func newDispatcher(registry *session.SessionRegistry) *control.Dispatcher {
+	return control.NewDispatcher(registry, tmuxctl.New())
 }
 
 // startControlServer uses the same fallback policy as IPC because both socket
 // paths are published together.
 // They must make the same choice about an occupied stable path.
-func startControlServer(registry *session.SessionRegistry, courier *session.Courier) *control.UnixServer {
-	dispatcher := newDispatcher(registry, courier)
+func startControlServer(registry *session.SessionRegistry) *control.UnixServer {
+	dispatcher := newDispatcher(registry)
 	var srv *control.UnixServer
 	bound := bindWithFallback("control", controlSocketPath(), controlSockBase, control.ErrSocketInUse,
 		func(path string) error {
@@ -860,30 +841,26 @@ func startControlServer(registry *session.SessionRegistry, courier *session.Cour
 	return srv
 }
 
-// startCourier builds the delivery courier and points it at every session
-// manager, present and future.
+// startNotifier hints to parents when their subagents change state, across
+// every session manager present and future.
 //
-// A failure here is not fatal. Queued delivery and subagent reports stop
-// working and say so; everything else — including the unqueued send-input the
-// TUI and CLI already rely on — is untouched.
-func startCourier(ctx context.Context, registry *session.SessionRegistry) *session.Courier {
-	courier, err := session.NewCourier(
+// A failure here is not fatal, and neither is a dropped hint: completion is
+// recorded by the lane and read by the orchestrator's poll. This only shortens
+// the wait.
+func startNotifier(ctx context.Context, registry *session.SessionRegistry) *session.Notifier {
+	notifier, err := session.NewNotifier(
 		session.NewRegistryDeliveryTarget(registry),
 		tmuxctl.NewPaneWriter(tmuxctl.New()),
-		session.CourierConfig{},
+		session.NotifierConfig{},
 	)
 	if err != nil {
-		slog.Warn("courier failed to start; queued delivery and subagent reports are unavailable", "err", err)
+		slog.Warn("notifier failed to start; subagent activity hints are unavailable", "err", err)
 		return nil
 	}
 	registry.OnRegister(func(mgr *session.Manager) {
-		courier.Watch(ctx, mgr)
-		// Queues reloaded from disk belong to sessions that may already be
-		// idle, and an idle session produces no transition for Watch to react
-		// to. Sweep once now that this manager's sessions are reachable.
-		courier.DrainIdle(ctx)
+		notifier.Watch(ctx, mgr)
 	})
-	return courier
+	return notifier
 }
 
 // startRemoteAgent dials the cloud hub when BRAMBLE_HUB_URL is set, serving
@@ -894,7 +871,7 @@ func startCourier(ctx context.Context, registry *session.SessionRegistry) *sessi
 //	BRAMBLE_HUB_URL    wss://hub.example/agent
 //	BRAMBLE_HUB_TOKEN  machine auth token
 //	BRAMBLE_MACHINE_ID stable machine id (defaults to hostname)
-func startRemoteAgent(ctx context.Context, registry *session.SessionRegistry, courier *session.Courier) func() {
+func startRemoteAgent(ctx context.Context, registry *session.SessionRegistry) func() {
 	hubURL := os.Getenv("BRAMBLE_HUB_URL")
 	if hubURL == "" {
 		return nil
@@ -909,7 +886,7 @@ func startRemoteAgent(ctx context.Context, registry *session.SessionRegistry, co
 		Token:      os.Getenv("BRAMBLE_HUB_TOKEN"),
 		MachineID:  machineID,
 		Hostname:   hostname,
-		Dispatcher: newDispatcher(registry, courier),
+		Dispatcher: newDispatcher(registry),
 	})
 	runCtx, cancel := context.WithCancel(ctx)
 	go func() {

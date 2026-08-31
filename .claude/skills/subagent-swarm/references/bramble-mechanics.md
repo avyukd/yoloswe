@@ -71,7 +71,9 @@ and then submit the composer before treating the lane as live.
 
 ## Track and communicate
 
-`<lane>.<phase>.done` and idle notifications are claims. Before transitioning:
+`<lane>.<phase>.done` files are claims, and a pane hint is only a nudge that
+something happened — it names no lane and may never arrive. The run directory and
+git are the record. Before transitioning:
 
 ~~~bash
 git -C "$WORKTREE" log --oneline "$PHASE_START_SHA..HEAD"
@@ -133,7 +135,6 @@ cat "$RUN/OBJECTIVE.md"
 python3 "$SW/ledger.py" show "$RUN"
 ls "$RUN"/*.done 2>/dev/null
 bramble list-sessions --parent "$SELF"
-cat ~/.bramble/deliveries/"$SELF".json 2>/dev/null
 ~~~
 
 A running ledger lane with no live session either finished without reporting or died.
