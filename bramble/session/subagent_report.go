@@ -167,11 +167,14 @@ func (c *Courier) reportToParent(ctx context.Context, child SessionInfo) {
 	// the manager deletes a completed tmux session before this callback runs,
 	// so "completed" for a session already gone is a normal last report.
 	//
-	// Dropping the stale case also collects history forgetChild would never
-	// reach: it runs only on an observed terminal transition, which a killed
-	// window never makes.
+	// Only the report is dropped, never the child's history. One monitor tick
+	// can queue a non-terminal and a terminal event for the same reaped child,
+	// and both drain after the delete; forgetting here would let the terminal
+	// one past shouldReport's "has the parent heard anything at all" gate and
+	// deliver the duplicate this guard exists to stop. So a child reaped
+	// without a terminal transition keeps its entry for the process lifetime —
+	// a bounded leak of a small map, which is the cheaper half of that trade.
 	if _, known := c.target.SessionInfo(child.ID); !known && !child.Status.IsTerminal() {
-		c.forgetChild(child.ID)
 		return
 	}
 	if !c.shouldReport(child.ID, child.Status) {
@@ -283,6 +286,12 @@ func formatSubagentReport(child SessionInfo, resultPath string) string {
 // Both land in the same directory under the same name, so the label is the only
 // thing that can tell them apart.
 func resultLabel(child SessionInfo, resultPath string) string {
+	if resultPath == "" {
+		// A child with no plan and no research file — the normal shape of a
+		// tmux child — has "" in both fields, so an empty path would otherwise
+		// match the first case and be labelled a plan.
+		return ""
+	}
 	switch resultPath {
 	case child.PlanFilePath:
 		return "plan"

@@ -69,8 +69,11 @@ func TestReapedChildIsNotReportedAgainAfterAFailedWrite(t *testing.T) {
 // answer for the parent to wait on and re-arming only leaves the door open for
 // a late duplicate.
 //
-// Both halves are load-bearing: a reaped window leaves only absence behind,
-// while a session the manager did mark terminal is still in the registry.
+// Both halves are load-bearing, and both are reachable in production. A reaped
+// window leaves only absence behind. The terminal half is the same single-tick
+// race: Watch re-arms on a Running transition, and by then the monitor may have
+// already marked the session Completed (manager.go:2177) without yet having
+// deleted it (:2186), so isLive sees a present-but-terminal session.
 func TestResetIdleReportIgnoresADeadSession(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -175,4 +178,54 @@ func TestResearchFileIsStillLabelledResult(t *testing.T) {
 	text := formatSubagentReport(child, child.ResearchFilePath)
 	assert.Contains(t, text, "result: /research/x.md")
 	assert.NotContains(t, text, "pane-capture")
+}
+
+// TestAStaleEventDoesNotUnsuppressALaterTerminalReport is the pair of events one
+// monitor tick produces for a reaped child, and the case no single-event test
+// can see.
+//
+// pollPaneIdle can emit Idle→Running for a provider that corrects a premature
+// idle, and two lines later the dead pane drives Completed and deletes the
+// session; both drain from the async event pump after the delete. So
+// reportToParent sees a non-terminal event and then a terminal one, both for a
+// child the registry no longer knows.
+//
+// The stale Running must be dropped — but dropping it must not also drop the
+// record of the idle report the parent already received, or the Completed
+// behind it passes shouldReport's "has the parent heard anything at all" gate
+// and the parent is told twice about a lane it already merged (#330).
+func TestAStaleEventDoesNotUnsuppressALaterTerminalReport(t *testing.T) {
+	t.Parallel()
+	c, target, parentID, childID := reportFixture(t, StatusIdle)
+
+	reportNow(c, target, childID)
+	require.Len(t, c.Pending(parentID), 1, "the first idle report is the real one")
+
+	// One tick: the window dies, and the queued Running and Completed events
+	// for it are both drained afterwards.
+	stale := target.mustInfo(childID)
+	target.forget(childID)
+
+	running := stale
+	running.Status = StatusRunning
+	c.reportToParent(context.Background(), running)
+
+	final := stale
+	final.Status = StatusCompleted
+	c.reportToParent(context.Background(), final)
+
+	assert.Len(t, c.Pending(parentID), 1,
+		"a stale event must not re-open a child the parent has already heard from")
+}
+
+// TestResultLabelHasNoLabelForNoPath closes a trap for the next caller. The
+// switch compares the path against the child's own fields, and a tmux child has
+// neither set — so "" matches PlanFilePath and an absent artifact would be
+// announced as a plan. formatSubagentReport guards on a non-empty path today,
+// which is the only reason this has never shipped.
+func TestResultLabelHasNoLabelForNoPath(t *testing.T) {
+	t.Parallel()
+	_, childID := ids(t)
+	child := SessionInfo{ID: childID, Type: SessionTypeBuilder, Status: StatusIdle}
+	assert.Empty(t, resultLabel(child, ""), "no path is not a plan")
 }
