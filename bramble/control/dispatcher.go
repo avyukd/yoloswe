@@ -184,6 +184,13 @@ func (d *Dispatcher) sendInput(ctx context.Context, req *Msg, sessionScoped bool
 	if err != nil {
 		return SendInputResult{}, err
 	}
+	// Leave copy mode first. A pane someone scrolled back in swallows the Enter
+	// that would submit this text, so the message lands in the composer and sits
+	// there — successful by every measure the caller can see, and never read by
+	// the agent. The notifier's pane writer does the same for its own writes.
+	if err := d.ctl.ExitCopyMode(ctx, target); err != nil {
+		return SendInputResult{}, err
+	}
 	if err := d.ctl.Paste(ctx, target, r.Text); err != nil {
 		return SendInputResult{}, err
 	}

@@ -26,12 +26,10 @@ package integration
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -48,7 +46,7 @@ const (
 	// settleTimeout bounds waits on a real agent CLI reacting.
 	// Real backends have to receive, run, and answer a prompt within it.
 	settleTimeout = 90 * time.Second
-	pollInterval = 250 * time.Millisecond
+	pollInterval  = 250 * time.Millisecond
 )
 
 // harness is one isolated bramble under test.
@@ -418,29 +416,14 @@ func (h *harness) tmux(args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
-// deliveryQueueLen counts recipients, not messages. Tests that mean "my message
-// is held" should use queuedFor because parent reports may be racing too.
+// deliveryQueueLen counts files left in the retired courier's spool. It must be
+// zero at all times now: nothing writes there, and the notifier reclaims
+// anything a previous bramble left behind.
 // The courier persists one file per recipient, holding that recipient's queue.
 func (h *harness) deliveryQueueLen() int {
 	h.t.Helper()
 	files, _ := filepath.Glob(filepath.Join(h.home, ".bramble", "deliveries", "*.json"))
 	return len(files)
-}
-
-// queuedFor reports how many messages are held for one session.
-func (h *harness) queuedFor(id session.SessionID) int {
-	h.t.Helper()
-	data, err := os.ReadFile(filepath.Join(h.home, ".bramble", "deliveries", string(id)+".json"))
-	if err != nil {
-		return 0 // no file means nothing queued for this recipient
-	}
-	var queue []struct {
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(data, &queue); err != nil {
-		h.t.Fatalf("delivery queue for %s is not readable: %v", id, err)
-	}
-	return len(queue)
 }
 
 // startupDialog is a prompt an agent CLI puts in front of its own prompt.
@@ -451,7 +434,7 @@ type startupDialog struct {
 	name string
 	// match is specific on purpose: answering the wrong modal picks a menu item.
 	match []string
-	keys []string
+	keys  []string
 	// fatal dialogs are reported instead of cleared.
 	fatal string
 }
@@ -660,28 +643,11 @@ func (h *harness) awaitWorking(id session.SessionID, promptEcho string) {
 
 // reportedResultPath returns the newest report path; the path, not just the
 // marker text, proves the parent can read the child output.
-func reportedResultPath(pane string) (string, bool) {
-	matches := resultPathRE.FindAllStringSubmatch(pane, -1)
-	if len(matches) == 0 {
-		return "", false
-	}
-	return matches[len(matches)-1][1], true
-}
-
-var resultPathRE = regexp.MustCompile(`result:\s+(\S+)`)
-
-// queuedTextFor returns the on-disk queue a restarted bramble would read.
-func (h *harness) queuedTextFor(to session.SessionID) string {
+// researchFileFor is where a subagent's output lands for its parent to read.
+// Bramble no longer pastes this path into the parent's pane — a hint carries no
+// state — so a test resolves it the way the swarm skill does: from the session
+// id, at the documented location.
+func (h *harness) researchFileFor(id session.SessionID) string {
 	h.t.Helper()
-	files, _ := filepath.Glob(filepath.Join(h.home, ".bramble", "deliveries", "*.json"))
-	var b strings.Builder
-	for _, f := range files {
-		if !strings.Contains(filepath.Base(f), string(to)) {
-			continue
-		}
-		if data, err := os.ReadFile(f); err == nil {
-			b.Write(data)
-		}
-	}
-	return b.String()
+	return filepath.Join(h.home, ".bramble", "research", string(id)+".md")
 }

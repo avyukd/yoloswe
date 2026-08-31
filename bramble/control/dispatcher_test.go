@@ -266,3 +266,25 @@ func TestSendInputQueueIsRefused(t *testing.T) {
 		"refusing must not fall back to interrupting the recipient")
 	assert.Empty(t, ctl.CallsFor("SendSpecial"))
 }
+
+// TestSendInputLeavesCopyModeFirst pins a silent tmux failure. A pane someone
+// scrolled back in swallows the Enter that would submit the text, so the message
+// lands in the composer and sits there — reported OK by every measure the caller
+// can see, and never read by the agent.
+//
+// This was previously covered only through the queued path, whose pane writer
+// exits copy mode on its own. With --queue gone, the direct write is the only
+// path left and has to do it itself.
+func TestSendInputLeavesCopyModeFirst(t *testing.T) {
+	t.Parallel()
+	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+	d, ctl := newDispatcher(reg)
+
+	resp := d.Handle(context.Background(), req(t, TypeSessionSendInput,
+		SendInputReq{SessionID: "s1", Text: "hello", Submit: true}))
+
+	var result SendInputResult
+	require.NoError(t, resp.DecodeResponse(&result))
+	require.Len(t, ctl.CallsFor("ExitCopyMode"), 1, "the pane must be taken out of copy mode")
+	require.Len(t, ctl.CallsFor("Paste"), 1)
+}

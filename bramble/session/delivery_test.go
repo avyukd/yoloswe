@@ -497,3 +497,30 @@ func TestConcurrentNotificationsNudgeOnce(t *testing.T) {
 	// busy parent regardless of how the claims interleaved.
 	require.Equal(t, 1, panes.pasteCount(), "one hint reaches the pane")
 }
+
+// TestAHintDoesNotHintBack pins termination.
+//
+// A hint is typed into the parent's pane and submitted, which starts a turn —
+// so the parent goes running, then idle again. If that idle were itself
+// hint-worthy the pair would volley forever, filling both panes. It is not:
+// hints follow a *child's* transition, and a top-level parent has no parent to
+// tell. The integration suite caught the raw pane count that made this look
+// like a loop; this pins the actual rule.
+func TestAHintDoesNotHintBack(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	child := claudeChild(target)
+	panes := echoPanes(target)
+	n := newTestNotifier(t, target, panes)
+
+	n.NotifyParent(t.Context(), child)
+	require.Equal(t, 1, panes.pasteCount(), "the child's finish hints once")
+
+	// The parent is now running because the hint submitted a prompt. Its own
+	// return to idle is the transition that would close the loop.
+	target.set("parent", StatusIdle, RunnerTypeTmux)
+	n.NotifyParent(t.Context(), target.mustInfo("parent"))
+
+	require.Equal(t, 1, panes.pasteCount(),
+		"a parent going idle must not hint: it has no parent, and a volley would never stop")
+}
