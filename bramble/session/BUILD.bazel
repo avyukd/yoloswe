@@ -48,6 +48,7 @@ go_test(
         "main_test.go",
         "manager_control_sock_test.go",
         "manager_provider_fallback_test.go",
+        "manager_reap_test.go",
         "manager_test.go",
         "pane_idle_test.go",
         "provider_runner_test.go",

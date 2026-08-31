@@ -629,6 +629,17 @@ func tmuxWindowAlive(windowID, windowName string) bool {
 	return false
 }
 
+// dirExists reports whether path is an existing directory. Any Stat failure
+// counts as "not there", so callers must only use it where a false negative is
+// harmless — see the ID-less scoping of the reconcile worktree gate below.
+//
+// app.worktreePathExists is the same check for the app layer, kept separate
+// because that one is a package var for stubbing. Keep the two in step.
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
 // ReconcileTmuxSessions checks stored sessions for previously-running tmux sessions
 // and re-adopts any whose tmux windows are still alive. Sessions whose windows
 // have disappeared are marked as completed.
@@ -644,7 +655,13 @@ func (m *Manager) ReconcileTmuxSessions() error {
 	if !IsInsideTmux() || !IsTmuxAvailable() {
 		return nil
 	}
+	return m.reconcileTmuxSessions(tmuxWindowAlive)
+}
 
+// reconcileTmuxSessions is the reconcile pass behind ReconcileTmuxSessions,
+// split out so it can be tested without a tmux server: the caller's guards and
+// windowAlive are the only parts that need one.
+func (m *Manager) reconcileTmuxSessions(windowAlive func(windowID, windowName string) bool) error {
 	// List all worktrees for this repo
 	worktrees, err := m.config.Store.ListWorktrees(m.config.RepoName)
 	if err != nil {
@@ -679,9 +696,36 @@ func (m *Manager) ReconcileTmuxSessions() error {
 				continue
 			}
 
-			// Check if the tmux window is still alive
-			if !tmuxWindowAlive(stored.TmuxWindowID, stored.TmuxWindowName) {
-				// Window is gone — mark as completed.
+			// Is the session still there? For a record carrying a tmux window
+			// ID the window answers on its own: tmuxWindowAlive matches the ID
+			// exactly, and tmux never recycles a window ID within a server
+			// lifetime, so a live window under that ID is this session's window.
+			//
+			// A record carrying only a name cannot tell. Names are recycled —
+			// GenerateTmuxWindowName hands out the lowest free "repo/worktree:N"
+			// — so once a session's window is killed the next session on that
+			// worktree takes the same name back, and the record looks alive
+			// because a *different* session is answering for it. Adopted, it
+			// lands in m.sessions with a monitor goroutine free to emit fresh
+			// idle transitions that reach the parent as subagent reports for a
+			// session list-sessions no longer knows about: issue #331.
+			//
+			// For that ID-less case only, the worktree is the independent
+			// signal. Reaping a session kills its window and removes its
+			// worktree, so a worktree path that no longer exists says the
+			// session is gone whoever holds its old name. An empty path is not
+			// evidence of anything and defers to the window.
+			//
+			// Deliberately not applied to ID-carrying records. It could only
+			// ever reap them — the ID match is already exact — and a failed
+			// Stat is not a finished session. Reaping is unrecoverable: the
+			// branch below writes StatusCompleted to the store without killing
+			// the window, so every later pass skips the record as terminal and
+			// a live agent keeps working in a session bramble has disowned.
+			gone := !windowAlive(stored.TmuxWindowID, stored.TmuxWindowName) ||
+				(stored.TmuxWindowID == "" && stored.WorktreePath != "" && !dirExists(stored.WorktreePath))
+			if gone {
+				// The session is gone — mark as completed.
 				//
 				// Only when it is not terminal already: this runs on every
 				// start, and re-announcing a session that was completed three
@@ -2449,6 +2493,12 @@ func shouldReviveIdleTmuxSession(statusAtCapture SessionStatus, paneStatus *Pane
 func (m *Manager) updateSessionStatus(session *Session, newStatus SessionStatus) {
 	session.mu.Lock()
 	oldStatus := session.Status
+	if !mayLeaveStatus(oldStatus, newStatus) {
+		session.mu.Unlock()
+		slog.Debug("suppressed status change for a session already terminal",
+			"session", session.ID, "old_status", oldStatus, "new_status", newStatus)
+		return
+	}
 	applySessionStatusLocked(session, oldStatus, newStatus)
 	session.mu.Unlock()
 
@@ -2458,6 +2508,33 @@ func (m *Manager) updateSessionStatus(session *Session, newStatus SessionStatus)
 		OldStatus: oldStatus,
 		NewStatus: newStatus,
 	})
+}
+
+// mayLeaveStatus reports whether a session sitting at oldStatus may move to
+// newStatus.
+//
+// Terminal is final. A session reaches completed/failed/stopped exactly when its
+// window is gone or it was stopped, and every one of those paths then drops it
+// from m.sessions — the map list-sessions reports. Any later move back to running
+// or idle re-animates a session the orchestrator can no longer see, and
+// Courier.Watch forwards it to the parent as an "is idle" report for a session
+// that no longer exists. That is issue #331.
+//
+// The race is real: a tmux monitor's 15-second capture ticker and its own
+// 2-second liveness ticker hold the same *Session, so a stale poll lands after
+// the reap. Guarding at the writers rather than at each caller means no future
+// emitter can slip past. failSession needs no guard — StatusFailed is terminal,
+// so this would pass it through anyway.
+//
+// Terminal→terminal is allowed through so the settling paths keep working: a
+// stop racing a natural completion should still record the stop.
+//
+// This makes updateSessionStatus/tryUpdateSessionStatus unusable for reviving a
+// terminal session: a resume must write session.Status directly under
+// session.mu, as ResumeSession does, or it is silently dropped with only a
+// slog.Debug for a trace.
+func mayLeaveStatus(oldStatus, newStatus SessionStatus) bool {
+	return !oldStatus.IsTerminal() || newStatus.IsTerminal()
 }
 
 func (m *Manager) failSession(session *Session, err error) {
@@ -2480,6 +2557,12 @@ func (m *Manager) tryUpdateSessionStatus(session *Session, fromStatus, toStatus 
 	oldStatus := session.Status
 	if oldStatus != fromStatus {
 		session.mu.Unlock()
+		return false
+	}
+	if !mayLeaveStatus(oldStatus, toStatus) {
+		session.mu.Unlock()
+		slog.Debug("suppressed status change for a session already terminal",
+			"session", session.ID, "old_status", oldStatus, "new_status", toStatus)
 		return false
 	}
 	applySessionStatusLocked(session, oldStatus, toStatus)

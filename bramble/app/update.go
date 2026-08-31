@@ -1382,6 +1382,10 @@ func (m Model) sessionTargetAvailability(target sessionTarget) sessionTargetAvai
 // on disk. Symlinks are followed so an externally-managed link target moving
 // also counts as gone. Indirected through a package var so tests can stub the
 // disk check without creating real directories for every fake path.
+//
+// session.dirExists is the same check for the session layer. Keep the two in
+// step: both collapse every Stat error into "gone", so neither may be used
+// where a permission failure would be read as a session having finished.
 var worktreePathExists = func(worktreePath string) bool {
 	info, err := os.Stat(worktreePath)
 	if err != nil {
