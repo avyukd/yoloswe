@@ -648,16 +648,21 @@ func (c *Courier) write(ctx context.Context, info SessionInfo, text string, subm
 	// Anything written starts the recipient's next turn, so whatever it says at
 	// the end of that turn is fresh news for its parent.
 	//
-	// A held delivery is the exception, and it is the common case rather than a
-	// rare failure: errPaneBusy answers every turn bramble's bookkeeping calls
-	// idle while the pane still shows work, and errComposerBusy repeats every
-	// retryDelay for as long as a user's draft sits in the composer. Those paths
-	// reach here having written nothing and started no turn, so the recipient's
-	// next idle is the SAME turn the parent was already told about. Re-arming
-	// there sends the parent a duplicate report, which for a tmux child also
-	// costs another 2000-line pane capture and another result file.
+	// Only a write that succeeded, though. Every error path reaches here having
+	// started no turn, so the recipient's next idle is the SAME turn the parent
+	// was already told about; re-arming there sends a duplicate report, which
+	// for a tmux child also costs another 2000-line pane capture and another
+	// result file.
+	//
+	// A hold is the common shape of that — errPaneBusy answers every turn
+	// bramble's bookkeeping calls idle while the pane still shows work, and
+	// errComposerBusy repeats every retryDelay for as long as a user's draft
+	// sits in the composer — but an outright failure is the one that mattered
+	// in issues #330 and #331: a message sent to a child whose tmux window was
+	// killed fails, and re-arming on it let the next stale idle event for that
+	// reaped session be reported to the parent as a fresh answer.
 	defer func() {
-		if !isHeld(err) {
+		if err == nil {
 			c.resetIdleReport(info.ID)
 		}
 	}()
@@ -1213,23 +1218,6 @@ const maxDeliveryAge = 7 * 24 * time.Hour
 // to return them to.
 func logDeliveryWarn(msg string, to SessionID, err error) {
 	slog.Warn(msg, "session", to, "error", err)
-}
-
-// isHeld reports whether an error means the delivery was held rather than
-// written: nothing reached the recipient and no turn started, so the recipient's
-// next idle is the same turn the parent was already told about. write uses it to
-// decide whether re-arming idle reporting is justified; see
-// TestHeldWriteDoesNotRearmReporting for why re-arming on a hold costs the
-// parent a duplicate report and a tmux child another full pane capture.
-//
-// The test is what was written, not what was attempted. errPasteUnlanded
-// belongs here for the same reason the retry.foreign arm returns
-// errComposerBusy after pasting: a paste that never reached the prompt started
-// no turn, and it repeats every retryDelay for the life of the stall.
-func isHeld(err error) bool {
-	return errors.Is(err, errComposerBusy) ||
-		errors.Is(err, errPaneBusy) ||
-		errors.Is(err, errPasteUnlanded)
 }
 
 // quietHolds are the errors write() returns for a delivery that is waiting

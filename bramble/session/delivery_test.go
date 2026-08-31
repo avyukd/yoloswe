@@ -339,12 +339,16 @@ func reportNow(c *Courier, target *fakeTarget, childID SessionID) {
 	c.reportToParent(context.Background(), child)
 }
 
+// reportResultPath returns the path a report points at, under whichever label
+// names it — a pane capture is labelled distinctly from a real artifact, but it
+// is still the file the parent is told to read.
 func reportResultPath(t *testing.T, report string) string {
 	t.Helper()
 	for _, line := range strings.Split(report, "\n") {
-		path, ok := strings.CutPrefix(line, "result: ")
-		if ok {
-			return path
+		for _, label := range []string{"result: ", "plan: ", "pane-capture: "} {
+			if path, ok := strings.CutPrefix(line, label); ok {
+				return path
+			}
 		}
 	}
 	require.FailNow(t, "report did not include a result path", report)

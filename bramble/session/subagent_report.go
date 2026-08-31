@@ -100,12 +100,36 @@ func (c *Courier) noteChildSpoke(child SessionID) {
 // waiting on just as much. Without this, a two-way conversation goes silent
 // after the first exchange and the parent is left polling — the thing the
 // queue exists to avoid.
+//
+// Only a recipient that can still take a turn earns that. write's own guard is
+// on the delivery — it re-arms only when the write succeeded — and this one is
+// on the recipient, for the paths that reach here without one: Watch re-arms on
+// a StatusRunning transition, and a session can be reaped between the write and
+// the reset. Re-arming a session that will never run again leaves the door open
+// for the next stale idle event for its ID to be reported to the parent as a
+// fresh answer (issues #330, #331).
 func (c *Courier) resetIdleReport(to SessionID) {
+	if !c.isLive(to) {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if seen := c.reported[to]; seen != nil {
 		delete(seen, StatusIdle)
 	}
+}
+
+// isLive reports whether a session can still start another turn: the registry
+// knows it and it has not reached a terminal state.
+//
+// Absence is the load-bearing half. A session reaped with tmux kill-window —
+// the teardown subagent-swarm's docs recommend, because a wedged session cannot
+// process /exit — may never emit a terminal transition, so it disappears from
+// the registry without ever running forgetChild. "Gone" is the only signal that
+// case leaves behind.
+func (c *Courier) isLive(id SessionID) bool {
+	info, ok := c.target.SessionInfo(id)
+	return ok && !info.Status.IsTerminal()
 }
 
 // forgetChild drops a finished child's reporting history so the map does not
@@ -133,6 +157,25 @@ func (c *Courier) reportToParent(ctx context.Context, child SessionInfo) {
 	// file, all of it discarded if the parent has already gone.
 	parent, ok := c.target.SessionInfo(child.ParentSessionID)
 	if !ok || parent.Status.IsTerminal() {
+		return
+	}
+	// A child the registry no longer knows has been reaped, and a non-terminal
+	// status for it is stale by definition: nothing is running, so there is no
+	// turn whose answer this could be. Those are the reports issues #330 and
+	// #331 describe — an "is idle" for a lane already merged, arriving hours
+	// after its window was killed.
+	//
+	// A terminal status for an absent child is the opposite and must survive:
+	// the manager deletes a completed tmux session before this callback runs,
+	// so "completed" for a session that is already gone is the normal shape of
+	// a child's last report.
+	//
+	// Dropping the stale case also collects the history forgetChild would
+	// otherwise never reach: it runs only on an observed terminal transition,
+	// which a killed window never makes, so the entry would sit in c.reported
+	// for the life of the process.
+	if _, known := c.target.SessionInfo(child.ID); !known && !child.Status.IsTerminal() {
+		c.forgetChild(child.ID)
 		return
 	}
 	if !c.shouldReport(child.ID, child.Status) {
@@ -228,12 +271,28 @@ func formatSubagentReport(child SessionInfo, resultPath string) string {
 		fmt.Fprintf(&b, "\nerror: %s", child.ErrorMsg)
 	}
 	if resultPath != "" {
-		label := "result"
-		if resultPath == child.PlanFilePath {
-			label = "plan"
-		}
-		fmt.Fprintf(&b, "\n%s: %s", label, resultPath)
+		fmt.Fprintf(&b, "\n%s: %s", resultLabel(child, resultPath), resultPath)
 	}
 
 	return b.String()
+}
+
+// resultLabel names what the reported path actually is.
+//
+// The distinction matters to whoever reads the file. A plan or a research file
+// is something the agent wrote; a pane capture is 2000 lines of terminal
+// scrollback, which for a tmux child that never answered opens with the CLI's
+// startup frame followed by the brief that was pasted in — so a consumer
+// reading it for "what the lane concluded" gets its own prompt back (#331).
+// Both land in the same directory under the same name, so the label is the only
+// thing that can tell them apart.
+func resultLabel(child SessionInfo, resultPath string) string {
+	switch resultPath {
+	case child.PlanFilePath:
+		return "plan"
+	case child.ResearchFilePath:
+		return "result"
+	default:
+		return "pane-capture"
+	}
 }

@@ -54,6 +54,7 @@ go_test(
         "registry_test.go",
         "resolve_agent_model_test.go",
         "store_test.go",
+        "subagent_report_test.go",
         "summary_test.go",
         "tmux_name_test.go",
         "tmux_runner_env_test.go",
