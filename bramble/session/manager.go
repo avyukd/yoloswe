@@ -629,6 +629,51 @@ func tmuxWindowAlive(windowID, windowName string) bool {
 	return false
 }
 
+// reconcileAction is what ReconcileTmuxSessions should do with one stored session.
+type reconcileAction int
+
+const (
+	// reconcileAdopt puts the session back under this manager's monitoring.
+	reconcileAdopt reconcileAction = iota
+	// reconcileReap drives the session to a terminal status instead.
+	reconcileReap
+)
+
+// decideReconcile decides whether a stored tmux session is still live enough to
+// re-adopt, given whether some tmux window answers to its recorded identifiers.
+//
+// A live window is not sufficient on its own. Window names are recycled:
+// GenerateTmuxWindowName hands out the lowest free "repo/worktree:N", so once a
+// session's window is killed the very next session on that worktree takes the
+// same name back. A stored record that kept only a name — no window ID — then
+// looks alive because a *different* session is answering for it, and gets
+// adopted as a live session. From there it is in m.sessions with a monitor
+// goroutine, free to emit fresh idle transitions that its parent receives as
+// subagent reports. That is issue #331: notifications for sessions that
+// list-sessions no longer knows about, repeating across restarts because the
+// courier's reported-set does not survive one.
+//
+// The worktree is the independent signal. Killing a session's window and
+// removing its worktree is how a session is reaped, and a worktree path that no
+// longer exists says the session is gone no matter which window holds its old
+// name. An empty WorktreePath is not evidence of anything, so it defers to the
+// window check alone.
+func decideReconcile(stored *StoredSession, windowAlive bool) reconcileAction {
+	if !windowAlive {
+		return reconcileReap
+	}
+	if stored.WorktreePath != "" && !dirExists(stored.WorktreePath) {
+		return reconcileReap
+	}
+	return reconcileAdopt
+}
+
+// dirExists reports whether path is an existing directory.
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
 // ReconcileTmuxSessions checks stored sessions for previously-running tmux sessions
 // and re-adopts any whose tmux windows are still alive. Sessions whose windows
 // have disappeared are marked as completed.
@@ -680,8 +725,8 @@ func (m *Manager) ReconcileTmuxSessions() error {
 			}
 
 			// Check if the tmux window is still alive
-			if !tmuxWindowAlive(stored.TmuxWindowID, stored.TmuxWindowName) {
-				// Window is gone — mark as completed.
+			if decideReconcile(stored, tmuxWindowAlive(stored.TmuxWindowID, stored.TmuxWindowName)) == reconcileReap {
+				// The session is gone — mark as completed.
 				//
 				// Only when it is not terminal already: this runs on every
 				// start, and re-announcing a session that was completed three
@@ -2449,6 +2494,11 @@ func shouldReviveIdleTmuxSession(statusAtCapture SessionStatus, paneStatus *Pane
 func (m *Manager) updateSessionStatus(session *Session, newStatus SessionStatus) {
 	session.mu.Lock()
 	oldStatus := session.Status
+	if !mayLeaveStatus(oldStatus, newStatus) {
+		session.mu.Unlock()
+		logResurrection(session.ID, oldStatus, newStatus)
+		return
+	}
 	applySessionStatusLocked(session, oldStatus, newStatus)
 	session.mu.Unlock()
 
@@ -2458,6 +2508,40 @@ func (m *Manager) updateSessionStatus(session *Session, newStatus SessionStatus)
 		OldStatus: oldStatus,
 		NewStatus: newStatus,
 	})
+}
+
+// mayLeaveStatus reports whether a session sitting at oldStatus may move to
+// newStatus.
+//
+// Terminal is final. A session reaches completed/failed/stopped exactly when
+// its window is gone or it was stopped, and every one of those paths then drops
+// it from m.sessions — the map list-sessions reports. Any later move back to
+// running or idle re-animates a session the orchestrator can no longer see, and
+// Courier.Watch forwards it to the parent as an "is idle" report for a session
+// that no longer exists. That is issue #331.
+//
+// The transitions this blocks are not hypothetical. Both tmux monitor loops
+// poll the pane before deciding the window is gone, and a monitor's 15-second
+// capture ticker races its own 2-second liveness ticker holding the same
+// *Session; a stale poll landing after the reap is what re-arms the session.
+// Guarding here rather than at each caller is deliberate: applySessionStatusLocked
+// is the single place a status is written, so no future emitter can slip past.
+//
+// Terminal→terminal is allowed through so the settling paths keep working: a
+// stop racing a natural completion should still record the stop, and blocking
+// it would be a silent behaviour change well outside this fix.
+func mayLeaveStatus(oldStatus, newStatus SessionStatus) bool {
+	if !oldStatus.IsTerminal() {
+		return true
+	}
+	return newStatus.IsTerminal()
+}
+
+// logResurrection records a suppressed attempt to revive a terminal session, so
+// a stale poll shows up in the log instead of vanishing.
+func logResurrection(id SessionID, oldStatus, newStatus SessionStatus) {
+	slog.Debug("suppressed status change for a session already terminal",
+		"session", id, "old_status", oldStatus, "new_status", newStatus)
 }
 
 func (m *Manager) failSession(session *Session, err error) {
@@ -2480,6 +2564,11 @@ func (m *Manager) tryUpdateSessionStatus(session *Session, fromStatus, toStatus 
 	oldStatus := session.Status
 	if oldStatus != fromStatus {
 		session.mu.Unlock()
+		return false
+	}
+	if !mayLeaveStatus(oldStatus, toStatus) {
+		session.mu.Unlock()
+		logResurrection(session.ID, oldStatus, toStatus)
 		return false
 	}
 	applySessionStatusLocked(session, oldStatus, toStatus)
