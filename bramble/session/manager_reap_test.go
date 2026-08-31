@@ -1,6 +1,7 @@
 package session
 
 import (
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -154,11 +155,10 @@ func TestLiveSessionStillTransitions(t *testing.T) {
 	assert.Equal(t, StatusIdle, events[0].NewStatus)
 }
 
-// storedTmuxSession files one non-terminal tmux session at worktreePath and
-// returns a manager over that store plus a snapshot of what reconciling emits.
-// The recorded window name carries no ID — the shape a reaped session leaves
-// behind once GenerateTmuxWindowName has handed its "repo/worktree:N" on.
-func storedTmuxSession(t *testing.T, id SessionID, worktreePath string) (*Manager, *Store, func() []SessionStateChangeEvent) {
+// storedTmuxSessionWithWindowID files one non-terminal tmux session at
+// worktreePath under the given tmux window ID, and returns a manager over that
+// store plus a snapshot of what reconciling emits.
+func storedTmuxSessionWithWindowID(t *testing.T, id SessionID, worktreePath, windowID string) (*Manager, *Store, func() []SessionStateChangeEvent) {
 	t.Helper()
 	store, err := NewStore(t.TempDir())
 	require.NoError(t, err)
@@ -170,6 +170,7 @@ func storedTmuxSession(t *testing.T, id SessionID, worktreePath string) (*Manage
 		WorktreePath:   worktreePath,
 		WorktreeName:   "feature",
 		TmuxWindowName: "test-repo/feature:0",
+		TmuxWindowID:   windowID,
 		RunnerType:     RunnerTypeTmux,
 		CreatedAt:      time.Now(),
 	}))
@@ -178,6 +179,15 @@ func storedTmuxSession(t *testing.T, id SessionID, worktreePath string) (*Manage
 	snapshot, unsub := collectStateChanges(m)
 	t.Cleanup(unsub)
 	return m, store, snapshot
+}
+
+// storedTmuxSession files one non-terminal tmux session at worktreePath whose
+// record carries no window ID — the legacy shape, and the only one where a live
+// window is not proof the *stored* session is the one answering, because
+// GenerateTmuxWindowName has by then handed its "repo/worktree:N" on.
+func storedTmuxSession(t *testing.T, id SessionID, worktreePath string) (*Manager, *Store, func() []SessionStateChangeEvent) {
+	t.Helper()
+	return storedTmuxSessionWithWindowID(t, id, worktreePath, "")
 }
 
 // windowIsAlive stands in for tmuxWindowAlive answering yes — a window with the
@@ -254,4 +264,67 @@ func TestReconcileWithoutWorktreePathDefersToWindow(t *testing.T) {
 
 	_, adopted := m.GetSession("no-path")
 	assert.True(t, adopted, "a session with no recorded worktree was reaped on that alone")
+}
+
+// TestReconcileKeepsIDCarryingSessionWithUnstattableWorktree is the regression
+// for the widened worktree gate.
+//
+// tmux window IDs are never recycled within a server lifetime, so a record that
+// carries one is answered by its own window or by nothing — the name-recycling
+// confusion the worktree gate exists for cannot reach it. Letting the gate reap
+// it anyway turns any os.Stat failure into a verdict, and a failure is not the
+// same fact as an absence: here the worktree is present and the agent is working
+// in it, but a parent directory bramble cannot traverse makes it unstattable.
+//
+// Reaping is unrecoverable. It writes StatusCompleted to the store without
+// killing the window, so every later reconcile skips the record as terminal and
+// the agent keeps running in a session bramble has permanently disowned.
+func TestReconcileKeepsIDCarryingSessionWithUnstattableWorktree(t *testing.T) {
+	t.Parallel()
+
+	if os.Geteuid() == 0 {
+		t.Skip("root traverses a 0000 directory, so the stat cannot be made to fail")
+	}
+
+	// A live worktree under a parent bramble cannot traverse.
+	parent := filepath.Join(t.TempDir(), "locked")
+	worktree := filepath.Join(parent, "feature")
+	require.NoError(t, os.MkdirAll(worktree, 0o755))
+	require.NoError(t, os.Chmod(parent, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o755) })
+	_, err := os.Stat(worktree)
+	require.Error(t, err, "worktree is still stattable, so this test proves nothing")
+	require.False(t, os.IsNotExist(err), "want a traversal failure, not an absence")
+
+	m, store, snapshot := storedTmuxSessionWithWindowID(t, "id-live", worktree, "@7")
+	require.NoError(t, m.reconcileTmuxSessions(windowIsAlive))
+
+	_, adopted := m.GetSession("id-live")
+	assert.True(t, adopted, "a live ID-matched session was reaped on a failed stat")
+
+	reloaded, err := store.LoadSession("test-repo", "feature", "id-live")
+	require.NoError(t, err)
+	assert.Equal(t, StatusIdle, reloaded.Status,
+		"a live session was written to the store as terminal, which no later reconcile undoes")
+
+	events := snapshot()
+	require.Len(t, events, 1, "re-adoption owes the courier exactly one same-status event")
+	assert.Equal(t, StatusIdle, events[0].NewStatus)
+}
+
+// TestReconcileReapsIDCarryingSessionWhoseWindowIsGone keeps the dead-window
+// verdict decisive for ID-carrying records too: scoping the worktree gate to
+// ID-less records must not make an ID a shield.
+func TestReconcileReapsIDCarryingSessionWhoseWindowIsGone(t *testing.T) {
+	t.Parallel()
+
+	m, store, _ := storedTmuxSessionWithWindowID(t, "id-dead", t.TempDir(), "@9")
+	require.NoError(t, m.reconcileTmuxSessions(func(string, string) bool { return false }))
+
+	_, adopted := m.GetSession("id-dead")
+	assert.False(t, adopted, "a session whose window is gone was adopted")
+
+	reloaded, err := store.LoadSession("test-repo", "feature", "id-dead")
+	require.NoError(t, err)
+	assert.Equal(t, StatusCompleted, reloaded.Status)
 }
