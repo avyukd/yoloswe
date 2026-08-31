@@ -27,11 +27,25 @@ func collectStateChanges(m *Manager) (func() []SessionStateChangeEvent, func()) 
 	}, unsub
 }
 
+// tmuxManager builds a tmux-mode manager over store (nil for none) that closes
+// with the test.
+func tmuxManager(t *testing.T, store *Store) *Manager {
+	t.Helper()
+	m := NewManagerWithConfig(ManagerConfig{
+		RepoName:    "test-repo",
+		Store:       store,
+		SessionMode: SessionModeTmux,
+	})
+	t.Cleanup(m.Close)
+	return m
+}
+
 // reapedSession builds a session in the state a monitor loop leaves behind when
 // it finds the tmux window gone: driven to a terminal status, then dropped from
 // m.sessions. That pair is what makes list-sessions report zero while a stale
-// goroutine still holds the pointer.
-func reapedSession(t *testing.T, m *Manager, id SessionID) *Session {
+// goroutine still holds the pointer. It returns the stale pointer and a snapshot
+// of the state changes emitted after the reap.
+func reapedSession(t *testing.T, m *Manager, id SessionID) (*Session, func() []SessionStateChangeEvent) {
 	t.Helper()
 	s := &Session{
 		ID:           id,
@@ -49,7 +63,10 @@ func reapedSession(t *testing.T, m *Manager, id SessionID) *Session {
 	delete(m.sessions, s.ID)
 	m.mu.Unlock()
 	require.True(t, s.ToInfo().Status.IsTerminal(), "reap did not leave a terminal status")
-	return s
+
+	snapshot, unsub := collectStateChanges(m)
+	t.Cleanup(unsub)
+	return s, snapshot
 }
 
 // TestReapedSessionCannotBeRevivedToRunning is the core regression for issue
@@ -65,16 +82,8 @@ func reapedSession(t *testing.T, m *Manager, id SessionID) *Session {
 func TestReapedSessionCannotBeRevivedToRunning(t *testing.T) {
 	t.Parallel()
 
-	m := NewManagerWithConfig(ManagerConfig{
-		RepoName:    "test-repo",
-		SessionMode: SessionModeTmux,
-	})
-	defer m.Close()
-
-	s := reapedSession(t, m, "reaped-revive")
-
-	snapshot, unsub := collectStateChanges(m)
-	defer unsub()
+	m := tmuxManager(t, nil)
+	s, snapshot := reapedSession(t, m, "reaped-revive")
 
 	// The stale capture goroutine sees a working pane and tries to revive.
 	revived := m.tryUpdateSessionStatus(s, StatusCompleted, StatusRunning)
@@ -91,23 +100,12 @@ func TestReapedSessionCannotBeRevivedToRunning(t *testing.T) {
 func TestReapedSessionCannotBeMarkedIdle(t *testing.T) {
 	t.Parallel()
 
-	m := NewManagerWithConfig(ManagerConfig{
-		RepoName:    "test-repo",
-		SessionMode: SessionModeTmux,
-	})
-	defer m.Close()
-
-	s := reapedSession(t, m, "reaped-idle")
-
-	snapshot, unsub := collectStateChanges(m)
-	defer unsub()
+	m := tmuxManager(t, nil)
+	s, snapshot := reapedSession(t, m, "reaped-idle")
 
 	m.updateSessionStatus(s, StatusIdle)
 
-	for _, evt := range snapshot() {
-		assert.NotEqual(t, StatusIdle, evt.NewStatus,
-			"reaped session %s emitted a stale idle transition", evt.SessionID)
-	}
+	assert.Empty(t, snapshot(), "a reaped session emitted a stale idle transition")
 	assert.True(t, s.ToInfo().Status.IsTerminal(),
 		"reaped session status is %q, want terminal", s.ToInfo().Status)
 }
@@ -118,16 +116,8 @@ func TestReapedSessionCannotBeMarkedIdle(t *testing.T) {
 func TestReapedSessionStillSettles(t *testing.T) {
 	t.Parallel()
 
-	m := NewManagerWithConfig(ManagerConfig{
-		RepoName:    "test-repo",
-		SessionMode: SessionModeTmux,
-	})
-	defer m.Close()
-
-	s := reapedSession(t, m, "reaped-settle")
-
-	snapshot, unsub := collectStateChanges(m)
-	defer unsub()
+	m := tmuxManager(t, nil)
+	s, snapshot := reapedSession(t, m, "reaped-settle")
 
 	m.updateSessionStatus(s, StatusStopped)
 
@@ -141,11 +131,7 @@ func TestReapedSessionStillSettles(t *testing.T) {
 func TestLiveSessionStillTransitions(t *testing.T) {
 	t.Parallel()
 
-	m := NewManagerWithConfig(ManagerConfig{
-		RepoName:    "test-repo",
-		SessionMode: SessionModeTmux,
-	})
-	defer m.Close()
+	m := tmuxManager(t, nil)
 
 	s := &Session{
 		ID:         "live-1",
@@ -168,48 +154,94 @@ func TestLiveSessionStillTransitions(t *testing.T) {
 	assert.Equal(t, StatusIdle, events[0].NewStatus)
 }
 
-// TestReconcileSkipsSessionWhoseWorktreeIsGone pins the decision that keeps a
-// reaped session from being re-adopted on the next start.
+// storedTmuxSession files one non-terminal tmux session at worktreePath and
+// returns a manager over that store plus a snapshot of what reconciling emits.
+// The recorded window name carries no ID — the shape a reaped session leaves
+// behind once GenerateTmuxWindowName has handed its "repo/worktree:N" on.
+func storedTmuxSession(t *testing.T, id SessionID, worktreePath string) (*Manager, *Store, func() []SessionStateChangeEvent) {
+	t.Helper()
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+	require.NoError(t, store.SaveSession(&StoredSession{
+		ID:             id,
+		Type:           SessionTypeBuilder,
+		Status:         StatusIdle,
+		RepoName:       "test-repo",
+		WorktreePath:   worktreePath,
+		WorktreeName:   "feature",
+		TmuxWindowName: "test-repo/feature:0",
+		RunnerType:     RunnerTypeTmux,
+		CreatedAt:      time.Now(),
+	}))
+
+	m := tmuxManager(t, store)
+	snapshot, unsub := collectStateChanges(m)
+	t.Cleanup(unsub)
+	return m, store, snapshot
+}
+
+// windowIsAlive stands in for tmuxWindowAlive answering yes — a window with the
+// stored name exists, whether or not it belongs to the stored session.
+func windowIsAlive(string, string) bool { return true }
+
+// TestReconcileReapsSessionWhoseWorktreeIsGone drives the reconcile pass that
+// runs on every start, with a live window answering the stored name.
 //
-// Window names are recycled — GenerateTmuxWindowName hands out the lowest free
-// "repo/worktree:N" — so a killed session's recorded name is answered by the
-// next session on that worktree. A stored record that kept only a name then
-// looks alive, gets adopted into m.sessions with a monitor goroutine, and emits
-// fresh idle transitions. The courier's reported-set does not survive a
-// restart, so the parent hears about it again every time.
-func TestReconcileSkipsSessionWhoseWorktreeIsGone(t *testing.T) {
+// Deciding on the window alone re-adopts the session: into m.sessions, with a
+// monitor goroutine free to emit fresh idle transitions that reach the parent as
+// subagent reports for a session list-sessions no longer knows about. The
+// courier's reported-set does not survive a restart, so the parent hears it
+// again every time. The missing worktree is what says the session is gone.
+func TestReconcileReapsSessionWhoseWorktreeIsGone(t *testing.T) {
 	t.Parallel()
 
 	missing := filepath.Join(t.TempDir(), "removed-worktree")
-	stored := &StoredSession{
-		ID:             "stale-1",
-		Status:         StatusIdle,
-		WorktreePath:   missing,
-		TmuxWindowName: "test-repo/feature:0",
-		RunnerType:     RunnerTypeTmux,
-	}
+	m, store, snapshot := storedTmuxSession(t, "stale-1", missing)
+	require.NoError(t, m.reconcileTmuxSessions(windowIsAlive))
 
-	assert.Equal(t, reconcileReap, decideReconcile(stored, true),
-		"session with a removed worktree was adopted as live")
+	_, adopted := m.GetSession("stale-1")
+	assert.False(t, adopted, "session with a removed worktree was adopted as live")
+
+	reloaded, err := store.LoadSession("test-repo", "feature", "stale-1")
+	require.NoError(t, err)
+	assert.Equal(t, StatusCompleted, reloaded.Status)
+
+	events := snapshot()
+	require.Len(t, events, 1, "the reap owes the parent exactly one transition")
+	assert.Equal(t, StatusCompleted, events[0].NewStatus)
 }
 
-// TestReconcileAdoptsLiveSession keeps the worktree gate from reaping healthy
-// sessions, and keeps a dead window decisive on its own.
-func TestReconcileAdoptsLiveSession(t *testing.T) {
+// TestReconcileAdoptsSessionWhoseWorktreeSurvives keeps the worktree gate from
+// reaping healthy sessions: a live window over a live worktree is re-adopted,
+// and re-announced at its stored status so the courier learns it is reachable.
+func TestReconcileAdoptsSessionWhoseWorktreeSurvives(t *testing.T) {
 	t.Parallel()
 
-	live := t.TempDir()
-	stored := &StoredSession{
-		ID:             "live-1",
-		Status:         StatusIdle,
-		WorktreePath:   live,
-		TmuxWindowName: "test-repo/feature:0",
-		RunnerType:     RunnerTypeTmux,
-	}
+	m, _, snapshot := storedTmuxSession(t, "live-wt", t.TempDir())
+	require.NoError(t, m.reconcileTmuxSessions(windowIsAlive))
 
-	assert.Equal(t, reconcileAdopt, decideReconcile(stored, true))
-	assert.Equal(t, reconcileReap, decideReconcile(stored, false),
-		"a dead window must be reaped even when the worktree survives")
+	_, adopted := m.GetSession("live-wt")
+	assert.True(t, adopted, "a live session was not re-adopted")
+
+	events := snapshot()
+	require.Len(t, events, 1)
+	assert.Equal(t, StatusIdle, events[0].NewStatus)
+}
+
+// TestReconcileReapsSessionWhoseWindowIsGone keeps a dead window decisive on its
+// own, worktree or no worktree.
+func TestReconcileReapsSessionWhoseWindowIsGone(t *testing.T) {
+	t.Parallel()
+
+	m, store, _ := storedTmuxSession(t, "dead-window", t.TempDir())
+	require.NoError(t, m.reconcileTmuxSessions(func(string, string) bool { return false }))
+
+	_, adopted := m.GetSession("dead-window")
+	assert.False(t, adopted, "a session whose window is gone was adopted")
+
+	reloaded, err := store.LoadSession("test-repo", "feature", "dead-window")
+	require.NoError(t, err)
+	assert.Equal(t, StatusCompleted, reloaded.Status)
 }
 
 // TestReconcileWithoutWorktreePathDefersToWindow keeps an unrecorded worktree
@@ -217,13 +249,9 @@ func TestReconcileAdoptsLiveSession(t *testing.T) {
 func TestReconcileWithoutWorktreePathDefersToWindow(t *testing.T) {
 	t.Parallel()
 
-	stored := &StoredSession{
-		ID:             "no-path",
-		Status:         StatusIdle,
-		TmuxWindowName: "test-repo/feature:0",
-		RunnerType:     RunnerTypeTmux,
-	}
+	m, _, _ := storedTmuxSession(t, "no-path", "")
+	require.NoError(t, m.reconcileTmuxSessions(windowIsAlive))
 
-	assert.Equal(t, reconcileAdopt, decideReconcile(stored, true))
-	assert.Equal(t, reconcileReap, decideReconcile(stored, false))
+	_, adopted := m.GetSession("no-path")
+	assert.True(t, adopted, "a session with no recorded worktree was reaped on that alone")
 }
