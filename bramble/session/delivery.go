@@ -645,22 +645,18 @@ func (c *Courier) Drain(ctx context.Context, to SessionID) {
 
 // write puts text into the session using whichever path its runner supports.
 func (c *Courier) write(ctx context.Context, info SessionInfo, text string, submit bool) (err error) {
-	// Anything written starts the recipient's next turn, so whatever it says at
-	// the end of that turn is fresh news for its parent.
+	// A write that lands starts the recipient's next turn, so whatever it says
+	// at the end of that turn is fresh news for its parent. Every error path
+	// reaches here having started no turn, so the recipient's next idle is the
+	// SAME turn the parent was already told about; re-arming there sends a
+	// duplicate report, which for a tmux child also costs another 2000-line
+	// pane capture and another result file.
 	//
-	// Only a write that succeeded, though. Every error path reaches here having
-	// started no turn, so the recipient's next idle is the SAME turn the parent
-	// was already told about; re-arming there sends a duplicate report, which
-	// for a tmux child also costs another 2000-line pane capture and another
-	// result file.
-	//
-	// A hold is the common shape of that — errPaneBusy answers every turn
-	// bramble's bookkeeping calls idle while the pane still shows work, and
-	// errComposerBusy repeats every retryDelay for as long as a user's draft
-	// sits in the composer — but an outright failure is the one that mattered
-	// in issues #330 and #331: a message sent to a child whose tmux window was
-	// killed fails, and re-arming on it let the next stale idle event for that
-	// reaped session be reported to the parent as a fresh answer.
+	// The holds are the frequent shape of that — errPaneBusy and
+	// errComposerBusy both repeat for as long as the stall lasts — but the one
+	// that mattered in #330/#331 is an outright failure: writing to a child
+	// whose tmux window was killed fails, and re-arming there let the next
+	// stale idle for that reaped session reach the parent as a fresh answer.
 	defer func() {
 		if err == nil {
 			c.resetIdleReport(info.ID)

@@ -64,59 +64,37 @@ func TestReapedChildIsNotReportedAgainAfterAFailedWrite(t *testing.T) {
 		"a child reaped without a terminal transition must not be reported idle twice")
 }
 
-// TestResetIdleReportIgnoresAGoneSession covers the recipient that has vanished
-// from the registry entirely: nothing will ever start a turn for it, so there
-// is no next answer for the parent to wait on and no reason to re-arm.
-func TestResetIdleReportIgnoresAGoneSession(t *testing.T) {
+// TestResetIdleReportIgnoresADeadSession covers the two ways a recipient can
+// be past taking another turn. Neither will ever start one, so there is no next
+// answer for the parent to wait on and re-arming only leaves the door open for
+// a late duplicate.
+//
+// Both halves are load-bearing: a reaped window leaves only absence behind,
+// while a session the manager did mark terminal is still in the registry.
+func TestResetIdleReportIgnoresADeadSession(t *testing.T) {
 	t.Parallel()
-	c, target, _, childID := reportFixture(t, StatusIdle)
-	reportNow(c, target, childID)
-	require.True(t, reportedIdle(c, childID))
+	for _, tc := range []struct {
+		kill func(*fakeTarget, SessionID)
+		name string
+	}{
+		{(*fakeTarget).forget, "gone from the registry"},
+		{func(f *fakeTarget, id SessionID) {
+			f.set(id, StatusStopped, RunnerTypeTmux)
+		}, "marked terminal"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c, target, _, childID := reportFixture(t, StatusIdle)
+			reportNow(c, target, childID)
+			require.True(t, reportedIdle(c, childID))
 
-	target.forget(childID)
-	c.resetIdleReport(childID)
+			tc.kill(target, childID)
+			c.resetIdleReport(childID)
 
-	assert.True(t, reportedIdle(c, childID),
-		"a session absent from the registry must not have its idle report re-armed")
-}
-
-// TestResetIdleReportIgnoresATerminalSession is the same guard for a session
-// the manager did mark terminal. It can never take another turn, so re-arming
-// only leaves the door open for a late duplicate.
-func TestResetIdleReportIgnoresATerminalSession(t *testing.T) {
-	t.Parallel()
-	c, target, _, childID := reportFixture(t, StatusIdle)
-	reportNow(c, target, childID)
-	require.True(t, reportedIdle(c, childID))
-
-	target.set(childID, StatusStopped, RunnerTypeTmux)
-	c.resetIdleReport(childID)
-
-	assert.True(t, reportedIdle(c, childID),
-		"a terminal session must not have its idle report re-armed")
-}
-
-// TestReapedChildDoesNotReportAgainAfterAResetRace is the interleaving in #330
-// stated end to end: reset happens (however it was reached) and a stale idle
-// event follows. The child is gone from the registry by then, which is the fact
-// that must stop the second report.
-func TestReapedChildDoesNotReportAgainAfterAResetRace(t *testing.T) {
-	t.Parallel()
-	c, target, parentID, childID := reportFixture(t, StatusIdle)
-	reportNow(c, target, childID)
-	require.Len(t, c.Pending(parentID), 1)
-
-	// The child is reaped with tmux kill-window: no terminal transition, and
-	// the manager eventually drops it.
-	stale := target.mustInfo(childID)
-	target.forget(childID)
-	c.resetIdleReport(childID)
-
-	// A stale event snapshot for the reaped child, as Watch would pass it.
-	c.reportToParent(context.Background(), stale)
-
-	assert.Len(t, c.Pending(parentID), 1,
-		"a child that is gone from the registry must not produce a second report")
+			assert.True(t, reportedIdle(c, childID),
+				"a session that cannot take another turn must not have its idle report re-armed")
+		})
+	}
 }
 
 // TestStaleIdleForAGoneChildIsNotReportedAfterARestart is the case dedup state

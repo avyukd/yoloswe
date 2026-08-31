@@ -101,13 +101,12 @@ func (c *Courier) noteChildSpoke(child SessionID) {
 // after the first exchange and the parent is left polling — the thing the
 // queue exists to avoid.
 //
-// Only a recipient that can still take a turn earns that. write's own guard is
-// on the delivery — it re-arms only when the write succeeded — and this one is
-// on the recipient, for the paths that reach here without one: Watch re-arms on
-// a StatusRunning transition, and a session can be reaped between the write and
+// Only a recipient that can still take a turn earns that. write guards the
+// delivery — it re-arms only when the write succeeded — and this guards the
+// recipient, for the paths that reach here without one: Watch re-arms on a
+// StatusRunning transition, and a session can be reaped between the write and
 // the reset. Re-arming a session that will never run again leaves the door open
-// for the next stale idle event for its ID to be reported to the parent as a
-// fresh answer (issues #330, #331).
+// for its next stale idle to reach the parent as a fresh answer (#330, #331).
 func (c *Courier) resetIdleReport(to SessionID) {
 	if !c.isLive(to) {
 		return
@@ -119,8 +118,7 @@ func (c *Courier) resetIdleReport(to SessionID) {
 	}
 }
 
-// isLive reports whether a session can still start another turn: the registry
-// knows it and it has not reached a terminal state.
+// isLive reports whether a session can still start another turn.
 //
 // Absence is the load-bearing half. A session reaped with tmux kill-window —
 // the teardown subagent-swarm's docs recommend, because a wedged session cannot
@@ -161,19 +159,17 @@ func (c *Courier) reportToParent(ctx context.Context, child SessionInfo) {
 	}
 	// A child the registry no longer knows has been reaped, and a non-terminal
 	// status for it is stale by definition: nothing is running, so there is no
-	// turn whose answer this could be. Those are the reports issues #330 and
-	// #331 describe — an "is idle" for a lane already merged, arriving hours
-	// after its window was killed.
+	// turn whose answer this could be. This is the guard that survives a
+	// restart, where the in-memory dedup map is empty and absence is the only
+	// evidence left that the "is idle" is hours stale (#330, #331).
 	//
 	// A terminal status for an absent child is the opposite and must survive:
 	// the manager deletes a completed tmux session before this callback runs,
-	// so "completed" for a session that is already gone is the normal shape of
-	// a child's last report.
+	// so "completed" for a session already gone is a normal last report.
 	//
-	// Dropping the stale case also collects the history forgetChild would
-	// otherwise never reach: it runs only on an observed terminal transition,
-	// which a killed window never makes, so the entry would sit in c.reported
-	// for the life of the process.
+	// Dropping the stale case also collects history forgetChild would never
+	// reach: it runs only on an observed terminal transition, which a killed
+	// window never makes.
 	if _, known := c.target.SessionInfo(child.ID); !known && !child.Status.IsTerminal() {
 		c.forgetChild(child.ID)
 		return
