@@ -299,20 +299,27 @@ func TestLiveSubagentTwoWay(t *testing.T) {
 			// polling for cursor.
 			h.awaitPaneClearingDialogs(child, "ARTICHOKE", "the subagent never answered round one")
 			h.awaitStatus(child, "idle")
-			h.awaitPaneCond(parent, func() bool {
-				return h.countInPane(parent, nudgeMarker) >= 1
-			}, "the parent was never hinted about its %s subagent", backend.provider)
+			// Deliberately NOT asserted here: that a hint reached the parent, or
+			// that bramble wrote a result file.
+			//
+			// The hint is dropped whenever the parent is not idle at that
+			// instant, and a live child often finishes its first turn while the
+			// parent is still settling. Requiring it would be requiring the
+			// guarantee this branch removed.
+			//
+			// And a tmux-mode child has no result file: writeResearchFile runs
+			// in the TUI turn loop, which tmux sessions never enter. The old
+			// courier papered over that by capturing 2000 lines of pane, which
+			// is the artifact issue #331 objects to — it opened with the CLI
+			// splash screen and the prompt echoed back. A tmux lane reports by
+			// writing the literal path its brief names, which is what
+			// subagent-swarm briefs every lane to do.
+			//
+			// What must hold is that the child's turn is observable at all,
+			// which awaitStatus above just proved: that is what a polling
+			// orchestrator reads.
 
-			// The hint carries no path, so the parent reads the child's output
-			// where the swarm skill says it lives. That file is the delivery.
-			resultPath := h.researchFileFor(child)
-			require.Eventuallyf(t, func() bool {
-				body, err := os.ReadFile(resultPath)
-				return err == nil && strings.Contains(string(body), "ARTICHOKE")
-			}, settleTimeout, pollInterval,
-				"the %s subagent's answer never reached its result file %s", backend.provider, resultPath)
-
-			// Delivery must move the child off idle or round two produces no
+			// A write must move the child off idle, or round two produces no
 			// state change and the conversation goes quiet.
 			_, err := h.send(parent, child,
 				"R2: reply with exactly one line and nothing else: R2 CONFIRMED", false)
@@ -327,9 +334,12 @@ func TestLiveSubagentTwoWay(t *testing.T) {
 			}
 
 			h.awaitPaneClearingDialogs(child, "R2 CONFIRMED", "the subagent never answered round two")
-			h.awaitPaneCond(parent, func() bool {
-				return h.countInPane(parent, nudgeMarker) >= 2
-			}, "round two was never hinted for %s — the conversation went quiet after one exchange", backend.provider)
+
+			// Round two must also be observable. This is the real two-way bug:
+			// a child that never leaves idle ends its second turn with a notify
+			// that lands on a session already marked idle, so the turn goes
+			// unrecorded and a polling parent sees nothing new.
+			h.awaitStatus(child, "idle")
 		})
 	}
 }
@@ -355,7 +365,12 @@ func TestLiveBusyChildIsNeverWrittenInto(t *testing.T) {
 			// Builder can run the sleep command that keeps the child mid-turn.
 			child := h.spawn("builder", model, string(parent), longTurnPrompt("LONG-DONE"))
 			dumpPanesOnFailure(t, h, parent, child)
-			h.awaitWorking(child, "sleep")
+			if !h.reachedWorking(child, "sleep", 60*time.Second) {
+				// The setup did not happen, so there is no live turn to protect
+				// and the assertions below would pass without proving anything.
+				t.Skipf("the %s child never started its long turn; nothing to hold mail against",
+					backend.provider)
+			}
 
 			watchFor := (longTurnSeconds - 6) * int(time.Second)
 			h.neverDuring(child, time.Duration(watchFor), func() bool {

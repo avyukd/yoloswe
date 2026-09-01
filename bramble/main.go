@@ -1515,21 +1515,20 @@ func runControl(typ control.MsgType, payload, v any) error {
 
 var sendInputCmd = &cobra.Command{
 	Use:   "send-input",
-	Short: "Send prompt text to a session (optionally queueing it until the session is idle)",
-	Long: `Send prompt text to a session's tmux pane, or with --queue to any session
-whatever its runner.
+	Short: "Send prompt text to a session's tmux pane",
+	Long: `Send prompt text to a session's tmux pane, immediately.
 
-Without --queue the text is typed into the pane immediately. That is the right
-behaviour for a deliberate interrupt, but if the recipient is mid-turn the text
-lands in its *next* prompt, out of the context that made it make sense — and a
-TUI-mode session has no pane to type into at all.
+This is a deliberate interrupt. If the recipient is mid-turn the text lands in
+its *next* prompt, out of the context that made it make sense, and a TUI-mode
+session has no pane to type into at all.
 
-With --queue the message is held until the recipient goes idle and is then
-delivered through whichever path its runner supports. Use --queue for anything
-the recipient should read as part of its own work.
-
---queue requires --submit. Queued text that is staged without Enter is never
-delivered, and then blocks the next delivery as a draft in the composer.`,
+--queue is gone. Holding a message until the recipient looked idle required
+guessing readiness from a pane and keeping undeliverable mail on disk, and both
+halves misfired: queues accumulated for days and replayed after restarts. A
+subagent's completion is now recorded by the lane itself — a .done file, a
+commit, a branch — and read by the orchestrator, which verifies it against git.
+The flag is still accepted so scripts that pass it get this explanation rather
+than an unknown-flag error.`,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		sessionID, _ := cmd.Flags().GetString("session-id")
 		target, _ := cmd.Flags().GetString("target")
@@ -1538,32 +1537,18 @@ delivered, and then blocks the next delivery as a draft in the composer.`,
 		queue, _ := cmd.Flags().GetBool("queue")
 		from, _ := cmd.Flags().GetString("from")
 		if from == "" {
-			// A session messaging a peer is identified by its own ID, so a
-			// subagent reporting to its parent replaces bramble's generated
-			// report instead of arriving alongside it.
+			// A session messaging a peer is identified by its own ID.
 			from = os.Getenv(session.SessionIDEnvVar)
 		}
-		// Staged text without Enter is never delivered and then blocks later
-		// delivery as a draft; reject it before the control round trip.
-		if queue && !submit {
-			return fmt.Errorf("--queue requires --submit: text staged without Enter is never delivered")
-		}
-
 		typ := control.TypeSessionSendInput
 		if sessionID == "" {
 			typ = control.TypePaneSendInput
 		}
 		var result control.SendInputResult
-		if err := runControl(typ, control.SendInputReq{
+		return runControl(typ, control.SendInputReq{
 			SessionID: sessionID, Target: target, From: from,
 			Text: text, Submit: submit, Queue: queue,
-		}, &result); err != nil {
-			return err
-		}
-		if result.Queued {
-			fmt.Printf("queued for %s; it will be delivered when that session can take it\n", sessionID)
-		}
-		return nil
+		}, &result)
 	},
 }
 
@@ -1722,11 +1707,10 @@ func init() {
 	sendInputCmd.Flags().String("text", "", "Text to deliver to the pane")
 	sendInputCmd.Flags().Bool("submit", false, "Press Enter after delivering the text")
 	sendInputCmd.Flags().Bool("queue", false,
-		"Hold the text until the session is idle instead of typing into a live turn "+
-			"(requires --session-id and --submit; also reaches TUI-mode sessions)")
+		"Removed: queued delivery no longer exists and this is refused with an "+
+			"explanation. Completion is read from the run directory instead")
 	sendInputCmd.Flags().String("from", "",
-		"Sender's session ID (defaults to $"+session.SessionIDEnvVar+"); a subagent "+
-			"messaging its parent this way replaces bramble's generated report")
+		"Sender's session ID (defaults to $"+session.SessionIDEnvVar+")")
 	_ = sendInputCmd.MarkFlagRequired("text")
 
 	sendKeyCmd.Flags().String("session-id", "", "Target bramble session ID (session-centric)")

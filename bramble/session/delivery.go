@@ -80,13 +80,17 @@ type Notifier struct {
 	panes  PaneWriter
 	// pendingNudge coalesces: a parent already holding an unsent hint gets one
 	// line, not one per child. Cleared when the hint is written or abandoned.
+	//
+	// This is not dead ceremony, though it looks like it: Watch hands events to
+	// one worker goroutine per Manager, so a single repo's children are already
+	// serialized. A registry holds one Manager per open repo, and children in
+	// different repos can share a parent — those race here.
 	pendingNudge map[SessionID]bool
 	mu           sync.Mutex
 }
 
-// NotifierConfig is retained for callers that pin filesystem locations. The
-// notifier keeps no state on disk; ResearchDir still governs the manager's own
-// result files (see Manager.writeResearchFile).
+// NotifierConfig configures the one-shot startup sweep. The notifier itself
+// keeps no state on disk.
 type NotifierConfig struct {
 	// LegacyDeliveryDir is swept once at startup. Empty defaults to
 	// ~/.bramble/deliveries.
@@ -179,12 +183,17 @@ func (n *Notifier) nudge(ctx context.Context, parent SessionInfo) {
 	if parent.Status != StatusIdle {
 		return
 	}
+	// providerForSession first: it is a pure in-memory lookup, and for a
+	// provider whose pane can be read neither way capturePaneFor makes no tmux
+	// call at all. ResolveTmuxTarget stays ahead of the capture, though —
+	// both take the registry lock and scan every manager, but only the capture
+	// also pays a tmux round-trip, so the cheaper of the two rejects first.
+	provider := providerForSession(parent)
+
 	target, err := n.target.ResolveTmuxTarget(parent.ID)
 	if err != nil {
 		return
 	}
-
-	provider := providerForSession(parent)
 	lines := n.capturePaneFor(parent.ID, provider)
 
 	// Yield on any sign the pane is not free. Unlike the courier, an unreadable
@@ -202,7 +211,7 @@ func (n *Notifier) nudge(ctx context.Context, parent SessionInfo) {
 	// indistinguishable from a CLI still booting. Their panes are a documented
 	// gap rather than a solved case — but the exposure is one disposable line
 	// rather than a queue of reports, and nothing retries it.
-	if _, draft, known := composerDraftText(provider, lines); known && draft {
+	if draft, known := composerDraft(provider, lines); known && draft {
 		return
 	}
 
@@ -235,9 +244,11 @@ func (n *Notifier) releaseNudge(to SessionID) {
 	delete(n.pendingNudge, to)
 }
 
-// nudgeCaptureLines is how much pane the yield checks read. It matches the
-// depth the composer and working probes were measured against.
-const nudgeCaptureLines = 40
+// nudgeCaptureLines is how much pane the yield checks read. It aliases
+// paneCaptureLines rather than repeating it: these are the same walks
+// claudeComposerMaxLines is sized against, so a capture shallower than that
+// makes the composer judge permanently unknown.
+const nudgeCaptureLines = paneCaptureLines
 
 // capturePaneFor reads the recipient's pane once for both yield checks.
 func (n *Notifier) capturePaneFor(id SessionID, provider string) []string {

@@ -165,12 +165,6 @@ func (d *Dispatcher) sendInput(ctx context.Context, req *Msg, sessionScoped bool
 		return SendInputResult{}, err
 	}
 
-	// Queued delivery is gone. It promised to hold a message until the
-	// recipient was ready, which required guessing readiness from a pane and
-	// then keeping undeliverable mail on disk; both halves misfired. Completion
-	// is now read from the run directory, and this endpoint is only the
-	// deliberate interrupt it always was for the unqueued case.
-	//
 	// Refused rather than silently downgraded to an immediate paste: a caller
 	// that asked to wait for an idle recipient must not get a mid-turn
 	// interrupt instead.
@@ -184,14 +178,7 @@ func (d *Dispatcher) sendInput(ctx context.Context, req *Msg, sessionScoped bool
 	if err != nil {
 		return SendInputResult{}, err
 	}
-	// Leave copy mode first. A pane someone scrolled back in swallows the Enter
-	// that would submit this text, so the message lands in the composer and sits
-	// there — successful by every measure the caller can see, and never read by
-	// the agent. The notifier's pane writer does the same for its own writes.
-	if err := d.ctl.ExitCopyMode(ctx, target); err != nil {
-		return SendInputResult{}, err
-	}
-	if err := d.ctl.Paste(ctx, target, r.Text); err != nil {
+	if err := tmuxctl.Paste(ctx, d.ctl, target, r.Text); err != nil {
 		return SendInputResult{}, err
 	}
 	if r.Submit {

@@ -381,13 +381,6 @@ func claudePaneComposer(composer, state string, transcript ...string) []string {
 	)
 }
 
-// composerDraft is a test-only view of composerDraftText; production keeps the
-// unreadable-composer hold and bounded-tail fallback in one place.
-func composerDraft(provider string, lines []string) (draft, known bool) {
-	_, draft, known = composerDraftText(provider, lines)
-	return draft, known
-}
-
 // TestClaudeJudgeSeesAWrappedComposer pins capture depth to the composer walk:
 // wrapped deliveries push the upper rule away, and too shallow a capture makes
 // the judge return known=false forever.

@@ -73,21 +73,21 @@ type SessionRef struct {
 type SendInputReq struct {
 	SessionID string `json:"session_id,omitempty"` // session-centric form
 	Target    string `json:"target,omitempty"`     // raw-pane form
-	// From is the sender session; subagents use it to replace their automatic
-	// completion report.
+	// From is the sender session.
 	From string `json:"from,omitempty"`
 	Text string `json:"text"`
-	// Submit presses Enter after paste. Queue requires it because staged text
-	// otherwise looks like a human draft and blocks later delivery.
+	// Submit presses Enter after paste.
 	Submit bool `json:"submit"`
-	// Queue holds text until the recipient is idle. It requires SessionID,
-	// because raw panes have no status to wait on.
+	// Queue is refused. It asked to hold text until the recipient was idle,
+	// which required guessing readiness from a pane and persisting the mail
+	// that could not be written. The field stays on the wire so an older
+	// client gets the dispatcher's explanation rather than a decode error.
 	Queue bool `json:"queue,omitempty"`
 }
 
-// SendInputResult reports a send_input outcome. Queued means the message is
-// waiting or retrying; omitted Queued keeps unqueued sends wire-compatible with
-// the earlier OKResult.
+// SendInputResult reports a send_input outcome. Queued is always false now that
+// queued delivery is refused; it stays on the wire for compatibility with
+// clients that still read it.
 type SendInputResult struct {
 	OK     bool `json:"ok"`
 	Queued bool `json:"queued,omitempty"`

@@ -454,7 +454,7 @@ type Manager struct { //nolint:govet // fieldalignment: readability over packing
 	followUpChansMu sync.RWMutex
 	// stateSubscribers receive copies of SessionStateChangeEvent, without
 	// consuming the primary events channel. The delegator's child watcher and
-	// the subagent courier are both built on it.
+	// the subagent notifier are both built on it.
 	stateSubscribers   []*stateSink
 	stateSubscribersMu sync.Mutex
 	worktreeDirtyMu    sync.RWMutex
@@ -780,8 +780,8 @@ func (m *Manager) reconcileTmuxSessions(windowAlive func(windowID, windowName st
 			//
 			// Through emitSessionStateChange, so state subscribers see it too:
 			// a re-adopted session that is already idle makes no further
-			// transition, and the courier would otherwise never learn it is
-			// reachable and could take the mail waiting for it.
+			// transition, and a subscriber would otherwise never learn its
+			// status.
 			m.emitSessionStateChange(SessionStateChangeEvent{
 				Info:      session.ToInfo(),
 				SessionID: session.ID,
@@ -804,10 +804,10 @@ func (m *Manager) reconcileTmuxSessions(windowAlive func(windowID, windowName st
 // a tmux session that has not reached a terminal state. The caller auto-opens
 // them so a Manager re-adopts their sessions.
 //
-// Deliberately not "repos with a *live* window". This probe has no manager and
-// so no courier, which is why it mutates nothing: marking a dead session
-// completed here would consume the one transition its parent's report depends
-// on with nothing listening. That leaves ReconcileTmuxSessions to make the
+// Deliberately not "repos with a *live* window". This probe has no manager, and
+// so nothing subscribed to its transitions, which is why it mutates nothing:
+// marking a dead session completed here would spend that transition with
+// nothing listening. That leaves ReconcileTmuxSessions to make the
 // transition and emit it — and ReconcileTmuxSessions only runs for a repo that
 // gets opened. So a repo whose only subagent died while bramble was down has to
 // be returned too, or the parent is never told, which is the whole point of
@@ -2517,8 +2517,8 @@ func (m *Manager) updateSessionStatus(session *Session, newStatus SessionStatus)
 // window is gone or it was stopped, and every one of those paths then drops it
 // from m.sessions — the map list-sessions reports. Any later move back to running
 // or idle re-animates a session the orchestrator can no longer see, and
-// Courier.Watch forwards it to the parent as an "is idle" report for a session
-// that no longer exists. That is issue #331.
+// Notifier.Watch hints to the parent about a session that no longer exists.
+// That is issue #331.
 //
 // The race is real: a tmux monitor's 15-second capture ticker and its own
 // 2-second liveness ticker hold the same *Session, so a stale poll lands after

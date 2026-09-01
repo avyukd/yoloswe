@@ -31,8 +31,8 @@ type paneIdleProbe struct {
 }
 
 // paneIdleProbes lists only providers whose chrome is understood. A wrong idle
-// verdict releases queued messages into a live turn, so unknown providers are
-// not guessed from the pane.
+// verdict is written into the session status a polling orchestrator reads, so
+// unknown providers are not guessed from the pane.
 var paneIdleProbes = map[string]paneIdleProbe{
 	// "Add a follow-up" is not idle; Cursor shows it while working too.
 	ProviderCursor: {
@@ -195,7 +195,7 @@ const paneCaptureLines = 40
 // claudeComposerMaxLines bounds the composer walk so a missing upper rule cannot
 // turn arbitrary transcript into a composer. It is sized against paneCaptureLines
 // rather than a typical composer: long drafts can be ordinary, and too small a
-// bound manufactures the fail-closed path in composerDraftText.
+// bound manufactures the fail-closed path in composerDraft.
 const claudeComposerMaxLines = paneCaptureLines - 6
 
 // claudePaneContentTailLines finds nearby sparkle lines while staying below
@@ -228,8 +228,8 @@ func claudeLineVerdict(line string) (working, known bool) {
 }
 
 // paneIdleConfirmations is how many consecutive polls must agree before a
-// session is called idle. Two, so a single half-painted frame cannot release
-// queued mail into a turn that is still running.
+// session is called idle. Two, so a single half-painted frame cannot report a
+// turn that is still running as finished.
 const paneIdleConfirmations = 2
 
 // paneIdleTailLines bounds how far up from the bottom the composer line is
@@ -396,8 +396,9 @@ func (p *paneIdleTracker) observe(lines []string) bool {
 	return p.idleStreak == p.confirmationsNeeded()
 }
 
-// confirmationsNeeded is per-probe because false idle releases queued mail into
-// a live turn, while false working costs only polling latency.
+// confirmationsNeeded is per-probe because a false idle tells the orchestrator a
+// lane is done while it is still working, while a false working costs only
+// polling latency.
 func (p *paneIdleTracker) confirmationsNeeded() int {
 	if n := paneIdleProbes[p.provider].confirmations; n > 0 {
 		return n
@@ -499,19 +500,21 @@ func composerReadable(provider string) bool {
 	return provider == ProviderClaude
 }
 
-// composerDraftText reports whether claude's composer holds a draft and returns
-// its text so a changed draft can restart the hold.
-func composerDraftText(provider string, lines []string) (text string, draft, known bool) {
+// composerDraft reports whether claude's composer holds a draft.
+//
+// The draft's text is deliberately not returned. The courier needed it to notice
+// a changed draft and restart its hold; a hint has no hold to restart, and any
+// draft at all is reason enough to stay quiet.
+func composerDraft(provider string, lines []string) (draft, known bool) {
 	if provider != ProviderClaude {
-		return "", false, false
+		return false, false
 	}
 	if composerIdx, _ := claudeComposerIdx(lines); composerIdx >= 0 {
-		line := strings.TrimSpace(lines[composerIdx])
-		draft, known = judgeComposerLine(line)
+		draft, known = judgeComposerLine(strings.TrimSpace(lines[composerIdx]))
 		if !known {
-			return line, true, true
+			return true, true
 		}
-		return line, draft, known
+		return draft, known
 	}
 	// The composer could not be located by the bounded walk.
 	if searchedForComposer(lines) {
@@ -519,13 +522,13 @@ func composerDraftText(provider string, lines []string) (text string, draft, kno
 		// it is legible even though the upper region was not bounded.
 		if line, ok := lineAboveStatusRule(lines); ok {
 			if draft, known := judgeComposerLine(line); known {
-				return strings.TrimSpace(line), draft, known
+				return draft, known
 			}
 		}
 		// The composer region exists but cannot be read, often because a long draft
-		// filled it. Fail closed as a hold: the bounded cost is composerHoldGrace,
-		// while delivering here can submit a human draft with this message appended.
-		return "", true, true
+		// filled it. Fail closed: the cost is one dropped hint, while writing here
+		// can submit a human draft with this line appended.
+		return true, true
 	}
 	// No status rule means no claude chrome to scope; the tail scan is the only
 	// reader left, and there is no lower chrome competing for those rows.
@@ -533,11 +536,10 @@ func composerDraftText(provider string, lines []string) (text string, draft, kno
 		if !strings.HasPrefix(strings.TrimSpace(line), claudePromptGlyph) {
 			return false
 		}
-		text = strings.TrimSpace(line)
 		draft, known = judgeComposerLine(line)
 		return true
 	})
-	return text, draft, known
+	return draft, known
 }
 
 // lineAboveStatusRule returns the first non-empty line above the lowest status
@@ -574,6 +576,6 @@ func judgeComposerLine(line string) (draft, known bool) {
 		return false, true
 	}
 	// Do not decide bramble provenance here; the prefix is user-controllable.
-	// Only the courier knows what it staged for this recipient.
+	// Any text in the composer is a draft to yield to, whoever wrote it.
 	return true, true
 }

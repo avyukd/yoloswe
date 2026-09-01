@@ -63,8 +63,11 @@ type harness struct {
 	runtimeDir string
 	// Tracked because restart brings the replacement up in a new window.
 	brambleWindow string
-	// One visible dialog should collect one answer, even across TUI repaints.
-	answeredDialogs map[dialogKey]bool
+	// How many times one visible dialog has been answered. Bounded rather than
+	// boolean: a first answer can be sent while the CLI is still painting the
+	// menu, in which case the keys go nowhere and the dialog is still up. See
+	// dialogAnswerAttempts.
+	answeredDialogs map[dialogKey]int
 }
 
 // newHarness starts isolated tmux, repo, HOME/runtime state, and bramble.
@@ -84,7 +87,7 @@ func newHarness(t *testing.T, stubAgent bool) *harness {
 	h := &harness{
 		t:               t,
 		tmuxSocket:      filepath.Join(shortRoot, "t.sock"),
-		answeredDialogs: map[dialogKey]bool{},
+		answeredDialogs: map[dialogKey]int{},
 	}
 	wtRoot := filepath.Join(root, "worktrees")
 	runtimeDir := filepath.Join(shortRoot, "run")
@@ -416,10 +419,9 @@ func (h *harness) tmux(args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
-// deliveryQueueLen counts files left in the retired courier's spool. It must be
-// zero at all times now: nothing writes there, and the notifier reclaims
-// anything a previous bramble left behind.
-// The courier persists one file per recipient, holding that recipient's queue.
+// deliveryQueueLen counts files left in the retired courier's spool, one per
+// recipient. It must be zero at all times now: nothing writes there, and the
+// notifier reclaims anything a previous bramble left behind.
 func (h *harness) deliveryQueueLen() int {
 	h.t.Helper()
 	files, _ := filepath.Glob(filepath.Join(h.home, ".bramble", "deliveries", "*.json"))
@@ -447,10 +449,18 @@ type dialogKey struct {
 
 var startupDialogs = []startupDialog{
 	{
-		// Claude directory trust. Default is "Yes, I trust this folder".
+		// Claude directory trust.
+		//
+		// The cursor starts on "No, exit", NOT on the trusting answer, so a bare
+		// Enter quits the CLI: the session dies before it ever reaches a prompt,
+		// and the test then times out looking like bramble never started it.
+		// Measured against claude 2.1.252; this dialog defaulted to the
+		// trusting answer in earlier versions, which is why it once worked.
+		//
+		// Down moves to "Yes, I trust this folder"; Enter confirms it.
 		name:  "claude folder trust",
 		match: []string{"Is this a project you created or one you trust", "I trust this folder"},
-		keys:  []string{"Enter"},
+		keys:  []string{"Down", "Enter"},
 	},
 	{
 		// This modal must fail closed. Answering "Yes" can forward the user's
@@ -483,6 +493,20 @@ var startupDialogs = []startupDialog{
 		keys:  []string{"Escape"},
 	},
 }
+
+// dialogAnswerAttempts bounds how often one on-screen dialog is answered.
+//
+// One attempt is not enough: the matcher fires as soon as the question text is
+// painted, which can be before the CLI has drawn the menu it belongs to, and
+// keys sent into that gap are dropped. The dialog then stays up forever and the
+// session times out having never reached its prompt.
+//
+// It must stay small, though, and it must stop once the dialog is gone. Keys
+// sent into a live session after the dialog clears are typed into the composer
+// or submitted, which is how a stray Enter starts a turn nobody asked for. The
+// match check above is what enforces "still on screen"; this only bounds the
+// retries while it is.
+const dialogAnswerAttempts = 3
 
 // dialogTailLines limits matching to the pane bottom; dismissed dialog text
 // remains in scrollback and would otherwise be answered again.
@@ -522,8 +546,8 @@ func (h *harness) answerStartupDialogs(id session.SessionID, pane string) bool {
 			continue
 		}
 		key := dialogKey{id: id, name: d.name}
-		if h.answeredDialogs[key] {
-			return false // already answered; waiting for it to go away
+		if h.answeredDialogs[key] >= dialogAnswerAttempts {
+			return false // answered enough; waiting for it to go away
 		}
 
 		if d.fatal != "" {
@@ -539,7 +563,7 @@ func (h *harness) answerStartupDialogs(id session.SessionID, pane string) bool {
 			}
 			time.Sleep(300 * time.Millisecond)
 		}
-		h.answeredDialogs[key] = true
+		h.answeredDialogs[key]++
 		return true
 	}
 
@@ -574,6 +598,27 @@ func (h *harness) awaitClearingDialogsFor(id session.SessionID, timeout time.Dur
 		time.Sleep(pollInterval)
 	}
 	h.t.Fatalf(failf+"\n--- pane ---\n%s", append(args, pane)...)
+}
+
+// reachedWorking is awaitWorking that reports instead of failing.
+//
+// Holding a live CLI mid-turn is inherently best-effort: it depends on the model
+// choosing to run the sleep, and on the CLI actually starting its turn. A test
+// whose SETUP did not happen has proven nothing, so it says so and skips rather
+// than failing as though the behaviour under test had regressed — or, worse,
+// passing vacuously because the child was never busy in the first place.
+func (h *harness) reachedWorking(id session.SessionID, promptEcho string, timeout time.Duration) bool {
+	h.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		pane := h.pane(id)
+		if h.status(id) == "running" && strings.Contains(pane, promptEcho) {
+			return true
+		}
+		h.answerStartupDialogs(id, pane)
+		time.Sleep(pollInterval)
+	}
+	return false
 }
 
 // awaitPaneCond captures the pane only after timeout. Putting h.pane() in
@@ -639,15 +684,4 @@ func (h *harness) awaitWorking(id session.SessionID, promptEcho string) {
 	h.awaitClearingDialogs(id, func(pane string) bool {
 		return h.status(id) == "running" && strings.Contains(pane, promptEcho)
 	}, "session %s never started working", id)
-}
-
-// reportedResultPath returns the newest report path; the path, not just the
-// marker text, proves the parent can read the child output.
-// researchFileFor is where a subagent's output lands for its parent to read.
-// Bramble no longer pastes this path into the parent's pane — a hint carries no
-// state — so a test resolves it the way the swarm skill does: from the session
-// id, at the documented location.
-func (h *harness) researchFileFor(id session.SessionID) string {
-	h.t.Helper()
-	return filepath.Join(h.home, ".bramble", "research", string(id)+".md")
 }
