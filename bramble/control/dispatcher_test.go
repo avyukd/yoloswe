@@ -15,6 +15,8 @@ import (
 // fakeRegistry is a hand fake of the Registry interface for dispatcher tests.
 type fakeRegistry struct {
 	targets map[string]string // sessionID -> tmux target
+	// running is the session state the two compare-and-sets act on.
+	running map[string]bool
 	// onResolve, when set, runs inside ResolveTmuxTarget. It lets a test park a
 	// request inside a live handler so Close's drain has something to wait on.
 	onResolve  func()
@@ -51,12 +53,30 @@ func (f *fakeRegistry) CapturePaneText(id session.SessionID, _ int) ([]string, e
 	return f.captured, nil
 }
 
-func (f *fakeRegistry) SetSessionRunning(id session.SessionID) {
+// The status methods model the real compare-and-set, not just the call. A bare
+// append-list cannot tell a marking that took effect from one that no-opped on
+// an already-running session — which is precisely the case where an
+// unconditional rollback ends somebody else's turn, so a fake without the CAS
+// makes that bug untestable.
+func (f *fakeRegistry) SetSessionRunning(id session.SessionID) bool {
 	f.setRunning = append(f.setRunning, string(id))
+	if f.running[string(id)] {
+		return false
+	}
+	if f.running == nil {
+		f.running = map[string]bool{}
+	}
+	f.running[string(id)] = true
+	return true
 }
 
-func (f *fakeRegistry) SetSessionIdle(id session.SessionID) {
+func (f *fakeRegistry) SetSessionIdle(id session.SessionID) bool {
 	f.setIdle = append(f.setIdle, string(id))
+	if !f.running[string(id)] {
+		return false
+	}
+	f.running[string(id)] = false
+	return true
 }
 
 func (f *fakeRegistry) StopSession(id session.SessionID) error {
@@ -398,6 +418,32 @@ func TestAFailedSubmitRollsTheTurnBack(t *testing.T) {
 
 	require.Equal(t, []string{"s1"}, reg.setRunning, "marked before the Enter")
 	require.Equal(t, []string{"s1"}, reg.setIdle, "and put back when the Enter failed")
+}
+
+// TestAFailedSubmitLeavesAnAlreadyRunningSessionAlone is the ownership half of
+// the rollback rule.
+//
+// Interrupting a mid-turn session is what this endpoint is documented for, so
+// writing into an already-running lane is the ordinary case, not a race. There
+// SetSessionRunning is a no-op — the lane was already running — so an
+// unconditional undo would end a turn this write never started. That is the
+// harmful direction: list-sessions would report a working lane as finished, the
+// false Running→Idle would pass hintWorthyStatus and hint the parent, and the
+// lane's real completion notify would then be dropped.
+func TestAFailedSubmitLeavesAnAlreadyRunningSessionAlone(t *testing.T) {
+	t.Parallel()
+	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+	reg.SetSessionRunning("s1") // somebody else's turn is already in flight
+	reg.setRunning = nil
+	d, ctl := newDispatcher(reg)
+	ctl.SendSpecialErr = fmt.Errorf("send-keys failed")
+
+	d.Handle(context.Background(), req(t, TypeSessionSendInput,
+		SendInputReq{SessionID: "s1", Text: "hello", Submit: true}))
+
+	require.Empty(t, reg.setIdle,
+		"a write that did not start the turn must not end it")
+	require.True(t, reg.running["s1"], "the lane is still working")
 }
 
 // A raw --target names a pane, which has no session status to move.

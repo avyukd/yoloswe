@@ -2830,8 +2830,12 @@ func (m *Manager) ActiveWorktreePaths() map[string]struct{} {
 // racing the agent's notify hook by construction: bramble submits a prompt at
 // the same moment the previous turn's notify may be landing, and a separate
 // read and write would let the two interleave into a lost update.
-func (m *Manager) SetSessionRunning(id SessionID) {
-	m.trySetStatus(id, StatusIdle, StatusRunning)
+// It reports whether it moved the session, which is what lets a failed submit
+// undo only the turn it actually started: the transition is a no-op on a
+// session that was already running, and reverting that would end somebody
+// else's live turn.
+func (m *Manager) SetSessionRunning(id SessionID) bool {
+	return m.trySetStatus(id, StatusIdle, StatusRunning)
 }
 
 // pollPaneIdle reads idleness off a backend's pane, for one tick of the
@@ -2879,20 +2883,22 @@ func (m *Manager) pollPaneIdle(tracker *paneIdleTracker, id SessionID, status Se
 // SetSessionIdle transitions a session to StatusIdle (waiting for user input).
 // It only transitions from StatusRunning to avoid reverting terminal states
 // (completed, failed, stopped) that may have been set by the monitor loop.
-func (m *Manager) SetSessionIdle(id SessionID) {
-	m.trySetStatus(id, StatusRunning, StatusIdle)
+func (m *Manager) SetSessionIdle(id SessionID) bool {
+	return m.trySetStatus(id, StatusRunning, StatusIdle)
 }
 
 // trySetStatus looks a session up and moves it from one status to another,
 // doing nothing if it is not there or has since moved on.
-func (m *Manager) trySetStatus(id SessionID, from, to SessionStatus) {
+// trySetStatus reports whether it performed the transition, so a caller that
+// needs to undo its own write can tell that write apart from a no-op.
+func (m *Manager) trySetStatus(id SessionID, from, to SessionStatus) bool {
 	m.mu.RLock()
 	s, ok := m.sessions[id]
 	m.mu.RUnlock()
 	if !ok {
-		return
+		return false
 	}
-	m.tryUpdateSessionStatus(s, from, to)
+	return m.tryUpdateSessionStatus(s, from, to)
 }
 
 // GetAllSessions returns all sessions sorted by creation time (newest first).

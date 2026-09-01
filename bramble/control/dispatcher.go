@@ -19,10 +19,12 @@ type Registry interface {
 	// SetSessionRunning records that a write started a turn. A tmux session's
 	// status is driven from outside — the agent's hook reports idle and nothing
 	// reports the opposite — so the party that typed the prompt is the only one
-	// that knows.
-	SetSessionRunning(id session.SessionID)
+	// that knows. It reports whether it moved the session: a no-op on an
+	// already-running session must not be undone, or the undo ends a turn this
+	// write did not start.
+	SetSessionRunning(id session.SessionID) bool
 	// SetSessionIdle rolls that back when the submit itself failed.
-	SetSessionIdle(id session.SessionID)
+	SetSessionIdle(id session.SessionID) bool
 }
 
 // Dispatcher handles control protocol requests against a registry (session
@@ -232,9 +234,16 @@ type turnStart struct {
 	id  session.SessionID
 }
 
-// undo returns the session to idle after a failed submit. Compare-and-set the
-// other way, so a notify that has legitimately moved the session on since is
-// not clobbered.
+// undo returns the session to idle after a failed submit.
+//
+// Only when this write is what made it running. The two halves are
+// compare-and-set with opposite preconditions — SetSessionRunning moves
+// Idle→Running and no-ops on an already-running session, while SetSessionIdle
+// moves Running→Idle and succeeds on exactly that session — so an unconditional
+// undo ends a turn somebody else started. That is the ordinary case here, not a
+// narrow race: interrupting a mid-turn session is what this endpoint is for, and
+// a false idle is the harmful direction, telling the orchestrator a working lane
+// has finished.
 func (t turnStart) undo() {
 	if t.reg != nil && t.id != "" {
 		t.reg.SetSessionIdle(t.id)
@@ -268,7 +277,11 @@ func (d *Dispatcher) noteTurnStarted(sessionScoped bool, sessionID string) turnS
 		return turnStart{}
 	}
 	id := session.SessionID(sessionID)
-	d.reg.SetSessionRunning(id)
+	if !d.reg.SetSessionRunning(id) {
+		// Already running: this write did not start that turn, so it has
+		// nothing to undo.
+		return turnStart{}
+	}
 	return turnStart{reg: d.reg, id: id}
 }
 

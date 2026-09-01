@@ -24,8 +24,10 @@ type DeliveryTarget interface {
 	// only to decide whether to stay quiet, never to verify what it wrote.
 	CapturePaneText(id SessionID, n int) ([]string, error)
 	// MarkRunning records that a turn has started. Only bramble knows this for
-	// a tmux session it just typed into; see Manager.SetSessionRunning.
-	MarkRunning(id SessionID)
+	// a tmux session it just typed into; see Manager.SetSessionRunning. It
+	// reports whether it moved the session, so a failed submit can undo its own
+	// write and only its own.
+	MarkRunning(id SessionID) bool
 	// MarkIdle rolls MarkRunning back when the submit itself failed.
 	MarkIdle(id SessionID)
 }
@@ -51,7 +53,7 @@ func (t *registryTarget) CapturePaneText(id SessionID, n int) ([]string, error) 
 	return t.reg.CapturePaneText(id, n)
 }
 
-func (t *registryTarget) MarkRunning(id SessionID) { t.reg.SetSessionRunning(id) }
+func (t *registryTarget) MarkRunning(id SessionID) bool { return t.reg.SetSessionRunning(id) }
 
 func (t *registryTarget) MarkIdle(id SessionID) { t.reg.SetSessionIdle(id) }
 
@@ -268,9 +270,16 @@ func (n *Notifier) nudge(ctx context.Context, parent SessionInfo) {
 	//
 	// Marking first inverts the failure: if the Enter fails, the parent is
 	// briefly running with no turn, which MarkIdle puts back.
-	n.target.MarkRunning(parent.ID)
+	// Undo only if this write is what made the parent running. parent.Status was
+	// read before two tmux round-trips, so the parent can legitimately have
+	// started a turn since — and reverting that would tell the orchestrator a
+	// working lane had finished, which is the failure this design exists to
+	// remove.
+	startedTurn := n.target.MarkRunning(parent.ID)
 	if err := n.panes.SendEnter(ctx, target); err != nil {
-		n.target.MarkIdle(parent.ID)
+		if startedTurn {
+			n.target.MarkIdle(parent.ID)
+		}
 		return
 	}
 }

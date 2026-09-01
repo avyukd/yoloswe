@@ -144,15 +144,17 @@ func (f *fakeTarget) MarkIdle(id SessionID) {
 	f.markedIdle = append(f.markedIdle, id)
 }
 
-func (f *fakeTarget) MarkRunning(id SessionID) {
+func (f *fakeTarget) MarkRunning(id SessionID) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	info := f.sessions[id]
-	if info.Status == StatusIdle {
-		info.Status = StatusRunning
-		f.sessions[id] = info
-	}
 	f.markedRunning = append(f.markedRunning, id)
+	if info.Status != StatusIdle {
+		return false
+	}
+	info.Status = StatusRunning
+	f.sessions[id] = info
+	return true
 }
 
 // mustInfo returns a registered session, for tests that hand a SessionInfo
@@ -620,6 +622,36 @@ func TestAFailedEnterRollsTheTurnBack(t *testing.T) {
 	require.Equal(t, []SessionID{"parent"}, target.markedIdle,
 		"a submit that failed must put the session back")
 	require.Equal(t, StatusIdle, target.mustInfo("parent").Status)
+}
+
+// TestAFailedEnterLeavesAnAlreadyRunningParentAlone pins the ownership half of
+// the rollback on the notifier side.
+//
+// nudge reads parent.Status once, then does two tmux round-trips (a capture and
+// a paste) before submitting. The parent can legitimately start a turn of its
+// own in that window — a user typing, or another writer — at which point
+// MarkRunning no-ops because the parent is already running. An unconditional
+// rollback on a failed Enter would then report that live turn as finished,
+// which is the exact failure this design exists to remove.
+//
+// The parent is moved to running from inside the paste, which is where that
+// window actually is.
+func TestAFailedEnterLeavesAnAlreadyRunningParentAlone(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	child := claudeChild(target)
+	panes := &fakePanes{enterErr: fmt.Errorf("send-keys failed")}
+	panes.echo = func(string) {
+		// The parent starts its own turn between the paste and the Enter.
+		target.set("parent", StatusRunning, RunnerTypeTmux)
+	}
+
+	newTestNotifier(t, target, panes).NotifyParent(t.Context(), child)
+
+	require.Empty(t, target.markedIdle,
+		"a hint that did not start the turn must not end it")
+	require.Equal(t, StatusRunning, target.mustInfo("parent").Status,
+		"the parent's own turn survives the failed hint")
 }
 
 // TestAHintDoesNotHintBack pins termination.
