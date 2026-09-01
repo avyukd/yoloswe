@@ -174,8 +174,12 @@ different grounds do not stack (see `dag/BDC-WINDDOWN-CHANNEL.yaml`'s closing pa
   stooq is behind a JS challenge; stockanalysis is client-rendered.
 - LSE: `api.londonstockexchange.com/api/gw/lse/instruments/alldata/<TIDM>` for quotes,
   `investegate.co.uk/company/<TIDM>` for ~55 server-rendered RNS headlines (its advanced
-  search is broken). Nordics: `https://mfn.se/all/s?query=likvidation` works (keywords:
-  likvidation, utskiftning, avvikling, "return of capital"); EQS is not URL-searchable.
+  search is broken). Nordics: `https://mfn.se/all/s/nordic.json?compact=true&limit=100&query=<kw>`
+  — a JSON Feed with server-side full-text search over release bodies (keywords: likvidation,
+  utskiftning, avvikling; "return of capital" is token-matched, not phrase-matched, and ~40% of
+  those requests answer HTTP 500 — retry). The HTML form `https://mfn.se/all/s?query=<kw>`
+  301-redirects to `/all/s/nordic` and SILENTLY DROPS THE QUERY, returning the unfiltered feed;
+  found by the first Nordic lane on 2026-09-01. EQS is not URL-searchable.
   ASX: `asx.api.markitdigital.com/asx-research/1.0/companies/<ticker>/announcements`.
 - Already-fetched filings live under `/tmp/opencode/` (does not survive a reboot); check before
   re-pulling.

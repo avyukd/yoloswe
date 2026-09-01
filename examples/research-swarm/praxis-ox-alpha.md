@@ -144,7 +144,9 @@ Launch NOW (fills the three slots):
    2026-09-10 18:00 UTC.
 
 3. **`nordic-mfn-0901`** · channel-refresh · p2 · now · owns `dag/EUROPE-LIQUIDATION-SCOUT.yaml`.
-   Mission: the first weekly MFN keyword pull — `https://mfn.se/all/s?query=<kw>` for
+   Mission: the first weekly MFN keyword pull — `https://mfn.se/all/s/nordic.json?compact=true&limit=100&query=<kw>`
+   (the HTML form `/all/s?query=` 301-redirects and silently drops the query — found by the
+   first lane on 2026-09-01) for
    `likvidation`, `utskiftning`, `avvikling`, `"return of capital"` over the last seven days;
    open each hit's release (MFN shows titles only); kill on the class (a saneeraus / creditor
    process is not a solvent wind-down). Seed: the Dovre Group 1-Sep release must appear or the
