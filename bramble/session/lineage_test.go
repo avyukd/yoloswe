@@ -124,8 +124,8 @@ func TestStartSessionLeavesParentEmpty(t *testing.T) {
 // write StatusRunning unconditionally once Start returned, overwriting that
 // idle — and because SetSessionIdle only advances a *Running* session, the next
 // notify never comes: the agent is sitting at a prompt waiting for input. The
-// session then reports "running" forever, so nothing drains its queued mail and
-// its parent is never told it finished.
+// session then reports "running" forever, so a polling parent never sees it
+// finish.
 func TestFastIdleIsNotClobberedByStartup(t *testing.T) {
 	t.Parallel()
 

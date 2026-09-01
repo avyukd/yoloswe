@@ -362,8 +362,8 @@ type SessionStateChangeEvent struct { //nolint:govet // fieldalignment: readabil
 	// subscriber often runs after the session is gone: the tmux monitor emits
 	// StatusCompleted and then deletes the session from the manager, so a
 	// lookup keyed on SessionID races the delete and usually loses. That race
-	// silently dropped the completion report a subagent's parent was waiting
-	// for — see Courier.Watch.
+	// silently dropped the completion a subagent's parent was waiting for —
+	// see Notifier.Watch.
 	Info      SessionInfo
 	SessionID SessionID
 	OldStatus SessionStatus

@@ -31,8 +31,8 @@ type paneIdleProbe struct {
 }
 
 // paneIdleProbes lists only providers whose chrome is understood. A wrong idle
-// verdict releases queued messages into a live turn, so unknown providers are
-// not guessed from the pane.
+// verdict is written into the session status a polling orchestrator reads, so
+// unknown providers are not guessed from the pane.
 var paneIdleProbes = map[string]paneIdleProbe{
 	// "Add a follow-up" is not idle; Cursor shows it while working too.
 	ProviderCursor: {
@@ -142,8 +142,8 @@ func claudeComposerIdx(lines []string) (composerIdx, contentEndIdx int) {
 
 // claudePaneJudge reads claude-code's pane to decide whether a turn is in flight.
 // It does not use ParseClaudeStatusBar's IsIdle: the live composer is visible in
-// both states, so that parser can call a working pane idle and release queued
-// mail into it.
+// both states, so that parser can call a working pane idle, which is written
+// into the status a polling orchestrator reads.
 //
 // Claude's reliable signal is the nearest sparkle line in the bounded content
 // tail: gerund/ellipsis means working, past tense plus "for <duration>" means
@@ -187,12 +187,16 @@ func claudePaneJudge(lines []string) (working, known bool) {
 	return false, false
 }
 
+// paneCaptureLines is how deep every pane read in this file goes. The walks
+// below are sized against it, so it is the one number to change if a CLI's
+// chrome grows taller.
+const paneCaptureLines = 40
+
 // claudeComposerMaxLines bounds the composer walk so a missing upper rule cannot
-// turn arbitrary transcript into a composer. It is sized against pasteVerifyLines
-// rather than a typical composer: wrapped deliveries and long drafts can be
-// ordinary, and too small a bound manufactures the fail-closed paths in
-// pasteEvidenceObscured and composerDraftText.
-const claudeComposerMaxLines = pasteVerifyLines - 6
+// turn arbitrary transcript into a composer. It is sized against paneCaptureLines
+// rather than a typical composer: long drafts can be ordinary, and too small a
+// bound manufactures the fail-closed path in composerDraft.
+const claudeComposerMaxLines = paneCaptureLines - 6
 
 // claudePaneContentTailLines finds nearby sparkle lines while staying below
 // quoted transcript history.
@@ -224,8 +228,8 @@ func claudeLineVerdict(line string) (working, known bool) {
 }
 
 // paneIdleConfirmations is how many consecutive polls must agree before a
-// session is called idle. Two, so a single half-painted frame cannot release
-// queued mail into a turn that is still running.
+// session is called idle. Two, so a single half-painted frame cannot report a
+// turn that is still running as finished.
 const paneIdleConfirmations = 2
 
 // paneIdleTailLines bounds how far up from the bottom the composer line is
@@ -392,8 +396,9 @@ func (p *paneIdleTracker) observe(lines []string) bool {
 	return p.idleStreak == p.confirmationsNeeded()
 }
 
-// confirmationsNeeded is per-probe because false idle releases queued mail into
-// a live turn, while false working costs only polling latency.
+// confirmationsNeeded is per-probe because a false idle tells the orchestrator a
+// lane is done while it is still working, while a false working costs only
+// polling latency.
 func (p *paneIdleTracker) confirmationsNeeded() int {
 	if n := paneIdleProbes[p.provider].confirmations; n > 0 {
 		return n
@@ -464,250 +469,9 @@ func decidePaneIdlePoll(tracker *paneIdleTracker, status SessionStatus, lines []
 // paneIdleCaptureLines is sized against the walks it feeds, not a typical
 // footer. claudePaneJudge must find the composer, its upper rule, and
 // claudePaneContentTailLines above that; too shallow a capture makes the judge
-// unknown forever. Keep it equal to pasteVerifyLines because
+// unknown forever. Keep it equal to paneCaptureLines because
 // claudeComposerMaxLines is sized against the same capture depth.
-const paneIdleCaptureLines = pasteVerifyLines
-
-// pasteEvidence describes how a provider's pane shows that a paste arrived.
-// This is separate from paneIdleProbe: a CLI can expose turn state but still not
-// echo pasted text.
-type pasteEvidence struct {
-	// chipMarkers are what a CLI renders *instead of* the pasted text.
-	// cursor-agent collapses a bracketed paste to "[Pasted text #N]", so the
-	// characters never appear in the pane and looking for them always fails.
-	chipMarkers []string
-	// required means Enter waits for positive paste confirmation. False is
-	// deliberate for providers whose paste evidence is silence rather than a
-	// reliable negative; re-pasting on silence duplicates the message.
-	required bool
-}
-
-// Non-required entries are not consulted in production, but they document chip
-// evidence and keep pasteConfirmed covered for providers that do not echo text.
-var pasteEvidenceProbes = map[string]pasteEvidence{
-	ProviderCursor: {chipMarkers: []string{"[Pasted text"}},
-	ProviderCodex:  {required: true},
-	// Claude's composer is readable, so dropped pastes must be caught before
-	// MarkRunning records a turn that never started. Keep the chip marker:
-	// a chip still proves arrival, while a false negative re-pastes and
-	// re-queues.
-	ProviderClaude: {required: true, chipMarkers: []string{"[Pasted text"}},
-}
-
-// pasteVerifyRequired reports whether a paste must be confirmed before Enter.
-func pasteVerifyRequired(provider string) bool {
-	return pasteEvidenceProbes[provider].required
-}
-
-// composerHoldsForeignText reports that the composer was read, is not empty, and
-// does not hold this delivery. That is the one shape a re-paste must never see.
-//
-// A negative paste verdict has two causes that look identical to the caller but
-// call for opposite responses. An EMPTY composer means the paste was genuinely
-// dropped, and pasting again is the repair. A composer holding text that is not
-// ours means something else got there — most often a user who started typing
-// inside the ~1.8s verification window, since a draft-prefixed body can never
-// satisfy confirmsComposer's one-way prefix rule — and pasting again appends a
-// second copy to that person's unsent line.
-//
-// Only a located composer can answer. An unlocatable one is silence, already
-// handled as unreadable by pasteEvidenceObscured, and a provider with no
-// readable composer cannot distinguish these shapes at all.
-func composerHoldsForeignText(provider string, lines []string, first string) bool {
-	if !composerReadable(provider) {
-		return false
-	}
-	composerIdx, _ := claudeComposerIdx(lines)
-	if composerIdx < 0 {
-		return false
-	}
-	body, _ := composerBody(lines[composerIdx])
-	if body == "" {
-		return false // an empty composer is a dropped paste, not interference
-	}
-	// The same one-way rule confirmsComposer uses: our own text may be truncated
-	// by pane width, so a body that prefixes this delivery is still ours.
-	return !strings.HasPrefix(first, body)
-}
-
-// pasteEvidenceObscured reports that the pane cannot answer whether the paste
-// arrived. For a provider whose composer bramble reads, evidence is readable
-// only when the composer was actually located: that is the one shape able to
-// tell an EMPTY composer (a real dropped paste, repaired by one re-paste) from
-// an ABSENT one (silence, where re-pasting appends a duplicate copy forever).
-//
-// An unlocatable composer is silence whether or not claude chrome is on screen.
-// A pane showing no chrome at all — an alt-screen pager, fullscreen tool output,
-// /help, a restarted CLI, a bare shell — is the MOST obscured case, not the
-// least: nothing about it says the paste was dropped, and the composer may be
-// holding it out of view. Keying readability off a status separator classified
-// that silence as a hard negative, which re-pasted and re-queued every
-// retryDelay for the life of the process.
-func pasteEvidenceObscured(provider string, lines []string) bool {
-	if !composerReadable(provider) {
-		return promptChromeAbsent(provider, lines)
-	}
-	composerIdx, _ := claudeComposerIdx(lines)
-	return composerIdx < 0
-}
-
-// promptChromeAbsent reports that a pane for a provider with no readable
-// composer showed none of that CLI's prompt chrome. It is the counterpart of a
-// located composer: without the prompt on screen, the tail that scanForPaste
-// searched was not a composer at all, so its silence is not evidence the paste
-// was dropped.
-//
-// This does not make every unconfirmed paste unreadable for such providers.
-// Codex really does swallow pastes while finalizing a turn, and that shape —
-// prompt on screen, text absent from the tail — must still cost one re-paste.
-// Only a pane with no prompt chrome anywhere in the tail is silence.
-func promptChromeAbsent(provider string, lines []string) bool {
-	// Only a provider whose paste verdict is actually consulted can be held to
-	// this rule. Others never reach pasteVerdict, and claiming their evidence
-	// is obscured would answer a question nothing asks.
-	if !pasteVerifyRequired(provider) {
-		return false
-	}
-	markers := paneIdleProbes[provider].promptMarkers
-	if len(markers) == 0 {
-		// No chrome to look for, so the pane cannot testify either way — and
-		// silence is obscured, not readable. Answering "readable" here is the
-		// pre-fix classification that turned a silent pane into a hard negative
-		// and drove the re-paste loop. TestEveryVerifiedProviderCanBeRead keeps
-		// this branch unreachable in production; it is the fail-safe for a
-		// provider added to pasteEvidenceProbes without prompt chrome.
-		return true
-	}
-	_, found := findPromptLine(lines, markers)
-	return !found
-}
-
-// pasteConfirmed reports whether the pane shows the paste arrived, either as
-// text or as a chip.
-//
-// If the composer is located, only that line may answer. A full-pane scan can
-// match an older echoed prompt and then press Enter on an empty composer.
-//
-// If no composer can be scoped to, only the pane tail is scanned. The bound keeps
-// transcript history out, while pasteConfirmTailLines is still large enough for
-// wrapped deliveries because it is sized against pasteVerifyLines. The probe,
-// not this depth, is what distinguishes neighboring deliveries.
-//
-// A residual remains: two first lines identical across the probe window still
-// collide when the provider has no readable composer. Closing that needs pre-
-// and post-paste evidence from the delivery path; the test documents the gap.
-// The two arms are handed different anchors on purpose: a located composer shows
-// the head of the first line, while the tail scan reads transcript rows that
-// echo it whole. See confirmsComposer and pasteProbe.
-func pasteConfirmed(provider string, lines []string, first, probe string) bool {
-	if probe == "" {
-		return true // nothing distinctive to look for
-	}
-	chips := pasteEvidenceProbes[provider].chipMarkers
-	return scanForPaste(provider, lines,
-		func(line string) bool { return confirmsComposer(line, first, chips) },
-		func(line string) bool { return strings.Contains(line, probe) || containsAny(line, chips) })
-}
-
-// scanForPaste scopes both paste readers the same way: a located composer when
-// readable, otherwise a bounded tail. The excluded region is transcript history
-// where an older delivery can match the same probe.
-func scanForPaste(provider string, lines []string, onComposer, onTail func(string) bool) bool {
-	if composerReadable(provider) {
-		if composerIdx, _ := claudeComposerIdx(lines); composerIdx >= 0 {
-			return onComposer(lines[composerIdx])
-		}
-		// An unlocatable readable composer is silence, not a negative. Do not
-		// fall back to transcript scanning, and let Courier.pasteVerdict avoid
-		// the infinite re-paste loop on silence.
-		return false
-	}
-	// No readable composer, so use the pane tail, never the whole capture.
-	// Transcript echoes above it can falsely confirm a dropped paste. This uses
-	// pasteConfirmTailLines, not paneIdleTailLines: the idle probe looks for
-	// footer chrome, while paste confirmation must reach the first line of a
-	// wrapped composer.
-	seen := 0
-	for i := len(lines) - 1; i >= 0 && seen < pasteConfirmTailLines; i-- {
-		if strings.TrimSpace(lines[i]) == "" {
-			continue
-		}
-		seen++
-		if onTail(lines[i]) {
-			return true
-		}
-	}
-	return false
-}
-
-// pasteConfirmTailLines bounds pasteConfirmed's fallback. Like
-// claudeComposerMaxLines, it is sized against pasteVerifyLines because the target
-// is the top of a composer holding this delivery, and the composer grows with
-// message length. It still leaves enough of the capture unread to keep transcript
-// echoes from confirming a paste that never arrived.
-const pasteConfirmTailLines = pasteVerifyLines - 8
-
-// confirmsComposer checks a located composer line against the delivery's whole
-// first line, not against pasteProbe. The two anchor at opposite ends: a
-// composer wraps, so claudeComposerIdx returns its topmost row and tmux truncates
-// that row at the pane width, leaving the HEAD of the line visible — while
-// pasteProbe deliberately returns the TAIL. Matching a head-truncated row against
-// a tail probe fails for every delivery whose first line exceeds the pane width,
-// and for claude that false negative is not cosmetic: pasteVerifyRequired is
-// true, so write's `default` branch pastes a second copy and re-queues, which is
-// the duplicate-paste loop this package exists to prevent.
-//
-// The comparison is the same one-way rule composerHoldsThisDelivery uses: the
-// visible body must be a prefix of what we sent. Narrow panes then read as
-// confirmation rather than as a dropped paste.
-func confirmsComposer(line, first string, chips []string) bool {
-	body, _ := composerBody(line)
-	// An empty composer confirms nothing: that is what a dropped paste looks
-	// like, and every string has the empty prefix.
-	if body == "" {
-		return false
-	}
-	// A chip proves arrival only when it is the WHOLE body. A chip with text
-	// beside it is a human composer — somebody typed next to the paste — and
-	// this package already treats that shape as a draft everywhere else
-	// (TestAChipBesideTypedTextIsStillAHumanDraft holds it at the draft check).
-	//
-	// Accepting a merely-contained chip here would confirm that pane, so
-	// pasteVerdict would report landed and never consult composerHoldsForeignText,
-	// and write() would press Enter on the person's half-typed line with the
-	// delivery riding on it — the same race the foreign check closes for the
-	// echoed-text form, arriving instead through the chip.
-	if bodyIsOnlyAChip(body, chips) {
-		return true
-	}
-	return strings.HasPrefix(first, body)
-}
-
-// bodyIsOnlyAChip reports whether a composer body is one paste chip and nothing
-// else. Chips render as a self-contained bracketed token ("[Pasted text #1 +42
-// lines]"), so anything outside those brackets was typed by a person.
-func bodyIsOnlyAChip(body string, chips []string) bool {
-	for _, chip := range chips {
-		start := strings.Index(body, chip)
-		if start < 0 {
-			continue
-		}
-		// Nothing may precede the chip, and only its own closing bracket may
-		// follow it. Bracket-matching rather than marker length so a chip whose
-		// contents change ("+42 lines", a filename) still reads as whole.
-		if start != 0 {
-			continue
-		}
-		end := strings.Index(body, "]")
-		if end < 0 {
-			continue // an unterminated chip is a truncated capture, not evidence
-		}
-		if strings.TrimSpace(body[end+1:]) == "" {
-			return true
-		}
-	}
-	return false
-}
+const paneIdleCaptureLines = paneCaptureLines
 
 // claudePromptGlyph is the composer prompt in claude-code's TUI, U+276F.
 const claudePromptGlyph = "❯"
@@ -716,15 +480,12 @@ const claudePromptGlyph = "❯"
 // what the user or bramble put after it, reporting whether the glyph was there
 // at all.
 //
-// This is the one place the glyph is stripped. Every reader needs the same two
-// Unicode-aware trims and gets them wrong in the same way: claude separates
+// This is the one place the glyph is stripped, because the trims have to be
+// Unicode-aware and are easy to get wrong in the same way: claude separates
 // `❯` from the body with U+00A0, so an ASCII-only cutset leaves that byte
-// behind and reads every EMPTY composer as holding text. That single regression
-// breaks each caller in a different direction — judgeComposerLine reports a
-// draft on every idle pane, composerHoldsThisDelivery stops recognizing
-// bramble's own staged text, and confirmsComposer stops confirming a landed
-// paste and drives write() into a second paste — which is why they share one
-// implementation and one test rather than three copies of the expression.
+// behind and reads every EMPTY composer as holding text. judgeComposerLine
+// would then report a draft on every idle pane, which silences the notifier
+// permanently — it yields whenever it sees a draft.
 func composerBody(line string) (body string, hasGlyph bool) {
 	trimmed := strings.TrimSpace(line)
 	if !strings.HasPrefix(trimmed, claudePromptGlyph) {
@@ -739,19 +500,21 @@ func composerReadable(provider string) bool {
 	return provider == ProviderClaude
 }
 
-// composerDraftText reports whether claude's composer holds a draft and returns
-// its text so a changed draft can restart the hold.
-func composerDraftText(provider string, lines []string) (text string, draft, known bool) {
+// composerDraft reports whether claude's composer holds a draft.
+//
+// The draft's text is deliberately not returned. The courier needed it to notice
+// a changed draft and restart its hold; a hint has no hold to restart, and any
+// draft at all is reason enough to stay quiet.
+func composerDraft(provider string, lines []string) (draft, known bool) {
 	if provider != ProviderClaude {
-		return "", false, false
+		return false, false
 	}
 	if composerIdx, _ := claudeComposerIdx(lines); composerIdx >= 0 {
-		line := strings.TrimSpace(lines[composerIdx])
-		draft, known = judgeComposerLine(line)
+		draft, known = judgeComposerLine(strings.TrimSpace(lines[composerIdx]))
 		if !known {
-			return line, true, true
+			return true, true
 		}
-		return line, draft, known
+		return draft, known
 	}
 	// The composer could not be located by the bounded walk.
 	if searchedForComposer(lines) {
@@ -759,13 +522,13 @@ func composerDraftText(provider string, lines []string) (text string, draft, kno
 		// it is legible even though the upper region was not bounded.
 		if line, ok := lineAboveStatusRule(lines); ok {
 			if draft, known := judgeComposerLine(line); known {
-				return strings.TrimSpace(line), draft, known
+				return draft, known
 			}
 		}
 		// The composer region exists but cannot be read, often because a long draft
-		// filled it. Fail closed as a hold: the bounded cost is composerHoldGrace,
-		// while delivering here can submit a human draft with this message appended.
-		return "", true, true
+		// filled it. Fail closed: the cost is one dropped hint, while writing here
+		// can submit a human draft with this line appended.
+		return true, true
 	}
 	// No status rule means no claude chrome to scope; the tail scan is the only
 	// reader left, and there is no lower chrome competing for those rows.
@@ -773,11 +536,10 @@ func composerDraftText(provider string, lines []string) (text string, draft, kno
 		if !strings.HasPrefix(strings.TrimSpace(line), claudePromptGlyph) {
 			return false
 		}
-		text = strings.TrimSpace(line)
 		draft, known = judgeComposerLine(line)
 		return true
 	})
-	return text, draft, known
+	return draft, known
 }
 
 // lineAboveStatusRule returns the first non-empty line above the lowest status
@@ -814,6 +576,6 @@ func judgeComposerLine(line string) (draft, known bool) {
 		return false, true
 	}
 	// Do not decide bramble provenance here; the prefix is user-controllable.
-	// Only the courier knows what it staged for this recipient.
+	// Any text in the composer is a draft to yield to, whoever wrote it.
 	return true, true
 }

@@ -16,33 +16,29 @@ type Registry interface {
 	ResolveTmuxTarget(id session.SessionID) (string, error)
 	CapturePaneText(id session.SessionID, n int) ([]string, error)
 	StopSession(id session.SessionID) error
-}
-
-// Courier is the narrow slice of *session.Courier the dispatcher needs to hold
-// a message back until its recipient is idle. Consumer-side, like Registry, so
-// the queue branch can be tested without a real delivery directory.
-type Courier interface {
-	Send(ctx context.Context, from, to session.SessionID, text string, submit bool) (bool, error)
+	// SetSessionRunning records that a write started a turn. A tmux session's
+	// status is driven from outside — the agent's hook reports idle and nothing
+	// reports the opposite — so the party that typed the prompt is the only one
+	// that knows. It reports whether it moved the session: a no-op on an
+	// already-running session must not be undone, or the undo ends a turn this
+	// write did not start.
+	SetSessionRunning(id session.SessionID) bool
+	// SetSessionIdle rolls that back when the submit itself failed.
+	SetSessionIdle(id session.SessionID) bool
 }
 
 // Dispatcher handles control protocol requests against a registry (session
 // -centric ops) and a tmuxctl.Controller (raw-pane ops). It is transport
 // -agnostic: the local CLI and the remote hub client both call Handle.
 type Dispatcher struct {
-	reg     Registry
-	ctl     tmuxctl.Controller
-	courier Courier
+	reg Registry
+	ctl tmuxctl.Controller
 }
 
-// NewDispatcher constructs a Dispatcher. Queued delivery is unavailable until
-// SetCourier is called; a send_input asking for it gets a clear error rather
-// than silently interrupting the recipient.
+// NewDispatcher constructs a Dispatcher.
 func NewDispatcher(reg Registry, ctl tmuxctl.Controller) *Dispatcher {
 	return &Dispatcher{reg: reg, ctl: ctl}
 }
-
-// SetCourier enables queued delivery.
-func (d *Dispatcher) SetCourier(c Courier) { d.courier = c }
 
 // Handle processes one request Msg and returns a response Msg. It never returns
 // a nil Msg for a known request: failures are encoded as a TypeResponse with an
@@ -178,46 +174,27 @@ func (d *Dispatcher) sendInput(ctx context.Context, req *Msg, sessionScoped bool
 		return SendInputResult{}, err
 	}
 
-	// The queued path goes through the courier, which knows how to reach a
-	// session whatever its runner. The unqueued path below types straight into
-	// a pane, which stays the right behaviour for a deliberate interrupt and
-	// for raw pane targets.
+	// Refused rather than silently downgraded to an immediate paste: a caller
+	// that asked to wait for an idle recipient must not get a mid-turn
+	// interrupt instead.
 	if r.Queue {
-		if r.SessionID == "" {
-			return SendInputResult{}, fmt.Errorf("queue requires session_id: a raw pane target has no status to wait on")
-		}
-		if d.courier == nil {
-			return SendInputResult{}, fmt.Errorf("queued delivery is not available on this bramble")
-		}
-		// A queued delivery must be submitted, and saying otherwise is refused
-		// rather than silently ignored: Submit is a documented field, and a
-		// caller that asked to stage text deserves to learn that this endpoint
-		// cannot do that, not to be told OK and get a submitted message.
-		//
-		// Staging into a composer without pressing Enter delivers nothing, and
-		// the text then sits there looking like a human draft — it holds every
-		// later delivery to that session behind it for the full grace period
-		// and is then pasted on top.
-		if !r.Submit {
-			return SendInputResult{}, fmt.Errorf(
-				"queue requires submit: text staged without Enter is never delivered and blocks the queue behind it")
-		}
-		queued, err := d.courier.Send(ctx, session.SessionID(r.From), session.SessionID(r.SessionID), r.Text, r.Submit)
-		if err != nil {
-			return SendInputResult{}, err
-		}
-		return SendInputResult{OK: true, Queued: queued}, nil
+		return SendInputResult{}, fmt.Errorf(
+			"queued delivery has been removed: send without --queue for a deliberate interrupt, " +
+				"or let the orchestrator read completion from the run directory")
 	}
 
 	target, err := d.targetFor(r.SessionID, r.Target, sessionScoped)
 	if err != nil {
 		return SendInputResult{}, err
 	}
-	if err := d.ctl.Paste(ctx, target, r.Text); err != nil {
+	if err := tmuxctl.Paste(ctx, d.ctl, target, r.Text); err != nil {
 		return SendInputResult{}, err
 	}
 	if r.Submit {
+		// Before the Enter, not after. See noteTurnStarted.
+		started := d.noteTurnStarted(sessionScoped, r.SessionID)
 		if err := d.ctl.SendSpecial(ctx, target, tmuxctl.KeyEnter); err != nil {
+			started.undo()
 			return SendInputResult{}, err
 		}
 	}
@@ -233,10 +210,79 @@ func (d *Dispatcher) sendKey(ctx context.Context, req *Msg, sessionScoped bool) 
 	if err != nil {
 		return OKResult{}, err
 	}
+	// Enter submits whatever is in the composer, which is a turn starting just
+	// as much as a submitted send-input is — and the two-step "stage, then
+	// Enter" is a documented workflow, so this is the completion of the write
+	// the unsubmitted send deliberately did not finish. Only Enter: C-c,
+	// Escape and the arrows do not start a turn.
+	//
+	// Before the key, not after. See noteTurnStarted.
+	var started turnStart
+	if r.Key == tmuxctl.KeyEnter {
+		started = d.noteTurnStarted(sessionScoped, r.SessionID)
+	}
 	if err := d.ctl.SendSpecial(ctx, target, r.Key); err != nil {
+		started.undo()
 		return OKResult{}, err
 	}
 	return OKResult{OK: true}, nil
+}
+
+// turnStart undoes a turn-start marking whose submit then failed.
+type turnStart struct {
+	reg Registry
+	id  session.SessionID
+}
+
+// undo returns the session to idle after a failed submit.
+//
+// Only when this write is what made it running. The two halves are
+// compare-and-set with opposite preconditions — SetSessionRunning moves
+// Idle→Running and no-ops on an already-running session, while SetSessionIdle
+// moves Running→Idle and succeeds on exactly that session — so an unconditional
+// undo ends a turn somebody else started. That is the ordinary case here, not a
+// narrow race: interrupting a mid-turn session is what this endpoint is for, and
+// a false idle is the harmful direction, telling the orchestrator a working lane
+// has finished.
+func (t turnStart) undo() {
+	if t.reg != nil && t.id != "" {
+		t.reg.SetSessionIdle(t.id)
+	}
+}
+
+// noteTurnStarted records that a write is starting a turn in a session.
+//
+// One helper rather than the same lines at each write path, because the cost of
+// forgetting it is invisible locally and severe downstream: a tmux session's
+// status only ever moves one way from outside — the agent's hook reports idle
+// and nothing reports the opposite — so a turn that goes unrecorded leaves the
+// session reading idle for its whole duration. list-sessions, which this
+// transport relies on for delivery, then calls a working lane finished; and
+// SetSessionIdle is a compare-and-set from StatusRunning, so the turn's real
+// completion notify is dropped too and the next turn produces no state change
+// either.
+//
+// **Called before the Enter, not after.** Marking afterwards looks harmless and
+// is not: a fast agent can answer and fire its completion notify in the gap. That
+// notify hits SetSessionIdle's compare-and-set, sees StatusIdle rather than
+// StatusRunning, and is dropped — and then this marks the session running with
+// nothing left alive to end it, so it reads busy forever. Marking first means
+// the worst case is a session briefly running when the submit failed, which
+// undo corrects.
+//
+// Session-scoped writes only: a raw --target names a pane, which has no session
+// status to move.
+func (d *Dispatcher) noteTurnStarted(sessionScoped bool, sessionID string) turnStart {
+	if !sessionScoped || sessionID == "" {
+		return turnStart{}
+	}
+	id := session.SessionID(sessionID)
+	if !d.reg.SetSessionRunning(id) {
+		// Already running: this write did not start that turn, so it has
+		// nothing to undo.
+		return turnStart{}
+	}
+	return turnStart{reg: d.reg, id: id}
 }
 
 func (d *Dispatcher) sessionSelect(ctx context.Context, req *Msg) (OKResult, error) {

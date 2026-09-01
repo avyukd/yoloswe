@@ -78,8 +78,8 @@ func reapedSession(t *testing.T, m *Manager, id SessionID) (*Session, func() []S
 // reaped the session calls tryUpdateSessionStatus(idle→running) on that stale
 // pointer, and neither it nor updateSessionStatus consulted anything but the
 // session's own status. The revive re-arms the session for a later idle, which
-// Courier.Watch reports to the parent as a subagent that is "is idle" — for a
-// session list-sessions no longer knows about.
+// Notifier.Watch hints to the parent about — for a session list-sessions no
+// longer knows about.
 func TestReapedSessionCannotBeRevivedToRunning(t *testing.T) {
 	t.Parallel()
 
@@ -198,10 +198,10 @@ func windowIsAlive(string, string) bool { return true }
 // runs on every start, with a live window answering the stored name.
 //
 // Deciding on the window alone re-adopts the session: into m.sessions, with a
-// monitor goroutine free to emit fresh idle transitions that reach the parent as
-// subagent reports for a session list-sessions no longer knows about. The
-// courier's reported-set does not survive a restart, so the parent hears it
-// again every time. The missing worktree is what says the session is gone.
+// monitor goroutine free to emit fresh idle transitions that hint the parent
+// about a session list-sessions no longer knows about — and since a hint keeps
+// no history, a restart cannot suppress the repeat. The missing worktree is
+// what says the session is gone.
 func TestReconcileReapsSessionWhoseWorktreeIsGone(t *testing.T) {
 	t.Parallel()
 
@@ -223,7 +223,7 @@ func TestReconcileReapsSessionWhoseWorktreeIsGone(t *testing.T) {
 
 // TestReconcileAdoptsSessionWhoseWorktreeSurvives keeps the worktree gate from
 // reaping healthy sessions: a live window over a live worktree is re-adopted,
-// and re-announced at its stored status so the courier learns it is reachable.
+// and re-announced at its stored status so subscribers learn it is reachable.
 func TestReconcileAdoptsSessionWhoseWorktreeSurvives(t *testing.T) {
 	t.Parallel()
 
@@ -308,7 +308,7 @@ func TestReconcileKeepsIDCarryingSessionWithUnstattableWorktree(t *testing.T) {
 		"a live session was written to the store as terminal, which no later reconcile undoes")
 
 	events := snapshot()
-	require.Len(t, events, 1, "re-adoption owes the courier exactly one same-status event")
+	require.Len(t, events, 1, "re-adoption owes subscribers exactly one same-status event")
 	assert.Equal(t, StatusIdle, events[0].NewStatus)
 }
 

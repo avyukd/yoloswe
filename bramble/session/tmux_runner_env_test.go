@@ -200,10 +200,9 @@ func TestTmuxRunnerEnvArgs_OmitsUnsetValues(t *testing.T) {
 }
 
 // A codex window that never runs its notify program leaves bramble believing
-// the session is still working after it has answered. Nothing then drains that
-// session's queued messages, and its parent is only told it finished when the
-// window dies — so both directions of subagent messaging go quiet. Assert the
-// override is spliced in.
+// the session is still working after it has answered — which a polling
+// orchestrator reads as a lane still running — and its parent is only told it
+// finished when the window dies. Assert the override is spliced in.
 func TestTmuxRunnerCodexGetsNotifyHook(t *testing.T) {
 	r := &tmuxRunner{
 		provider:   ProviderCodex,

@@ -57,68 +57,67 @@ each is weighed differently from a typed one:
 The delegator deliberately does *not* set a parent: it runs its own child
 watcher and would otherwise be told about every transition twice.
 
-### 2. The courier — `bramble/session/delivery.go`
+### 2. The notifier — `bramble/session/delivery.go`
 
-One place that can address a session without the caller knowing how it runs:
+The return leg is a **poll**, not a push. A lane records its own completion — a
+`.done` file, a commit, a branch — and the orchestrator reads that record and
+verifies every claim against git before acting on it. Nothing is delivered, so
+nothing can be lost.
 
-| Runner | Write path |
-|---|---|
-| `tui` | `Manager.SendFollowUp` — a real prompt in the turn loop |
-| `tmux` / `tmux-tracked` | `tmuxctl` paste + Enter into the pane |
+On top of that, the notifier drops at most one disposable line into an idle
+parent's pane:
 
-Before this, `SendFollowUp` reached only TUI sessions and `send-input` only tmux
-ones, and neither was reachable from the other's caller.
+    [bramble] subagent activity — check your run directory
 
-`send-input --queue` routes through the courier. If the recipient is idle the
-message is written now; otherwise it is queued under `~/.bramble/deliveries/`
-and written on the next idle transition, driven by
-`Manager.SubscribeStateChanges` — no polling. A recipient in a terminal state is
-refused rather than queued, and a queue whose session dies is reclaimed.
+It names no child, no status and no path, because anything it carried could go
+stale before it was read. It is:
 
-**One delivery per idle transition.** Writing a message starts the recipient's
-next turn, so a second write in the same drain would land mid-turn — the very
-thing the queue prevents. The rest ride the transition after.
+- **droppable** — never queued, never persisted, never retried. A hint that does
+  not land costs one poll interval of latency, not a lost report.
+- **stateless** — no payload, no history, so a duplicate is harmless.
+- **yielding** — any doubt about the pane (a draft in the composer, an
+  unreadable frame, a turn in flight) means stay silent.
 
-**No state change reaches the courier through a buffer.** Reporting rides
-transitions, and a lost completion is the one event that never comes again — so
-`SubscribeStateChanges` takes a function called on the goroutine that made the
-transition, and `watchStateChanges` puts a growable queue behind it. A bounded
-channel would have to drop or block: drop loses exactly the fan-out case this
-feature is for (and a tight burst fills any buffer before the reader is
-scheduled once, so a bigger one is not the fix), and block would stall a status
-transition behind a pane capture and a file write.
+**Why the queue was removed.** The previous design pushed a generated report
+through an at-least-once queue under `~/.bramble/deliveries/`. That queue could
+not be both safe for a human's half-typed line and reliable, and it chose
+reliability: undeliverable mail accumulated for days and replayed after
+restarts, so a stale report and a real failure became indistinguishable. One
+queue found in practice held 23 reports spanning 4.5 hours; another held ten
+status updates each announcing that it superseded the last. `NewNotifier` sweeps
+and *deletes* any such queue at startup rather than delivering it, because
+replaying that history would reproduce exactly the noise this design removes.
 
-**A failed write queues instead of failing.** Both write paths — the direct one
-for an idle recipient and the drain — hand a failure to the queue and arm a
-timed retry, because the recipient of a failed write is a session that was idle
-and stays idle: there is no later transition for the message to ride. Only a
-queue that cannot be written is reported as an error, and that is the one case
-where a subagent report releases its dedup reservation and tries again on the
-child's next transition.
+**`send-input --queue` is refused, not downgraded.** A caller that asked to wait
+for an idle recipient must not silently get a mid-turn interrupt instead. The
+unqueued path is unchanged and stays the right tool for a deliberate interrupt
+and for raw pane targets; it now leaves copy mode first, because a pane someone
+scrolled back in swallows the Enter that would submit the text.
 
-The unqueued `send-input` path is unchanged, and stays the right tool for a
-deliberate interrupt and for raw pane targets.
+**No state change reaches the notifier through a buffer.** `SubscribeStateChanges`
+takes a function called on the goroutine that made the transition, and
+`watchStateChanges` puts a growable queue behind it. A bounded channel would have
+to drop or block: drop loses exactly the fan-out case this feature is for (and a
+tight burst fills any buffer before the reader is scheduled once, so a bigger one
+is not the fix), and block would stall a status transition behind a pane capture.
 
-### 3. Automatic reporting
+### 3. Status is the report
 
-The same watcher reports a child's progress to its parent: a one-line headline
-plus a path to the child's full output — pointer, not payload, the same shape as
-the delegator reading a `research_file` instead of scraping a screen.
+There is no generated report and no composition step. What a parent reads is the
+child's *status* — accurate because the manager that owns a session is the one
+that records its transitions — plus whatever the lane wrote into the run
+directory.
 
-Because the report is generated from bramble's own view of the session, it
-arrives whatever backend ran and whether or not the agent inside cooperated.
-That is what makes Codex a first-class subagent: it has no system prompt, no MCP
-and no tool restrictions in this wrapper, so a reporting instruction in its
-prompt is a suggestion it may ignore.
+This is what makes Codex a first-class subagent: status comes from bramble's own
+view of the session, so it is right whatever backend ran and whether or not the
+agent inside cooperated. Codex has no system prompt, no MCP and no tool
+restrictions in this wrapper, so a reporting instruction in its prompt is a
+suggestion it may ignore — but its window dying, or its notify hook firing, is
+not.
 
-Reporting is deliberately quiet: at most once per (child, status). A completed
-or stopped that follows a report adds nothing and is suppressed; a failure is
-always reported, because it changes what the parent should do next. A child that
-messages its parent itself replaces the generated report.
-
-Reporting is **per turn, not per lifetime**: any message written to a session
-re-arms its idle report, so a conversation keeps flowing instead of going silent
-after the first exchange.
+A tmux-mode child has no result file: `writeResearchFile` runs in the TUI turn
+loop, which tmux sessions never enter. A tmux lane reports by writing the literal
+path its brief names, which is what `subagent-swarm` briefs every lane to do.
 
 ## Three bugs this surfaced
 
@@ -157,17 +156,16 @@ success either way. Worse, a pane someone scrolled back in sits in **tmux copy
 mode**, where the pager eats the Enter — the message lands in the composer and
 sits there, delivered by every measure bramble can see and never read.
 
-Two fixes: the courier reads the pane back after pasting and retries once before
-giving up (a failure leaves the delivery queued rather than dropping it), and
-`tmuxctl`'s pane writer leaves copy mode first. `send-keys -X cancel` exits
-non-zero on a pane that is *not* in a mode, so the mode is queried first —
-cancelling blindly would fail every delivery.
+The fix that survives is leaving copy mode first — `tmuxctl`'s pane writer does
+it, and so does `send_input`'s direct paste. `send-keys -X cancel` exits non-zero
+on a pane that is *not* in a mode, so the mode is queried first; cancelling
+blindly would fail every write.
 
-There is deliberately **no** read-back check that the Enter was taken. An agent
-CLI echoes the submitted prompt into its transcript directly above the composer,
-so a pane scrape cannot distinguish "still pending" from "just submitted". A
-false negative would re-queue a message the recipient already answered, which is
-worse than the case it guards.
+The read-back-and-retry half is gone with the queue. There is deliberately **no**
+check that a paste or its Enter was taken: an agent CLI echoes the submitted
+prompt into its transcript directly above the composer, so a pane scrape cannot
+distinguish "still pending" from "just submitted". For a droppable hint the
+question does not arise — a write that did not land is simply a hint not given.
 
 ### Cursor has no hook at all, so its idleness is read off the pane
 
@@ -183,7 +181,8 @@ providers with no hook only. Two things make that safe enough to act on:
 - **It keys on the composer line, not a window of trailing lines.** Cursor's
   footer grows a mode line in plan mode — which is what a codetalk subagent
   runs in — and a fixed trailing window then misses the working hint and reads a
-  running turn as *idle*, releasing queued mail into it. The hint lives on the
+  running turn as *idle*, which is what would put a line into it. The hint lives
+  on the
   composer line, so that line is found first and only it is examined.
 - **`Add a follow-up` is not an idle marker.** Cursor shows it the whole time.
   Only `ctrl+c to stop`, on that same line, means a turn is in flight. This is
@@ -200,10 +199,10 @@ session re-adopted after a restart gets — through
 `Manager.newPaneIdleTrackerForModel`, and
 `TestReadoptedCursorSubagentIsStillSeenToFinish` drives the second of those for
 real: it restarts bramble under tmux and asserts the re-adopted cursor session
-is still seen to finish a turn. A loop that skipped it would leave a
-cursor subagent that outlived a bramble restart running forever: nothing would
-drain its queued mail and its parent would never be told it finished, which is
-the whole failure this section exists to fix.
+is still seen to finish a turn. A loop that skipped it would leave a cursor
+subagent that outlived a bramble restart reporting *running* forever — and since
+status is what the orchestrator polls, its lane would never be seen to finish,
+which is the whole failure this section exists to fix.
 
 ## Known limitations
 
@@ -214,36 +213,27 @@ the whole failure this section exists to fix.
   loudly when it happens.
 - Gemini and Agy have neither a hook nor a probe, so subagents on those backends
   still report only when their window dies.
-- Fan-out durability was broken until the concurrency tests were written: each
-  enqueue snapshotted the queue under the lock and wrote it *outside* the lock,
-  so a goroutine that snapshotted first could write last and put back a queue
-  missing everything appended in between. Writes now happen under the lock. The
-  cost is a small file write inside the critical section, at the rate subagents
-  finish turns.
-- A subagent's output reaches its parent as ordinary prompt text. A parent
-  should treat it as data, not instructions — during testing a Claude parent
-  correctly flagged a captured cursor transcript as a possible prompt-injection
-  attempt.
-- Paste verification costs up to ~1.8s per delivery when a TUI is slow to
-  render, and passes vacuously if the pasted text is under a few characters.
-- A modal in the recipient's TUI (Codex's rate-limit prompt, for instance)
-  blocks delivery. This is correctly reported as an error rather than being
-  Enter-ed through — pressing Enter would select a menu item — but it needs a
-  human.
+- Only claude's composer can be read, so only claude's pane is protected from a
+  hint landing on a half-typed line. Cursor and codex render placeholder text
+  that vanishes the moment a user types, making a draft indistinguishable from a
+  CLI still booting. This is a documented gap rather than a solved case — but
+  the exposure is one disposable line, and nothing retries it.
+- A hint is dropped whenever the parent is not idle at that instant, which for a
+  busy parent can be most of the time. That is by design: the poll is the
+  delivery path, and the hint only shortens the wait.
 
 ## Files
 
 | Path | Role |
 |---|---|
-| `bramble/session/delivery.go` | courier: queue, persistence, mode-aware write, paste verification |
-| `bramble/session/subagent_report.go` | report composition and the quiet/re-arm rules |
+| `bramble/session/delivery.go` | notifier: the droppable pane hint and the legacy-queue sweep |
 | `bramble/session/manager.go` | `SpawnOpts`, `SetSessionRunning`, result file for any subagent |
 | `bramble/session/tmux_runner.go` | Codex notify hook |
 | `bramble/session/pane_idle.go` | pane-read idleness for hookless providers (cursor) |
 | `bramble/integration/` | end-to-end tests: a real bramble in tmux, stubbed and live backends |
 | `bramble/tmuxctl/panewriter.go` | `session.PaneWriter` adapter; exits copy mode |
-| `bramble/control/{proto,dispatcher}.go` | `Queue`/`From` on `SendInputReq` |
-| `bramble/ipc/protocol.go`, `bramble/main.go` | `--parent`, `--no-parent`, `--queue`, `--from` |
+| `bramble/control/{proto,dispatcher}.go` | `send_input`; `Queue` is refused |
+| `bramble/ipc/protocol.go`, `bramble/main.go` | `--parent`, `--no-parent`, `--from` |
 
 ## Tests
 
@@ -258,8 +248,8 @@ Two layers:
 
 - **Stubbed.** Scripted stand-ins for the agent CLIs, installed on PATH as
   `codex` and as `agent` (cursor's binary), exercise bramble's own logic
-  deterministically and with no credentials: lineage, the notify hook, queued
-  delivery, delivery into a pane left in copy mode, and a full two-round
+  deterministically and with no credentials: lineage, the notify hook, a refused
+  `--queue`, delivery into a pane left in copy mode, and a full two-round
   conversation. The cursor stand-in is faithful about one thing only — the
   composer footer, which is the entire idle signal for a backend with no hook.
   - `TestReadoptedCursorSubagentIsStillSeenToFinish` restarts bramble (by
@@ -271,18 +261,17 @@ Two layers:
   each, with a Claude parent. They run by default and skip only when a backend
   is missing or logged out, because every bug this feature shipped with was
   invisible without a real CLI in a real pane.
-  - `TestLiveSubagentTwoWay` — a two-round conversation, and the result file the
-    report points at is opened and checked for the subagent's answer. Asserting
-    only that a path appeared would pass on a report naming a file that a failed
-    pane capture never wrote.
-  - `TestLiveQueuedDeliveryWaitsForALiveTurn` — the deferred path, which every
-    other live assertion misses by delivering to an idle child. The subagent is
-    given a twenty-second shell command, and the test asserts the message is
-    held, that nothing is typed into the running turn, and — the point of it —
-    that the session is not mistaken for idle while it works. That last one is
-    the harmful direction for the cursor probe: a false idle would release the
-    queued message into the live turn. The unit tests pin it against a synthetic
-    pane; only this pins it against the real chrome.
+  - `TestLiveSubagentTwoWay` — a two-round conversation, asserting that each of
+    the child's turns is observable as a status transition. It deliberately does
+    *not* assert that a hint arrived: a hint is dropped whenever the parent is
+    not idle at that instant, so requiring one would be requiring the guarantee
+    this design removed.
+  - `TestLiveBusyChildIsNeverWrittenInto` — the harmful direction for the pane
+    probes. The subagent is given a twenty-second shell command, and the test
+    asserts nothing is typed into the running turn and that the session is not
+    mistaken for idle while it works. A false idle is what would put a line into
+    a live turn. The unit tests pin this against a synthetic pane; only this
+    pins it against the real chrome.
 
   `TestSubagentOnItsOwnWorktree*` cover `--create-worktree`: the isolation is
   asserted against git, not against the path bramble reports — the branch it is
@@ -290,17 +279,17 @@ Two layers:
   other. The return path is checked across that boundary too, since lineage
   travels by session ID rather than by tree.
 
-  `TestConcurrentSubagents*` cover a fan-out: several subagents working at once
-  and reporting to the same parent. That is the only place the queue takes
-  concurrent writes, and where a lost report is quiet rather than loud — the
-  parent simply waits forever for a subagent that already finished. The second
-  of the two holds the parent mid-turn so the reports genuinely pile up, and
-  reads the queue off disk while they do; otherwise the parent answers each one
-  as it lands and the queue never holds more than one thing.
+  `TestConcurrentSubagentsCoalesceIntoOneNudge` and
+  `TestABusyParentAccumulatesNothing` cover a fan-out: several subagents working
+  at once with the same parent. Coalescing is what this pins — many children
+  finishing must not put one line per child into the parent's pane — and the
+  second holds the parent mid-turn, where the correct outcome is that *nothing*
+  accumulates: with no queue there is nowhere for a hint to wait, so a busy
+  parent simply misses them and reads the run directory instead.
 
   A backend is occupied with `sleep` rather than a long answer because generated
   text is not a clock — a model told to count slowly may emit the whole list at
-  once, leaving no live turn to queue behind.
+  once, leaving no live turn to write against.
 
 The live cases answer the CLIs' first-run dialogs themselves — Claude's folder
 trust, codex's directory trust, its model-deprecation and rate-limit prompts —

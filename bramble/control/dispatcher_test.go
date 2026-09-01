@@ -15,6 +15,8 @@ import (
 // fakeRegistry is a hand fake of the Registry interface for dispatcher tests.
 type fakeRegistry struct {
 	targets map[string]string // sessionID -> tmux target
+	// running is the session state the two compare-and-sets act on.
+	running map[string]bool
 	// onResolve, when set, runs inside ResolveTmuxTarget. It lets a test park a
 	// request inside a live handler so Close's drain has something to wait on.
 	onResolve  func()
@@ -24,6 +26,8 @@ type fakeRegistry struct {
 	sessions   []session.SessionInfo
 	captured   []string
 	stopped    []string
+	setRunning []string
+	setIdle    []string
 }
 
 func (f *fakeRegistry) GetAllSessions() []session.SessionInfo { return f.sessions }
@@ -47,6 +51,32 @@ func (f *fakeRegistry) CapturePaneText(id session.SessionID, _ int) ([]string, e
 		return nil, f.captureErr
 	}
 	return f.captured, nil
+}
+
+// The status methods model the real compare-and-set, not just the call. A bare
+// append-list cannot tell a marking that took effect from one that no-opped on
+// an already-running session — which is precisely the case where an
+// unconditional rollback ends somebody else's turn, so a fake without the CAS
+// makes that bug untestable.
+func (f *fakeRegistry) SetSessionRunning(id session.SessionID) bool {
+	f.setRunning = append(f.setRunning, string(id))
+	if f.running[string(id)] {
+		return false
+	}
+	if f.running == nil {
+		f.running = map[string]bool{}
+	}
+	f.running[string(id)] = true
+	return true
+}
+
+func (f *fakeRegistry) SetSessionIdle(id session.SessionID) bool {
+	f.setIdle = append(f.setIdle, string(id))
+	if !f.running[string(id)] {
+		return false
+	}
+	f.running[string(id)] = false
+	return true
 }
 
 func (f *fakeRegistry) StopSession(id session.SessionID) error {
@@ -225,171 +255,205 @@ func TestUnsupportedTypeErrors(t *testing.T) {
 // compile-time: the real registry satisfies the narrow Registry interface.
 var _ Registry = (*session.SessionRegistry)(nil)
 
-// fakeCourier records queued sends so the dispatcher's queue branch can be
-// tested without a real delivery directory or live sessions.
-type fakeCourier struct { //nolint:govet // fieldalignment: readability over packing
-	sendErr   error
-	sends     []fakeSend
-	callCount int
-	queued    bool
-}
-
-type fakeSend struct {
-	from, to session.SessionID
-	text     string
-	submit   bool
-}
-
-func (c *fakeCourier) Send(_ context.Context, from, to session.SessionID, text string, submit bool) (bool, error) {
-	c.callCount++
-	if c.sendErr != nil {
-		return false, c.sendErr
-	}
-	c.sends = append(c.sends, fakeSend{from: from, to: to, text: text, submit: submit})
-	return c.queued, nil
-}
-
-// TestSendInputQueueGoesThroughCourier pins that --queue takes the delivery
-// path that can wait, rather than pasting into a possibly-running turn.
-func TestSendInputQueueGoesThroughCourier(t *testing.T) {
+// TestSendInputWithoutQueueTypesIntoThePane is the compatibility guard: the
+// deliberate-interrupt path is what send-input has always done for a caller who
+// wants the recipient to see the text now, and it is untouched.
+func TestSendInputWithoutQueueTypesIntoThePane(t *testing.T) {
 	t.Parallel()
 	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
 	d, ctl := newDispatcher(reg)
-	courier := &fakeCourier{queued: true}
-	d.SetCourier(courier)
-
-	resp := d.Handle(context.Background(), req(t, TypeSessionSendInput,
-		SendInputReq{SessionID: "s1", From: "s0", Text: "hello", Submit: true, Queue: true}))
-
-	var result SendInputResult
-	require.NoError(t, resp.DecodeResponse(&result))
-	assert.True(t, result.OK)
-	assert.True(t, result.Queued)
-
-	require.Len(t, courier.sends, 1)
-	assert.Equal(t, session.SessionID("s0"), courier.sends[0].from)
-	assert.Equal(t, session.SessionID("s1"), courier.sends[0].to)
-	assert.Equal(t, "hello", courier.sends[0].text)
-	assert.True(t, courier.sends[0].submit)
-
-	assert.Empty(t, ctl.CallsFor("Paste"), "a queued message must not be typed into the pane")
-	assert.Empty(t, ctl.CallsFor("SendSpecial"))
-}
-
-// TestSendInputQueueReportsImmediateWrite covers the courier deciding the
-// recipient was already idle: the caller is told it was not queued.
-func TestSendInputQueueReportsImmediateWrite(t *testing.T) {
-	t.Parallel()
-	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
-	d, _ := newDispatcher(reg)
-	d.SetCourier(&fakeCourier{queued: false})
-
-	resp := d.Handle(context.Background(), req(t, TypeSessionSendInput,
-		SendInputReq{SessionID: "s1", Text: "hello", Submit: true, Queue: true}))
-
-	var result SendInputResult
-	require.NoError(t, resp.DecodeResponse(&result))
-	assert.True(t, result.OK)
-	assert.False(t, result.Queued)
-}
-
-// TestSendInputWithoutQueueBypassesCourier is the compatibility guard: the
-// default path must stay exactly the direct paste it has always been.
-func TestSendInputWithoutQueueBypassesCourier(t *testing.T) {
-	t.Parallel()
-	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
-	d, ctl := newDispatcher(reg)
-	courier := &fakeCourier{}
-	d.SetCourier(courier)
 
 	resp := d.Handle(context.Background(), req(t, TypeSessionSendInput,
 		SendInputReq{SessionID: "s1", Text: "hello", Submit: true}))
 
-	var result OKResult
+	var result SendInputResult
 	require.NoError(t, resp.DecodeResponse(&result))
 	assert.True(t, result.OK)
-	assert.Zero(t, courier.callCount, "the unqueued path must not involve the courier")
-	pastes := ctl.CallsFor("Paste")
-	require.Len(t, pastes, 1)
-	assert.Equal(t, "@7", pastes[0].Target)
-	assert.Equal(t, "hello", pastes[0].Text)
+	assert.Len(t, ctl.CallsFor("Paste"), 1)
+	assert.Len(t, ctl.CallsFor("SendSpecial"), 1, "Submit presses Enter")
 }
 
-// TestSendInputQueueRequiresSessionID: a raw pane target has no status, so
-// there is nothing to wait for. Better to refuse than to paste anyway.
-func TestSendInputQueueRequiresSessionID(t *testing.T) {
-	t.Parallel()
-	d, ctl := newDispatcher(&fakeRegistry{})
-	d.SetCourier(&fakeCourier{})
-
-	resp := d.Handle(context.Background(), req(t, TypePaneSendInput,
-		SendInputReq{Target: "%9", Text: "hello", Queue: true}))
-
-	err := resp.DecodeResponse(nil)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "session_id")
-	assert.Empty(t, ctl.CallsFor("Paste"))
-}
-
-// TestSendInputQueueWithoutCourierErrors keeps a bramble whose courier failed
-// to start from silently downgrading to an interrupting write.
-func TestSendInputQueueWithoutCourierErrors(t *testing.T) {
-	t.Parallel()
-	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
-	d, ctl := newDispatcher(reg) // no SetCourier
-
-	resp := d.Handle(context.Background(), req(t, TypeSessionSendInput,
-		SendInputReq{SessionID: "s1", Text: "hello", Queue: true}))
-
-	err := resp.DecodeResponse(nil)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not available")
-	assert.Empty(t, ctl.CallsFor("Paste"), "refusing must not fall back to interrupting the recipient")
-}
-
-// TestSendInputQueueSurfacesCourierError makes a rejected recipient (already
-// completed, say) reach the caller instead of vanishing.
-func TestSendInputQueueSurfacesCourierError(t *testing.T) {
-	t.Parallel()
-	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
-	d, _ := newDispatcher(reg)
-	d.SetCourier(&fakeCourier{sendErr: fmt.Errorf("session s1 is completed and cannot receive messages")})
-
-	resp := d.Handle(context.Background(), req(t, TypeSessionSendInput,
-		// Submit is set because Queue requires it; this test is about the
-		// courier's error reaching the caller, not the flag combination.
-		SendInputReq{SessionID: "s1", Text: "hello", Submit: true, Queue: true}))
-
-	err := resp.DecodeResponse(nil)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "cannot receive messages")
-}
-
-// TestSendInputQueueRequiresSubmit: a queued delivery must be submitted, and
-// asking otherwise is refused rather than silently ignored.
+// TestSendInputQueueIsRefused pins the removal of queued delivery.
 //
-// Submit is a documented wire field, so quietly overriding it would tell a
-// caller OK and then do something else. And staging text into a composer
-// without Enter delivers nothing: it sits there looking like a human draft,
-// holding every later delivery to that session behind it for the full grace
-// period before being pasted on top.
-//
-// Enforced here rather than only in the CLI because every producer reaches the
-// courier through this dispatcher; the hub forwards SendInputReq from remote
-// agents, which never pass through cobra's flags.
-func TestSendInputQueueRequiresSubmit(t *testing.T) {
+// It is refused rather than downgraded to an immediate paste on purpose: a
+// caller that asked to wait for an idle recipient must not silently get a
+// mid-turn interrupt instead. Queued delivery held a message until the pane
+// looked ready, which meant guessing readiness from screen chrome and keeping
+// undeliverable mail on disk; both halves misfired, so completion is now read
+// from the run directory rather than pushed.
+func TestSendInputQueueIsRefused(t *testing.T) {
 	t.Parallel()
 	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
-	d, _ := newDispatcher(reg)
-	courier := &fakeCourier{queued: true}
-	d.SetCourier(courier)
+	d, ctl := newDispatcher(reg)
 
 	resp := d.Handle(context.Background(), req(t, TypeSessionSendInput,
-		SendInputReq{SessionID: "s1", From: "s0", Text: "hello", Submit: false, Queue: true}))
+		SendInputReq{SessionID: "s1", From: "s0", Text: "hello", Submit: true, Queue: true}))
+
+	err := resp.DecodeResponse(nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "removed")
+	assert.Empty(t, ctl.CallsFor("Paste"),
+		"refusing must not fall back to interrupting the recipient")
+	assert.Empty(t, ctl.CallsFor("SendSpecial"))
+}
+
+// TestSendInputLeavesCopyModeFirst pins a silent tmux failure. A pane someone
+// scrolled back in swallows the Enter that would submit the text, so the message
+// lands in the composer and sits there — reported OK by every measure the caller
+// can see, and never read by the agent.
+//
+// This was previously covered only through the queued path, whose pane writer
+// exits copy mode on its own. With --queue gone, the direct write is the only
+// path left and has to do it itself.
+func TestSendInputLeavesCopyModeFirst(t *testing.T) {
+	t.Parallel()
+	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+	d, ctl := newDispatcher(reg)
+
+	resp := d.Handle(context.Background(), req(t, TypeSessionSendInput,
+		SendInputReq{SessionID: "s1", Text: "hello", Submit: true}))
 
 	var result SendInputResult
-	err := resp.DecodeResponse(&result)
-	require.Error(t, err, "the combination must be refused, not quietly submitted")
-	assert.Contains(t, err.Error(), "submit")
-	assert.Empty(t, courier.sends, "nothing may be queued for a request that cannot be honoured")
+	require.NoError(t, resp.DecodeResponse(&result))
+	require.Len(t, ctl.CallsFor("ExitCopyMode"), 1, "the pane must be taken out of copy mode")
+	require.Len(t, ctl.CallsFor("Paste"), 1)
+}
+
+// TestSubmittedSendMarksTheSessionRunning pins the status half of a write.
+//
+// A tmux session's status only ever moves one way from outside: the agent's
+// hook reports idle, and nothing reports the opposite. Whoever typed the prompt
+// is the only party that knows a turn started. This used to be the courier's
+// job on the --queue path; with --queue refused, the direct write is the only
+// write left, so it has to do it.
+//
+// Leaving it unset is not cosmetic. list-sessions is the delivery path this
+// transport now relies on, so an idle-looking session is read as a finished
+// lane; and the turn's real completion notify is then dropped by the
+// StatusRunning guard in SetSessionIdle, so the next turn produces no state
+// change either and the conversation goes quiet after one exchange.
+func TestSubmittedSendMarksTheSessionRunning(t *testing.T) {
+	t.Parallel()
+	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+	d, _ := newDispatcher(reg)
+
+	resp := d.Handle(context.Background(), req(t, TypeSessionSendInput,
+		SendInputReq{SessionID: "s1", Text: "hello", Submit: true}))
+
+	var result SendInputResult
+	require.NoError(t, resp.DecodeResponse(&result))
+	require.Equal(t, []string{"s1"}, reg.setRunning,
+		"a submitted prompt started a turn and nothing else reports that")
+}
+
+// Staged text is not a turn: without Enter the agent never sees it, so moving
+// the session to running would make an idle session look busy forever.
+func TestUnsubmittedSendDoesNotMarkRunning(t *testing.T) {
+	t.Parallel()
+	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+	d, _ := newDispatcher(reg)
+
+	d.Handle(context.Background(), req(t, TypeSessionSendInput,
+		SendInputReq{SessionID: "s1", Text: "hello", Submit: false}))
+
+	require.Empty(t, reg.setRunning, "no Enter, no turn")
+}
+
+// A raw --target names a pane, not a session, so there is no status to move.
+func TestRawPaneSendMarksNothingRunning(t *testing.T) {
+	t.Parallel()
+	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+	d, _ := newDispatcher(reg)
+
+	d.Handle(context.Background(), req(t, TypePaneSendInput,
+		SendInputReq{Target: "@9", Text: "hello", Submit: true}))
+
+	require.Empty(t, reg.setRunning, "a raw pane target has no session status")
+}
+
+// send-key is the other half of the documented two-step: stage text with an
+// unsubmitted send, then press Enter. That Enter is what starts the turn, so it
+// carries the same obligation as a submitted send — the defect this mirrors was
+// found only because send_input was fixed and its sibling was not.
+func TestSendKeyEnterMarksTheSessionRunning(t *testing.T) {
+	t.Parallel()
+	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+	d, _ := newDispatcher(reg)
+
+	d.Handle(context.Background(), req(t, TypeSessionSendKey,
+		SendKeyReq{SessionID: "s1", Key: tmuxctl.KeyEnter}))
+
+	require.Equal(t, []string{"s1"}, reg.setRunning,
+		"Enter submits the composer, which starts a turn")
+}
+
+// Only Enter. Interrupting or dismissing does not start a turn, and marking one
+// would leave an idle session looking busy with nothing to end it.
+func TestNonSubmittingKeysMarkNothingRunning(t *testing.T) {
+	t.Parallel()
+	for _, key := range []tmuxctl.SpecialKey{tmuxctl.KeyEscape, tmuxctl.KeyCtrlC} {
+		t.Run(string(key), func(t *testing.T) {
+			t.Parallel()
+			reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+			d, _ := newDispatcher(reg)
+
+			d.Handle(context.Background(), req(t, TypeSessionSendKey,
+				SendKeyReq{SessionID: "s1", Key: key}))
+
+			require.Empty(t, reg.setRunning, "%s does not start a turn", key)
+		})
+	}
+}
+
+// A submit that failed started no turn, so the marking must be rolled back or
+// the session reads busy forever with nothing alive to end it.
+func TestAFailedSubmitRollsTheTurnBack(t *testing.T) {
+	t.Parallel()
+	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+	d, ctl := newDispatcher(reg)
+	ctl.SendSpecialErr = fmt.Errorf("send-keys failed")
+
+	d.Handle(context.Background(), req(t, TypeSessionSendInput,
+		SendInputReq{SessionID: "s1", Text: "hello", Submit: true}))
+
+	require.Equal(t, []string{"s1"}, reg.setRunning, "marked before the Enter")
+	require.Equal(t, []string{"s1"}, reg.setIdle, "and put back when the Enter failed")
+}
+
+// TestAFailedSubmitLeavesAnAlreadyRunningSessionAlone is the ownership half of
+// the rollback rule.
+//
+// Interrupting a mid-turn session is what this endpoint is documented for, so
+// writing into an already-running lane is the ordinary case, not a race. There
+// SetSessionRunning is a no-op — the lane was already running — so an
+// unconditional undo would end a turn this write never started. That is the
+// harmful direction: list-sessions would report a working lane as finished, the
+// false Running→Idle would pass hintWorthyStatus and hint the parent, and the
+// lane's real completion notify would then be dropped.
+func TestAFailedSubmitLeavesAnAlreadyRunningSessionAlone(t *testing.T) {
+	t.Parallel()
+	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+	reg.SetSessionRunning("s1") // somebody else's turn is already in flight
+	reg.setRunning = nil
+	d, ctl := newDispatcher(reg)
+	ctl.SendSpecialErr = fmt.Errorf("send-keys failed")
+
+	d.Handle(context.Background(), req(t, TypeSessionSendInput,
+		SendInputReq{SessionID: "s1", Text: "hello", Submit: true}))
+
+	require.Empty(t, reg.setIdle,
+		"a write that did not start the turn must not end it")
+	require.True(t, reg.running["s1"], "the lane is still working")
+}
+
+// A raw --target names a pane, which has no session status to move.
+func TestRawPaneEnterMarksNothingRunning(t *testing.T) {
+	t.Parallel()
+	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+	d, _ := newDispatcher(reg)
+
+	d.Handle(context.Background(), req(t, TypePaneSendKey,
+		SendKeyReq{Target: "@9", Key: tmuxctl.KeyEnter}))
+
+	require.Empty(t, reg.setRunning, "a raw pane target has no session status")
 }

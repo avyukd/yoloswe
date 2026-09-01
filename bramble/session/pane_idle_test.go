@@ -2,7 +2,6 @@ package session
 
 import (
 	"testing"
-	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -89,7 +88,7 @@ func TestEveryTmuxProviderHasAProbe(t *testing.T) {
 }
 
 // TestTrackerNeedsConsecutiveObservations stops one half-painted frame from
-// releasing queued mail.
+// reporting a working lane as finished.
 func TestTrackerNeedsConsecutiveObservations(t *testing.T) {
 	t.Parallel()
 
@@ -382,13 +381,6 @@ func claudePaneComposer(composer, state string, transcript ...string) []string {
 	)
 }
 
-// composerDraft is a test-only view of composerDraftText; production keeps the
-// unreadable-composer hold and bounded-tail fallback in one place.
-func composerDraft(provider string, lines []string) (draft, known bool) {
-	_, draft, known = composerDraftText(provider, lines)
-	return draft, known
-}
-
 // TestClaudeJudgeSeesAWrappedComposer pins capture depth to the composer walk:
 // wrapped deliveries push the upper rule away, and too shallow a capture makes
 // the judge return known=false forever.
@@ -419,7 +411,7 @@ func TestClaudeJudgeSeesAWrappedComposer(t *testing.T) {
 
 // TestClaudePaneJudge covers each visible shape. Markerless frames must stay
 // unknown because live monitoring usually misses claude's sub-second spinner.
-// Reading unknown as idle would release queued mail into a running turn.
+// Reading unknown as idle would report a running turn as finished.
 func TestClaudePaneJudge(t *testing.T) {
 	t.Parallel()
 
@@ -511,7 +503,7 @@ func TestClaudeWorkingFrameIsNeverIdle(t *testing.T) {
 // TestWorkingClaudePaneIsNeverReadAsIdle pins the repo fixture where
 // ParseClaudeStatusBar reads a working pane as idle because the composer is
 // always on screen. The pane-idle judge must not repeat that failure.
-// Repeating it would report the turn finished and drain queued mail into it.
+// Repeating it would report the turn finished while it is still running.
 func TestWorkingClaudePaneIsNeverReadAsIdle(t *testing.T) {
 	t.Parallel()
 
@@ -694,15 +686,14 @@ func TestOversizedComposerIsHeldNotDelivered(t *testing.T) {
 }
 
 // TestComposerLayerDoesNotJudgeOwnership: whether staged text belongs to
-// bramble is not decidable from the pane. The "[bramble]" prefix is
-// user-controllable, so this layer reports any non-empty composer as a draft
-// and leaves ownership to the courier, which knows what it queued.
-// See TestBrambleOwnStagedDeliveryIsOverwritten.
+// bramble is not decidable from the pane. Text that looks like bramble's own
+// output is user-controllable, so this layer reports any non-empty composer as
+// a draft — and the notifier yields on that, which is the safe direction.
 func TestComposerLayerDoesNotJudgeOwnership(t *testing.T) {
 	t.Parallel()
 
 	for _, body := range []string{
-		subagentReportPrefix + " subagent forge-planner-0da3be25 (planner, opus) is idle",
+		"[bramble] subagent forge-planner-0da3be25 (planner, opus) is idle",
 		"file the dev deprovisioning bug",
 	} {
 		draft, known := composerDraft(ProviderClaude, claudePaneComposer("❯ "+body, "✻ Worked for 12s"))
@@ -742,8 +733,8 @@ func TestLocatedButUnreadableComposerHolds(t *testing.T) {
 // boundary: a previous completion can sit just above this turn's echoed prompt,
 // but nothing above that prompt speaks for the turn now running.
 //
-// Reading the old completion as current would mark a live turn idle, release the
-// next queued delivery into it, and report completion to the parent.
+// Reading the old completion as current would mark a live turn idle and let a
+// hint be typed into it.
 // forTurn resets the streak at the submitted-prompt boundary, where the spinner
 // is often absent from individual frames.
 func TestStaleCompletionLineIsNotThisTurnsVerdict(t *testing.T) {
@@ -751,8 +742,8 @@ func TestStaleCompletionLineIsNotThisTurnsVerdict(t *testing.T) {
 
 	justSubmitted := []string{
 		"  Worktree is ready for your next task.",
-		"✻ Worked for 36m 36s",                                    // the PREVIOUS turn's completion
-		"❯ " + subagentReportPrefix + " subagent child-1 is idle", // THIS turn's prompt
+		"✻ Worked for 36m 36s",                 // the PREVIOUS turn's completion
+		"❯ [bramble] subagent child-1 is idle", // THIS turn's prompt
 		"────────────────────────────────────────────",
 		"❯ ",
 		"────────────────────────────────────────────",
@@ -769,12 +760,12 @@ func TestStaleCompletionLineIsNotThisTurnsVerdict(t *testing.T) {
 	tr := &paneIdleTracker{provider: ProviderClaude}
 	for i := 0; i < 3*tr.confirmationsNeeded(); i++ {
 		require.False(t, tr.observe(justSubmitted),
-			"frame %d released queued mail into a live turn", i+1)
+			"frame %d reported a live turn as finished", i+1)
 	}
 
 	// Once the turn ends, its own completion sits below the prompt.
 	finished := []string{
-		"❯ " + subagentReportPrefix + " subagent child-1 is idle",
+		"❯ [bramble] subagent child-1 is idle",
 		"● Read(delivery.go)",
 		"✻ Worked for 12s",
 		"────────────────────────────────────────────",
@@ -786,164 +777,6 @@ func TestStaleCompletionLineIsNotThisTurnsVerdict(t *testing.T) {
 	working, known = claudePaneJudge(finished)
 	require.True(t, known, "a completed turn below its own prompt is readable")
 	assert.False(t, working, "and reads as idle")
-}
-
-// TestClaudeAcceptsAPasteChip pins collapsed paste confirmation for Claude.
-// Accepting a chip cannot produce a harmful false positive: a chip in the pane
-// means the paste reached the composer.
-// Claude is required:true, so a paste it cannot confirm is re-pasted and
-// re-queued; this case prevents that loop for large pasted reports.
-func TestClaudeAcceptsAPasteChip(t *testing.T) {
-	t.Parallel()
-
-	require.True(t, pasteVerifyRequired(ProviderClaude), "precondition")
-
-	confirmed := func(composer, text string) bool {
-		return pasteConfirmed(ProviderClaude,
-			claudePaneComposer(composer, "✻ Worked for 12s"),
-			pasteFirstLine(text), pasteProbe(text))
-	}
-
-	// Real chrome is needed so the composer can be located.
-	assert.True(t, confirmed("❯ [Pasted text #1 +42 lines]", "a report from a subagent"),
-		"a collapsed paste is still a paste that arrived")
-
-	// An empty composer is not confirmation.
-	assert.False(t, confirmed("❯ ", "a report from a subagent"))
-
-	// Transcript echoes must not confirm a dropped paste into an empty composer.
-	assert.False(t, pasteConfirmed(ProviderClaude,
-		claudePaneComposer("❯ ", "❯ a report from a subagent", "● I read it."),
-		pasteFirstLine("a report from a subagent"), pasteProbe("a report from a subagent")),
-		"transcript history must not confirm a paste that never arrived")
-
-	// Narrow panes show only the HEAD of a paste that did arrive, because the
-	// composer renders from the start of the text and tmux truncates the row at
-	// the pane width. The text below is heterogeneous on purpose: with a
-	// repeated character head and tail are indistinguishable, so the assertion
-	// passes whichever end the matcher anchors at and pins nothing.
-	long := "report from subagent alpha about session 7f3a91c2 finishing"
-	require.Greater(t, len([]rune(long)), pasteProbeLen, "precondition: long enough to be truncated")
-	require.NotEqual(t, pasteFirstLine(long)[:8], pasteProbe(long)[:8],
-		"precondition: head and tail must differ, or this test cannot tell them apart")
-	assert.True(t, confirmed("❯ "+long[:30], long),
-		"a composer showing the head of the paste confirms it; the pane is simply narrow")
-
-	// Truncation is evidence only when it is a prefix of this paste.
-	assert.False(t, confirmed("❯ zzzz", long),
-		"an unrelated short line is not a truncation of our paste")
-
-	// The tail is precisely what a claude composer does NOT show first. Before
-	// this was head-anchored, only the tail matched, so every delivery wider
-	// than the pane read as dropped and was pasted a second time.
-	assert.False(t, confirmed("❯ "+pasteProbe(long), long),
-		"a row holding only the tail is not the head of our first line")
-
-	// The probe must cut on a rune boundary. This string is chosen so that the
-	// last pasteProbeLen BYTES begin inside the 2-byte "é": a byte slice yields
-	// "\xa9日🎉🎉🎉🎉🎉", invalid UTF-8 that matches nothing any pane can render,
-	// so a paste that did land reads as dropped. For claude, required:true, that
-	// false negative pastes a second copy and re-queues.
-	multibyte := "xxxxxxxxxxaé日🎉🎉🎉🎉🎉"
-	require.False(t, utf8.ValidString(multibyte[len(multibyte)-pasteProbeLen:]),
-		"precondition: a byte slice of this string must split a rune, or the case proves nothing")
-	require.True(t, utf8.ValidString(pasteProbe(multibyte)),
-		"the probe must never be cut mid-rune")
-
-	// The draft race, pinned here because head anchoring is what closes it.
-	// The composer is read once BEFORE the paste, but verification then costs up
-	// to pasteVerifyAttempts*pasteVerifyInterval, and a user typing inside that
-	// window has their draft appended to by tmux. Confirming such a composer
-	// would press Enter on the human's half-written sentence wearing our text.
-	// A tail probe matched it (our text is present, at the end); the one-way
-	// head rule does not, because the visible body starts with the draft.
-	assert.False(t, confirmed("❯ file the dev bug "+long, long),
-		"a composer whose body starts with a user's draft is not our paste, however much of our text trails it")
-
-	// The chip counterpart to the assertion above, and the reason the chip arm
-	// may not short-circuit. Claude collapses our paste to a chip, so the
-	// echoed-text rule above never runs for it; a person typing inside the same
-	// verification window leaves the chip with their words beside it. Accepting
-	// that as confirmation reports landed, which means composerHoldsForeignText
-	// is never consulted and Enter goes onto their half-typed line.
-	//
-	// A chip that IS the whole body stays confirmation — that is the collapsed
-	// paste this test opens by pinning.
-	assert.False(t, confirmed("❯ [Pasted text #1 +42 lines] file the dev bug", long),
-		"a chip with someone's typing beside it is a human composer, not proof our paste is alone there")
-	assert.False(t, confirmed("❯ file the dev bug [Pasted text #1 +42 lines]", long),
-		"nor when their text comes first")
-	assert.True(t, confirmed("❯ [Pasted text #1 +42 lines]  ", long),
-		"trailing whitespace does not make a whole-body chip partial")
-}
-
-// TestCodexTranscriptDoesNotConfirmAPaste pins required:true fallback safety:
-// transcript history near the composer cannot confirm the paste now being sent.
-//
-// pasteProbe must distinguish ordinary subagent reports because otherwise report
-// #1's echoed first line can confirm report #2's dropped paste.
-// Codex is required:true and never composer-readable, so confirming from
-// transcript history would press Enter on an empty composer and wedge a turn that
-// never started.
-func TestCodexTranscriptDoesNotConfirmAPaste(t *testing.T) {
-	t.Parallel()
-
-	require.True(t, pasteVerifyRequired(ProviderCodex), "precondition: codex's verdict gates Enter")
-	require.False(t, composerReadable(ProviderCodex), "precondition: codex always takes the fallback")
-
-	report := "[bramble] subagent wt-builder-a1b2c3d4 (builder) is completed"
-	probe := pasteProbe(report)
-
-	// The echoed report sits close enough that only probe uniqueness can save it.
-	other := "[bramble] subagent wt-builder-b2b2b2b2 (builder) is completed"
-	shortReply := codexPane(false, "  › "+other, "  • Noted, waiting on the others.")
-	assert.False(t, pasteConfirmed(ProviderCodex, shortReply, pasteFirstLine(report), probe),
-		"a DIFFERENT delivery echoed two rows up must not confirm this one, which may have been dropped")
-
-	// The same echo deeper in history is still not confirmation.
-	deep := []string{"  › " + other, "  • I read the report and acted on it."}
-	for len(deep) < pasteVerifyLines {
-		deep = append(deep, "  • still working through it")
-	}
-	assert.False(t, pasteConfirmed(ProviderCodex, codexPane(false, deep...), pasteFirstLine(report), probe),
-		"and neither does the same echo far above the composer")
-
-	// Wrapped deliveries still confirm; their first line moves upward with the
-	// composer height.
-	wrapped := []string{"  › " + report}
-	for i := 0; i < 12; i++ {
-		wrapped = append(wrapped, "    continuation of the wrapped delivery")
-	}
-	assert.True(t, pasteConfirmed(ProviderCodex, codexPane(false, wrapped...), pasteFirstLine(report), probe),
-		"a wrapped delivery's first line is still the composer, however far up it sits")
-
-	// Ordinary bottom-of-pane paste.
-	assert.True(t, pasteConfirmed(ProviderCodex,
-		codexPane(false, "  • an earlier turn", "  › "+report), pasteFirstLine(report), probe),
-		"a paste sitting at the bottom of the pane is what the check is for")
-}
-
-// TestCodexPaneVerdictIsBoundedByWhatBrambleCanSee records the known gap: when
-// a composer cannot be isolated, one capture cannot distinguish this paste from
-// an identical earlier echo at any scan depth.
-//
-// Closing that requires before/after pane evidence, not a deeper predicate.
-// That means paying a second CapturePaneText per delivery or accepting the gap.
-func TestCodexPaneVerdictIsBoundedByWhatBrambleCanSee(t *testing.T) {
-	t.Parallel()
-
-	require.False(t, composerReadable(ProviderCodex),
-		"the whole gap follows from this: no composer boundary, so no way to attribute pane text to our paste")
-
-	// Two deliveries whose first lines agree over the probe window.
-	same := "[bramble] subagent wt-builder-9a9a9a9a (builder) is completed"
-	pane := codexPane(false, "  › "+same, "  • Noted.")
-	assert.True(t, pasteConfirmed(ProviderCodex, pane, pasteFirstLine(same), pasteProbe(same)),
-		"KNOWN GAP: an echo of a delivery with the same probe confirms a paste that may have been dropped")
-
-	// Reading less would also miss ordinary wrapped composers.
-	assert.Less(t, 2, pasteConfirmTailLines,
-		"a depth that excluded this echo would also exclude an ordinary wrapped composer")
 }
 
 // TestTallComposerIsHeldNotDelivered pins the draft half of an over-tall
@@ -968,91 +801,6 @@ func TestTallComposerIsHeldNotDelivered(t *testing.T) {
 	assert.True(t, draft, "a composer taller than six lines is still a draft")
 }
 
-// TestObscuredPasteEvidenceIsNotANegative pins the distinction that ends the
-// re-paste loop. For claude there are exactly three rows, and only the first is
-// a real negative:
-//
-//	composer located, no text  -> readable: a genuine dropped paste, re-paste once
-//	chrome on screen, composer unfound -> obscured: silence
-//	no chrome at all           -> obscured: silence
-//
-// Rows two and three are the same answer for the same reason — the composer was
-// never read, so the pane cannot say the text is absent from it. Row three was
-// once treated as a negative because readability keyed off a status separator
-// being on screen; that made an alt-screen pager or a restarted CLI look like
-// proof of a dropped paste, and the courier re-pasted on silence, appending a
-// second copy of the message every retry and submitting none of them.
-func TestObscuredPasteEvidenceIsNotANegative(t *testing.T) {
-	t.Parallel()
-
-	// Chrome on screen, composer region unbounded above: obscured.
-	obscured := []string{
-		"a composer line with no rule above it",
-		"────────────────────────────────────────────",
-		"  ~/wt/branch  main  Opus 4.6  ctx:43%  tokens:20k",
-	}
-	assert.True(t, pasteEvidenceObscured(ProviderClaude, obscured),
-		"chrome present but composer unfound is silence, not a negative")
-
-	// Nothing painted at all, and a pane holding something else entirely: the
-	// composer was not read, so neither can report the paste as dropped.
-	assert.True(t, pasteEvidenceObscured(ProviderClaude, nil),
-		"an unpainted pane shows no composer, so it cannot say the paste was dropped")
-	assert.True(t, pasteEvidenceObscured(ProviderClaude, []string{"nothing here"}),
-		"a pane with no claude chrome is the most obscured case, not the least")
-
-	// A locatable composer is readable, so its verdict is real either way.
-	assert.False(t, pasteEvidenceObscured(ProviderClaude, claudePaneComposer("❯ ", "✻ Worked for 12s")),
-		"a located composer yields a real verdict")
-
-	// Providers whose composer bramble does not read never reach this path.
-	assert.False(t, pasteEvidenceObscured(ProviderCursor, nil), "cursor's evidence is never obscured")
-}
-
-// TestCodexPaneWithoutItsPromptIsSilence is the same rule for a provider whose
-// composer bramble cannot read at all. Codex confirmation scans the pane tail,
-// so the question its readability turns on is whether that tail was a codex
-// prompt in the first place.
-//
-// Without this, every codex pane was declared readable, so any unconfirmed
-// paste — including one into a pager or a CLI that had exited — was a hard
-// negative that re-pasted and re-queued every retryDelay forever.
-func TestCodexPaneWithoutItsPromptIsSilence(t *testing.T) {
-	t.Parallel()
-
-	assert.True(t, pasteEvidenceObscured(ProviderCodex, []string{"$ ", "(END)"}),
-		"a pane with no codex prompt was never showing a composer, so its silence proves nothing")
-	assert.True(t, pasteEvidenceObscured(ProviderCodex, nil),
-		"an unpainted codex pane is silence for the same reason")
-	assert.False(t, pasteEvidenceObscured(ProviderCodex, []string{"› Ask Codex to do anything"}),
-		"codex's prompt on screen makes an absent paste a real negative — the swallowed-paste shape that must still cost one re-paste")
-}
-
-// TestEveryVerifiedProviderCanBeRead enforces the coupling between two maps
-// that are otherwise independent: pasteEvidenceProbes decides whose paste must
-// be verified, and paneIdleProbes supplies the chrome that verification reads.
-//
-// A provider whose verdict is required but whose composer bramble cannot read
-// has exactly one way left to tell "the composer is empty" from "no composer is
-// on screen": its prompt markers. Without them pasteEvidenceObscured falls back
-// to reporting silence for every pane, which is safe but blind — every paste
-// into that provider becomes unverifiable. Today codex is the only provider in
-// this class and it carries markers; this test is what makes that a rule rather
-// than a coincidence.
-func TestEveryVerifiedProviderCanBeRead(t *testing.T) {
-	t.Parallel()
-
-	for provider, evidence := range pasteEvidenceProbes {
-		if !evidence.required || composerReadable(provider) {
-			continue
-		}
-		assert.NotEmpty(t, paneIdleProbes[provider].promptMarkers,
-			"provider %q needs its paste verified and has no readable composer, "+
-				"so it must supply promptMarkers or its pane can never testify "+
-				"that a paste was dropped", provider)
-	}
-}
-
 // TestComposerBoundFollowsTheCapture: the walk's bound must be sized against
 // the capture it runs over, not against a guess at composer height. At 6 it
 // manufactured the unfound case for ordinary panes.
@@ -1060,6 +808,6 @@ func TestComposerBoundFollowsTheCapture(t *testing.T) {
 	t.Parallel()
 	assert.Greater(t, claudeComposerMaxLines, paneIdleTailLines,
 		"the walk must reach further than the tail scan it replaced")
-	assert.Less(t, claudeComposerMaxLines, pasteVerifyLines,
+	assert.Less(t, claudeComposerMaxLines, paneCaptureLines,
 		"but never past the capture, or it walks into transcript")
 }

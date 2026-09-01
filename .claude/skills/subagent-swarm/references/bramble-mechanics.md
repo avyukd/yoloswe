@@ -71,7 +71,9 @@ and then submit the composer before treating the lane as live.
 
 ## Track and communicate
 
-`<lane>.<phase>.done` and idle notifications are claims. Before transitioning:
+`<lane>.<phase>.done` files are claims, and a pane hint is only a nudge that
+something happened — it names no lane and may never arrive. The run directory and
+git are the record. Before transitioning:
 
 ~~~bash
 git -C "$WORKTREE" log --oneline "$PHASE_START_SHA..HEAD"
@@ -90,7 +92,8 @@ Run `snapshot_at_risk.sh "$RUN"` every tick. It backs up lanes with uncommitted 
 `refs/backup/<lane>` without changing their index or HEAD. Never use an empty branch or
 an idle report as evidence that no backup is needed.
 
-Use the run directory for reports. Queue live-session nudges, then inspect the pane:
+Use the run directory for reports. Send a live-session nudge only to an idle
+session — `--queue` is refused — then inspect the pane:
 Codex can fire idle mid-turn and Cursor can leave pasted instructions unsubmitted.
 `poll_panes.sh "$RUN"` detects questions, trust prompts, and stacked pastes. Do not resend
 while an earlier paste is still visible. Confirm a nudge started work via the pane timer or
@@ -133,7 +136,6 @@ cat "$RUN/OBJECTIVE.md"
 python3 "$SW/ledger.py" show "$RUN"
 ls "$RUN"/*.done 2>/dev/null
 bramble list-sessions --parent "$SELF"
-cat ~/.bramble/deliveries/"$SELF".json 2>/dev/null
 ~~~
 
 A running ledger lane with no live session either finished without reporting or died.

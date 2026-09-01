@@ -18,7 +18,7 @@ import (
 // screen, so a single line written to stderr lands in the middle of a painted
 // frame and corrupts it until the next full repaint. Diagnostics logged while a
 // session is running are exactly the lines most likely to appear, and the
-// delivery courier can emit one every retryDelay for as long as a recipient
+// delivery path could emit one every retry for as long as a recipient
 // refuses its mail.
 //
 // klogfmt.InitToFile calls slog.SetDefault, which also redirects the standard

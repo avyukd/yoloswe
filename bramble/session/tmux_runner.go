@@ -286,9 +286,8 @@ func (r *tmuxRunner) buildCommand() (binary string, args []string) {
 		// Codex's notify program is its analogue of Claude's Stop hook: it runs
 		// when a turn completes. Without it bramble never learns a codex window
 		// went idle, so the session sits at "running" forever after answering —
-		// which breaks both halves of subagent messaging. Nothing drains the
-		// queue for it, and its parent is only told it finished when the window
-		// finally dies.
+		// which is what a polling orchestrator reads as a lane still working,
+		// and its parent is only told it finished when the window finally dies.
 		//
 		// Codex appends its own JSON payload as a trailing argument; `bramble
 		// notify` takes no positional arguments, so the extra one is ignored.

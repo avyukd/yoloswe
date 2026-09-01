@@ -31,6 +31,8 @@ func (f *fakeRegistry) ResolveTmuxTarget(id session.SessionID) (string, error) {
 }
 func (f *fakeRegistry) CapturePaneText(session.SessionID, int) ([]string, error) { return nil, nil }
 func (f *fakeRegistry) StopSession(session.SessionID) error                      { return nil }
+func (f *fakeRegistry) SetSessionRunning(session.SessionID) bool                 { return true }
+func (f *fakeRegistry) SetSessionIdle(session.SessionID) bool                    { return true }
 
 func assertNotFound(id session.SessionID) error {
 	return &control.RemoteError{Message: "not found: " + string(id)}

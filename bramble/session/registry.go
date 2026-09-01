@@ -75,21 +75,23 @@ func (r *SessionRegistry) findManager(id SessionID) *Manager {
 }
 
 // SetSessionIdle finds the owning manager for the session and marks it idle.
-func (r *SessionRegistry) SetSessionIdle(id SessionID) {
+func (r *SessionRegistry) SetSessionIdle(id SessionID) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if mgr := r.findManager(id); mgr != nil {
-		mgr.SetSessionIdle(id)
+		return mgr.SetSessionIdle(id)
 	}
+	return false
 }
 
 // SetSessionRunning finds the owning manager and marks the session running.
-func (r *SessionRegistry) SetSessionRunning(id SessionID) {
+func (r *SessionRegistry) SetSessionRunning(id SessionID) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if mgr := r.findManager(id); mgr != nil {
-		mgr.SetSessionRunning(id)
+		return mgr.SetSessionRunning(id)
 	}
+	return false
 }
 
 // CapturePaneText finds the owning manager and delegates the capture.

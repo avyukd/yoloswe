@@ -2,7 +2,7 @@
 
 // Package integration drives a real bramble binary, in tmux mode, on a real
 // (throwaway) git repo, and exercises the subagent path end to end: lineage,
-// automatic reporting to a parent, and queued delivery in both directions.
+// the disposable hint to a parent, and messaging in both directions.
 //
 // These are the manual reproductions of the bugs that only appear once a real
 // CLI is running in a real pane — a paste dropped while the agent's TUI is
@@ -11,7 +11,7 @@
 // are visible from unit tests, and all three silently broke subagent messaging.
 //
 // Everything is isolated: a private tmux server (`tmux -S`), a private HOME so
-// the delivery queue and session store are the test's own, a private
+// the session store and the retired spool are the test's own, a private
 // XDG_RUNTIME_DIR so socket discovery cannot find another bramble, and a
 // throwaway worktree repo. Nothing here touches the developer's tmux session,
 // their ~/.bramble, or their real repos.
@@ -26,12 +26,10 @@ package integration
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -48,7 +46,7 @@ const (
 	// settleTimeout bounds waits on a real agent CLI reacting.
 	// Real backends have to receive, run, and answer a prompt within it.
 	settleTimeout = 90 * time.Second
-	pollInterval = 250 * time.Millisecond
+	pollInterval  = 250 * time.Millisecond
 )
 
 // harness is one isolated bramble under test.
@@ -65,8 +63,11 @@ type harness struct {
 	runtimeDir string
 	// Tracked because restart brings the replacement up in a new window.
 	brambleWindow string
-	// One visible dialog should collect one answer, even across TUI repaints.
-	answeredDialogs map[dialogKey]bool
+	// How many times one visible dialog has been answered. Bounded rather than
+	// boolean: a first answer can be sent while the CLI is still painting the
+	// menu, in which case the keys go nowhere and the dialog is still up. See
+	// dialogAnswerAttempts.
+	answeredDialogs map[dialogKey]int
 }
 
 // newHarness starts isolated tmux, repo, HOME/runtime state, and bramble.
@@ -86,7 +87,7 @@ func newHarness(t *testing.T, stubAgent bool) *harness {
 	h := &harness{
 		t:               t,
 		tmuxSocket:      filepath.Join(shortRoot, "t.sock"),
-		answeredDialogs: map[dialogKey]bool{},
+		answeredDialogs: map[dialogKey]int{},
 	}
 	wtRoot := filepath.Join(root, "worktrees")
 	runtimeDir := filepath.Join(shortRoot, "run")
@@ -94,7 +95,7 @@ func newHarness(t *testing.T, stubAgent bool) *harness {
 	// The live-backend cases must keep the developer's real HOME: an agent CLI
 	// reads its credentials from there, and a logged-out CLI hangs on an
 	// interactive prompt rather than failing. The stubbed cases get a private
-	// HOME so the delivery queue and session store are the test's own.
+	// HOME so the session store and the retired spool are the test's own.
 	h.home = os.Getenv("HOME")
 	if stubAgent {
 		h.home = filepath.Join(root, "home")
@@ -340,8 +341,9 @@ func (h *harness) awaitStatus(id session.SessionID, want ...string) {
 	}, settleTimeout, pollInterval, "session %s never reached %v (last: %s)", id, want, h.status(id))
 }
 
-// send delivers text to a session over the control plane. queue holds it until
-// the recipient is idle instead of typing into a live turn.
+// send delivers text to a session over the control plane. queue asks for the
+// removed queued path, which the dispatcher refuses — kept as a parameter so a
+// test can assert that refusal.
 func (h *harness) send(from, to session.SessionID, text string, queue bool) (control.SendInputResult, error) {
 	h.t.Helper()
 	req, err := control.NewRequest(control.TypeSessionSendInput, "it-send",
@@ -418,29 +420,13 @@ func (h *harness) tmux(args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
-// deliveryQueueLen counts recipients, not messages. Tests that mean "my message
-// is held" should use queuedFor because parent reports may be racing too.
-// The courier persists one file per recipient, holding that recipient's queue.
+// deliveryQueueLen counts files left in the retired courier's spool, one per
+// recipient. It must be zero at all times now: nothing writes there, and the
+// notifier reclaims anything a previous bramble left behind.
 func (h *harness) deliveryQueueLen() int {
 	h.t.Helper()
 	files, _ := filepath.Glob(filepath.Join(h.home, ".bramble", "deliveries", "*.json"))
 	return len(files)
-}
-
-// queuedFor reports how many messages are held for one session.
-func (h *harness) queuedFor(id session.SessionID) int {
-	h.t.Helper()
-	data, err := os.ReadFile(filepath.Join(h.home, ".bramble", "deliveries", string(id)+".json"))
-	if err != nil {
-		return 0 // no file means nothing queued for this recipient
-	}
-	var queue []struct {
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(data, &queue); err != nil {
-		h.t.Fatalf("delivery queue for %s is not readable: %v", id, err)
-	}
-	return len(queue)
 }
 
 // startupDialog is a prompt an agent CLI puts in front of its own prompt.
@@ -451,7 +437,7 @@ type startupDialog struct {
 	name string
 	// match is specific on purpose: answering the wrong modal picks a menu item.
 	match []string
-	keys []string
+	keys  []string
 	// fatal dialogs are reported instead of cleared.
 	fatal string
 }
@@ -464,10 +450,18 @@ type dialogKey struct {
 
 var startupDialogs = []startupDialog{
 	{
-		// Claude directory trust. Default is "Yes, I trust this folder".
+		// Claude directory trust.
+		//
+		// The cursor starts on "No, exit", NOT on the trusting answer, so a bare
+		// Enter quits the CLI: the session dies before it ever reaches a prompt,
+		// and the test then times out looking like bramble never started it.
+		// Measured against claude 2.1.252; this dialog defaulted to the
+		// trusting answer in earlier versions, which is why it once worked.
+		//
+		// Down moves to "Yes, I trust this folder"; Enter confirms it.
 		name:  "claude folder trust",
 		match: []string{"Is this a project you created or one you trust", "I trust this folder"},
-		keys:  []string{"Enter"},
+		keys:  []string{"Down", "Enter"},
 	},
 	{
 		// This modal must fail closed. Answering "Yes" can forward the user's
@@ -500,6 +494,20 @@ var startupDialogs = []startupDialog{
 		keys:  []string{"Escape"},
 	},
 }
+
+// dialogAnswerAttempts bounds how often one on-screen dialog is answered.
+//
+// One attempt is not enough: the matcher fires as soon as the question text is
+// painted, which can be before the CLI has drawn the menu it belongs to, and
+// keys sent into that gap are dropped. The dialog then stays up forever and the
+// session times out having never reached its prompt.
+//
+// It must stay small, though, and it must stop once the dialog is gone. Keys
+// sent into a live session after the dialog clears are typed into the composer
+// or submitted, which is how a stray Enter starts a turn nobody asked for. The
+// match check above is what enforces "still on screen"; this only bounds the
+// retries while it is.
+const dialogAnswerAttempts = 3
 
 // dialogTailLines limits matching to the pane bottom; dismissed dialog text
 // remains in scrollback and would otherwise be answered again.
@@ -539,8 +547,8 @@ func (h *harness) answerStartupDialogs(id session.SessionID, pane string) bool {
 			continue
 		}
 		key := dialogKey{id: id, name: d.name}
-		if h.answeredDialogs[key] {
-			return false // already answered; waiting for it to go away
+		if h.answeredDialogs[key] >= dialogAnswerAttempts {
+			return false // answered enough; waiting for it to go away
 		}
 
 		if d.fatal != "" {
@@ -556,7 +564,7 @@ func (h *harness) answerStartupDialogs(id session.SessionID, pane string) bool {
 			}
 			time.Sleep(300 * time.Millisecond)
 		}
-		h.answeredDialogs[key] = true
+		h.answeredDialogs[key]++
 		return true
 	}
 
@@ -591,6 +599,27 @@ func (h *harness) awaitClearingDialogsFor(id session.SessionID, timeout time.Dur
 		time.Sleep(pollInterval)
 	}
 	h.t.Fatalf(failf+"\n--- pane ---\n%s", append(args, pane)...)
+}
+
+// reachedWorking is awaitWorking that reports instead of failing.
+//
+// Holding a live CLI mid-turn is inherently best-effort: it depends on the model
+// choosing to run the sleep, and on the CLI actually starting its turn. A test
+// whose SETUP did not happen has proven nothing, so it says so and skips rather
+// than failing as though the behaviour under test had regressed — or, worse,
+// passing vacuously because the child was never busy in the first place.
+func (h *harness) reachedWorking(id session.SessionID, promptEcho string, timeout time.Duration) bool {
+	h.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		pane := h.pane(id)
+		if h.status(id) == "running" && strings.Contains(pane, promptEcho) {
+			return true
+		}
+		h.answerStartupDialogs(id, pane)
+		time.Sleep(pollInterval)
+	}
+	return false
 }
 
 // awaitPaneCond captures the pane only after timeout. Putting h.pane() in
@@ -636,12 +665,12 @@ func (h *harness) awaitPaneClearingDialogs(id session.SessionID, want, because s
 }
 
 // longTurnSeconds is how long a "keep busy" prompt occupies an agent. Long
-// enough that a queued message is unambiguously held across a live turn, short
-// enough not to dominate the suite.
+// enough that a live turn is unambiguously in flight while the test writes,
+// short enough not to dominate the suite.
 const longTurnSeconds = 20
 
 // longTurnPrompt shells out because generated text is not a reliable clock; a
-// sleep gives every backend the same live turn to queue behind.
+// sleep gives every backend the same live turn to write against.
 func longTurnPrompt(done string) string {
 	return fmt.Sprintf(
 		"Run this exact shell command and wait for it to finish: sleep %d. "+
@@ -656,32 +685,4 @@ func (h *harness) awaitWorking(id session.SessionID, promptEcho string) {
 	h.awaitClearingDialogs(id, func(pane string) bool {
 		return h.status(id) == "running" && strings.Contains(pane, promptEcho)
 	}, "session %s never started working", id)
-}
-
-// reportedResultPath returns the newest report path; the path, not just the
-// marker text, proves the parent can read the child output.
-func reportedResultPath(pane string) (string, bool) {
-	matches := resultPathRE.FindAllStringSubmatch(pane, -1)
-	if len(matches) == 0 {
-		return "", false
-	}
-	return matches[len(matches)-1][1], true
-}
-
-var resultPathRE = regexp.MustCompile(`result:\s+(\S+)`)
-
-// queuedTextFor returns the on-disk queue a restarted bramble would read.
-func (h *harness) queuedTextFor(to session.SessionID) string {
-	h.t.Helper()
-	files, _ := filepath.Glob(filepath.Join(h.home, ".bramble", "deliveries", "*.json"))
-	var b strings.Builder
-	for _, f := range files {
-		if !strings.Contains(filepath.Base(f), string(to)) {
-			continue
-		}
-		if data, err := os.ReadFile(f); err == nil {
-			b.Write(data)
-		}
-	}
-	return b.String()
 }

@@ -454,7 +454,7 @@ type Manager struct { //nolint:govet // fieldalignment: readability over packing
 	followUpChansMu sync.RWMutex
 	// stateSubscribers receive copies of SessionStateChangeEvent, without
 	// consuming the primary events channel. The delegator's child watcher and
-	// the subagent courier are both built on it.
+	// the subagent notifier are both built on it.
 	stateSubscribers   []*stateSink
 	stateSubscribersMu sync.Mutex
 	worktreeDirtyMu    sync.RWMutex
@@ -780,8 +780,8 @@ func (m *Manager) reconcileTmuxSessions(windowAlive func(windowID, windowName st
 			//
 			// Through emitSessionStateChange, so state subscribers see it too:
 			// a re-adopted session that is already idle makes no further
-			// transition, and the courier would otherwise never learn it is
-			// reachable and could take the mail waiting for it.
+			// transition, and a subscriber would otherwise never learn its
+			// status.
 			m.emitSessionStateChange(SessionStateChangeEvent{
 				Info:      session.ToInfo(),
 				SessionID: session.ID,
@@ -804,10 +804,10 @@ func (m *Manager) reconcileTmuxSessions(windowAlive func(windowID, windowName st
 // a tmux session that has not reached a terminal state. The caller auto-opens
 // them so a Manager re-adopts their sessions.
 //
-// Deliberately not "repos with a *live* window". This probe has no manager and
-// so no courier, which is why it mutates nothing: marking a dead session
-// completed here would consume the one transition its parent's report depends
-// on with nothing listening. That leaves ReconcileTmuxSessions to make the
+// Deliberately not "repos with a *live* window". This probe has no manager, and
+// so nothing subscribed to its transitions, which is why it mutates nothing:
+// marking a dead session completed here would spend that transition with
+// nothing listening. That leaves ReconcileTmuxSessions to make the
 // transition and emit it — and ReconcileTmuxSessions only runs for a repo that
 // gets opened. So a repo whose only subagent died while bramble was down has to
 // be returned too, or the parent is never told, which is the whole point of
@@ -2517,8 +2517,8 @@ func (m *Manager) updateSessionStatus(session *Session, newStatus SessionStatus)
 // window is gone or it was stopped, and every one of those paths then drops it
 // from m.sessions — the map list-sessions reports. Any later move back to running
 // or idle re-animates a session the orchestrator can no longer see, and
-// Courier.Watch forwards it to the parent as an "is idle" report for a session
-// that no longer exists. That is issue #331.
+// Notifier.Watch hints to the parent about a session that no longer exists.
+// That is issue #331.
 //
 // The race is real: a tmux monitor's 15-second capture ticker and its own
 // 2-second liveness ticker hold the same *Session, so a stale poll lands after
@@ -2830,8 +2830,12 @@ func (m *Manager) ActiveWorktreePaths() map[string]struct{} {
 // racing the agent's notify hook by construction: bramble submits a prompt at
 // the same moment the previous turn's notify may be landing, and a separate
 // read and write would let the two interleave into a lost update.
-func (m *Manager) SetSessionRunning(id SessionID) {
-	m.trySetStatus(id, StatusIdle, StatusRunning)
+// It reports whether it moved the session, which is what lets a failed submit
+// undo only the turn it actually started: the transition is a no-op on a
+// session that was already running, and reverting that would end somebody
+// else's live turn.
+func (m *Manager) SetSessionRunning(id SessionID) bool {
+	return m.trySetStatus(id, StatusIdle, StatusRunning)
 }
 
 // pollPaneIdle reads idleness off a backend's pane, for one tick of the
@@ -2879,20 +2883,22 @@ func (m *Manager) pollPaneIdle(tracker *paneIdleTracker, id SessionID, status Se
 // SetSessionIdle transitions a session to StatusIdle (waiting for user input).
 // It only transitions from StatusRunning to avoid reverting terminal states
 // (completed, failed, stopped) that may have been set by the monitor loop.
-func (m *Manager) SetSessionIdle(id SessionID) {
-	m.trySetStatus(id, StatusRunning, StatusIdle)
+func (m *Manager) SetSessionIdle(id SessionID) bool {
+	return m.trySetStatus(id, StatusRunning, StatusIdle)
 }
 
 // trySetStatus looks a session up and moves it from one status to another,
 // doing nothing if it is not there or has since moved on.
-func (m *Manager) trySetStatus(id SessionID, from, to SessionStatus) {
+// trySetStatus reports whether it performed the transition, so a caller that
+// needs to undo its own write can tell that write apart from a no-op.
+func (m *Manager) trySetStatus(id SessionID, from, to SessionStatus) bool {
 	m.mu.RLock()
 	s, ok := m.sessions[id]
 	m.mu.RUnlock()
 	if !ok {
-		return
+		return false
 	}
-	m.tryUpdateSessionStatus(s, from, to)
+	return m.tryUpdateSessionStatus(s, from, to)
 }
 
 // GetAllSessions returns all sessions sorted by creation time (newest first).
