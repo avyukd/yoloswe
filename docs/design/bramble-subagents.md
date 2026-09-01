@@ -181,7 +181,8 @@ providers with no hook only. Two things make that safe enough to act on:
 - **It keys on the composer line, not a window of trailing lines.** Cursor's
   footer grows a mode line in plan mode — which is what a codetalk subagent
   runs in — and a fixed trailing window then misses the working hint and reads a
-  running turn as *idle*, releasing queued mail into it. The hint lives on the
+  running turn as *idle*, which is what would put a line into it. The hint lives
+  on the
   composer line, so that line is found first and only it is examined.
 - **`Add a follow-up` is not an idle marker.** Cursor shows it the whole time.
   Only `ctrl+c to stop`, on that same line, means a turn is in flight. This is
@@ -198,10 +199,10 @@ session re-adopted after a restart gets — through
 `Manager.newPaneIdleTrackerForModel`, and
 `TestReadoptedCursorSubagentIsStillSeenToFinish` drives the second of those for
 real: it restarts bramble under tmux and asserts the re-adopted cursor session
-is still seen to finish a turn. A loop that skipped it would leave a
-cursor subagent that outlived a bramble restart running forever: nothing would
-drain its queued mail and its parent would never be told it finished, which is
-the whole failure this section exists to fix.
+is still seen to finish a turn. A loop that skipped it would leave a cursor
+subagent that outlived a bramble restart reporting *running* forever — and since
+status is what the orchestrator polls, its lane would never be seen to finish,
+which is the whole failure this section exists to fix.
 
 ## Known limitations
 
@@ -247,8 +248,8 @@ Two layers:
 
 - **Stubbed.** Scripted stand-ins for the agent CLIs, installed on PATH as
   `codex` and as `agent` (cursor's binary), exercise bramble's own logic
-  deterministically and with no credentials: lineage, the notify hook, queued
-  delivery, delivery into a pane left in copy mode, and a full two-round
+  deterministically and with no credentials: lineage, the notify hook, a refused
+  `--queue`, delivery into a pane left in copy mode, and a full two-round
   conversation. The cursor stand-in is faithful about one thing only — the
   composer footer, which is the entire idle signal for a backend with no hook.
   - `TestReadoptedCursorSubagentIsStillSeenToFinish` restarts bramble (by
@@ -260,18 +261,17 @@ Two layers:
   each, with a Claude parent. They run by default and skip only when a backend
   is missing or logged out, because every bug this feature shipped with was
   invisible without a real CLI in a real pane.
-  - `TestLiveSubagentTwoWay` — a two-round conversation, and the result file the
-    report points at is opened and checked for the subagent's answer. Asserting
-    only that a path appeared would pass on a report naming a file that a failed
-    pane capture never wrote.
-  - `TestLiveQueuedDeliveryWaitsForALiveTurn` — the deferred path, which every
-    other live assertion misses by delivering to an idle child. The subagent is
-    given a twenty-second shell command, and the test asserts the message is
-    held, that nothing is typed into the running turn, and — the point of it —
-    that the session is not mistaken for idle while it works. That last one is
-    the harmful direction for the cursor probe: a false idle would release the
-    queued message into the live turn. The unit tests pin it against a synthetic
-    pane; only this pins it against the real chrome.
+  - `TestLiveSubagentTwoWay` — a two-round conversation, asserting that each of
+    the child's turns is observable as a status transition. It deliberately does
+    *not* assert that a hint arrived: a hint is dropped whenever the parent is
+    not idle at that instant, so requiring one would be requiring the guarantee
+    this design removed.
+  - `TestLiveBusyChildIsNeverWrittenInto` — the harmful direction for the pane
+    probes. The subagent is given a twenty-second shell command, and the test
+    asserts nothing is typed into the running turn and that the session is not
+    mistaken for idle while it works. A false idle is what would put a line into
+    a live turn. The unit tests pin this against a synthetic pane; only this
+    pins it against the real chrome.
 
   `TestSubagentOnItsOwnWorktree*` cover `--create-worktree`: the isolation is
   asserted against git, not against the path bramble reports — the branch it is
@@ -279,13 +279,13 @@ Two layers:
   other. The return path is checked across that boundary too, since lineage
   travels by session ID rather than by tree.
 
-  `TestConcurrentSubagents*` cover a fan-out: several subagents working at once
-  and reporting to the same parent. That is the only place the queue takes
-  concurrent writes, and where a lost report is quiet rather than loud — the
-  parent simply waits forever for a subagent that already finished. The second
-  of the two holds the parent mid-turn so the reports genuinely pile up, and
-  reads the queue off disk while they do; otherwise the parent answers each one
-  as it lands and the queue never holds more than one thing.
+  `TestConcurrentSubagentsCoalesceIntoOneNudge` and
+  `TestABusyParentAccumulatesNothing` cover a fan-out: several subagents working
+  at once with the same parent. Coalescing is what this pins — many children
+  finishing must not put one line per child into the parent's pane — and the
+  second holds the parent mid-turn, where the correct outcome is that *nothing*
+  accumulates: with no queue there is nowhere for a hint to wait, so a busy
+  parent simply misses them and reads the run directory instead.
 
   A backend is occupied with `sleep` rather than a long answer because generated
   text is not a clock — a model told to count slowly may emit the whole list at

@@ -263,13 +263,16 @@ func TestReadoptedCursorSubagentIsStillSeenToFinish(t *testing.T) {
 
 	h.restart()
 
-	// Queued delivery exercises the courier path that needs the child to go idle.
 	h.awaitStatus(child, "idle")
 	_, err := h.send(parent, child, "AFTER-RESTART", false)
 	require.NoError(t, err)
 	h.awaitPane(child, "CURSOR-STUB-REPLY AFTER-RESTART", "the message never reached the re-adopted child")
 
-	// The re-adopted loop must see the pane go quiet again.
+	// A submitted send marks the recipient running, so this is a real
+	// running→idle transition rather than a status that never moved. Only the
+	// re-adopted loop's pane polling can produce it for cursor, which has no
+	// completion hook.
+	h.awaitStatus(child, "running")
 	h.awaitPaneCond(child, func() bool {
 		return h.status(child) == "idle"
 	}, "the re-adopted cursor session was never seen to finish its turn — nothing polls its pane")
@@ -447,11 +450,10 @@ func TestABusyParentAccumulatesNothing(t *testing.T) {
 	parent := h.spawn("builder", stubModel, "", "PARENT-BOOT")
 	h.awaitStatus(parent, "idle")
 
-	// STUB-SLEEP holds the parent inside a turn. Its status is not asserted
-	// here: an explicit send goes straight to the pane and deliberately does not
-	// mark the session running — only bramble's own writes do that — so the
-	// status may still read idle while the pane is busy. What matters is that
-	// nothing accumulates either way.
+	// STUB-SLEEP holds the parent inside a turn. A submitted send marks the
+	// recipient running, so the parent is genuinely busy for the assertions
+	// below rather than merely looking busy in the pane. What matters here is
+	// that nothing accumulates while it is.
 	_, err := h.send("", parent, "STUB-SLEEP 8", false)
 	require.NoError(t, err)
 
@@ -640,8 +642,10 @@ func TestSessionsStillReachBrambleAfterARestart(t *testing.T) {
 	require.NoError(t, err)
 	h.awaitPane(parent, "STUB-REPLY AFTER-RESTART", "a pre-restart session was unreachable afterwards")
 
-	require.Eventually(t, func() bool { return h.deliveryQueueLen() == 0 },
-		settleTimeout, pollInterval, "the queue must drain, which needs the session to be seen going idle")
+	// A plain check, not Eventually: nothing writes to the retired spool any
+	// more, so there is no drain to wait for. It stays as a regression fence
+	// against reintroducing persistence.
+	require.Zero(t, h.deliveryQueueLen(), "the retired spool must stay unused")
 }
 
 // TestSwarmLaneProtocol walks the exact contract the subagent-swarm skill

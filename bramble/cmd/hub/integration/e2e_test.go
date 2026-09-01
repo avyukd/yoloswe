@@ -60,6 +60,7 @@ func (r *e2eRegistry) CapturePaneText(_ session.SessionID, n int) ([]string, err
 	return r.ctl.Capture(context.Background(), r.target, n)
 }
 func (r *e2eRegistry) StopSession(session.SessionID) error { return nil }
+func (r *e2eRegistry) SetSessionRunning(session.SessionID) {}
 
 func startTmux(t *testing.T) (socketPath, target string) {
 	t.Helper()

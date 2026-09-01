@@ -16,6 +16,11 @@ type Registry interface {
 	ResolveTmuxTarget(id session.SessionID) (string, error)
 	CapturePaneText(id session.SessionID, n int) ([]string, error)
 	StopSession(id session.SessionID) error
+	// SetSessionRunning records that a write started a turn. A tmux session's
+	// status is driven from outside — the agent's hook reports idle and nothing
+	// reports the opposite — so the party that typed the prompt is the only one
+	// that knows.
+	SetSessionRunning(id session.SessionID)
 }
 
 // Dispatcher handles control protocol requests against a registry (session
@@ -184,6 +189,18 @@ func (d *Dispatcher) sendInput(ctx context.Context, req *Msg, sessionScoped bool
 	if r.Submit {
 		if err := d.ctl.SendSpecial(ctx, target, tmuxctl.KeyEnter); err != nil {
 			return SendInputResult{}, err
+		}
+		// A submitted prompt started a turn, and for a tmux session nothing else
+		// reports that: the agent's hook only ever says "idle". Leave it unset
+		// and the session reads idle for the whole turn, so list-sessions — the
+		// poll this transport now relies on — calls a working lane finished, and
+		// the turn's own completion notify is dropped by the StatusRunning guard
+		// in SetSessionIdle, so the next turn produces no state change either.
+		//
+		// Session-scoped sends only: a raw --target names a pane, which has no
+		// session status to move.
+		if sessionScoped && r.SessionID != "" {
+			d.reg.SetSessionRunning(session.SessionID(r.SessionID))
 		}
 	}
 	return SendInputResult{OK: true}, nil

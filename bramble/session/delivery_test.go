@@ -413,7 +413,15 @@ func TestATUIParentIsNotPastedInto(t *testing.T) {
 // An unreadable pane is silence, not a problem to solve. The notifier proceeds
 // because refusing every pane it cannot parse would silence hints for every
 // backend without claude's chrome — and a wrong hint costs nothing.
-func TestAnUnreadablePaneStillGetsAHint(t *testing.T) {
+// TestAFailedCaptureYieldsForClaude pins the "unreadable frame" half of the
+// yielding contract the Notifier doc states.
+//
+// A failed capture is not the same as a pane with nothing to say. For claude the
+// draft guard is the only thing between this line and a human's half-typed one,
+// and tmux paste-buffer appends — so writing while that guard is blind is
+// exactly the failure the guard exists to prevent. Yielding costs one poll
+// interval, which is what droppable buys.
+func TestAFailedCaptureYieldsForClaude(t *testing.T) {
 	t.Parallel()
 	target := newFakeTarget()
 	child := claudeChild(target)
@@ -422,8 +430,28 @@ func TestAnUnreadablePaneStillGetsAHint(t *testing.T) {
 
 	newTestNotifier(t, target, panes).NotifyParent(t.Context(), child)
 
+	require.Empty(t, panes.recorded(),
+		"a blind draft guard must not be written past")
+	require.Empty(t, target.markedRunning, "and no turn was started")
+}
+
+// TestAFailedCaptureStillHintsWhereNoGuardApplies is the other half: gemini has
+// neither an idle probe nor a readable composer, so no guard would have
+// consulted the capture. Yielding there would withhold every hint from those
+// providers for no protection — the capture is skipped, not failed.
+func TestAFailedCaptureStillHintsWhereNoGuardApplies(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("parent", StatusIdle, RunnerTypeTmux)
+	target.setBackend("parent", "gemini", "gemini-3-flash-preview")
+	target.setChild("child", "parent", StatusIdle, RunnerTypeTmux)
+	target.captureErr = fmt.Errorf("pane is gone")
+	panes := &fakePanes{}
+
+	newTestNotifier(t, target, panes).NotifyParent(t.Context(), target.mustInfo("child"))
+
 	require.Equal(t, 1, panes.pasteCount(),
-		"a hint is disposable, so an unreadable pane is not a reason to withhold it")
+		"no guard reads this provider's pane, so a capture error withholds nothing")
 }
 
 func TestAFailedPasteIsDroppedNotRetried(t *testing.T) {
@@ -536,4 +564,53 @@ func TestAHintDoesNotHintBack(t *testing.T) {
 
 	require.Equal(t, 1, panes.pasteCount(),
 		"a parent going idle must not hint: it has no parent, and a volley would never stop")
+}
+
+// TestAChildStartingWorkIsNotNews pins the status gate.
+//
+// A hint is typed and submitted, so it starts a real turn in the recipient.
+// Hinting on idle→running would therefore spend a turn to report that a lane
+// began working — and because the hint moves the recipient idle→running too,
+// the same rule would fire again one level up.
+func TestAChildStartingWorkIsNotNews(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	claudeChild(target)
+	target.set("child", StatusRunning, RunnerTypeTmux)
+	panes := echoPanes(target)
+
+	newTestNotifier(t, target, panes).NotifyParent(t.Context(), target.mustInfo("child"))
+
+	require.Empty(t, panes.recorded(), "a lane getting on with its work is not news")
+}
+
+// TestAHintDoesNotClimbTheAncestorChain is the case TestAHintDoesNotHintBack
+// cannot reach: a parent that is itself somebody's child.
+//
+// new-session inherits --parent unless --no-parent is passed, so a nested swarm
+// is the normal shape rather than an exotic one. Without the status gate, one
+// leaf finishing hints its parent, which marks that parent running, which is a
+// transition that hints the grandparent — one completion billing a turn to
+// every ancestor.
+func TestAHintDoesNotClimbTheAncestorChain(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	target.set("grandparent", StatusIdle, RunnerTypeTmux)
+	target.setBackend("grandparent", "claude", "opus")
+	target.setChild("parent", "grandparent", StatusIdle, RunnerTypeTmux)
+	target.setBackend("parent", "claude", "opus")
+	target.setChild("child", "parent", StatusIdle, RunnerTypeTmux)
+	target.setPane(claudeComposerPane(""))
+	panes := echoPanes(target)
+	n := newTestNotifier(t, target, panes)
+
+	n.NotifyParent(t.Context(), target.mustInfo("child"))
+	require.Equal(t, 1, panes.pasteCount(), "the child's finish hints its parent once")
+
+	// The hint just moved the parent idle→running. That transition is what
+	// would climb, so feed it back the way Watch does.
+	n.NotifyParent(t.Context(), target.mustInfo("parent"))
+
+	require.Equal(t, 1, panes.pasteCount(),
+		"a parent starting a turn must not hint the grandparent")
 }

@@ -24,6 +24,7 @@ type fakeRegistry struct {
 	sessions   []session.SessionInfo
 	captured   []string
 	stopped    []string
+	setRunning []string
 }
 
 func (f *fakeRegistry) GetAllSessions() []session.SessionInfo { return f.sessions }
@@ -47,6 +48,10 @@ func (f *fakeRegistry) CapturePaneText(id session.SessionID, _ int) ([]string, e
 		return nil, f.captureErr
 	}
 	return f.captured, nil
+}
+
+func (f *fakeRegistry) SetSessionRunning(id session.SessionID) {
+	f.setRunning = append(f.setRunning, string(id))
 }
 
 func (f *fakeRegistry) StopSession(id session.SessionID) error {
@@ -287,4 +292,56 @@ func TestSendInputLeavesCopyModeFirst(t *testing.T) {
 	require.NoError(t, resp.DecodeResponse(&result))
 	require.Len(t, ctl.CallsFor("ExitCopyMode"), 1, "the pane must be taken out of copy mode")
 	require.Len(t, ctl.CallsFor("Paste"), 1)
+}
+
+// TestSubmittedSendMarksTheSessionRunning pins the status half of a write.
+//
+// A tmux session's status only ever moves one way from outside: the agent's
+// hook reports idle, and nothing reports the opposite. Whoever typed the prompt
+// is the only party that knows a turn started. This used to be the courier's
+// job on the --queue path; with --queue refused, the direct write is the only
+// write left, so it has to do it.
+//
+// Leaving it unset is not cosmetic. list-sessions is the delivery path this
+// transport now relies on, so an idle-looking session is read as a finished
+// lane; and the turn's real completion notify is then dropped by the
+// StatusRunning guard in SetSessionIdle, so the next turn produces no state
+// change either and the conversation goes quiet after one exchange.
+func TestSubmittedSendMarksTheSessionRunning(t *testing.T) {
+	t.Parallel()
+	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+	d, _ := newDispatcher(reg)
+
+	resp := d.Handle(context.Background(), req(t, TypeSessionSendInput,
+		SendInputReq{SessionID: "s1", Text: "hello", Submit: true}))
+
+	var result SendInputResult
+	require.NoError(t, resp.DecodeResponse(&result))
+	require.Equal(t, []string{"s1"}, reg.setRunning,
+		"a submitted prompt started a turn and nothing else reports that")
+}
+
+// Staged text is not a turn: without Enter the agent never sees it, so moving
+// the session to running would make an idle session look busy forever.
+func TestUnsubmittedSendDoesNotMarkRunning(t *testing.T) {
+	t.Parallel()
+	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+	d, _ := newDispatcher(reg)
+
+	d.Handle(context.Background(), req(t, TypeSessionSendInput,
+		SendInputReq{SessionID: "s1", Text: "hello", Submit: false}))
+
+	require.Empty(t, reg.setRunning, "no Enter, no turn")
+}
+
+// A raw --target names a pane, not a session, so there is no status to move.
+func TestRawPaneSendMarksNothingRunning(t *testing.T) {
+	t.Parallel()
+	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+	d, _ := newDispatcher(reg)
+
+	d.Handle(context.Background(), req(t, TypePaneSendInput,
+		SendInputReq{Target: "@9", Text: "hello", Submit: true}))
+
+	require.Empty(t, reg.setRunning, "a raw pane target has no session status")
 }

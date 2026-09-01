@@ -1710,7 +1710,8 @@ func init() {
 		"Removed: queued delivery no longer exists and this is refused with an "+
 			"explanation. Completion is read from the run directory instead")
 	sendInputCmd.Flags().String("from", "",
-		"Sender's session ID (defaults to $"+session.SessionIDEnvVar+")")
+		"Sender's session ID (defaults to $"+session.SessionIDEnvVar+"); currently "+
+			"recorded on the request but not acted on")
 	_ = sendInputCmd.MarkFlagRequired("text")
 
 	sendKeyCmd.Flags().String("session-id", "", "Target bramble session ID (session-centric)")

@@ -151,12 +151,36 @@ func (n *Notifier) sweepLegacyQueue(dir string) {
 // stale, which is the failure this design exists to prevent.
 const nudgeText = "[bramble] subagent activity — check your run directory"
 
+// hintWorthyStatus reports whether a child reaching status is news for its
+// parent.
+//
+// Only the statuses that mean "this lane wants attention". A child moving
+// idle→running is the lane getting on with its work, and hinting it would be
+// actively harmful rather than merely noisy: a hint is typed and submitted,
+// which starts a real turn in the parent and moves the parent idle→running —
+// so if that parent has a parent, the grandparent is hinted too, and one leaf
+// starting work bills every ancestor a turn.
+//
+// That transition is not hypothetical: codex's premature-idle correction and
+// shouldReviveIdleTmuxSession both produce it, as does a submitted send-input.
+func hintWorthyStatus(status SessionStatus) bool {
+	switch status {
+	case StatusIdle, StatusFailed, StatusCompleted, StatusStopped:
+		return true
+	default:
+		return false
+	}
+}
+
 // NotifyParent hints to a child's parent that the child changed state.
 //
 // Every failure mode is a silent return. There is no error to report because
 // there is no promise to break: the orchestrator's poll is the delivery path.
 func (n *Notifier) NotifyParent(ctx context.Context, child SessionInfo) {
 	if child.ParentSessionID == "" {
+		return
+	}
+	if !hintWorthyStatus(child.Status) {
 		return
 	}
 	parent, ok := n.target.SessionInfo(child.ParentSessionID)
@@ -194,7 +218,19 @@ func (n *Notifier) nudge(ctx context.Context, parent SessionInfo) {
 	if err != nil {
 		return
 	}
-	lines := n.capturePaneFor(parent.ID, provider)
+	lines, read := n.capturePaneFor(parent.ID, provider)
+
+	// A capture that was attempted and failed is the "unreadable frame" the
+	// yielding contract names: for claude the draft guard below is the only
+	// thing standing between this line and a human's half-typed one, and a
+	// blind guard cannot do that job. Yield rather than write on a guess —
+	// the cost is one poll interval, which is what droppable means.
+	//
+	// Only where a guard would actually have run. A provider whose pane says
+	// nothing either way loses no protection by proceeding.
+	if !read && composerReadable(provider) {
+		return
+	}
 
 	// Yield on any sign the pane is not free. Unlike the courier, an unreadable
 	// or busy pane is not a problem to be solved with a retry or a grace
@@ -250,17 +286,24 @@ func (n *Notifier) releaseNudge(to SessionID) {
 // makes the composer judge permanently unknown.
 const nudgeCaptureLines = paneCaptureLines
 
-// capturePaneFor reads the recipient's pane once for both yield checks.
-func (n *Notifier) capturePaneFor(id SessionID, provider string) []string {
+// capturePaneFor reads the recipient's pane once for both yield checks. ok is
+// false when the pane was supposed to be read and could not be.
+//
+// The two nil cases are not the same and must not be collapsed. A provider with
+// neither an idle probe nor a readable composer is skipped deliberately: no
+// capture is attempted, no guard would have consulted it, and the hint proceeds.
+// A capture that was attempted and failed leaves the guards blind, which for
+// claude means the draft guard cannot do the one job it exists for.
+func (n *Notifier) capturePaneFor(id SessionID, provider string) (lines []string, ok bool) {
 	// Avoid a tmux round-trip when every provider-keyed check would be unknown.
 	if !providerHasIdleProbe(provider) && !composerReadable(provider) {
-		return nil
+		return nil, true
 	}
 	lines, err := n.target.CapturePaneText(id, nudgeCaptureLines)
 	if err != nil {
-		return nil
+		return nil, false
 	}
-	return lines
+	return lines, true
 }
 
 // Watch hints to parents as their children change state. It returns an

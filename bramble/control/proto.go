@@ -73,7 +73,10 @@ type SessionRef struct {
 type SendInputReq struct {
 	SessionID string `json:"session_id,omitempty"` // session-centric form
 	Target    string `json:"target,omitempty"`     // raw-pane form
-	// From is the sender session.
+	// From is the sender session. Nothing reads it: its only consumer was the
+	// courier, which used it to suppress a generated report when a subagent
+	// messaged its parent itself, and there are no generated reports now. Kept
+	// on the wire so an older client's send still decodes.
 	From string `json:"from,omitempty"`
 	Text string `json:"text"`
 	// Submit presses Enter after paste.

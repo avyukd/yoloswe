@@ -181,25 +181,29 @@ bramble list-sessions --parent=
 With no `--branch` and no `--worktree`, a subagent works on its parent's
 worktree — the usual "helper on the same branch" case.
 
-When a subagent finishes a turn, Bramble delivers a one-line report to its
-parent naming a file with the subagent's full output:
+When a subagent finishes a turn, Bramble may drop a single disposable line into
+its parent's pane:
 
 ```
-[bramble] subagent <id> (codetalk, gpt-5.5) is idle
-result: ~/.bramble/research/<id>.md
+[bramble] subagent activity — check your run directory
 ```
+
+It names no subagent, no status and no path on purpose: anything it carried
+could be read later and be wrong. It is a hint, not a delivery — dropped
+whenever the parent is busy or holds a draft, never queued and never retried.
+The record is what the lane itself wrote (a `.done` file, a commit, a branch),
+read back with `bramble list-sessions` and `git`, which is also what verifies
+it.
 
 Backends differ in how Bramble learns a turn ended: Claude and Codex are given a
 completion hook, and Cursor — which has neither a notify flag nor a working CLI
 hook — has its idleness read off its pane. Gemini and Agy have neither, so a
-subagent on those reports only when its window closes.
+subagent on those is only seen to finish when its window closes.
 
-The report is generated from Bramble's own view of the session, so it arrives
-whatever backend the subagent ran and whether or not the agent inside
-cooperated — which is what makes Codex, Gemini, Cursor and Agy usable as
-subagents, none of which can be given a reporting instruction as reliably as
-Claude. A subagent that messages its parent itself replaces the generated
-report rather than being duplicated by it.
+Because a session's status comes from Bramble's own view rather than the agent's
+cooperation, it is accurate whatever backend ran — which is what makes Codex,
+Gemini, Cursor and Agy usable as subagents, none of which can be given a
+reporting instruction as reliably as Claude.
 
 ### Messaging a session
 
@@ -208,16 +212,15 @@ deliberate interrupt, but if the recipient is mid-turn the text lands in its
 *next* prompt, stripped of the context that made it make sense — and a TUI-mode
 session has no pane at all.
 
-`--queue` holds the message until the recipient is idle, then delivers it by
-whichever path its runner supports:
-
 ```bash
-bramble send-input --session-id <id> --queue --submit --text "also check the tests"
+bramble send-input --session-id <id> --submit --text "also check the tests"
 ```
 
-Queued messages are persisted under `~/.bramble/deliveries/`, so they survive a
-Bramble restart, and are delivered one per idle transition — a delivery starts
-the recipient's next turn, so the rest wait for the one after it.
+`--queue` is **refused**. Holding a message until the recipient looked idle
+meant guessing readiness from a pane and keeping undeliverable mail on disk;
+both halves misfired, and queues accumulated for days before replaying after a
+restart. To reach a subagent without interrupting it, wait for its status to go
+idle (`bramble list-sessions`) and then send.
 
 ## Configuration
 

@@ -7,11 +7,11 @@
 # Writes a real commit via plumbing at refs/backup/<task>: keeps authorship and
 # parentage, recoverable with ordinary git, survives a session death.
 #
-# The brief asks lanes to commit early, which is not protection: a queued message
-# only lands when the lane's turn ENDS, and the risk window is the middle of a
-# long turn. Lanes have reached 298k tokens with 92 uncommitted files while a
-# polite request sat in the queue. When a control depends on the other party
-# acting, add one that does not.
+# The brief asks lanes to commit early, which is not protection: a nudge is only
+# read when the lane's turn ENDS, and the risk window is the middle of a long
+# turn. Lanes have reached 298k tokens with 92 uncommitted files while a polite
+# request went unread. When a control depends on the other party acting, add one
+# that does not.
 #
 # Guard on "has uncommitted work", never "has no commits" — the first version
 # skipped any lane with >=1 commit, switching itself off the moment the

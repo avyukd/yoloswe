@@ -92,7 +92,8 @@ Run `snapshot_at_risk.sh "$RUN"` every tick. It backs up lanes with uncommitted 
 `refs/backup/<lane>` without changing their index or HEAD. Never use an empty branch or
 an idle report as evidence that no backup is needed.
 
-Use the run directory for reports. Queue live-session nudges, then inspect the pane:
+Use the run directory for reports. Send a live-session nudge only to an idle
+session — `--queue` is refused — then inspect the pane:
 Codex can fire idle mid-turn and Cursor can leave pasted instructions unsubmitted.
 `poll_panes.sh "$RUN"` detects questions, trust prompts, and stacked pastes. Do not resend
 while an earlier paste is still visible. Confirm a nudge started work via the pane timer or
