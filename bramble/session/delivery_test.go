@@ -27,6 +27,7 @@ type fakeTarget struct { //nolint:govet // fieldalignment: readability over pack
 	captureDelay  time.Duration
 	captureCount  int
 	markedRunning []SessionID
+	markedIdle    []SessionID
 }
 
 func newFakeTarget() *fakeTarget {
@@ -130,6 +131,17 @@ func (f *fakeTarget) appendPane(text string) {
 	for id := range f.sessions {
 		f.captured[id] = append(f.captured[id], strings.Split(text, "\n")...)
 	}
+}
+
+func (f *fakeTarget) MarkIdle(id SessionID) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	info := f.sessions[id]
+	if info.Status == StatusRunning {
+		info.Status = StatusIdle
+		f.sessions[id] = info
+	}
+	f.markedIdle = append(f.markedIdle, id)
 }
 
 func (f *fakeTarget) MarkRunning(id SessionID) {
@@ -566,6 +578,48 @@ func TestAFanOutNeverHintsPerChild(t *testing.T) {
 	require.NotZero(t, pastes, "the parent is idle, so it must be hinted at least once")
 	require.LessOrEqual(t, pastes, children,
 		"a hint is never queued, so the pane can never hold more than one line per child")
+}
+
+// TestTheTurnIsMarkedBeforeTheEnter pins the ordering, not just the marking.
+//
+// The recipient can answer and fire its completion notify the instant Enter
+// lands. If the turn were marked after, that notify would hit SetSessionIdle's
+// compare-and-set while the session still read idle, be dropped, and then this
+// would mark it running with nothing alive to end it — busy forever, which is
+// the state the polling orchestrator reads as a working lane.
+func TestTheTurnIsMarkedBeforeTheEnter(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	child := claudeChild(target)
+	panes := echoPanes(target)
+
+	var statusAtEnter SessionStatus
+	inner := panes.onSubmit
+	panes.onSubmit = func() {
+		// Stands in for the notify arriving as Enter is processed.
+		statusAtEnter = target.mustInfo("parent").Status
+		inner()
+	}
+
+	newTestNotifier(t, target, panes).NotifyParent(t.Context(), child)
+
+	require.Equal(t, StatusRunning, statusAtEnter,
+		"a notify landing with the Enter must find the session already running, or it is dropped")
+}
+
+// A failed Enter started no turn, so the marking must not stand: the session
+// would otherwise read busy forever with nothing to end it.
+func TestAFailedEnterRollsTheTurnBack(t *testing.T) {
+	t.Parallel()
+	target := newFakeTarget()
+	child := claudeChild(target)
+	panes := &fakePanes{enterErr: fmt.Errorf("send-keys failed")}
+
+	newTestNotifier(t, target, panes).NotifyParent(t.Context(), child)
+
+	require.Equal(t, []SessionID{"parent"}, target.markedIdle,
+		"a submit that failed must put the session back")
+	require.Equal(t, StatusIdle, target.mustInfo("parent").Status)
 }
 
 // TestAHintDoesNotHintBack pins termination.

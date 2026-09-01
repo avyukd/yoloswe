@@ -21,6 +21,8 @@ type Registry interface {
 	// reports the opposite — so the party that typed the prompt is the only one
 	// that knows.
 	SetSessionRunning(id session.SessionID)
+	// SetSessionIdle rolls that back when the submit itself failed.
+	SetSessionIdle(id session.SessionID)
 }
 
 // Dispatcher handles control protocol requests against a registry (session
@@ -187,10 +189,12 @@ func (d *Dispatcher) sendInput(ctx context.Context, req *Msg, sessionScoped bool
 		return SendInputResult{}, err
 	}
 	if r.Submit {
+		// Before the Enter, not after. See noteTurnStarted.
+		started := d.noteTurnStarted(sessionScoped, r.SessionID)
 		if err := d.ctl.SendSpecial(ctx, target, tmuxctl.KeyEnter); err != nil {
+			started.undo()
 			return SendInputResult{}, err
 		}
-		d.noteTurnStarted(sessionScoped, r.SessionID)
 	}
 	return SendInputResult{OK: true}, nil
 }
@@ -204,38 +208,68 @@ func (d *Dispatcher) sendKey(ctx context.Context, req *Msg, sessionScoped bool) 
 	if err != nil {
 		return OKResult{}, err
 	}
-	if err := d.ctl.SendSpecial(ctx, target, r.Key); err != nil {
-		return OKResult{}, err
-	}
 	// Enter submits whatever is in the composer, which is a turn starting just
 	// as much as a submitted send-input is — and the two-step "stage, then
 	// Enter" is a documented workflow, so this is the completion of the write
 	// the unsubmitted send deliberately did not finish. Only Enter: C-c,
 	// Escape and the arrows do not start a turn.
+	//
+	// Before the key, not after. See noteTurnStarted.
+	var started turnStart
 	if r.Key == tmuxctl.KeyEnter {
-		d.noteTurnStarted(sessionScoped, r.SessionID)
+		started = d.noteTurnStarted(sessionScoped, r.SessionID)
+	}
+	if err := d.ctl.SendSpecial(ctx, target, r.Key); err != nil {
+		started.undo()
+		return OKResult{}, err
 	}
 	return OKResult{OK: true}, nil
 }
 
-// noteTurnStarted records that a write just started a turn in a session.
+// turnStart undoes a turn-start marking whose submit then failed.
+type turnStart struct {
+	reg Registry
+	id  session.SessionID
+}
+
+// undo returns the session to idle after a failed submit. Compare-and-set the
+// other way, so a notify that has legitimately moved the session on since is
+// not clobbered.
+func (t turnStart) undo() {
+	if t.reg != nil && t.id != "" {
+		t.reg.SetSessionIdle(t.id)
+	}
+}
+
+// noteTurnStarted records that a write is starting a turn in a session.
 //
-// One helper rather than the same three lines at each write path, because the
-// cost of forgetting it is invisible locally and severe downstream: a tmux
-// session's status only ever moves one way from outside — the agent's hook
-// reports idle and nothing reports the opposite — so a turn that goes
-// unrecorded leaves the session reading idle for its whole duration.
-// list-sessions, which this transport relies on for delivery, then calls a
-// working lane finished; and SetSessionIdle is a compare-and-set from
-// StatusRunning, so the turn's real completion notify is dropped too and the
-// next turn produces no state change either.
+// One helper rather than the same lines at each write path, because the cost of
+// forgetting it is invisible locally and severe downstream: a tmux session's
+// status only ever moves one way from outside — the agent's hook reports idle
+// and nothing reports the opposite — so a turn that goes unrecorded leaves the
+// session reading idle for its whole duration. list-sessions, which this
+// transport relies on for delivery, then calls a working lane finished; and
+// SetSessionIdle is a compare-and-set from StatusRunning, so the turn's real
+// completion notify is dropped too and the next turn produces no state change
+// either.
+//
+// **Called before the Enter, not after.** Marking afterwards looks harmless and
+// is not: a fast agent can answer and fire its completion notify in the gap. That
+// notify hits SetSessionIdle's compare-and-set, sees StatusIdle rather than
+// StatusRunning, and is dropped — and then this marks the session running with
+// nothing left alive to end it, so it reads busy forever. Marking first means
+// the worst case is a session briefly running when the submit failed, which
+// undo corrects.
 //
 // Session-scoped writes only: a raw --target names a pane, which has no session
 // status to move.
-func (d *Dispatcher) noteTurnStarted(sessionScoped bool, sessionID string) {
-	if sessionScoped && sessionID != "" {
-		d.reg.SetSessionRunning(session.SessionID(sessionID))
+func (d *Dispatcher) noteTurnStarted(sessionScoped bool, sessionID string) turnStart {
+	if !sessionScoped || sessionID == "" {
+		return turnStart{}
 	}
+	id := session.SessionID(sessionID)
+	d.reg.SetSessionRunning(id)
+	return turnStart{reg: d.reg, id: id}
 }
 
 func (d *Dispatcher) sessionSelect(ctx context.Context, req *Msg) (OKResult, error) {

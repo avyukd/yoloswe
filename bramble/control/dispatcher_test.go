@@ -25,6 +25,7 @@ type fakeRegistry struct {
 	captured   []string
 	stopped    []string
 	setRunning []string
+	setIdle    []string
 }
 
 func (f *fakeRegistry) GetAllSessions() []session.SessionInfo { return f.sessions }
@@ -52,6 +53,10 @@ func (f *fakeRegistry) CapturePaneText(id session.SessionID, _ int) ([]string, e
 
 func (f *fakeRegistry) SetSessionRunning(id session.SessionID) {
 	f.setRunning = append(f.setRunning, string(id))
+}
+
+func (f *fakeRegistry) SetSessionIdle(id session.SessionID) {
+	f.setIdle = append(f.setIdle, string(id))
 }
 
 func (f *fakeRegistry) StopSession(id session.SessionID) error {
@@ -378,6 +383,21 @@ func TestNonSubmittingKeysMarkNothingRunning(t *testing.T) {
 			require.Empty(t, reg.setRunning, "%s does not start a turn", key)
 		})
 	}
+}
+
+// A submit that failed started no turn, so the marking must be rolled back or
+// the session reads busy forever with nothing alive to end it.
+func TestAFailedSubmitRollsTheTurnBack(t *testing.T) {
+	t.Parallel()
+	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+	d, ctl := newDispatcher(reg)
+	ctl.SendSpecialErr = fmt.Errorf("send-keys failed")
+
+	d.Handle(context.Background(), req(t, TypeSessionSendInput,
+		SendInputReq{SessionID: "s1", Text: "hello", Submit: true}))
+
+	require.Equal(t, []string{"s1"}, reg.setRunning, "marked before the Enter")
+	require.Equal(t, []string{"s1"}, reg.setIdle, "and put back when the Enter failed")
 }
 
 // A raw --target names a pane, which has no session status to move.

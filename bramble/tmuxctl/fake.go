@@ -22,6 +22,10 @@ type FakeCall struct {
 type FakeController struct {
 	// Optional error to return from every method (for fault-injection tests).
 	Err error
+	// SendSpecialErr fails only SendSpecial, so a test can let a paste land and
+	// then fail the Enter that submits it — the ordering case where a turn is
+	// marked started and the submit never happens.
+	SendSpecialErr error
 
 	// Canned read results.
 	PaneStatus *session.PaneStatus
@@ -84,6 +88,9 @@ func (f *FakeController) ListPanes(_ context.Context, target string) ([]TmuxPane
 
 func (f *FakeController) SendSpecial(_ context.Context, target string, key SpecialKey) error {
 	f.record(FakeCall{Method: "SendSpecial", Target: target, Special: key})
+	if f.SendSpecialErr != nil {
+		return f.SendSpecialErr
+	}
 	return f.Err
 }
 

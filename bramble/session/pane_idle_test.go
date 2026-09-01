@@ -88,7 +88,7 @@ func TestEveryTmuxProviderHasAProbe(t *testing.T) {
 }
 
 // TestTrackerNeedsConsecutiveObservations stops one half-painted frame from
-// releasing queued mail.
+// reporting a working lane as finished.
 func TestTrackerNeedsConsecutiveObservations(t *testing.T) {
 	t.Parallel()
 
@@ -411,7 +411,7 @@ func TestClaudeJudgeSeesAWrappedComposer(t *testing.T) {
 
 // TestClaudePaneJudge covers each visible shape. Markerless frames must stay
 // unknown because live monitoring usually misses claude's sub-second spinner.
-// Reading unknown as idle would release queued mail into a running turn.
+// Reading unknown as idle would report a running turn as finished.
 func TestClaudePaneJudge(t *testing.T) {
 	t.Parallel()
 
@@ -503,7 +503,7 @@ func TestClaudeWorkingFrameIsNeverIdle(t *testing.T) {
 // TestWorkingClaudePaneIsNeverReadAsIdle pins the repo fixture where
 // ParseClaudeStatusBar reads a working pane as idle because the composer is
 // always on screen. The pane-idle judge must not repeat that failure.
-// Repeating it would report the turn finished and drain queued mail into it.
+// Repeating it would report the turn finished while it is still running.
 func TestWorkingClaudePaneIsNeverReadAsIdle(t *testing.T) {
 	t.Parallel()
 
@@ -760,7 +760,7 @@ func TestStaleCompletionLineIsNotThisTurnsVerdict(t *testing.T) {
 	tr := &paneIdleTracker{provider: ProviderClaude}
 	for i := 0; i < 3*tr.confirmationsNeeded(); i++ {
 		require.False(t, tr.observe(justSubmitted),
-			"frame %d released queued mail into a live turn", i+1)
+			"frame %d reported a live turn as finished", i+1)
 	}
 
 	// Once the turn ends, its own completion sits below the prompt.

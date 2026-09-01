@@ -50,6 +50,7 @@ func (f *fakeRegistry) ResolveTmuxTarget(id session.SessionID) (string, error) {
 }
 func (f *fakeRegistry) CapturePaneText(session.SessionID, int) ([]string, error) { return nil, nil }
 func (f *fakeRegistry) SetSessionRunning(session.SessionID)                      {}
+func (f *fakeRegistry) SetSessionIdle(session.SessionID)                         {}
 func (f *fakeRegistry) StopSession(session.SessionID) error                      { return nil }
 
 // startTestHub starts an httptest hub and connects an in-process agent to it,

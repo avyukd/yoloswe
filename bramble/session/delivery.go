@@ -26,6 +26,8 @@ type DeliveryTarget interface {
 	// MarkRunning records that a turn has started. Only bramble knows this for
 	// a tmux session it just typed into; see Manager.SetSessionRunning.
 	MarkRunning(id SessionID)
+	// MarkIdle rolls MarkRunning back when the submit itself failed.
+	MarkIdle(id SessionID)
 }
 
 // registryTarget adapts a *SessionRegistry to DeliveryTarget.
@@ -50,6 +52,8 @@ func (t *registryTarget) CapturePaneText(id SessionID, n int) ([]string, error) 
 }
 
 func (t *registryTarget) MarkRunning(id SessionID) { t.reg.SetSessionRunning(id) }
+
+func (t *registryTarget) MarkIdle(id SessionID) { t.reg.SetSessionIdle(id) }
 
 // Notifier hints to a parent session that one of its subagents changed state.
 //
@@ -254,12 +258,21 @@ func (n *Notifier) nudge(ctx context.Context, parent SessionInfo) {
 	if err := n.panes.Paste(ctx, target, nudgeText); err != nil {
 		return
 	}
+	// Marked before the Enter, not after. A submitted prompt starts a turn and
+	// nothing else reports that for a tmux session bramble just typed into —
+	// but a fast parent can answer and fire its completion notify in the gap
+	// between Enter and this call. That notify hits SetSessionIdle's
+	// compare-and-set, sees idle rather than running, and is dropped; this then
+	// marks the parent running with nothing alive to end it, and it reads busy
+	// forever.
+	//
+	// Marking first inverts the failure: if the Enter fails, the parent is
+	// briefly running with no turn, which MarkIdle puts back.
+	n.target.MarkRunning(parent.ID)
 	if err := n.panes.SendEnter(ctx, target); err != nil {
+		n.target.MarkIdle(parent.ID)
 		return
 	}
-	// A submitted prompt started a turn; nothing else reports that for a tmux
-	// session bramble just typed into.
-	n.target.MarkRunning(parent.ID)
 }
 
 // claimNudge reserves the right to hint at a parent, reporting whether it got

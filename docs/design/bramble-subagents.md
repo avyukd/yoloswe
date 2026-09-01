@@ -289,7 +289,7 @@ Two layers:
 
   A backend is occupied with `sleep` rather than a long answer because generated
   text is not a clock — a model told to count slowly may emit the whole list at
-  once, leaving no live turn to queue behind.
+  once, leaving no live turn to write against.
 
 The live cases answer the CLIs' first-run dialogs themselves — Claude's folder
 trust, codex's directory trust, its model-deprecation and rate-limit prompts —
