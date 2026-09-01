@@ -222,6 +222,25 @@ both halves misfired, and queues accumulated for days before replaying after a
 restart. To reach a subagent without interrupting it, wait for its status to go
 idle (`bramble list-sessions`) and then send.
 
+## Research swarm
+
+The same lane machinery that runs engineering work (`.claude/skills/subagent-swarm/`) can run
+investment-research units — dated filings, channel refreshes, new ground, corrections to
+published numbers, adversarial verifiers — against a praxis-style research repo, with a
+`hunt → redteam → record → integrate` lifecycle, disjoint ownership of `dag/*.yaml` files, the
+repo's own mechanical gates as phase exits, and PRs as the human handoff. No Go code changed.
+
+- Skill: [`.claude/skills/research-swarm/SKILL.md`](.claude/skills/research-swarm/SKILL.md)
+  (references: the standing run protocol, the lane contract and brief templates, the doctrine
+  with citations)
+- Loaded example: [`examples/research-swarm/praxis-ox-alpha.md`](examples/research-swarm/praxis-ox-alpha.md)
+  — the text to paste after `/research-swarm`
+- Design note: [`docs/design/research-swarm.md`](docs/design/research-swarm.md)
+
+Install it the same way as `subagent-swarm`, as a symlink into the user skill directory:
+`ln -s "$PWD/.claude/skills/research-swarm" ~/.claude/skills/research-swarm`. Its `scripts/`
+is a symlink to `../subagent-swarm/scripts`, so both skills must be present in the checkout.
+
 ## Configuration
 
 Settings are stored in `~/.bramble/settings.json`:
