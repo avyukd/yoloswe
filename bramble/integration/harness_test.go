@@ -2,7 +2,7 @@
 
 // Package integration drives a real bramble binary, in tmux mode, on a real
 // (throwaway) git repo, and exercises the subagent path end to end: lineage,
-// automatic reporting to a parent, and queued delivery in both directions.
+// the disposable hint to a parent, and messaging in both directions.
 //
 // These are the manual reproductions of the bugs that only appear once a real
 // CLI is running in a real pane — a paste dropped while the agent's TUI is
@@ -11,7 +11,7 @@
 // are visible from unit tests, and all three silently broke subagent messaging.
 //
 // Everything is isolated: a private tmux server (`tmux -S`), a private HOME so
-// the delivery queue and session store are the test's own, a private
+// the session store and the retired spool are the test's own, a private
 // XDG_RUNTIME_DIR so socket discovery cannot find another bramble, and a
 // throwaway worktree repo. Nothing here touches the developer's tmux session,
 // their ~/.bramble, or their real repos.
@@ -95,7 +95,7 @@ func newHarness(t *testing.T, stubAgent bool) *harness {
 	// The live-backend cases must keep the developer's real HOME: an agent CLI
 	// reads its credentials from there, and a logged-out CLI hangs on an
 	// interactive prompt rather than failing. The stubbed cases get a private
-	// HOME so the delivery queue and session store are the test's own.
+	// HOME so the session store and the retired spool are the test's own.
 	h.home = os.Getenv("HOME")
 	if stubAgent {
 		h.home = filepath.Join(root, "home")
@@ -341,8 +341,9 @@ func (h *harness) awaitStatus(id session.SessionID, want ...string) {
 	}, settleTimeout, pollInterval, "session %s never reached %v (last: %s)", id, want, h.status(id))
 }
 
-// send delivers text to a session over the control plane. queue holds it until
-// the recipient is idle instead of typing into a live turn.
+// send delivers text to a session over the control plane. queue asks for the
+// removed queued path, which the dispatcher refuses — kept as a parameter so a
+// test can assert that refusal.
 func (h *harness) send(from, to session.SessionID, text string, queue bool) (control.SendInputResult, error) {
 	h.t.Helper()
 	req, err := control.NewRequest(control.TypeSessionSendInput, "it-send",
@@ -664,12 +665,12 @@ func (h *harness) awaitPaneClearingDialogs(id session.SessionID, want, because s
 }
 
 // longTurnSeconds is how long a "keep busy" prompt occupies an agent. Long
-// enough that a queued message is unambiguously held across a live turn, short
-// enough not to dominate the suite.
+// enough that a live turn is unambiguously in flight while the test writes,
+// short enough not to dominate the suite.
 const longTurnSeconds = 20
 
 // longTurnPrompt shells out because generated text is not a reliable clock; a
-// sleep gives every backend the same live turn to queue behind.
+// sleep gives every backend the same live turn to write against.
 func longTurnPrompt(done string) string {
 	return fmt.Sprintf(
 		"Run this exact shell command and wait for it to finish: sleep %d. "+

@@ -345,3 +345,49 @@ func TestRawPaneSendMarksNothingRunning(t *testing.T) {
 
 	require.Empty(t, reg.setRunning, "a raw pane target has no session status")
 }
+
+// send-key is the other half of the documented two-step: stage text with an
+// unsubmitted send, then press Enter. That Enter is what starts the turn, so it
+// carries the same obligation as a submitted send — the defect this mirrors was
+// found only because send_input was fixed and its sibling was not.
+func TestSendKeyEnterMarksTheSessionRunning(t *testing.T) {
+	t.Parallel()
+	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+	d, _ := newDispatcher(reg)
+
+	d.Handle(context.Background(), req(t, TypeSessionSendKey,
+		SendKeyReq{SessionID: "s1", Key: tmuxctl.KeyEnter}))
+
+	require.Equal(t, []string{"s1"}, reg.setRunning,
+		"Enter submits the composer, which starts a turn")
+}
+
+// Only Enter. Interrupting or dismissing does not start a turn, and marking one
+// would leave an idle session looking busy with nothing to end it.
+func TestNonSubmittingKeysMarkNothingRunning(t *testing.T) {
+	t.Parallel()
+	for _, key := range []tmuxctl.SpecialKey{tmuxctl.KeyEscape, tmuxctl.KeyCtrlC} {
+		t.Run(string(key), func(t *testing.T) {
+			t.Parallel()
+			reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+			d, _ := newDispatcher(reg)
+
+			d.Handle(context.Background(), req(t, TypeSessionSendKey,
+				SendKeyReq{SessionID: "s1", Key: key}))
+
+			require.Empty(t, reg.setRunning, "%s does not start a turn", key)
+		})
+	}
+}
+
+// A raw --target names a pane, which has no session status to move.
+func TestRawPaneEnterMarksNothingRunning(t *testing.T) {
+	t.Parallel()
+	reg := &fakeRegistry{targets: map[string]string{"s1": "@7"}}
+	d, _ := newDispatcher(reg)
+
+	d.Handle(context.Background(), req(t, TypePaneSendKey,
+		SendKeyReq{Target: "@9", Key: tmuxctl.KeyEnter}))
+
+	require.Empty(t, reg.setRunning, "a raw pane target has no session status")
+}

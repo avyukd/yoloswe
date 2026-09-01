@@ -103,7 +103,7 @@ func TestSubagentNudgesItsParentWithoutState(t *testing.T) {
 }
 
 // TestSubagentNotifyHookMarksItIdle covers the hook that moves codex sessions
-// off "running" so queues drain and parents hear before window exit.
+// off "running" so a parent sees the lane finish before its window exits.
 func TestSubagentNotifyHookMarksItIdle(t *testing.T) {
 	h := newHarness(t, true)
 
@@ -246,7 +246,7 @@ func TestFinishedSubagentDoesNotHintForever(t *testing.T) {
 
 // TestReadoptedCursorSubagentIsStillSeenToFinish pins the restart monitor loop.
 // Cursor has no completion hook, so a re-adopted cursor subagent must be polled
-// from its pane or it stays "running" forever and drains no queued mail.
+// from its pane or it stays "running" forever and is never seen to finish.
 //
 // The second turn is the proof because only the re-adopted loop can observe it.
 func TestReadoptedCursorSubagentIsStillSeenToFinish(t *testing.T) {
@@ -400,7 +400,7 @@ const concurrentSubagents = 3
 // TestConcurrentSubagentsCoalesceIntoOneNudge covers a fan-out the way the
 // swarm skill actually runs it: one parent, several lanes finishing at once.
 //
-// The old queue delivered one report per child, in order, one per idle
+// The retired queue delivered one report per child, in order, one per idle
 // transition — which is how a parent ended up holding 25 reports spanning 4.5
 // hours. A hint says only "something happened", so a wave is bounded, and the
 // parent then polls the run directory for what actually changed.
@@ -549,7 +549,7 @@ func TestSubagentWorktreeIsReusedNotDuplicated(t *testing.T) {
 }
 
 // TestCursorDeliveryIsPastedOnceAndSubmitted covers the hookless backend end to
-// end: one paste, submitted, queue drained.
+// end: one paste, submitted, nothing left behind.
 //
 // A shell stand-in cannot reproduce cursor-agent's paste chip, because the
 // terminal echoes the delivered text. The chip and unverifiable-paste branches

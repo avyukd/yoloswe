@@ -190,18 +190,7 @@ func (d *Dispatcher) sendInput(ctx context.Context, req *Msg, sessionScoped bool
 		if err := d.ctl.SendSpecial(ctx, target, tmuxctl.KeyEnter); err != nil {
 			return SendInputResult{}, err
 		}
-		// A submitted prompt started a turn, and for a tmux session nothing else
-		// reports that: the agent's hook only ever says "idle". Leave it unset
-		// and the session reads idle for the whole turn, so list-sessions — the
-		// poll this transport now relies on — calls a working lane finished, and
-		// the turn's own completion notify is dropped by the StatusRunning guard
-		// in SetSessionIdle, so the next turn produces no state change either.
-		//
-		// Session-scoped sends only: a raw --target names a pane, which has no
-		// session status to move.
-		if sessionScoped && r.SessionID != "" {
-			d.reg.SetSessionRunning(session.SessionID(r.SessionID))
-		}
+		d.noteTurnStarted(sessionScoped, r.SessionID)
 	}
 	return SendInputResult{OK: true}, nil
 }
@@ -218,7 +207,35 @@ func (d *Dispatcher) sendKey(ctx context.Context, req *Msg, sessionScoped bool) 
 	if err := d.ctl.SendSpecial(ctx, target, r.Key); err != nil {
 		return OKResult{}, err
 	}
+	// Enter submits whatever is in the composer, which is a turn starting just
+	// as much as a submitted send-input is — and the two-step "stage, then
+	// Enter" is a documented workflow, so this is the completion of the write
+	// the unsubmitted send deliberately did not finish. Only Enter: C-c,
+	// Escape and the arrows do not start a turn.
+	if r.Key == tmuxctl.KeyEnter {
+		d.noteTurnStarted(sessionScoped, r.SessionID)
+	}
 	return OKResult{OK: true}, nil
+}
+
+// noteTurnStarted records that a write just started a turn in a session.
+//
+// One helper rather than the same three lines at each write path, because the
+// cost of forgetting it is invisible locally and severe downstream: a tmux
+// session's status only ever moves one way from outside — the agent's hook
+// reports idle and nothing reports the opposite — so a turn that goes
+// unrecorded leaves the session reading idle for its whole duration.
+// list-sessions, which this transport relies on for delivery, then calls a
+// working lane finished; and SetSessionIdle is a compare-and-set from
+// StatusRunning, so the turn's real completion notify is dropped too and the
+// next turn produces no state change either.
+//
+// Session-scoped writes only: a raw --target names a pane, which has no session
+// status to move.
+func (d *Dispatcher) noteTurnStarted(sessionScoped bool, sessionID string) {
+	if sessionScoped && sessionID != "" {
+		d.reg.SetSessionRunning(session.SessionID(sessionID))
+	}
 }
 
 func (d *Dispatcher) sessionSelect(ctx context.Context, req *Msg) (OKResult, error) {

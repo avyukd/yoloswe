@@ -354,10 +354,39 @@ func TestTheNudgeCarriesNoState(t *testing.T) {
 
 	newTestNotifier(t, target, panes).NotifyParent(t.Context(), target.mustInfo("child"))
 
+	// Before the loop: every assertion below lives inside it, so without this a
+	// run that hinted nothing at all would pass while proving nothing.
+	require.NotEmpty(t, panes.recorded(), "a failed child must still hint")
 	for _, w := range panes.recorded() {
 		require.NotContains(t, w, "child", "a hint names no session")
 		require.NotContains(t, w, "research", "a hint points at no file")
 		require.NotContains(t, w, "died", "a hint reports no status")
+	}
+}
+
+// TestEveryTerminalStatusHints covers the arms of hintWorthyStatus that no other
+// test reaches.
+//
+// Idle is well covered and Running is covered negatively, but Failed, Completed
+// and Stopped had no positive test — so narrowing the switch to `case
+// StatusIdle` left the whole suite green. These are exactly the transitions
+// issue #330 is about: a lane whose window died cannot report for itself, so
+// the hint is the only thing that fires.
+func TestEveryTerminalStatusHints(t *testing.T) {
+	t.Parallel()
+	for _, status := range []SessionStatus{StatusFailed, StatusCompleted, StatusStopped} {
+		t.Run(string(status), func(t *testing.T) {
+			t.Parallel()
+			target := newFakeTarget()
+			claudeChild(target)
+			target.annotate("child", func(i *SessionInfo) { i.Status = status })
+			panes := echoPanes(target)
+
+			newTestNotifier(t, target, panes).NotifyParent(t.Context(), target.mustInfo("child"))
+
+			require.Equal(t, 1, panes.pasteCount(),
+				"a child reaching %s is news its parent cannot get elsewhere", status)
+		})
 	}
 }
 
