@@ -612,7 +612,8 @@ func userSockName(base string) string {
 // kill -9, or fresh launch under a new pid.
 // tmux set-environment reaches only later processes, and agent CLIs read hook
 // settings once at startup. A stranded Stop hook fires into a dead socket,
-// --silent swallows the failure, and parent mail never drains.
+// --silent swallows the failure, and the session's status never leaves running —
+// which a polling orchestrator reads as a lane still working.
 // syscall.Exec keeps the pid, so in-place restart was not the failing case.
 func ipcSocketPath() string {
 	return stableOrPidScoped(ipcSockBase)

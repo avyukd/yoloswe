@@ -142,8 +142,8 @@ func claudeComposerIdx(lines []string) (composerIdx, contentEndIdx int) {
 
 // claudePaneJudge reads claude-code's pane to decide whether a turn is in flight.
 // It does not use ParseClaudeStatusBar's IsIdle: the live composer is visible in
-// both states, so that parser can call a working pane idle and release queued
-// mail into it.
+// both states, so that parser can call a working pane idle, which is written
+// into the status a polling orchestrator reads.
 //
 // Claude's reliable signal is the nearest sparkle line in the bounded content
 // tail: gerund/ellipsis means working, past tense plus "for <duration>" means

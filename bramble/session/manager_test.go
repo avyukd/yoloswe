@@ -1324,9 +1324,9 @@ func TestResolveSessionModeIsWhatBothCallersAgreeOn(t *testing.T) {
 
 // TestReposNeedingTmuxReconcileIncludesDeadWindows is the case that used to
 // fall through the floor. The probe leaves a dead session alone on purpose —
-// completing it here would spend the transition its parent's report rides,
-// with no courier listening — so the repo must be named for opening, or
-// nothing ever completes it and the parent waits forever.
+// completing it here would spend that transition with nothing subscribed to
+// hear it — so the repo must be named for opening, or nothing ever completes
+// it and the lane never reads as finished.
 //
 // The store scan is tested directly: the exported entry point refuses outside
 // tmux, which is where tests run.
