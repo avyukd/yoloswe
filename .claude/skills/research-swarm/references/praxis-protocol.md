@@ -179,7 +179,12 @@ different grounds do not stack (see `dag/BDC-WINDDOWN-CHANNEL.yaml`'s closing pa
   utskiftning, avvikling; "return of capital" is token-matched, not phrase-matched, and ~40% of
   those requests answer HTTP 500 — retry). The HTML form `https://mfn.se/all/s?query=<kw>`
   301-redirects to `/all/s/nordic` and SILENTLY DROPS THE QUERY, returning the unfiltered feed;
-  found by the first Nordic lane on 2026-09-01. EQS is not URL-searchable.
+  found by the first Nordic lane on 2026-09-01. Germany/DACH: EQS IS searchable server-side at
+  `https://www.eqs-news.com/search-results/?searchtype=news&searchword=<kw>` (25 a page,
+  `/search-results/page/N/?...` to page; body-matched, token-matched) — `tools/eqsnews.py`;
+  the earlier "EQS is not URL-searchable" note was the wrong URL. Market-wide title pulls:
+  `tools/tdnet.py` (Japan, by date), `tools/ukrns.py` (UK, by date), `tools/asxanns.py` (ASX,
+  two-day window, run daily), `tools/nzxanns.py` (NZX, latest 200, run daily).
   ASX: `asx.api.markitdigital.com/asx-research/1.0/companies/<ticker>/announcements`.
 - Already-fetched filings live under `/tmp/opencode/` (does not survive a reboot); check before
   re-pulling.
