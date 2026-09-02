@@ -190,6 +190,9 @@ different grounds do not stack (see `dag/BDC-WINDDOWN-CHANNEL.yaml`'s closing pa
   server-rendered, 50 a page; the title filter matches EACH WORD separately, so pass single
   words only; `--read <nid>` works for releases carried as PDF attachments, but nodes that
   redirect to `/products/equities/company-news/<slug>` hit an AWS WAF challenge, HTTP 202).
+  `tools/jsesens.py` (JSE via Sharenet, anonymous two-day window only), `tools/emarketnews.py`
+  (Borsa Italiana via emarketstorage.it: `titolo=` is a stemmed title filter, `mercato=` honoured,
+  `data_from` IGNORED so the tool filters dates itself, `cerca=` is body full-text).
   `tools/dailypulls.sh` runs all of them.
   ASX: `asx.api.markitdigital.com/asx-research/1.0/companies/<ticker>/announcements`.
 - Already-fetched filings live under `/tmp/opencode/` (does not survive a reboot); check before
