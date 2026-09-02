@@ -193,7 +193,9 @@ different grounds do not stack (see `dag/BDC-WINDDOWN-CHANNEL.yaml`'s closing pa
   `tools/jsesens.py` (JSE via Sharenet, anonymous two-day window only), `tools/emarketnews.py`
   (Borsa Italiana via emarketstorage.it: `titolo=` is a stemmed title filter, `mercato=` honoured,
   `data_from` IGNORED so the tool filters dates itself, `cerca=` is body full-text).
-  `tools/dailypulls.sh` runs all of them.
+  `tools/hkexnews.py` (HKEXnews titleSearchServlet: needs the search-page cookie first, else every
+  query is recordCnt 0; pull a WHOLE DAY with empty title and t1code=-2, filter locally on LONG_TEXT --
+  the servlet's own title filter is unusable). `tools/dailypulls.sh` runs all of them.
   ASX: `asx.api.markitdigital.com/asx-research/1.0/companies/<ticker>/announcements`.
 - Already-fetched filings live under `/tmp/opencode/` (does not survive a reboot); check before
   re-pulling.
