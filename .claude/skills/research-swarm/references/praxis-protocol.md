@@ -184,7 +184,13 @@ different grounds do not stack (see `dag/BDC-WINDDOWN-CHANNEL.yaml`'s closing pa
   `/search-results/page/N/?...` to page; body-matched, token-matched) — `tools/eqsnews.py`;
   the earlier "EQS is not URL-searchable" note was the wrong URL. Market-wide title pulls:
   `tools/tdnet.py` (Japan, by date), `tools/ukrns.py` (UK, by date), `tools/asxanns.py` (ASX,
-  two-day window, run daily), `tools/nzxanns.py` (NZX, latest 200, run daily).
+  two-day window, run daily), `tools/nzxanns.py` (NZX, latest 200, run daily),
+  `tools/euronextnews.py` (Paris/Amsterdam/Brussels/Lisbon/Oslo/Dublin — NOT Milan or Athens —
+  via `live.euronext.com/en/listview/company-press-release/all?combine=<word>&page=N`,
+  server-rendered, 50 a page; the title filter matches EACH WORD separately, so pass single
+  words only; `--read <nid>` works for releases carried as PDF attachments, but nodes that
+  redirect to `/products/equities/company-news/<slug>` hit an AWS WAF challenge, HTTP 202).
+  `tools/dailypulls.sh` runs all of them.
   ASX: `asx.api.markitdigital.com/asx-research/1.0/companies/<ticker>/announcements`.
 - Already-fetched filings live under `/tmp/opencode/` (does not survive a reboot); check before
   re-pulling.
